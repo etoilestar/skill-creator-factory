@@ -23,7 +23,7 @@ from .repair import *  # noqa: F403
 from .generation import *  # noqa: F403
 from ..kernel_loader import load_kernel_creator_for_phase
 from ..blueprint_parser import BlueprintShapeError, exact_file_plan_paths_from_strict_skillplan, parse_blueprint, validate_blueprint_shape_for_creator
-from ..skill_plan import normalize_structured_function_items, normalize_structured_responsibility_edges, validate_structured_responsibility_edge_transport
+from ..skill_plan import normalize_structured_function_items, normalize_structured_responsibility_edges, validate_structured_responsibility_edge_transport, structured_responsibility_graph_input_provenance_gaps
 
 from .upload_context import save_creator_context_upload, UPLOAD_ROOT, sanitize_session_id
 from .tool_pool_store import (
@@ -6541,6 +6541,17 @@ FunctionItem responsibility fields and affected ResponsibilityEdges. Prefer the
 issue target_files and affected_edge_indexes; adjust directly connected edges
 only when needed for a coherent repair. Do not rewrite unrelated FunctionItems.
 
+A repair must preserve full declared-input provenance. Never repair an invalid
+platform source merely by deleting the edge while leaving its FunctionItem input
+unresolved. For a dynamic runtime parameter, bind through the supplied
+preferred_structured_input_root with exactly one platform_parameter_binding
+constraint containing explicit source_key, required, and an explicit default
+when required is false. A platform_parameter_binding is required only when
+selecting a dynamic child parameter; a whole structured input root may be passed
+directly without that constraint. Remove an input only when the confirmed Blueprint
+makes it creation-time fixed configuration, retaining that configuration as a
+FunctionItem constraint.
+
 Return only strict JSON:
 {"function_items": [...], "responsibility_edges": [...]}
 """.strip()
@@ -6556,6 +6567,7 @@ Return only strict JSON:
         "platform_boundary_contract": {
             "input_fields": platform_boundary["input_envelope_fields"],
             "final_output_fields": platform_boundary["final_output_fields"],
+            "preferred_structured_input_root": platform_boundary["preferred_structured_input_root"],
         },
     }
     text = await complete_creator_role_once(
@@ -6730,6 +6742,8 @@ constraints must be a JSON array of objects.
 Use platform_io_contract as an exact immutable boundary contract.
 For platform_input_node, from_output must be an actual platform input source slot.
 For platform_output_node, to_input must be an actual platform final output terminal slot.
+
+Every declared FunctionItem input must have explicit runtime provenance through an incoming ResponsibilityEdge. Do not invent top-level platform input slots for Skill-specific parameters. Use platform_io_contract.platform_skill_boundary.preferred_structured_input_root directly when the whole structured value is the FunctionItem input. When binding one dynamic parameter from that structured root, add exactly one constraints entry with type "platform_parameter_binding", an explicit non-empty source_key, and required as a boolean; optional parameters (required=false) must also include an explicit default. source_key is planner-declared and may differ from to_input. If a value is creation-time fixed and not runtime-overridable, keep it in FunctionItem.constraints rather than FunctionItem.inputs. Removing an invalid edge is not a valid repair if it leaves a declared FunctionItem input without provenance.
 
 Return only:
 {
@@ -7732,30 +7746,70 @@ Blueprint Planner 只规划业务责任。
             current_issues: list[dict[str, Any]] = []
             last_error = ""
             for repair_index in range(3):
-                alignment_review = await _review_responsibility_graph_alignment(
-                    request=request, frozen_blueprint_text=frozen_blueprint_text,
-                    allowed_function_item_targets=allowed_function_item_targets,
-                    function_items=current_function_items, responsibility_edges=current_edges,
-                    planner_model=route.model,
-                )
-                boundary_error = ""
+                current_issues = []
+                deterministic_error = ""
                 try:
-                    _validate_responsibility_graph_boundary_presence(current_edges, allowed_function_item_targets)
+                    current_function_items = normalize_structured_function_items(
+                        current_function_items, source="planner"
+                    )
+                    _validate_function_item_targets_in_allowed_domain(
+                        current_function_items, allowed_function_item_targets
+                    )
+                    current_edges = validate_structured_responsibility_edge_transport(
+                        current_edges, function_items=current_function_items, source="planner"
+                    )
+                    provenance_gaps = structured_responsibility_graph_input_provenance_gaps(
+                        current_function_items, current_edges, source="planner"
+                    )
+                    if provenance_gaps:
+                        current_issues = [
+                            {
+                                "id": "responsibility_input_provenance",
+                                "target_files": [target_file],
+                                "affected_edge_indexes": [],
+                                "reason": "Declared FunctionItem input has no runtime provenance.",
+                                "evidence": f"target_file={target_file}; input={input_name}",
+                                "repair_guidance": "Provide an explicit upstream/platform binding or remove it from runtime inputs only if the confirmed Blueprint makes it creation-time fixed configuration.",
+                            }
+                            for target_file, input_name in provenance_gaps
+                        ]
+                        deterministic_error = (
+                            "declared FunctionItem inputs without runtime provenance; "
+                            f"gap_count={len(provenance_gaps)}"
+                        )
+                    else:
+                        _validate_responsibility_graph_boundary_presence(
+                            current_edges, allowed_function_item_targets
+                        )
                 except ValueError as exc:
-                    boundary_error = str(exc)
-                current_issues = list(alignment_review["issues"])
-                if alignment_review["passed"] and not boundary_error:
-                    data["function_items"] = current_function_items
-                    data["responsibility_edges"] = current_edges
-                    data["internal_blueprint_text"] = _render_structured_responsibility_view(
-                        frozen_blueprint_text, current_function_items, current_edges)
-                    break
-                if boundary_error:
-                    current_issues.append({"id": "platform_boundary_presence", "target_files": [],
-                        "affected_edge_indexes": [], "reason": boundary_error,
-                        "evidence": "The current responsibility graph lacks a required platform boundary edge.",
-                        "repair_guidance": "Restore platform boundary closure without changing the frozen FilePlan."})
-                last_error = boundary_error
+                    deterministic_error = str(exc)
+
+                if deterministic_error:
+                    last_error = deterministic_error
+                    if not current_issues:
+                        current_issues = [{
+                            "id": "responsibility_graph_candidate_validation",
+                            "target_files": [], "affected_edge_indexes": [],
+                            "reason": deterministic_error,
+                            "evidence": "The latest responsibility graph failed deterministic protocol validation.",
+                            "repair_guidance": "Repair only the invalid FunctionItem or ResponsibilityEdge fields identified by the validator. Preserve the frozen FilePlan.",
+                        }]
+                else:
+                    alignment_review = await _review_responsibility_graph_alignment(
+                        request=request, frozen_blueprint_text=frozen_blueprint_text,
+                        allowed_function_item_targets=allowed_function_item_targets,
+                        function_items=current_function_items, responsibility_edges=current_edges,
+                        planner_model=route.model,
+                    )
+                    current_issues = list(alignment_review["issues"])
+                    if alignment_review["passed"]:
+                        data["function_items"] = current_function_items
+                        data["responsibility_edges"] = current_edges
+                        data["internal_blueprint_text"] = _render_structured_responsibility_view(
+                            frozen_blueprint_text, current_function_items, current_edges)
+                        break
+                    last_error = "semantic responsibility graph alignment review failed"
+
                 if repair_index >= 2:
                     raise PreparePlanProtocolError(
                         "Responsibility graph alignment remained unresolved after two localized same-Planner repairs; "
@@ -7770,60 +7824,6 @@ Blueprint Planner 只规划业务责任。
                 )
                 current_function_items = list(repaired_graph["function_items"])
                 current_edges = list(repaired_graph["responsibility_edges"])
-                try:
-                    current_function_items = normalize_structured_function_items(current_function_items, source="planner")
-                    _validate_function_item_targets_in_allowed_domain(current_function_items, allowed_function_item_targets)
-                    current_edges = validate_structured_responsibility_edge_transport(
-                        current_edges, function_items=current_function_items, source="planner")
-                except Exception as exc:
-                    last_error = str(exc)
-                    current_issues = [{
-                        "id": "responsibility_graph_candidate_validation", "target_files": [],
-                        "affected_edge_indexes": [], "reason": last_error,
-                        "evidence": "The latest repaired responsibility graph failed the existing deterministic validator.",
-                        "repair_guidance": "Repair only the invalid FunctionItem or ResponsibilityEdge fields identified by the validator. Preserve the frozen FilePlan.",
-                    }]
-                    if repair_index >= 1:
-                        raise PreparePlanProtocolError(
-                            "Responsibility graph repaired candidate remained invalid after two localized same-Planner repairs; "
-                            f"last_error={last_error}; issues={current_issues}; "
-                            f"function_items={current_function_items}; responsibility_edges={current_edges}"
-                        ) from exc
-                    # The invalid candidate itself is intentionally the next repair input.
-                    repaired_graph = await _repair_responsibility_graph_alignment(
-                        request=request, frozen_blueprint_text=frozen_blueprint_text,
-                        allowed_function_item_targets=allowed_function_item_targets,
-                        function_items=current_function_items, responsibility_edges=current_edges,
-                        review_issues=current_issues, planner_model=route.model,
-                    )
-                    current_function_items = normalize_structured_function_items(repaired_graph["function_items"], source="planner")
-                    _validate_function_item_targets_in_allowed_domain(current_function_items, allowed_function_item_targets)
-                    current_edges = validate_structured_responsibility_edge_transport(
-                        repaired_graph["responsibility_edges"], function_items=current_function_items, source="planner")
-                    # This is a fresh candidate: the first candidate's
-                    # deterministic error is repair feedback, not a final error.
-                    last_error = ""
-                    alignment_review = await _review_responsibility_graph_alignment(
-                        request=request, frozen_blueprint_text=frozen_blueprint_text,
-                        allowed_function_item_targets=allowed_function_item_targets,
-                        function_items=current_function_items, responsibility_edges=current_edges,
-                        planner_model=route.model,
-                    )
-                    try:
-                        _validate_responsibility_graph_boundary_presence(current_edges, allowed_function_item_targets)
-                    except ValueError as boundary_exc:
-                        last_error = str(boundary_exc)
-                    if not alignment_review["passed"] or last_error:
-                        raise PreparePlanProtocolError(
-                            "Responsibility graph alignment remained unresolved after two localized same-Planner repairs; "
-                            f"last_error={last_error}; issues={alignment_review['issues']}; "
-                            f"function_items={current_function_items}; responsibility_edges={current_edges}"
-                        )
-                    data["function_items"] = current_function_items
-                    data["responsibility_edges"] = current_edges
-                    data["internal_blueprint_text"] = _render_structured_responsibility_view(
-                        frozen_blueprint_text, current_function_items, current_edges)
-                    break
         except PreparePlanProtocolError:
             raise
         except Exception as exc:

@@ -3946,6 +3946,41 @@ def test_skill_md_block_reviewer_invalid_json_schema_retry_succeeds(monkeypatch)
     assert "不重新审查 command block" in calls[1][-1]["content"]
 
 
+def test_skill_md_block_reviewer_unknown_source_preserves_backend_source_facts(monkeypatch):
+    import asyncio
+    from backend.services.creator import contracts
+    from backend.services.creator.common import build_default_requirement_graph
+
+    async def fake_complete(messages, model):
+        return json.dumps({
+            "passed": True,
+            "target_script_path": "scripts/current.py",
+            "key_checks": [],
+            "value_checks": [],
+            "type_checks": [],
+            "issues": [],
+            "repair_suggestions": "",
+        })
+
+    monkeypatch.setattr(contracts, "complete_chat_once", fake_complete)
+    monkeypatch.setattr(contracts, "_available_source_fields_for_block_review", lambda **_: ["image_prompt_list"])
+    monkeypatch.setattr(contracts, "_available_source_types_for_block_review", lambda **_: {"image_prompt_list": "array"})
+    review = asyncio.run(contracts._review_skill_md_command_block_with_model(
+        skill_name="demo",
+        script_path="scripts/current.py",
+        command_block='python scripts/current.py \'{"slot":"{{story_output.image_prompt_list}}"}\'',
+        ordinal=1,
+        prior_stdout=[],
+        requirement_graph=build_default_requirement_graph([]),
+        model="unit-test",
+    ))
+
+    assert review["passed"] is False
+    assert review["available_source_fields"] == ["image_prompt_list"]
+    assert review["available_source_types"] == {"image_prompt_list": "array"}
+    assert any(check.get("category") == "unknown_source" for check in review["value_checks"])
+
+
 def test_skill_md_block_reviewer_missing_checks_schema_retry_succeeds(monkeypatch):
     import asyncio
     from backend.services.creator import contracts
@@ -4660,3 +4695,35 @@ def test_skill_md_block_reconcile_auto_normalization_keeps_real_errors_failing()
     )
     assert missing["passed"] is False
     assert any(check.get("category") == "missing_required_key" for check in missing["key_checks"])
+
+
+def test_skill_md_block_reconcile_rejects_unknown_namespace_with_matching_suffix():
+    from backend.services.creator import contracts
+
+    review = {
+        "passed": True,
+        "target_script_path": "scripts/current.py",
+        "key_checks": [],
+        "value_checks": [],
+        "type_checks": [],
+        "issues": [],
+        "repair_suggestions": "",
+    }
+    valid = contracts._reconcile_block_review_with_runtime_contract(
+        dict(review),
+        command_block='python scripts/current.py \'{"slot":"{{image_prompt_list}}"}\'',
+        script_path="scripts/current.py",
+        argv_schema={"allowed_keys": ["slot"], "required_keys": ["slot"]},
+        available_source_fields=["image_prompt_list"],
+    )
+    guessed = contracts._reconcile_block_review_with_runtime_contract(
+        dict(review),
+        command_block='python scripts/current.py \'{"slot":"{{foo.image_prompt_list}}"}\'',
+        script_path="scripts/current.py",
+        argv_schema={"allowed_keys": ["slot"], "required_keys": ["slot"]},
+        available_source_fields=["image_prompt_list"],
+    )
+
+    assert valid["passed"] is True
+    assert guessed["passed"] is False
+    assert any(check.get("category") == "unknown_source" for check in guessed["value_checks"])

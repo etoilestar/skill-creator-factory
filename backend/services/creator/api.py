@@ -12151,6 +12151,9 @@ async def _repair_skill_md_command_block(
                 "除非当前脚本合同明确声明 argparse_flags。JSON key 必须来自真实 argv_schema，不得自行发明或替换字段名。"
                 "如果 argv_schema 或 required_keys 为空，只修复 shell quoting 和 JSON object argv 形态；"
                 "优先保留当前命令中已有的 JSON key，不得自行猜测、重命名或新增业务字段。"
+                "如果失败原因包含 category=unknown_source，必须只依据失败信息中 review.available_source_fields 已明确提供的字段修复 placeholder source；"
+                "不得自行增加、保留或猜测 available_source_fields 中不存在的 namespace、prefix、step/output/result 容器名。"
+                "此类修复只能修改 placeholder source，不得借此修改 argv key、script_path、Graph 或其他 command block。"
                 "格式示例 python scripts/example.py '{\"field\":\"{{source}}\"}' 中 field 仅是格式示例，真实字段必须来自 argv_schema。"
             ),
         },
@@ -12192,9 +12195,15 @@ def _replace_skill_md_command_block_exact(candidate: str, locator: dict[str, Any
         raise ValueError("SKILL.md command block locator is stale; rerun validation for a fresh locator")
     if hashlib.sha256(block_text.encode("utf-8")).hexdigest() != block_sha256:
         raise ValueError("SKILL.md command block hash mismatch; rerun validation for a fresh locator")
-    repaired_candidate = candidate[:block_start] + repaired_block + candidate[block_end:]
+    replacement = str(repaired_block or "").rstrip("\r\n")
+    original_trailing_newlines = block_text[len(block_text.rstrip("\r\n")):]
+    if original_trailing_newlines:
+        replacement += original_trailing_newlines
+    elif candidate[block_end:] and not candidate[block_end:].startswith(("\n", "\r")):
+        replacement += "\n"
+    repaired_candidate = candidate[:block_start] + replacement + candidate[block_end:]
     assert repaired_candidate[:block_start] == candidate[:block_start]
-    assert repaired_candidate[block_start + len(repaired_block):] == candidate[block_end:]
+    assert repaired_candidate[block_start + len(replacement):] == candidate[block_end:]
     return repaired_candidate
 
 

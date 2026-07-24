@@ -497,7 +497,15 @@ async def test_skill_md_single_command_block_repair_only_replaces_failed_block(m
         "block_end": end,
         "block_sha256": api.hashlib.sha256(bad_block.encode("utf-8")).hexdigest(),
         "structured_checks": {"value_checks": [{"passed": False}]},
-        "failure_reasons": [{"message": "literal value has no source"}],
+        "failure_reasons": [{
+            "message": "placeholder source is not available",
+            "details": {
+                "review": {
+                    "available_source_fields": ["image_prompt_list"],
+                    "available_source_types": {"image_prompt_list": "array"},
+                },
+            },
+        }],
     }
     repaired_block = "```bash\npython scripts/two.py '{\"text\":\"{{one}}\"}'\n```\n"
     seen_prompts = []
@@ -525,6 +533,8 @@ async def test_skill_md_single_command_block_repair_only_replaces_failed_block(m
     assert frontmatter in repaired
     assert body_before in repaired and middle in repaired and body_after in repaired and tail in repaired
     assert all(candidate not in message["content"] for message in seen_prompts)
+    assert "review.available_source_fields" in seen_prompts[0]["content"]
+    assert "image_prompt_list" in seen_prompts[1]["content"]
 
 
 @pytest.mark.asyncio
@@ -1075,6 +1085,29 @@ def test_skill_md_exact_replacement_real_failure_replaces_only_current_block():
     assert first in repaired
     assert third in repaired
     assert bad not in repaired
+
+
+def test_skill_md_exact_replacement_preserves_markdown_boundary_when_repair_lacks_newline():
+    from backend.services.creator import api
+    from backend.services.creator.command_normalizer import parse_skill_md_bash_command_blocks
+
+    original_block = "```bash\npython scripts/a.py '{\"x\":\"{{x}}\"}'\n```\n"
+    repaired_block = "```bash\npython scripts/a.py '{\"x\":\"{{y}}\"}'\n```"
+    suffix = "#### Next Section\n\n"
+    candidate = original_block + suffix
+    block = parse_skill_md_bash_command_blocks(candidate)[0]
+    locator = {
+        "block_start": block.start,
+        "block_end": block.end,
+        "block_text": candidate[block.start:block.end],
+        "block_sha256": hashlib.sha256(candidate[block.start:block.end].encode("utf-8")).hexdigest(),
+    }
+
+    repaired = api._replace_skill_md_command_block_exact(candidate, locator, repaired_block)
+
+    assert repaired == repaired_block + "\n" + suffix
+    assert "```#### Next Section" not in repaired
+    assert repaired[len(repaired_block) + 1:] == candidate[block.end:]
 
 
 def test_skill_md_exact_replacement_does_not_rematch():

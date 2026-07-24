@@ -2580,7 +2580,7 @@ async def _review_skill_md_command_block_with_model(
     prompt = (
         "你是 Creator 第一轮 SKILL.md 单 command block 接口审查器，只输出严格 JSON object。\n"
         "你一次只审查当前 script_path 的当前 command_block；不得审查完整 SKILL.md 或其他脚本。\n"
-        "只判断：1) command block 是否调用目标脚本；2) JSON argv 是否为可解析 object；3) argv key 是否被目标脚本接口接受；4) 整值占位符根来源是否存在于 available_source_fields；5) literal value 是否与目标类型明显冲突；6) 占位符形式是否符合平台既有语法。\n"
+        "只判断：1) command block 是否调用目标脚本；3) argv key 是否被目标脚本接口接受；4) 整值占位符根来源是否存在于 available_source_fields；5) literal value 是否与目标类型明显冲突；6) 占位符形式是否符合平台既有语法。\n"
         "判断占位符来源是否合法时，只检查占位符根字段是否存在于 available_source_fields；incoming_edges、prior_available_stdout 和 input bindings 仅作为构造 available_source_fields 的结构化证据。\n"
         "SKILL.md 统一使用平台现有 {{source}} 占位符语法，不要求将来源容器名写入占位符，不得发明其他占位符语法。\n"
         "当 JSON value 完全由一个占位符构成时，它是运行时引用，不是普通字符串常量；运行时在 JSON object 解析完成后解析该引用，并保持来源值的原生 JSON 类型。不得仅依据模板中的引号判断最终运行时类型。\n"

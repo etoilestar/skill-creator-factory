@@ -2149,6 +2149,84 @@ def test_alignment_review_prompt_stops_for_closed_multi_input_and_output_graphs(
 
 
 @pytest.mark.asyncio
+async def test_alignment_review_payload_contains_only_graph_authorities(monkeypatch):
+    import json
+
+    captured_messages = []
+
+    async def fake_complete_creator_role_once(messages, role, fallback_model):
+        captured_messages.extend(messages)
+        assert role == "reviewer"
+        assert fallback_model == "planner"
+        return '{"passed": true, "issues": []}'
+
+    monkeypatch.setattr(api, "complete_creator_role_once", fake_complete_creator_role_once)
+    request = _request(
+        conversation_history=[{"role": "user", "content": "add visual validation"}],
+        user_request="an obsolete raw request",
+        human_feedback="add a feedback loop",
+        previous_blueprint_text="previous blueprint required validation",
+    )
+    function_items = [{
+        **_function_item("scripts/document_builder.py"),
+        "outputs": ["pdf_path"],
+    }]
+    responsibility_edges = [{
+        "from_node": "scripts/document_builder.py",
+        "from_output": "pdf_path",
+        "to_node": "platform_output_node",
+        "to_input": "pdf_path",
+        "purpose": "deliver the document",
+        "constraints": [],
+    }]
+
+    review = await api._review_responsibility_graph_alignment(
+        request=request,
+        frozen_blueprint_text="confirmed blueprint only",
+        allowed_function_item_targets=["scripts/document_builder.py"],
+        function_items=function_items,
+        responsibility_edges=responsibility_edges,
+        planner_model="planner",
+    )
+
+    assert review == {"passed": True, "issues": []}
+    payload = json.loads(captured_messages[1]["content"])
+    assert payload == {
+        "task": "review_responsibility_graph_alignment",
+        "confirmed_blueprint": "confirmed blueprint only",
+        "allowed_function_item_targets": ["scripts/document_builder.py"],
+        "function_items": function_items,
+        "responsibility_edges": responsibility_edges,
+        "platform_boundary_contract": {
+            "input_fields": api.build_platform_io_contract()["platform_skill_boundary"]["input_envelope_fields"],
+            "final_output_fields": api.build_platform_io_contract()["platform_skill_boundary"]["final_output_fields"],
+        },
+    }
+
+    serialized_payload = json.dumps(payload, ensure_ascii=False)
+    for forbidden_text in [
+        "OUTPUT_DIR",
+        "artifact helper",
+        "allowed_artifact_roots",
+        "helper_filename_rule",
+        "valid_absolute_paths",
+        "forbidden_patterns",
+        "basename only",
+        "file exists",
+        "os.path.join(OUTPUT_DIR",
+        "stdout JSON transport",
+        "argv conventions",
+        "conversation_history",
+        "previous_blueprint_text",
+        "human_feedback",
+        "an obsolete raw request",
+    ]:
+        assert forbidden_text not in serialized_payload
+    assert "user_request" not in payload
+    assert "user_request" in payload["platform_boundary_contract"]["input_fields"]
+
+
+@pytest.mark.asyncio
 async def test_alignment_review_requires_localizable_failure_issues(monkeypatch):
     responses = iter([
         '{"passed":false,"issues":[]}',

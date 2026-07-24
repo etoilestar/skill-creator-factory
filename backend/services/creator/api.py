@@ -6476,19 +6476,17 @@ or
 "repair_guidance": "..."}]}
 Do not return function_items or responsibility_edges.
 """.strip()
+    platform_contract = build_platform_io_contract()
+    platform_boundary = platform_contract["platform_skill_boundary"]
     payload = {
         "task": "review_responsibility_graph_alignment",
-        "frozen_file_plan": frozen_blueprint_text,
+        "confirmed_blueprint": frozen_blueprint_text,
         "allowed_function_item_targets": allowed_function_item_targets,
         "function_items": function_items,
         "responsibility_edges": responsibility_edges,
-        "platform_io_contract": platform_io_contract_prompt_text(),
-        "confirmed_decision_context": {
-            "conversation_history": request.conversation_history,
-            "user_request": request.user_request,
-            "human_feedback": request.human_feedback,
-            "previous_blueprint_text": request.previous_blueprint_text,
-            "skill_name": request.skill_name,
+        "platform_boundary_contract": {
+            "input_fields": platform_boundary["input_envelope_fields"],
+            "final_output_fields": platform_boundary["final_output_fields"],
         },
     }
     text = await complete_creator_role_once(

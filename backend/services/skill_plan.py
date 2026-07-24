@@ -530,11 +530,49 @@ def validate_structured_responsibility_edge_transport(
     else:
         function_item_io = {}
 
+    preferred_structured_input_root = str(
+        boundary.get("preferred_structured_input_root") or ""
+    ).strip()
+
     for index, edge in enumerate(normalized_edges):
         from_node = str(edge.get("from_node") or "")
         from_output = str(edge.get("from_output") or "")
         to_node = str(edge.get("to_node") or "")
         to_input = str(edge.get("to_input") or "")
+
+        if (
+            from_node == "platform_input_node"
+            and from_output == preferred_structured_input_root
+        ):
+            parameter_bindings = [
+                constraint
+                for constraint in edge["constraints"]
+                if constraint.get("type") == "platform_parameter_binding"
+            ]
+            if len(parameter_bindings) != 1:
+                raise ValueError(
+                    f"{source}.responsibility_edges structured platform input "
+                    "requires exactly one platform_parameter_binding constraint; "
+                    f"index={index}"
+                )
+            binding = parameter_bindings[0]
+            source_key = binding.get("source_key")
+            if not isinstance(source_key, str) or not source_key.strip():
+                raise ValueError(
+                    f"{source}.responsibility_edges structured platform input "
+                    f"binding requires non-empty source_key; index={index}"
+                )
+            required = binding.get("required")
+            if not isinstance(required, bool):
+                raise ValueError(
+                    f"{source}.responsibility_edges structured platform input "
+                    f"binding requires boolean required; index={index}"
+                )
+            if not required and "default" not in binding:
+                raise ValueError(
+                    f"{source}.responsibility_edges optional structured platform "
+                    f"input binding requires explicit default; index={index}"
+                )
 
         if from_node == "platform_output_node":
             raise ValueError(
@@ -620,6 +658,49 @@ def validate_structured_responsibility_edge_transport(
             )
 
     return normalized_edges
+
+
+def structured_responsibility_graph_input_provenance_gaps(
+    function_items: object,
+    responsibility_edges: object,
+    *,
+    source: str = "planner",
+) -> list[tuple[str, str]]:
+    """Return declared FunctionItem inputs that have no incoming graph edge."""
+    normalized_function_items = normalize_structured_function_items(
+        function_items, source=source
+    )
+    normalized_edges = normalize_structured_responsibility_edges(
+        responsibility_edges, source=source
+    )
+    incoming = {
+        (str(edge.get("to_node") or ""), str(edge.get("to_input") or ""))
+        for edge in normalized_edges
+    }
+    return [
+        (str(item["target_file"]), input_name)
+        for item in normalized_function_items
+        for input_name in item["inputs"]
+        if (str(item["target_file"]), input_name) not in incoming
+    ]
+
+
+def validate_structured_responsibility_graph_input_closure(
+    function_items: object,
+    responsibility_edges: object,
+    *,
+    source: str = "planner",
+) -> None:
+    """Require every declared FunctionItem runtime input to have an incoming edge."""
+    gaps = structured_responsibility_graph_input_provenance_gaps(
+        function_items, responsibility_edges, source=source
+    )
+    if gaps:
+        target_file, input_name = gaps[0]
+        raise ValueError(
+            "responsibility graph contains FunctionItem input without declared "
+            f"provenance; target_file={target_file}; input={input_name}"
+        )
 
 
 def parse_responsibility_edges(blueprint_text: str) -> list[dict[str, object]]:

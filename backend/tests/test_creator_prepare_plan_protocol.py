@@ -2411,3 +2411,48 @@ async def test_boundary_presence_failure_after_repair_blocks(monkeypatch):
 
     with pytest.raises(api.PreparePlanProtocolError, match="missing platform output boundary edge"):
         await _run_ready_graph_alignment_flow(monkeypatch, review, repair, initial_edges=[input_edge])
+
+
+def test_responsibility_graph_runtime_input_provenance_protocol():
+    from backend.services.skill_plan import (
+        validate_structured_responsibility_edge_transport,
+        validate_structured_responsibility_graph_input_closure,
+    )
+
+    root = api.build_platform_io_contract()["platform_skill_boundary"]["preferred_structured_input_root"]
+    source = {**_function_item("scripts/a.py"), "inputs": ["primary_input", "optional_parameter"], "outputs": ["result"]}
+    top_level = {"from_node": "platform_input_node", "from_output": "user_request", "to_node": "scripts/a.py", "to_input": "primary_input", "purpose": "provide primary input", "constraints": []}
+    structured = {"from_node": "platform_input_node", "from_output": root, "to_node": "scripts/a.py", "to_input": "optional_parameter", "purpose": "provide dynamic parameter", "constraints": [{"type": "platform_parameter_binding", "source_key": "custom_parameter", "required": False, "default": None}]}
+
+    valid_edges = [top_level, structured]
+    assert validate_structured_responsibility_edge_transport(valid_edges, function_items=[source]) == valid_edges
+    validate_structured_responsibility_graph_input_closure([source], valid_edges)
+
+    with pytest.raises(ValueError, match="undefined platform input field"):
+        validate_structured_responsibility_edge_transport([{**structured, "from_output": "custom_parameter"}], function_items=[source])
+    for invalid_constraints, message in [
+        ([{"type": "platform_parameter_binding", "required": False, "default": None}], "source_key"),
+        ([{"type": "platform_parameter_binding", "source_key": "custom_parameter", "required": "false", "default": None}], "boolean required"),
+        ([{"type": "platform_parameter_binding", "source_key": "custom_parameter", "required": False}], "explicit default"),
+    ]:
+        with pytest.raises(ValueError, match=message):
+            validate_structured_responsibility_edge_transport([{**structured, "constraints": invalid_constraints}], function_items=[source])
+
+    with pytest.raises(ValueError, match=r"target_file=scripts/a.py; input=optional_parameter"):
+        validate_structured_responsibility_graph_input_closure([source], [top_level])
+    # Deleting an invalid dynamic edge does not resolve the declared input.
+    with pytest.raises(ValueError, match="optional_parameter"):
+        validate_structured_responsibility_graph_input_closure([source], [top_level])
+
+
+def test_responsibility_graph_runtime_input_provenance_accepts_upstream_function_item():
+    from backend.services.skill_plan import (
+        validate_structured_responsibility_edge_transport,
+        validate_structured_responsibility_graph_input_closure,
+    )
+
+    producer = {**_function_item("scripts/a.py"), "inputs": [], "outputs": ["result"]}
+    consumer = {**_function_item("scripts/b.py"), "inputs": ["input_value"], "outputs": ["final"]}
+    edge = {"from_node": "scripts/a.py", "from_output": "result", "to_node": "scripts/b.py", "to_input": "input_value", "purpose": "handoff", "constraints": []}
+    assert validate_structured_responsibility_edge_transport([edge], function_items=[producer, consumer]) == [edge]
+    validate_structured_responsibility_graph_input_closure([producer, consumer], [edge])

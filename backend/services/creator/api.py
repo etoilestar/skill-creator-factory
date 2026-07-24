@@ -6546,8 +6546,10 @@ platform source merely by deleting the edge while leaving its FunctionItem input
 unresolved. For a dynamic runtime parameter, bind through the supplied
 preferred_structured_input_root with exactly one platform_parameter_binding
 constraint containing explicit source_key, required, and an explicit default
-when required is false. Remove an input only when the confirmed Blueprint makes
-it creation-time fixed configuration, retaining that configuration as a
+when required is false. A platform_parameter_binding is required only when
+selecting a dynamic child parameter; a whole structured input root may be passed
+directly without that constraint. Remove an input only when the confirmed Blueprint
+makes it creation-time fixed configuration, retaining that configuration as a
 FunctionItem constraint.
 
 Return only strict JSON:
@@ -6741,7 +6743,7 @@ Use platform_io_contract as an exact immutable boundary contract.
 For platform_input_node, from_output must be an actual platform input source slot.
 For platform_output_node, to_input must be an actual platform final output terminal slot.
 
-Every declared FunctionItem input must have explicit runtime provenance through an incoming ResponsibilityEdge. Do not invent top-level platform input slots for Skill-specific parameters. Bind every dynamic runtime parameter through platform_io_contract.platform_skill_boundary.preferred_structured_input_root. That edge must include exactly one constraints entry with type "platform_parameter_binding", an explicit non-empty source_key, and required as a boolean; optional parameters (required=false) must also include an explicit default. source_key is planner-declared and may differ from to_input. If a value is creation-time fixed and not runtime-overridable, keep it in FunctionItem.constraints rather than FunctionItem.inputs. Removing an invalid edge is not a valid repair if it leaves a declared FunctionItem input without provenance.
+Every declared FunctionItem input must have explicit runtime provenance through an incoming ResponsibilityEdge. Do not invent top-level platform input slots for Skill-specific parameters. Use platform_io_contract.platform_skill_boundary.preferred_structured_input_root directly when the whole structured value is the FunctionItem input. When binding one dynamic parameter from that structured root, add exactly one constraints entry with type "platform_parameter_binding", an explicit non-empty source_key, and required as a boolean; optional parameters (required=false) must also include an explicit default. source_key is planner-declared and may differ from to_input. If a value is creation-time fixed and not runtime-overridable, keep it in FunctionItem.constraints rather than FunctionItem.inputs. Removing an invalid edge is not a valid repair if it leaves a declared FunctionItem input without provenance.
 
 Return only:
 {

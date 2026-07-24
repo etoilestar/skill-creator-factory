@@ -2489,12 +2489,21 @@ def test_responsibility_graph_runtime_input_provenance_protocol():
     assert validate_structured_responsibility_edge_transport(valid_edges, function_items=[source]) == valid_edges
     validate_structured_responsibility_graph_input_closure([source], valid_edges)
 
+    whole_root_source = {**_function_item("scripts/a.py"), "inputs": ["runtime_payload"]}
+    whole_root_edge = {**structured, "to_input": "runtime_payload", "purpose": "provide structured input", "constraints": []}
+    assert validate_structured_responsibility_edge_transport([whole_root_edge], function_items=[whole_root_source]) == [whole_root_edge]
+    validate_structured_responsibility_graph_input_closure([whole_root_source], [whole_root_edge])
+
     with pytest.raises(ValueError, match="undefined platform input field"):
         validate_structured_responsibility_edge_transport([{**structured, "from_output": "custom_parameter"}], function_items=[source])
     for invalid_constraints, message in [
         ([{"type": "platform_parameter_binding", "required": False, "default": None}], "source_key"),
         ([{"type": "platform_parameter_binding", "source_key": "custom_parameter", "required": "false", "default": None}], "boolean required"),
         ([{"type": "platform_parameter_binding", "source_key": "custom_parameter", "required": False}], "explicit default"),
+        ([
+            {"type": "platform_parameter_binding", "source_key": "first_key", "required": True},
+            {"type": "platform_parameter_binding", "source_key": "second_key", "required": True},
+        ], "multiple platform_parameter_binding"),
     ]:
         with pytest.raises(ValueError, match=message):
             validate_structured_responsibility_edge_transport([{**structured, "constraints": invalid_constraints}], function_items=[source])
@@ -2504,6 +2513,8 @@ def test_responsibility_graph_runtime_input_provenance_protocol():
     # Deleting an invalid dynamic edge does not resolve the declared input.
     with pytest.raises(ValueError, match="optional_parameter"):
         validate_structured_responsibility_graph_input_closure([source], [top_level])
+    with pytest.raises(ValueError, match="runtime_payload"):
+        validate_structured_responsibility_graph_input_closure([whole_root_source], [])
 
 
 def test_responsibility_graph_runtime_input_provenance_accepts_upstream_function_item():

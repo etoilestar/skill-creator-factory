@@ -549,30 +549,31 @@ def validate_structured_responsibility_edge_transport(
                 for constraint in edge["constraints"]
                 if constraint.get("type") == "platform_parameter_binding"
             ]
-            if len(parameter_bindings) != 1:
+            if len(parameter_bindings) > 1:
                 raise ValueError(
                     f"{source}.responsibility_edges structured platform input "
-                    "requires exactly one platform_parameter_binding constraint; "
+                    "contains multiple platform_parameter_binding constraints; "
                     f"index={index}"
                 )
-            binding = parameter_bindings[0]
-            source_key = binding.get("source_key")
-            if not isinstance(source_key, str) or not source_key.strip():
-                raise ValueError(
-                    f"{source}.responsibility_edges structured platform input "
-                    f"binding requires non-empty source_key; index={index}"
-                )
-            required = binding.get("required")
-            if not isinstance(required, bool):
-                raise ValueError(
-                    f"{source}.responsibility_edges structured platform input "
-                    f"binding requires boolean required; index={index}"
-                )
-            if not required and "default" not in binding:
-                raise ValueError(
-                    f"{source}.responsibility_edges optional structured platform "
-                    f"input binding requires explicit default; index={index}"
-                )
+            if parameter_bindings:
+                binding = parameter_bindings[0]
+                source_key = binding.get("source_key")
+                if not isinstance(source_key, str) or not source_key.strip():
+                    raise ValueError(
+                        f"{source}.responsibility_edges structured platform input "
+                        f"binding requires non-empty source_key; index={index}"
+                    )
+                required = binding.get("required")
+                if not isinstance(required, bool):
+                    raise ValueError(
+                        f"{source}.responsibility_edges structured platform input "
+                        f"binding requires boolean required; index={index}"
+                    )
+                if not required and "default" not in binding:
+                    raise ValueError(
+                        f"{source}.responsibility_edges optional structured platform "
+                        f"input binding requires explicit default; index={index}"
+                    )
 
         if from_node == "platform_output_node":
             raise ValueError(

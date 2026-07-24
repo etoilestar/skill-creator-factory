@@ -1972,11 +1972,11 @@ async def test_responsibility_graph_alignment_review_is_read_only(monkeypatch):
         )
 
 
-async def _run_ready_graph_alignment_flow(monkeypatch, review, repair=None, initial_edges=None):
+async def _run_ready_graph_alignment_flow(monkeypatch, review, repair=None, initial_edges=None, function_item=None):
     import json
 
     blueprint = _ready_blueprint(_skill_plan_block("\n" + _script_plan_block("scripts/a.py")))
-    item = _function_item("scripts/a.py")
+    item = function_item or _function_item("scripts/a.py")
     edges = [
         {"from_node": "platform_input_node", "from_output": "user_request", "to_node": "scripts/a.py", "to_input": "source", "purpose": "provide input", "constraints": []},
         _output_edge("scripts/a.py"),
@@ -1993,7 +1993,11 @@ async def _run_ready_graph_alignment_flow(monkeypatch, review, repair=None, init
     async def converge(**kwargs):
         return {**_ready_payload("converged"), "function_items": [item], "responsibility_edges": edges}
 
+    async def fake_complete_creator_role_once(messages, role, fallback_model):
+        return await fake_complete(messages, fallback_model)
+
     monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    monkeypatch.setattr(api, "complete_creator_role_once", fake_complete_creator_role_once)
     monkeypatch.setattr(api, "_bind_executable_responsibility_plan", bind)
     monkeypatch.setattr(api, "_converge_ready_executable_plan", converge)
     monkeypatch.setattr(api, "_review_responsibility_graph_alignment", review)
@@ -2412,6 +2416,63 @@ async def test_boundary_presence_failure_after_repair_blocks(monkeypatch):
     with pytest.raises(api.PreparePlanProtocolError, match="missing platform output boundary edge"):
         await _run_ready_graph_alignment_flow(monkeypatch, review, repair, initial_edges=[input_edge])
 
+
+
+@pytest.mark.asyncio
+async def test_provenance_repair_cannot_delete_invalid_source_and_leave_input_unresolved(monkeypatch):
+    root = api.build_platform_io_contract()["platform_skill_boundary"]["preferred_structured_input_root"]
+    item = {**_function_item("scripts/a.py"), "inputs": ["optional_parameter"]}
+    invalid_edge = {"from_node": "platform_input_node", "from_output": "invalid_dynamic_slot", "to_node": "scripts/a.py", "to_input": "optional_parameter", "purpose": "invalid dynamic input", "constraints": []}
+    repaired_edge = {"from_node": "platform_input_node", "from_output": root, "to_node": "scripts/a.py", "to_input": "optional_parameter", "purpose": "bound dynamic input", "constraints": [{"type": "platform_parameter_binding", "source_key": "dynamic_key", "required": False, "default": None}]}
+    repair_issues = []
+    review_calls = 0
+
+    async def review(**kwargs):
+        nonlocal review_calls
+        review_calls += 1
+        return {"passed": True, "issues": []}
+
+    async def repair(**kwargs):
+        repair_issues.append(kwargs["review_issues"])
+        assert review_calls == 0
+        if len(repair_issues) == 1:
+            # Removing the invalid source alone leaves the declared input dangling.
+            return {"function_items": [item], "responsibility_edges": [_output_edge("scripts/a.py")]}
+        assert repair_issues[1][0]["id"] == "responsibility_input_provenance"
+        return {"function_items": [item], "responsibility_edges": [repaired_edge, _output_edge("scripts/a.py")]}
+
+    result, _, _ = await _run_ready_graph_alignment_flow(
+        monkeypatch, review, repair, initial_edges=[invalid_edge, _output_edge("scripts/a.py")], function_item=item,
+    )
+    assert result["responsibility_edges"] == [repaired_edge, _output_edge("scripts/a.py")]
+    assert len(repair_issues) == 2
+    assert review_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_provenance_repair_receives_all_current_gaps_together(monkeypatch):
+    root = api.build_platform_io_contract()["platform_skill_boundary"]["preferred_structured_input_root"]
+    item = {**_function_item("scripts/a.py"), "inputs": ["first_input", "second_input"]}
+    repaired_edges = [
+        {"from_node": "platform_input_node", "from_output": root, "to_node": "scripts/a.py", "to_input": input_name, "purpose": "bind runtime input", "constraints": [{"type": "platform_parameter_binding", "source_key": source_key, "required": True}]}
+        for input_name, source_key in [("first_input", "first_key"), ("second_input", "second_key")]
+    ]
+    received_issues = []
+
+    async def review(**kwargs):
+        return {"passed": True, "issues": []}
+
+    async def repair(**kwargs):
+        received_issues.extend(kwargs["review_issues"])
+        return {"function_items": [item], "responsibility_edges": [*repaired_edges, _output_edge("scripts/a.py")]}
+
+    await _run_ready_graph_alignment_flow(
+        monkeypatch, review, repair, initial_edges=[_output_edge("scripts/a.py")], function_item=item,
+    )
+    assert [(issue["target_files"], issue["evidence"]) for issue in received_issues] == [
+        (["scripts/a.py"], "target_file=scripts/a.py; input=first_input"),
+        (["scripts/a.py"], "target_file=scripts/a.py; input=second_input"),
+    ]
 
 def test_responsibility_graph_runtime_input_provenance_protocol():
     from backend.services.skill_plan import (

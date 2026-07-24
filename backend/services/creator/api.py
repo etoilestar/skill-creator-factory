@@ -7760,16 +7760,21 @@ Blueprint Planner 只规划业务责任。
                         current_function_items, current_edges, source="planner"
                     )
                     if provenance_gaps:
-                        target_file, input_name = provenance_gaps[0]
-                        current_issues = [{
-                            "id": "responsibility_input_provenance",
-                            "target_files": [target_file],
-                            "affected_edge_indexes": [],
-                            "reason": "Declared FunctionItem input has no runtime provenance.",
-                            "evidence": f"target_file={target_file}; input={input_name}",
-                            "repair_guidance": "Provide an explicit upstream/platform binding or remove it from runtime inputs only if the confirmed Blueprint makes it creation-time fixed configuration.",
-                        }]
-                        deterministic_error = current_issues[0]["evidence"]
+                        current_issues = [
+                            {
+                                "id": "responsibility_input_provenance",
+                                "target_files": [target_file],
+                                "affected_edge_indexes": [],
+                                "reason": "Declared FunctionItem input has no runtime provenance.",
+                                "evidence": f"target_file={target_file}; input={input_name}",
+                                "repair_guidance": "Provide an explicit upstream/platform binding or remove it from runtime inputs only if the confirmed Blueprint makes it creation-time fixed configuration.",
+                            }
+                            for target_file, input_name in provenance_gaps
+                        ]
+                        deterministic_error = (
+                            "declared FunctionItem inputs without runtime provenance; "
+                            f"gap_count={len(provenance_gaps)}"
+                        )
                     else:
                         _validate_responsibility_graph_boundary_presence(
                             current_edges, allowed_function_item_targets

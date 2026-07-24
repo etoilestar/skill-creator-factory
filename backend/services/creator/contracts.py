@@ -2626,7 +2626,7 @@ async def _review_skill_md_command_block_with_model(
             if not last_schema_error:
                 data["target_script_path"] = script_path
                 data["command_block_ordinal"] = ordinal
-                return _reconcile_block_review_with_runtime_contract(
+                reconciled = _reconcile_block_review_with_runtime_contract(
                     data,
                     command_block=command_block,
                     script_path=script_path,
@@ -2634,6 +2634,11 @@ async def _review_skill_md_command_block_with_model(
                     available_source_fields=available_source_fields,
                     available_source_types=available_source_types,
                 )
+                # Preserve backend-established source facts for the narrowly
+                # scoped command-block repair context.
+                reconciled["available_source_fields"] = list(available_source_fields)
+                reconciled["available_source_types"] = dict(available_source_types)
+                return reconciled
         if review_attempt < 2:
             logger.info(
                 "[Creator][skill_md][block_review][schema_retry] skill=%s script=%s ordinal=%d attempt=%d error=%s",

@@ -2090,16 +2090,62 @@ async def test_alignment_final_review_failure_blocks_after_bounded_calls(monkeyp
     assert repair_calls == 1
 
 
-def test_alignment_review_and_repair_prompts_are_abstract_and_bounded():
+def test_alignment_review_prompt_has_bounded_reviewer_authority():
     import inspect
 
     review_source = inspect.getsource(api._review_responsibility_graph_alignment)
     repair_source = inspect.getsource(api._repair_responsibility_graph_alignment)
-    for text in ["requirement", "traceability", "dependency", "executability", "frozen FilePlan", "platform boundary closure", "required runtime inputs", "required final results"]:
-        assert text in review_source or text in repair_source
+
+    # Assert durable authority boundaries, rather than the full prompt wording.
+    for text in [
+        "read-only ResponsibilityGraph Alignment Reviewer",
+        "Do not redesign it.",
+        "Do not improve it.",
+        "CONFIRMED Blueprint",
+        "Check ONLY these three principles",
+        "Sufficient is PASS.",
+        "runtime implementation verification",
+        "feedback loops",
+        "synchronization mechanisms",
+        "file existence",
+        "Do not propose FilePlan changes.",
+    ]:
+        assert text in review_source
+    assert "the same Blueprint Planner acting only" not in review_source
+    assert "actual host execution model" not in review_source
     assert "localized" in repair_source
-    assert "while " not in review_source
-    assert "while " not in repair_source
+
+
+def test_alignment_review_prompt_preserves_semantic_mismatch_regression_boundary():
+    import inspect
+
+    review_source = inspect.getsource(api._review_responsibility_graph_alignment)
+
+    # A declared result mismatch remains reviewable; this is not a
+    # field-presence-only reviewer.
+    assert "producer output and consumer input" in review_source
+    assert "story_text into story_segments" in review_source
+    assert "affected_edge_indexes must include that edge's index" in review_source
+
+
+def test_alignment_review_prompt_stops_for_closed_multi_input_and_output_graphs():
+    import inspect
+
+    review_source = inspect.getsource(api._review_responsibility_graph_alignment)
+
+    # These boundaries cover the repaired graph: generation based on source
+    # content, two inputs consumed by one owner, a terminal artifact edge, and
+    # internal-only intermediate outputs.
+    for text in [
+        "owns generation",
+        "separate synchronization, pairing, or mapping responsibility",
+        "incoming declared\ndependencies are sufficient",
+        "sufficient platform-output closure",
+        "OUTPUT_DIR",
+        "output MAY be internal-only",
+        "post-generation validation",
+    ]:
+        assert text in review_source
 
 
 @pytest.mark.asyncio

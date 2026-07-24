@@ -6374,34 +6374,99 @@ async def _review_responsibility_graph_alignment(
     responsibility_edges: list[dict[str, Any]],
     planner_model: str,
 ) -> dict[str, Any]:
-    """Use the same Planner as a read-only graph alignment reviewer."""
+    """Review declared graph alignment without redesigning the Blueprint."""
 
     prompt = """
-You are the same Blueprint Planner acting only as a read-only Responsibility
-Graph Alignment Reviewer. You are not planning, repairing, or replacing the
-responsibility graph.
+You are a read-only ResponsibilityGraph Alignment Reviewer.
 
-Review current confirmed requirements for traceability to the current
-FunctionItems and ResponsibilityEdges under the frozen FilePlan and actual
-host execution model. Do not infer predefined requirement categories.
+You did not design this graph. Do not redesign it. Do not improve it. Do not
+extend it. Your only job is to determine whether the CURRENT declared
+FunctionItems and ResponsibilityEdges are sufficient and internally consistent
+with the CONFIRMED Blueprint.
 
-Check only these three principles:
-1. Requirement fidelity: every confirmed requirement has an appropriate
-   responsibility owner and is not weakened, lost, or incorrectly assigned.
-2. Responsibility and dependency closure: FunctionItem role, purpose, inputs,
-   outputs, capabilities, and constraints express a consistent boundary; real
-   cross-responsibility dependencies are represented by ResponsibilityEdges
-   whose source can produce and target can consume the transported result.
-3. Executability: every required computation has a real execution owner and
-   the graph does not depend on implicit host execution behavior.
+Review only the confirmed Blueprint, frozen FilePlan, current FunctionItems,
+current ResponsibilityEdges, and immutable platform I/O contract supplied in
+this payload. Do not infer requirements from industry practice, best practice,
+robustness, or capabilities that could be useful.
 
-Graph alignment includes end-to-end platform boundary closure. A graph is not
-fully aligned when required runtime inputs or required final results exist in
-FunctionItems but are disconnected from immutable platform boundary slots.
+Check ONLY these three principles:
+1. Confirmed requirement fidelity: each requirement explicitly confirmed by the
+   Blueprint has an existing FunctionItem owner. Report only a current omission,
+   weakening, or incorrect assignment of an explicit requirement.
+2. Declared dataflow closure: for each required ResponsibilityEdge, its producer
+   can produce the declared result, its consumer can consume that declared
+   result, and the transported result's business meaning is clearly consistent
+   with the producer output and consumer input. This permits reporting an actual
+   mismatch such as transporting story_text into story_segments. Do not infer
+   Python control flow, serialization, helper calls, file storage, or transport
+   implementation details.
+3. Platform boundary closure: explicitly required platform inputs connect to an
+   appropriate FunctionItem input, and explicitly required platform final
+   outputs connect from a FunctionItem output to an allowed immutable platform
+   output slot.
 
-For each issue, localize the affected target_files and affected_edge_indexes,
-state the current alignment fact as evidence, and give only localized repair
-guidance. Do not propose FilePlan changes.
+At ResponsibilityGraph review time, executability means only that every
+required declared responsibility has an existing FunctionItem owner, every
+required cross-responsibility result has a declared dataflow edge, and required
+platform inputs and final outputs have declared boundary closure. Do NOT
+interpret executability as runtime implementation verification.
+
+SUFFICIENCY / STOP RULE
+Once all CONFIRMED Blueprint requirements have an existing responsibility
+owner, all required declared data dependencies are closed, and required platform
+boundaries are connected, the graph is SUFFICIENT. Sufficient is PASS. When the
+graph is sufficient, you MUST return {"passed": true, "issues": []}. Stop
+reviewing. Do not continue searching for optional improvements, robustness
+mechanisms, validation mechanisms, synchronization mechanisms, feedback loops,
+helper usage, or implementation details.
+
+A graph MUST NOT fail merely because an additional mechanism COULD make the
+implementation more robust, explicit, validated, synchronized, or
+production-ready. Only a CURRENT contradiction, omission, or mismatch against
+the CONFIRMED Blueprint and declared graph may produce an issue.
+
+Do NOT require or invent any of the following unless explicitly required by the
+confirmed Blueprint: semantic validation feedback loops; image/text validation
+stages; synchronization mechanisms; mapping or pairing subsystems; additional
+validation or aggregation FunctionItems; helper functions or artifact helper
+usage; command syntax; argv conventions; stdin transport; stdout JSON transport;
+serialization protocols; OUTPUT_DIR or artifact-root implementation; runtime
+file existence or path checks; filesystem validation; retry mechanisms;
+error-handling protocols; or implementation-specific transport mechanisms.
+
+For example, a requirement to generate results consistent with supplied source
+content is satisfied at this graph level when the generation responsibility
+receives the relevant source content and owns generation. Do NOT infer a
+separate semantic-validation or feedback-loop responsibility unless the
+confirmed Blueprint explicitly requires post-generation validation.
+
+Multiple declared inputs to the same FunctionItem do not by themselves require
+a separate synchronization, pairing, or mapping responsibility. If that
+FunctionItem explicitly owns combining the inputs, separate incoming declared
+dependencies are sufficient unless the confirmed Blueprint explicitly requires
+separate synchronization.
+
+A declared FunctionItem output connected to an allowed immutable platform
+final-output slot is sufficient platform-output closure. Do NOT require proof
+that a file exists, has been written, resides under OUTPUT_DIR, or was produced
+by an artifact helper; those are runtime, code, and E2E concerns. A FunctionItem
+output MAY be internal-only. Do not require an internal result to connect to
+platform_output_node unless it is explicitly part of the immutable confirmed
+platform final-output contract.
+
+Do not propose FilePlan changes. Do not request a new file, script,
+FunctionItem, asset, reference, or runtime component unless the confirmed
+Blueprint already requires that responsibility and the current graph omitted its
+owner.
+
+Every issue's reason, evidence, and repair_guidance must be based on a current
+fact directly observable in this payload, not a hypothetical risk. Evidence
+must cite the inconsistent declared FunctionItem or ResponsibilityEdge fact; do
+not use absent implementation details as evidence. For a specific edge mismatch,
+affected_edge_indexes must include that edge's index. Before failing, verify that
+your evidence does not already prove the requirement is satisfied; for example,
+an edge that connects pdf_path to platform_output_node cannot support a claim
+that pdf_path lacks a platform-output connection.
 
 Return only strict JSON:
 {"passed": true, "issues": []}

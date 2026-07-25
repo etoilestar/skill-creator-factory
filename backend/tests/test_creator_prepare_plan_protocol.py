@@ -669,7 +669,7 @@ def _output_edge(path: str) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_binding_and_convergence_reject_frozen_blueprint_boundary_expansion(monkeypatch):
+async def test_binding_and_convergence_are_edge_only_over_frozen_function_items(monkeypatch):
     import json
 
     script_block = _script_plan_block("scripts/a.py").replace(
@@ -686,13 +686,26 @@ async def test_binding_and_convergence_reject_frozen_blueprint_boundary_expansio
         return json.dumps({"function_items": [expanded_item], "responsibility_edges": []})
 
     monkeypatch.setattr(api, "complete_creator_role_once", binding_response)
-    with pytest.raises(ValueError, match="planner binding changed frozen Blueprint"):
+    with pytest.raises(ValueError, match="binding must return only responsibility_edges"):
         await api._bind_executable_responsibility_plan(
             request=_request(),
             current_planner_result=_ready_payload(blueprint),
             planner_model="planner",
             allowed_function_item_targets=["scripts/a.py"],
         )
+
+    async def valid_binding_response(messages, role, fallback_model):
+        return json.dumps({"responsibility_edges": []})
+
+    monkeypatch.setattr(api, "complete_creator_role_once", valid_binding_response)
+    bound = await api._bind_executable_responsibility_plan(
+        request=_request(),
+        current_planner_result=_ready_payload(blueprint),
+        planner_model="planner",
+        allowed_function_item_targets=["scripts/a.py"],
+    )
+    assert bound["function_items"][0]["inputs"] == ["x"]
+    assert bound["function_items"][0]["outputs"] == ["y"]
 
     async def convergence_response(messages, role, fallback_model):
         return json.dumps({
@@ -702,7 +715,7 @@ async def test_binding_and_convergence_reject_frozen_blueprint_boundary_expansio
         })
 
     monkeypatch.setattr(api, "complete_creator_role_once", convergence_response)
-    with pytest.raises(ValueError, match="planner convergence changed frozen Blueprint"):
+    with pytest.raises(ValueError, match="convergence must return only responsibility_edges"):
         await api._converge_ready_executable_plan(
             request=_request(),
             current_planner_result={

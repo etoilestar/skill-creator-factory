@@ -6025,357 +6025,91 @@ async def _converge_ready_executable_plan(
     draft_transport_error: str = "",
     frozen_blueprint_text: str = "",
 ) -> dict[str, Any]:
-    """Run one same-Planner revision over an already-ready executable plan.
+    """Regenerate graph edges once without asking Planner to repeat FunctionItems."""
+    if not frozen_blueprint_text:
+        raise ValueError("Planner convergence requires frozen_blueprint_text")
 
-    This is still Blueprint Planner work: the same semantic authority revises
-    its own emitted plan once. The backend does not infer missing business
-    semantics and does not apply patches.
-    """
-
+    frozen_function_items = _frozen_function_items_from_blueprint(
+        frozen_blueprint_text=frozen_blueprint_text,
+        allowed_function_item_targets=allowed_function_item_targets,
+    )
     draft_edges = list(current_planner_result.get("responsibility_edges") or [])
-    draft_function_items = list(current_planner_result.get("function_items") or [])
+    graph_context = _build_responsibility_graph_construction_context(
+        frozen_blueprint_text=frozen_blueprint_text,
+        allowed_function_item_targets=allowed_function_item_targets,
+        function_items=frozen_function_items,
+        responsibility_edges=draft_edges,
+    )
     logger.info(
         "[Creator][planner_convergence][draft] %s",
         json.dumps({
             "event": "creator_planner_convergence_draft",
             "skill_name": str(current_planner_result.get("skill_name") or request.skill_name or ""),
             "draft_edge_count": len(draft_edges),
-            "draft_function_item_count": len(draft_function_items),
-            "draft_targets": [item.get("target_file") for item in draft_function_items if isinstance(item, dict)],
-            "draft_endpoint_pairs": _responsibility_edge_endpoint_pairs(draft_edges),
-        }, ensure_ascii=False, default=str),
-    )
-    logger.info(
-        "[Creator][planner_convergence][draft_transport] %s",
-        json.dumps({
-            "event": "creator_planner_convergence_draft_transport",
-            "skill_name": str(current_planner_result.get("skill_name") or request.skill_name or ""),
-            "draft_edge_count": len(draft_edges),
-            "draft_function_item_count": len(draft_function_items),
             "draft_transport_valid": not bool(draft_transport_error),
             "draft_transport_error": draft_transport_error,
-            "draft_endpoint_pairs": _responsibility_edge_endpoint_pairs(draft_edges) if not draft_transport_error else [],
+            "draft_endpoint_pairs": _responsibility_edge_endpoint_pairs(draft_edges),
         }, ensure_ascii=False, default=str),
     )
 
     prompt = """
-You are the same Blueprint Planner that just emitted this already-ready executable plan.
+You are the same Blueprint Planner converging a ResponsibilityGraph over frozen
+FunctionItems. Blueprint defines responsibilities; Graph connects them.
 
-You are revising your own already-ready executable plan.
-This is not a new planning task.
-This is not a judge, validator, gate, repair model, or separate semantic authority.
+Return a complete responsibility_edges array only. Do not return or redesign
+FunctionItems, files, target_file, inputs, outputs, purpose, capabilities, or
+constraints. If frozen responsibility facts prevent closure, do not invent a
+new boundary; leave the facts unchanged so backend can request upstream replan.
 
-Preserve:
-- confirmed user decisions;
-- user goal;
-- required final outputs;
-- confirmed core actions;
+Use graph_construction_context as the only topology and endpoint authority. For
+each target input, choose the semantically correct provenance from its supplied
+legal_sources. Backend supplies only the structurally legal source domain and
+does not choose the semantic mapping. Use exact endpoint strings. Preserve the
+platform boundary contract and the canonical ResponsibilityEdge wire fields:
+from_node, from_output, to_node, to_input, purpose, constraints.
 
-Do not add a new business requirement.
-Do not remove a confirmed business requirement.
-Do not simplify the goal to fit tools.
-Do not reconsider tool availability.
-Do not use Tool Registry, ToolPool, candidate tools, or implementation convenience.
+Before returning, replay the complete graph and verify:
+1. Every declared runtime input has exactly one legal provenance.
+2. Every from_output exists in the supplied legal source domain.
+3. Every to_input exists on the frozen target FunctionItem.
+4. Every required final output has a producer-to-platform_output path.
+5. No input, output, FunctionItem, file, or platform slot was invented.
 
-Your first task is requirement fidelity: keep the executable plan aligned with the exact user request and confirmed decisions.
-Your second task is internal consistency: make FunctionItems and ResponsibilityEdges describe the same executable plan.
-
-The FilePlan is immutable.
-Do not add, remove, rename, split, or merge FilePlan entries.
-FunctionItem target_file, inputs, and outputs are frozen Blueprint facts.
-Convergence repairs ResponsibilityEdges and non-topology semantic description
-only. Do not add, remove, or rename a FunctionItem input or output.
-
-ResponsibilityEdge transport schema is exact.
-
-The FilePlan target domain is frozen.
-Every FunctionItem.target_file must be copied exactly from allowed_function_item_targets.
-Do not add, rename, or invent FunctionItem targets.
-Do not revise the FilePlan target set in this convergence pass.
-If an executable responsibility is inconsistent, revise its responsibility fields and ResponsibilityEdges.
-
-FunctionItems and ResponsibilityEdges are two parts of one executable responsibility plan.
-Do not revise FunctionItems and ResponsibilityEdges independently.
-First finalize the FunctionItem set.
-Then replay ResponsibilityEdges against those exact FunctionItems.
-If closure would require a new FunctionItem or boundary, do not invent it; keep
-the frozen facts unchanged so backend can reject and request upstream replanning.
-Do not add or remove a FunctionItem. If non-topology semantic description changes,
-revise affected ResponsibilityEdges in the same response.
-Return one complete revised executable plan.
-
-Executable ownership closure:
-
-Replay the complete executable plan against the actual host execution model.
-
-For every required business action or transformation:
-1. Identify the executable FunctionItem that owns it.
-2. Verify that this FunctionItem's purpose, inputs, outputs, capabilities, and constraints are sufficient to perform that owned responsibility.
-3. Verify that no required computation exists only in workflow prose or ResponsibilityEdge metadata without an executable owner.
-4. Verify that every ResponsibilityEdge represents data the source FunctionItem can actually produce and the target FunctionItem can directly consume as part of its responsibility boundary.
-5. If an edge depends on implicit execution behavior that the host runtime does not provide, revise affected ResponsibilityEdges and only non-topology FunctionItem description; never revise target_file, inputs, or outputs.
-6. Do not merely rename an edge or remove a constraint and preserve an unexecutable responsibility split.
-7. Responsibility boundaries must not change. Preserve FunctionItem target_file,
-   inputs, and outputs; revise only edges and non-topology semantic description.
-8. Preserve the frozen FilePlan target set. Do not add, remove, split, or merge script files.
-
-The final plan is ready only when every required computation has an executable
-owner under the real host execution model.
-
-Replay the complete graph from platform input boundary, through executable
-responsibility owners, to platform output boundary. Verify that required runtime
-inputs and required final results are not disconnected from their immutable
-platform boundary slots.
-
-Every function_items item must be a JSON object with exactly:
-target_file, role, purpose, inputs, outputs, required_capabilities, constraints.
-target_file must exactly equal one item from allowed_function_item_targets.
-inputs, outputs, required_capabilities must be string arrays.
-constraints must be a JSON array of objects.
-
-Every responsibility_edges item must be a JSON object
-with exactly these transport fields:
-
-{
-  "from_node": "...",
-  "from_output": "...",
-  "to_node": "...",
-  "to_input": "...",
-  "purpose": "...",
-  "constraints": []
-}
-
-Allowed fields are only:
-
-- from_node
-- from_output
-- to_node
-- to_input
-- purpose
-- constraints
-
-Do not use aliases or alternate graph dialects.
-
-For example, do not use:
-
-- from
-- to
-- source
-- target
-- description
-
-Use purpose rather than description.
-
-Use from_node and to_node for graph endpoints.
-
-constraints must be a JSON array of objects.
-
-Use [] when there is no explicit cross-responsibility constraint.
-
-ResponsibilityEdges connect FunctionItems and immutable platform boundary nodes only.
-Every non-platform from_node and to_node must exactly equal one current FunctionItem.target_file.
-References, assets, SKILL.md, configs, and other FilePlan resources are not ResponsibilityGraph nodes.
-Resource usage remains in FilePlan dependencies/references/resource metadata.
-
-Use platform_io_contract as an exact immutable boundary contract.
-
-For every edge whose from_node is platform_input_node:
-
-from_output must be an actual platform input source slot
-listed by platform_io_contract.
-
-For every edge whose to_node is platform_output_node:
-
-to_input must be an actual platform final output terminal slot
-listed by platform_io_contract.
-
-A script-local semantic input name is not automatically
-a platform input source slot.
-
-Do not copy a script-local field name into from_output
-unless that exact platform slot exists.
-
-Revise the ResponsibilityEdge yourself.
-
-Creator backend will not infer the mapping.
-
-Replay the exact workflow, SkillPlan script responsibilities, and responsibility_edges in the current draft.
-Revise the draft itself before returning.
-
-For each FunctionItem:
-1. What semantic inputs does this FunctionItem declare?
-2. For every cross-responsibility business input, which incoming ResponsibilityEdge provides it?
-3. If a declared input has no upstream producer, determine whether it is truly local/default/config/resource. If not, revise the plan.
-4. What semantic results does this FunctionItem actually produce?
-5. Does every outgoing ResponsibilityEdge transport a result the source FunctionItem actually produces?
-6. Does every downstream FunctionItem receive all upstream business results required for its owned action?
-7. Do platform input edges agree with the plan's declared runtime/user input?
-8. Do platform output edges deliver every required final result?
-9. Do required_capabilities describe the actual actions owned by each FunctionItem?
-10. Are workflow correctness requirements represented in the owning FunctionItem.constraints or relevant ResponsibilityEdge.constraints?
-
-A produced semantic result may have multiple downstream consumers.
-If multiple FunctionItems independently require the same upstream result, the emitted ResponsibilityEdges must represent every required cross-responsibility consumption.
-Do not assume that transporting a result to one consumer implicitly makes it available to other consumers.
-
-Platform input edges must represent a real input dependency of the emitted executable plan.
-Do not create a platform input edge merely because a platform input slot exists.
-If the emitted plan declares that execution requires no business input, do not invent a platform-input dependency.
-If a script uses a default or internal configuration value, do not model that default as a semantic result transported from an unrelated platform input slot.
-
-Do not merely describe a detected inconsistency.
-Revise function_items and responsibility_edges so the returned graph is internally consistent.
-
-Return the complete Planner response with this schema.
-The backend will consume only function_items and responsibility_edges from this convergence response:
-{
-  "status": "ready",
-  "clarifying_questions": [],
-  "review_summary": {...},
-  "internal_blueprint_text": "...",
-  "skill_name": "...",
-  "blockers": [],
-  "function_items": [...],
-  "responsibility_edges": [...]
-}
-Only output strict JSON object. Do not output Markdown or explanation.
+Return only strict JSON: {"responsibility_edges": [...]}
 """.strip()
-
     payload = {
-        "task": "prepare_plan_convergence",
-        "current_planner_result": current_planner_result,
-        "draft_transport_error": draft_transport_error,
-        "allowed_function_item_targets": allowed_function_item_targets,
-        "platform_io_contract": platform_io_contract_prompt_text(),
-        "confirmed_decision_context": {
-            "conversation_history": request.conversation_history,
-            "user_request": request.user_request,
-            "human_feedback": request.human_feedback,
-            "previous_blueprint_text": request.previous_blueprint_text,
-            "skill_name": request.skill_name,
-        },
+        "task": "converge_responsibility_graph_edges",
+        "graph_construction_context": graph_context,
+        "validation_issues": ([{
+            "reason": draft_transport_error,
+        }] if draft_transport_error else []),
     }
-
     text = await complete_creator_role_once(
-        [
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
-        ],
+        [{"role": "system", "content": prompt},
+         {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
         "planner", fallback_model=planner_model,
     )
     data = _parse_prepare_plan_json(text)
-    data.pop("tool_pool_patch", None)
-    data.pop("selected_tools", None)
-    data.pop("required_tool_slots", None)
-    required_transport_fields = {
-        "status",
-        "clarifying_questions",
-        "review_summary",
-        "internal_blueprint_text",
-        "skill_name",
-        "blockers",
-        "function_items",
-        "responsibility_edges",
-    }
-    if "function_items" not in data:
-        raise ValueError(
-            "Planner convergence ready response must explicitly include function_items"
-        )
-    if "responsibility_edges" not in data:
-        raise ValueError(
-            "Planner convergence ready response must explicitly include responsibility_edges"
-        )
-    if data.get("function_items") is None:
-        raise ValueError(
-            "Planner convergence ready response function_items must not be null"
-        )
-    if data.get("responsibility_edges") is None:
-        raise ValueError(
-            "Planner convergence ready response responsibility_edges must not be null"
-        )
-    missing_transport_fields = sorted(
-        field
-        for field
-        in required_transport_fields
-        if field not in data
-    )
-    if missing_transport_fields:
-        raise ValueError(
-            "Planner convergence returned incomplete ready response; "
-            f"missing fields: {missing_transport_fields}"
-        )
-    invalid_transport_fields = []
-    if not isinstance(data.get("status"), str):
-        invalid_transport_fields.append("status")
-    if not isinstance(data.get("clarifying_questions"), list):
-        invalid_transport_fields.append("clarifying_questions")
-    if not isinstance(data.get("review_summary"), dict):
-        invalid_transport_fields.append("review_summary")
-    if (
-        not isinstance(
-            data.get("internal_blueprint_text"),
-            str,
-        )
-        or not str(
-            data.get("internal_blueprint_text")
-            or ""
-        ).strip()
-    ):
-        invalid_transport_fields.append(
-            "internal_blueprint_text"
-        )
-    if not isinstance(data.get("skill_name"), str):
-        invalid_transport_fields.append("skill_name")
-    if not isinstance(data.get("blockers"), list):
-        invalid_transport_fields.append("blockers")
-    if not isinstance(data.get("function_items"), list):
-        invalid_transport_fields.append("function_items")
-    if not isinstance(data.get("responsibility_edges"), list):
-        invalid_transport_fields.append("responsibility_edges")
-    if invalid_transport_fields:
-        raise ValueError(
-            "Planner convergence returned invalid transport field shapes; "
-            f"invalid fields: {sorted(invalid_transport_fields)}"
-        )
-    if str(data.get("status") or "") != "ready":
-        raise ValueError("Planner convergence must return a complete ready plan")
-    normalized_function_items = normalize_structured_function_items(
-        data.get("function_items"),
-        source="planner",
-    )
-    if frozen_blueprint_text:
-        _validate_function_items_match_frozen_blueprint_boundaries(
-            frozen_blueprint_text=frozen_blueprint_text,
-            allowed_function_item_targets=allowed_function_item_targets,
-            function_items=normalized_function_items,
-            source="planner convergence",
-        )
-    _validate_function_item_targets_in_allowed_domain(
-        normalized_function_items,
-        allowed_function_item_targets,
-    )
+    if set(data) != {"responsibility_edges"} or not isinstance(data.get("responsibility_edges"), list):
+        raise ValueError("Planner convergence must return only responsibility_edges")
     normalized_edges = validate_structured_responsibility_edge_transport(
-        data.get("responsibility_edges"),
-        function_items=normalized_function_items,
-        source="planner",
+        data["responsibility_edges"],
+        function_items=frozen_function_items,
+        source="planner convergence",
     )
-    data["function_items"] = normalized_function_items
-    data["responsibility_edges"] = normalized_edges
+    result = dict(current_planner_result)
+    result["function_items"] = frozen_function_items
+    result["responsibility_edges"] = normalized_edges
     logger.info(
         "[Creator][planner_convergence][result] %s",
         json.dumps({
             "event": "creator_planner_convergence_result",
-            "skill_name": str(data.get("skill_name") or request.skill_name or ""),
+            "skill_name": str(result.get("skill_name") or request.skill_name or ""),
             "final_edge_count": len(normalized_edges),
-            "draft_function_item_count": len(draft_function_items),
-            "final_function_item_count": len(normalized_function_items),
-            "draft_targets": [item.get("target_file") for item in draft_function_items if isinstance(item, dict)],
-            "final_targets": [item.get("target_file") for item in normalized_function_items],
             "final_endpoint_pairs": _responsibility_edge_endpoint_pairs(normalized_edges),
-            "constraint_count": sum(len(edge.get("constraints") or []) for edge in normalized_edges),
         }, ensure_ascii=False, default=str),
     )
-    return data
+    return result
 
 
 async def _review_responsibility_graph_alignment(
@@ -6567,6 +6301,10 @@ selecting a dynamic child parameter; a whole structured input root may be passed
 directly without that constraint. Creation-time fixed configuration is an
 upstream Blueprint decision. Do not remove an input during localized graph repair.
 
+Before returning, verify every declared runtime input has exactly one legal
+provenance; every from_output and to_input exists; required final outputs have a
+producer-to-platform_output path; and no input, output, or FunctionItem was added.
+
 Return only strict JSON:
 {"function_items": [...], "responsibility_edges": [...]}
 """.strip()
@@ -6661,6 +6399,23 @@ def _build_responsibility_graph_construction_context(
             })
 
     platform_boundary = build_platform_io_contract()["platform_skill_boundary"]
+    legal_sources = [
+        {"from_node": "platform_input_node", "from_output": field}
+        for field in platform_boundary["input_envelope_fields"]
+    ] + [
+        {"from_node": item["target_file"], "from_output": output}
+        for item in projected_items
+        for output in item["outputs"]
+    ]
+    input_source_domains = [
+        {
+            "target_file": item["target_file"],
+            "target_input": input_name,
+            "legal_sources": list(legal_sources),
+        }
+        for item in projected_items
+        for input_name in item["inputs"]
+    ]
     return {
         "allowed_function_targets": list(allowed_function_item_targets),
         "function_items": projected_items,
@@ -6671,36 +6426,41 @@ def _build_responsibility_graph_construction_context(
         "platform_output_contract": {
             "final_output_fields": list(platform_boundary["final_output_fields"]),
         },
+        "input_source_domains": input_source_domains,
         "current_edges": list(responsibility_edges or []),
     }
 
 
-def _validate_function_items_match_frozen_blueprint_boundaries(
+def _frozen_function_items_from_blueprint(
     *,
     frozen_blueprint_text: str,
     allowed_function_item_targets: list[str],
-    function_items: list[dict[str, Any]],
-    source: str,
-) -> None:
-    """Reject planner output that changes frozen target/input/output facts."""
-    context = _build_responsibility_graph_construction_context(
-        frozen_blueprint_text=frozen_blueprint_text,
-        allowed_function_item_targets=allowed_function_item_targets,
+) -> list[dict[str, Any]]:
+    """Materialize FunctionItems directly from frozen structured SkillPlan facts."""
+    allowed = set(allowed_function_item_targets)
+    parsed = parse_blueprint(
+        [{"role": "assistant", "content": frozen_blueprint_text}], strict=True
     )
-    frozen_boundaries = {
-        item["target_file"]: (item["inputs"], item["outputs"])
-        for item in context["function_items"]
-    }
-    returned_boundaries = {
-        item["target_file"]: (item["inputs"], item["outputs"])
-        for item in function_items
-    }
-    if returned_boundaries != frozen_boundaries:
-        raise ValueError(
-            f"{source} changed frozen Blueprint target_file/inputs/outputs; "
-            f"frozen_boundaries={frozen_boundaries}; "
-            f"returned_boundaries={returned_boundaries}"
-        )
+    items = [
+        {
+            "target_file": entry.path,
+            "role": str(entry.role),
+            "purpose": entry.purpose,
+            "inputs": list(entry.inputs),
+            "outputs": list(entry.outputs),
+            "required_capabilities": list(entry.required_capabilities),
+            "constraints": list(entry.constraints),
+        }
+        for entry in (parsed.skill_plan.files if parsed.skill_plan else [])
+        if entry.path in allowed
+    ]
+    normalized = normalize_structured_function_items(
+        items, source="frozen_blueprint"
+    )
+    _validate_function_item_targets_in_allowed_domain(
+        normalized, allowed_function_item_targets
+    )
+    return normalized
 
 
 async def _regenerate_responsibility_graph(
@@ -6731,6 +6491,10 @@ legal source domain but does not choose the semantically correct source for you.
 Close platform input/output boundaries and use only exact declared endpoints.
 Do not invent aliases, functions, inputs, outputs, or platform slots. If frozen
 FunctionItems make closure impossible, do not redesign them.
+
+Before returning, verify every declared runtime input has exactly one legal
+provenance; every from_output and to_input exists; required final outputs have a
+producer-to-platform_output path; and no input, output, or FunctionItem was added.
 
 Return only strict JSON: {"responsibility_edges": [...]}
 """.strip()
@@ -6829,149 +6593,60 @@ async def _bind_executable_responsibility_plan(
     planner_model: str,
     allowed_function_item_targets: list[str],
 ) -> dict[str, Any]:
-    """Ask the same Planner to bind executable graph transport onto FilePlan."""
-
-    prompt = """
-You are the same Blueprint Planner.
-
-The business plan and FilePlan were produced by you in the immediately preceding planning pass.
-
-This is not a new planning task.
-This is not a judge, validator, gate, repair model, or separate semantic authority.
-
-The FilePlan is frozen for this binding pass.
-
-Do not add files.
-Do not remove files.
-Do not rename files.
-Do not reinterpret the user's goal.
-Preserve user-stated requirements by priority: latest explicit human_feedback, original user_request, confirmed supplements, historical requirements not overridden by later feedback, and only then planner inference. Latest feedback overrides only conflicting older requirements; keep all non-conflicting user goals, input modes, outputs/final artifacts, required steps/capabilities, and explicit prohibitions. Do not let previous summaries replace user wording.
-
-
-Your only task is to bind executable responsibilities and cross-responsibility transport onto the frozen FilePlan.
-
-Use graph_construction_context as the primary topology source. It is a compact
-projection of frozen structured SkillPlan facts. For each declared runtime input,
-choose the semantically correct provenance from the platform input contract or a
-declared FunctionItem output, then emit ResponsibilityEdges. Do not recover
-topology from prose, redesign the FilePlan, or invent a function for easier wiring.
-
-FunctionItems are executable responsibility nodes.
-
-Executable responsibility ownership:
-
-FunctionItems are the executable responsibility owners.
-ResponsibilityEdges describe cross-responsibility data dependencies and transport between executable owners.
-
-Reason from the actual host execution model. The current host invokes each
-generated script through its declared command invocation. There is no separate
-generic workflow engine that automatically executes arbitrary control-flow
-semantics described only in ResponsibilityEdge metadata.
-
-Therefore:
-- Any computation required to fulfill a FunctionItem's owned business responsibility must be executable inside that FunctionItem script unless the platform contract explicitly provides that execution capability.
-- Ordinary program logic needed to complete one script responsibility remains inside that script.
-- Do not externalize implementation logic from a FunctionItem into ResponsibilityEdges when the host runtime has no corresponding executable node.
-- A ResponsibilityEdge must represent a real value produced by one executable responsibility and consumed by another executable responsibility.
-- If fulfilling a downstream responsibility requires processing an upstream result before the downstream responsibility is complete, decide which FunctionItem owns that processing and express the FunctionItem input/output boundary accordingly.
-- FunctionItem inputs and outputs must represent stable cross-script responsibility boundaries, not temporary values that exist only because of internal implementation steps.
-- Do not promote script-local intermediate values into cross-script inputs or outputs unless another FunctionItem genuinely consumes them as part of its own independent responsibility.
-
-Before returning, mentally replay the plan using the actual host execution model:
-each FunctionItem script is invoked according to the generated workflow;
-every required computation must have a real executable owner; and every
-ResponsibilityEdge must be satisfiable as data transport without assuming an
-undeclared workflow execution engine.
-
-Platform boundary nodes are immutable transport endpoints, not executable
-FunctionItems. Preserve complete end-to-end platform boundary closure: required
-runtime inputs enter the executable responsibility graph through valid platform
-input boundary slots, and required final results leave it through valid platform
-output boundary slots. ResponsibilityEdges may connect platform boundary to
-FunctionItem, FunctionItem to FunctionItem, or FunctionItem to platform boundary.
-
-Every target_file must be copied exactly from allowed_function_item_targets.
-Do not invent a target path.
-Do not use SKILL.md, references, assets, configs, or any other file unless it appears exactly in allowed_function_item_targets.
-Every executable responsibility owned by a script in the frozen FilePlan must be represented by its FunctionItem.
-Do not move file-local metadata into FunctionItems.
-
-Every FunctionItem must be a JSON object with exactly:
-target_file, role, purpose, inputs, outputs, required_capabilities, constraints.
-inputs, outputs, required_capabilities must be string arrays.
-constraints must be a JSON array of objects.
-
-ResponsibilityEdges connect FunctionItems and immutable platform boundary nodes only:
-- platform_input_node
-- current FunctionItem.target_file values
-- platform_output_node
-
-Every non-platform from_node and to_node must exactly equal one FunctionItem.target_file.
-Resource usage remains in FilePlan dependencies/references/resource metadata.
-
-Every ResponsibilityEdge must be a JSON object with exactly:
-from_node, from_output, to_node, to_input, purpose, constraints.
-Do not use aliases or alternate graph dialects.
-constraints must be a JSON array of objects.
-
-Use platform_io_contract as an exact immutable boundary contract.
-For platform_input_node, from_output must be an actual platform input source slot.
-For platform_output_node, to_input must be an actual platform final output terminal slot.
-
-Every declared FunctionItem input must have explicit runtime provenance through an incoming ResponsibilityEdge. Do not invent top-level platform input slots for Skill-specific parameters. Use platform_io_contract.platform_skill_boundary.preferred_structured_input_root directly when the whole structured value is the FunctionItem input. When binding one dynamic parameter from that structured root, add exactly one constraints entry with type "platform_parameter_binding", an explicit non-empty source_key, and required as a boolean; optional parameters (required=false) must also include an explicit default. source_key is planner-declared and may differ from to_input. If a value is creation-time fixed and not runtime-overridable, keep it in FunctionItem.constraints rather than FunctionItem.inputs. Removing an invalid edge is not a valid repair if it leaves a declared FunctionItem input without provenance.
-
-Return only:
-{
-  "function_items": [],
-  "responsibility_edges": []
-}
-Only output strict JSON object. Do not output Markdown or explanation.
-""".strip()
-
+    """Ask Planner for initial edges over Backend-materialized frozen FunctionItems."""
     frozen_blueprint_text = str(
         current_planner_result.get("internal_blueprint_text") or ""
+    )
+    frozen_function_items = _frozen_function_items_from_blueprint(
+        frozen_blueprint_text=frozen_blueprint_text,
+        allowed_function_item_targets=allowed_function_item_targets,
     )
     graph_context = _build_responsibility_graph_construction_context(
         frozen_blueprint_text=frozen_blueprint_text,
         allowed_function_item_targets=allowed_function_item_targets,
+        function_items=frozen_function_items,
     )
+    prompt = """
+You are the Blueprint Planner binding the initial ResponsibilityGraph over frozen
+FunctionItems. Blueprint defines responsibilities; Graph connects them.
+
+Return a complete responsibility_edges array only. Do not return or redesign
+FunctionItems, files, target_file, inputs, outputs, purpose, capabilities, or
+constraints. Use graph_construction_context as the only topology and endpoint
+authority. For each target input, choose the semantically correct provenance
+from its supplied legal_sources. Backend supplies only the structurally legal
+source domain; it does not choose the semantic mapping.
+
+Use exact canonical ResponsibilityEdge fields: from_node, from_output, to_node,
+to_input, purpose, constraints. Platform endpoints and slots must come from the
+supplied platform contracts. Do not infer aliases or invent endpoints.
+
+Before returning, replay the complete graph and verify:
+1. Every declared runtime input has exactly one legal provenance.
+2. Every from_output exists in the supplied legal source domain.
+3. Every to_input exists on the frozen target FunctionItem.
+4. Every required final output has a producer-to-platform_output path.
+5. No input, output, FunctionItem, file, or platform slot was invented.
+
+Return only strict JSON: {"responsibility_edges": [...]}
+""".strip()
     payload = {
-        "task": "bind_executable_responsibilities",
+        "task": "bind_responsibility_graph_edges",
         "graph_construction_context": graph_context,
-        "confirmed_decision_context": {
-            "conversation_history": request.conversation_history,
-            "user_request": request.user_request,
-            "human_feedback": request.human_feedback,
-            "previous_blueprint_text": request.previous_blueprint_text,
-            "skill_name": request.skill_name,
-        },
-        "platform_io_contract": platform_io_contract_prompt_text(),
     }
     text = await complete_creator_role_once(
-        [
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
-        ],
+        [{"role": "system", "content": prompt},
+         {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
         "planner", fallback_model=planner_model,
     )
     data = _parse_prepare_plan_json(text)
-    if not isinstance(data.get("function_items"), list):
-        raise ValueError("Planner binding response must include function_items list")
-    if not isinstance(data.get("responsibility_edges"), list):
-        raise ValueError("Planner binding response must include responsibility_edges list")
-    normalized_function_items = normalize_structured_function_items(
-        data.get("function_items"), source="planner binding"
-    )
-    _validate_function_items_match_frozen_blueprint_boundaries(
-        frozen_blueprint_text=frozen_blueprint_text,
-        allowed_function_item_targets=allowed_function_item_targets,
-        function_items=normalized_function_items,
-        source="planner binding",
-    )
+    if set(data) != {"responsibility_edges"} or not isinstance(data.get("responsibility_edges"), list):
+        raise ValueError("Planner binding must return only responsibility_edges")
     return {
-        "function_items": normalized_function_items,
-        "responsibility_edges": data.get("responsibility_edges") or [],
+        "function_items": frozen_function_items,
+        "responsibility_edges": data["responsibility_edges"],
     }
+
 
 def _planner_convergence_review_event_from_result(result: dict[str, Any]) -> dict[str, Any]:
     review_summary = result.get("review_summary")

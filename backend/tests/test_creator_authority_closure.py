@@ -149,6 +149,12 @@ def test_graph_construction_context_contains_only_frozen_structured_topology():
     assert "scripts/extra.py" not in json.dumps(context)
     assert context["platform_input_contract"]["input_fields"]
     assert context["platform_output_contract"]["final_output_fields"]
+    domain = context["input_source_domains"][0]
+    assert (domain["target_file"], domain["target_input"]) == ("scripts/a.py", "value")
+    assert {tuple(source.values()) for source in domain["legal_sources"]} == {
+        *(('platform_input_node', field) for field in context["platform_input_contract"]["input_fields"]),
+        ("scripts/a.py", "result"),
+    }
 
 
 def test_blueprint_prompt_includes_lightweight_runtime_contract_self_check():

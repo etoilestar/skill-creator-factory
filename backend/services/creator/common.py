@@ -1727,12 +1727,41 @@ def _reject_custom_skill_md_protocol(content: str) -> None:
 
 
 def _extract_declared_skill_paths(text: str) -> list[str]:
-    """Return normalized Skill package file paths mentioned by a blueprint."""
+    """Return normalized Skill package paths mentioned anywhere in text.
+
+    This is deliberately a mention extractor, not a FilePlan authority source.
+    Authority consumers must use structured SkillPlan facts instead.
+    """
     seen: set[str] = set()
     paths: list[str] = []
     for raw in _SKILL_FILE_PATH_RE.findall(text or ""):
         path = raw.strip().rstrip("`，,。；;:)）]").replace("\\", "/")
         if path not in seen:
+            seen.add(path)
+            paths.append(path)
+    return paths
+
+
+def _authoritative_blueprint_skill_paths(blueprint_text: str) -> list[str]:
+    """Return paths declared by parsed, structured Blueprint file entries only."""
+    try:
+        parsed = parse_blueprint(
+            [{"role": "assistant", "content": blueprint_text or ""}],
+            strict=True,
+        )
+    except Exception:
+        return []
+
+    seen: set[str] = set()
+    paths: list[str] = []
+    planned_files = (
+        getattr(getattr(parsed, "skill_plan", None), "files", None)
+        or getattr(parsed, "files", [])
+        or []
+    )
+    for item in planned_files:
+        path = str(getattr(item, "path", "") or "").replace("\\", "/").strip().strip("`")
+        if path and path not in seen:
             seen.add(path)
             paths.append(path)
     return paths
@@ -1744,17 +1773,7 @@ def _paths_requiring_skill_md_mentions(blueprint_text: str, *, prefix: str) -> l
 
     seen: set[str] = set()
     paths: list[str] = []
-    try:
-        parsed = parse_blueprint(
-            [{"role": "assistant", "content": blueprint_text or ""}],
-            strict=True,
-        )
-    except Exception:
-        return []
-
-    planned_files = getattr(getattr(parsed, "skill_plan", None), "files", None) or getattr(parsed, "files", []) or []
-    for item in planned_files:
-        path = str(getattr(item, "path", "") or "").replace("\\", "/").strip().strip("`")
+    for path in _authoritative_blueprint_skill_paths(blueprint_text):
         if not path.startswith(prefix) or path in seen:
             continue
         seen.add(path)

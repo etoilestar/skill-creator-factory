@@ -7613,6 +7613,14 @@ Blueprint Planner 只规划业务责任。
             }
             data = dict(first_planner_result)
 
+        authoritative_paths = _extract_prepare_skill_plan_paths(frozen_blueprint_text)
+        logger.info(
+            "[Creator][file_plan_authority] authoritative_scripts=%s authoritative_references=%s authoritative_assets=%s",
+            [path for path in authoritative_paths if path.startswith("scripts/")],
+            [path for path in authoritative_paths if path.startswith("references/")],
+            [path for path in authoritative_paths if path.startswith("assets/")],
+        )
+
         allowed_function_item_targets = (
             _resolve_allowed_function_item_targets_from_blueprint(
                 frozen_blueprint_text
@@ -7761,14 +7769,37 @@ Blueprint Planner 只规划业务责任。
                     provenance_gaps = structured_responsibility_graph_input_provenance_gaps(
                         current_function_items, current_edges, source="planner"
                     )
+                    declared_input_count = sum(
+                        len(item.get("inputs") or []) for item in current_function_items
+                    )
+                    logger.info(
+                        "[Creator][graph_closure] resolved_input_count=%d unresolved_inputs=%s conflicting_provenance=[]",
+                        declared_input_count - len(provenance_gaps),
+                        [
+                            {"target_file": target_file, "target_input": input_name}
+                            for target_file, input_name in provenance_gaps
+                        ],
+                    )
                     if provenance_gaps:
                         current_issues = [
                             {
                                 "id": "responsibility_input_provenance",
+                                "category": "unresolved_input_provenance",
+                                "target_file": target_file,
+                                "target_input": input_name,
                                 "target_files": [target_file],
                                 "affected_edge_indexes": [],
                                 "reason": "Declared FunctionItem input has no runtime provenance.",
                                 "evidence": f"target_file={target_file}; input={input_name}",
+                                "available_incoming_edges": [
+                                    edge for edge in current_edges
+                                    if edge.get("to_node") == target_file
+                                ],
+                                "available_platform_bindings": [
+                                    edge for edge in current_edges
+                                    if edge.get("to_node") == target_file
+                                    and edge.get("from_node") == "platform_input_node"
+                                ],
                                 "repair_guidance": "Provide an explicit upstream/platform binding or remove it from runtime inputs only if the confirmed Blueprint makes it creation-time fixed configuration.",
                             }
                             for target_file, input_name in provenance_gaps
@@ -7783,6 +7814,20 @@ Blueprint Planner 只规划业务责任。
                         )
                 except ValueError as exc:
                     deterministic_error = str(exc)
+                    if deterministic_error.startswith("conflicting_input_provenance:"):
+                        logger.info(
+                            "[Creator][graph_closure] resolved_input_count=0 unresolved_inputs=[] conflicting_provenance=%s",
+                            deterministic_error,
+                        )
+                        current_issues = [{
+                            "id": "conflicting_input_provenance",
+                            "category": "conflicting_input_provenance",
+                            "target_files": [],
+                            "affected_edge_indexes": [],
+                            "reason": deterministic_error,
+                            "evidence": deterministic_error,
+                            "repair_guidance": "Remove one conflicting source declaration for the identified target input; do not guess which source is authoritative.",
+                        }]
 
                 if deterministic_error:
                     last_error = deterministic_error
@@ -10736,7 +10781,14 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
 
     base_paths = {f.path for f in plan.files if not is_directory_placeholder(f.path)}
 
-    candidate_paths: set[str] = {path for path in _extract_declared_skill_paths(blueprint_text) if not is_directory_placeholder(path)}
+    candidate_paths: set[str] = set()
+    if not request.strict:
+        # Legacy best-effort analysis may still display mentioned paths. Strict
+        # confirmed plans take topology exclusively from parsed SkillPlan facts.
+        candidate_paths.update(
+            path for path in _extract_declared_skill_paths(blueprint_text)
+            if not is_directory_placeholder(path)
+        )
     candidate_paths.update(entries_by_path.keys())
 
     extra_paths = []

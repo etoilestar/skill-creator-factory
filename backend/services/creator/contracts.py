@@ -1363,10 +1363,10 @@ def _collect_blueprint_skillplan_constraints(
     """Collect hard constraints that SKILL.md must reflect.
 
     This intentionally combines:
-    - declared file paths parsed from blueprint text
+    - structured file paths parsed from Blueprint SkillPlan entries
     - SKILL.md FileSpecOut / SkillPlanEntry passed by frontend
     """
-    declared_paths = sorted(_extract_declared_skill_paths(blueprint_text))
+    declared_paths = sorted(_authoritative_blueprint_skill_paths(blueprint_text))
     declared_scripts = sorted(p for p in declared_paths if p.startswith("scripts/"))
     declared_references = sorted(p for p in declared_paths if p.startswith("references/"))
     declared_assets = sorted(p for p in declared_paths if p.startswith("assets/"))
@@ -1616,7 +1616,7 @@ def _collect_skill_md_review_script_paths(
         seen.add(path)
         paths.append(path)
 
-    for path in _extract_declared_skill_paths(blueprint_text):
+    for path in _authoritative_blueprint_skill_paths(blueprint_text):
         add(path)
 
     def walk_skill_plan(value: Any) -> None:
@@ -1750,7 +1750,7 @@ async def _review_skill_md_blueprint_intent_with_model(
         skill_name=skill_name,
     )
 
-    parser_paths = _extract_declared_skill_paths(blueprint_text)
+    parser_paths = list(constraints["declared_paths"])
 
     prompt = (
         "你是 superskills Creator 的第一轮 SKILL.md 语义覆盖审查器，只输出严格 JSON object。\n\n"
@@ -1838,7 +1838,7 @@ async def _review_skill_md_blueprint_intent_with_model(
         "【蓝图约束 JSON，供参考；如和蓝图原文语境冲突，以蓝图原文为准】\n"
         f"{json.dumps(constraints, ensure_ascii=False, indent=2, default=str)[:12000]}\n\n"
 
-        "【解析器提取路径，供参考；不是最终裁决】\n"
+        "【Backend authoritative file manifest；Reviewer 不得扩展】\n"
         f"{json.dumps(parser_paths, ensure_ascii=False, indent=2, default=str)}\n\n"
 
         "【compact requirement_graph 上下文，仅用于大致理解流程；不得用于阻断跨步骤精确字段/placeholder 来源】\n"
@@ -1961,9 +1961,32 @@ async def _review_skill_md_blueprint_intent_with_model(
             out.append(path)
         return out
 
-    data["required_script_paths"] = _normalize_paths(data["required_script_paths"], "scripts/")
-    data["required_reference_paths"] = _normalize_paths(data["required_reference_paths"], "references/")
-    data["required_asset_paths"] = _paths_requiring_skill_md_mentions(blueprint_text, prefix="assets/")
+    authoritative_by_prefix = {
+        "scripts/": set(constraints["declared_scripts"]),
+        "references/": set(constraints["declared_references"]),
+        "assets/": set(constraints["declared_assets"]),
+    }
+    for field, prefix in (
+        ("required_script_paths", "scripts/"),
+        ("required_reference_paths", "references/"),
+        ("required_asset_paths", "assets/"),
+    ):
+        proposed = _normalize_paths(data[field], prefix)
+        data[field] = [path for path in proposed if path in authoritative_by_prefix[prefix]]
+        overreach = [path for path in proposed if path not in authoritative_by_prefix[prefix]]
+        if overreach:
+            logger.warning(
+                "[Creator][skill_md][reviewer_overreach] field=%s paths=%s",
+                field,
+                overreach,
+            )
+
+    logger.info(
+        "[Creator][skill_md][authority] authoritative_scripts=%s authoritative_references=%s authoritative_assets=%s",
+        constraints["declared_scripts"],
+        constraints["declared_references"],
+        constraints["declared_assets"],
+    )
 
     return data
 
@@ -3070,11 +3093,10 @@ async def _validate_skill_md_blueprint_alignment(
 
     required_script_paths = list(review.get("required_script_paths") or [])
     if not required_script_paths:
-        required_script_paths = [
-            path
-            for path in _extract_declared_skill_paths(blueprint_text)
-            if isinstance(path, str) and path.startswith("scripts/")
-        ]
+        required_script_paths = _collect_blueprint_skillplan_constraints(
+            blueprint_text=blueprint_text,
+            skill_plan_entry=skill_plan_entry,
+        )["declared_scripts"]
 
     command_blocks = [
         block

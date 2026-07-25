@@ -669,6 +669,71 @@ def _output_edge(path: str) -> dict:
 
 
 @pytest.mark.asyncio
+async def test_binding_and_convergence_are_edge_only_over_frozen_function_items(monkeypatch):
+    import json
+
+    script_block = _script_plan_block("scripts/a.py").replace(
+        "inputs: []", "inputs: [x]"
+    ).replace("outputs: [result]", "outputs: [y]")
+    blueprint = _ready_blueprint(_skill_plan_block("\n" + script_block))
+    expanded_item = {
+        **_function_item("scripts/a.py"),
+        "inputs": ["x", "z"],
+        "outputs": ["y"],
+    }
+
+    async def binding_response(messages, role, fallback_model):
+        return json.dumps({"function_items": [expanded_item], "responsibility_edges": []})
+
+    monkeypatch.setattr(api, "complete_creator_role_once", binding_response)
+    with pytest.raises(ValueError, match="binding must return only responsibility_edges"):
+        await api._bind_executable_responsibility_plan(
+            request=_request(),
+            current_planner_result=_ready_payload(blueprint),
+            planner_model="planner",
+            allowed_function_item_targets=["scripts/a.py"],
+        )
+
+    async def valid_binding_response(messages, role, fallback_model):
+        return json.dumps({"responsibility_edges": []})
+
+    monkeypatch.setattr(api, "complete_creator_role_once", valid_binding_response)
+    bound = await api._bind_executable_responsibility_plan(
+        request=_request(),
+        current_planner_result=_ready_payload(blueprint),
+        planner_model="planner",
+        allowed_function_item_targets=["scripts/a.py"],
+    )
+    assert bound["function_items"][0]["inputs"] == ["x"]
+    assert bound["function_items"][0]["outputs"] == ["y"]
+
+    async def convergence_response(messages, role, fallback_model):
+        return json.dumps({
+            **_ready_payload(blueprint),
+            "function_items": [expanded_item],
+            "responsibility_edges": [],
+        })
+
+    monkeypatch.setattr(api, "complete_creator_role_once", convergence_response)
+    with pytest.raises(ValueError, match="convergence must return only responsibility_edges"):
+        await api._converge_ready_executable_plan(
+            request=_request(),
+            current_planner_result={
+                **_ready_payload(blueprint),
+                "function_items": [{
+                    **_function_item("scripts/a.py"),
+                    "inputs": ["x"],
+                    "outputs": ["y"],
+                }],
+                "responsibility_edges": [],
+            },
+            planner_model="planner",
+            allowed_function_item_targets=["scripts/a.py"],
+            frozen_blueprint_text=blueprint,
+        )
+
+
+@pytest.mark.asyncio
 async def test_incomplete_binding_target_set_does_not_emit_draft_and_convergence_can_fix(monkeypatch):
     import json
 
@@ -1972,11 +2037,11 @@ async def test_responsibility_graph_alignment_review_is_read_only(monkeypatch):
         )
 
 
-async def _run_ready_graph_alignment_flow(monkeypatch, review, repair=None, initial_edges=None, function_item=None):
+async def _run_ready_graph_alignment_flow(monkeypatch, review, repair=None, initial_edges=None, function_item=None, regenerate=None):
     import json
 
     blueprint = _ready_blueprint(_skill_plan_block("\n" + _script_plan_block("scripts/a.py")))
-    item = function_item or _function_item("scripts/a.py")
+    item = function_item or {**_function_item("scripts/a.py"), "inputs": ["source"]}
     edges = [
         {"from_node": "platform_input_node", "from_output": "user_request", "to_node": "scripts/a.py", "to_input": "source", "purpose": "provide input", "constraints": []},
         _output_edge("scripts/a.py"),
@@ -2003,6 +2068,10 @@ async def _run_ready_graph_alignment_flow(monkeypatch, review, repair=None, init
     monkeypatch.setattr(api, "_review_responsibility_graph_alignment", review)
     if repair is not None:
         monkeypatch.setattr(api, "_repair_responsibility_graph_alignment", repair)
+    if regenerate is None:
+        async def regenerate(**kwargs):
+            return {"function_items": kwargs["function_items"], "responsibility_edges": edges}
+    monkeypatch.setattr(api, "_regenerate_responsibility_graph", regenerate)
     return await api._generate_internal_blueprint_or_questions(_request()), item, edges
 
 
@@ -2044,7 +2113,7 @@ async def test_alignment_failure_runs_one_localized_repair_then_final_review(mon
     async def repair(**kwargs):
         nonlocal repair_calls
         repair_calls += 1
-        item = _function_item("scripts/a.py")
+        item = {**kwargs["function_items"][0]}
         item["purpose"] = "repaired responsibility"
         return {"function_items": [item], "responsibility_edges": [{"from_node": "platform_input_node", "from_output": "user_request", "to_node": "scripts/a.py", "to_input": "source", "purpose": "provide input", "constraints": []}, _output_edge("scripts/a.py")]}
 
@@ -2086,12 +2155,71 @@ async def test_alignment_final_review_failure_blocks_after_bounded_calls(monkeyp
     async def repair(**kwargs):
         nonlocal repair_calls
         repair_calls += 1
-        return {"function_items": [_function_item("scripts/a.py")], "responsibility_edges": [{"from_node": "platform_input_node", "from_output": "user_request", "to_node": "scripts/a.py", "to_input": "source", "purpose": "provide input", "constraints": []}, _output_edge("scripts/a.py")]}
+        return {"function_items": kwargs["function_items"], "responsibility_edges": [{"from_node": "platform_input_node", "from_output": "user_request", "to_node": "scripts/a.py", "to_input": "source", "purpose": "provide input", "constraints": []}, _output_edge("scripts/a.py")]}
 
     with pytest.raises(api.PreparePlanProtocolError, match="remained unresolved"):
         await _run_ready_graph_alignment_flow(monkeypatch, review, repair)
-    assert review_calls == 2
+    assert review_calls == 3
     assert repair_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_localized_repair_runs_one_full_graph_regeneration(monkeypatch):
+    review_calls = 0
+    repair_calls = 0
+    regenerate_calls = 0
+    input_edge = {"from_node": "platform_input_node", "from_output": "user_request", "to_node": "scripts/a.py", "to_input": "source", "purpose": "provide input", "constraints": []}
+    valid_edges = [input_edge, _output_edge("scripts/a.py")]
+
+    async def review(**kwargs):
+        nonlocal review_calls
+        review_calls += 1
+        if review_calls == 1:
+            return {"passed": False, "issues": [{"id": "alignment", "target_files": ["scripts/a.py"], "affected_edge_indexes": [], "reason": "wrong topology", "evidence": "current graph", "repair_guidance": "rebuild edges"}]}
+        return {"passed": True, "issues": []}
+
+    async def repair(**kwargs):
+        nonlocal repair_calls
+        repair_calls += 1
+        return {"function_items": kwargs["function_items"], "responsibility_edges": [_output_edge("scripts/a.py")]}
+
+    async def regenerate(**kwargs):
+        nonlocal regenerate_calls
+        regenerate_calls += 1
+        return {"function_items": kwargs["function_items"], "responsibility_edges": valid_edges}
+
+    result, _, _ = await _run_ready_graph_alignment_flow(
+        monkeypatch, review, repair, initial_edges=valid_edges, regenerate=regenerate,
+    )
+    assert result["responsibility_edges"] == valid_edges
+    assert (repair_calls, regenerate_calls, review_calls) == (1, 1, 2)
+
+
+@pytest.mark.asyncio
+async def test_invalid_full_graph_regeneration_stops_without_more_retries(monkeypatch):
+    repair_calls = 0
+    regenerate_calls = 0
+    input_edge = {"from_node": "platform_input_node", "from_output": "user_request", "to_node": "scripts/a.py", "to_input": "source", "purpose": "provide input", "constraints": []}
+    valid_edges = [input_edge, _output_edge("scripts/a.py")]
+
+    async def review(**kwargs):
+        return {"passed": False, "issues": [{"id": "alignment", "target_files": ["scripts/a.py"], "affected_edge_indexes": [], "reason": "wrong topology", "evidence": "current graph", "repair_guidance": "rebuild edges"}]}
+
+    async def repair(**kwargs):
+        nonlocal repair_calls
+        repair_calls += 1
+        return {"function_items": kwargs["function_items"], "responsibility_edges": []}
+
+    async def regenerate(**kwargs):
+        nonlocal regenerate_calls
+        regenerate_calls += 1
+        return {"function_items": kwargs["function_items"], "responsibility_edges": []}
+
+    with pytest.raises(api.PreparePlanProtocolError, match="one localized repair and one full graph regeneration"):
+        await _run_ready_graph_alignment_flow(
+            monkeypatch, review, repair, initial_edges=valid_edges, regenerate=regenerate,
+        )
+    assert (repair_calls, regenerate_calls) == (1, 1)
 
 
 def test_alignment_review_prompt_has_bounded_reviewer_authority():
@@ -2393,13 +2521,13 @@ async def test_boundary_presence_failure_uses_one_existing_localized_repair(monk
     async def repair(**kwargs):
         nonlocal repair_calls
         repair_calls += 1
-        return {"function_items": [_function_item("scripts/a.py")], "responsibility_edges": [input_edge, _output_edge("scripts/a.py")]}
+        return {"function_items": kwargs["function_items"], "responsibility_edges": [input_edge, _output_edge("scripts/a.py")]}
 
     result, _, _ = await _run_ready_graph_alignment_flow(
         monkeypatch, review, repair, initial_edges=[input_edge]
     )
     assert result["responsibility_edges"] == [input_edge, _output_edge("scripts/a.py")]
-    assert review_calls == 2
+    assert review_calls == 1
     assert repair_calls == 1
 
 
@@ -2411,7 +2539,7 @@ async def test_boundary_presence_failure_after_repair_blocks(monkeypatch):
         return {"passed": True, "issues": []}
 
     async def repair(**kwargs):
-        return {"function_items": [_function_item("scripts/a.py")], "responsibility_edges": [input_edge]}
+        return {"function_items": kwargs["function_items"], "responsibility_edges": [input_edge]}
 
     with pytest.raises(api.PreparePlanProtocolError, match="missing platform output boundary edge"):
         await _run_ready_graph_alignment_flow(monkeypatch, review, repair, initial_edges=[input_edge])

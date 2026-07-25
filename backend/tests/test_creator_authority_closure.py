@@ -3,7 +3,10 @@ import json
 import pytest
 
 from backend.services.creator import contracts
-from backend.services.creator.common import _authoritative_blueprint_skill_paths
+from backend.services.creator.common import (
+    _authoritative_blueprint_skill_paths,
+    _paths_requiring_skill_md_mentions,
+)
 from backend.services.platform_io_contract import build_platform_io_contract
 from backend.services.skill_plan import (
     structured_responsibility_graph_input_provenance_gaps,
@@ -84,6 +87,11 @@ def test_prose_path_is_not_authoritative_but_structured_file_is():
     assert [path for path in paths if path.startswith("references/")] == ["references/real.md"]
 
 
+def test_prose_script_path_is_not_required_skill_md_mention():
+    blueprint = _blueprint("Documentation mentions scripts/example.py without a file entry.")
+    assert _paths_requiring_skill_md_mentions(blueprint, prefix="scripts/") == []
+
+
 def test_structured_dependency_remains_in_authoritative_constraints():
     constraints = contracts._collect_blueprint_skillplan_constraints(
         blueprint_text=_blueprint(),
@@ -157,3 +165,36 @@ async def test_skill_reviewer_cannot_expand_authoritative_manifest(monkeypatch):
         skill_plan_entry={},
     )
     assert result["required_reference_paths"] == ["references/real.md"]
+
+
+@pytest.mark.asyncio
+async def test_blocking_issue_cannot_bypass_authoritative_manifest(monkeypatch):
+    class Route:
+        model = "unit-test-model"
+
+    monkeypatch.setattr(contracts, "route_model", lambda *args, **kwargs: Route())
+
+    async def review(*args, **kwargs):
+        return json.dumps({
+            "passed": False,
+            "issues": [{
+                "severity": "error",
+                "blocking": True,
+                "field": "resources",
+                "message": "Missing references/extra.md",
+                "expected": "Add references/extra.md",
+                "minimal_edit": "Append references/extra.md",
+            }],
+            "repair_suggestions": "Add references/extra.md",
+        })
+
+    monkeypatch.setattr(contracts, "complete_creator_role_once", review)
+    result = await contracts._review_skill_md_blueprint_intent_with_model(
+        skill_name="authority-test",
+        content="# Authority test",
+        blueprint_text=_blueprint(),
+        skill_plan_entry={},
+    )
+    assert result["passed"] is True
+    assert result["issues"] == []
+    assert result["repair_suggestions"] == ""

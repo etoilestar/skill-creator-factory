@@ -1768,9 +1768,6 @@ def _authoritative_blueprint_skill_paths(blueprint_text: str) -> list[str]:
 
 
 def _paths_requiring_skill_md_mentions(blueprint_text: str, *, prefix: str) -> list[str]:
-    if prefix not in {"assets/", "references/"}:
-        return [path for path in _extract_declared_skill_paths(blueprint_text) if path.startswith(prefix)]
-
     seen: set[str] = set()
     paths: list[str] = []
     for path in _authoritative_blueprint_skill_paths(blueprint_text):

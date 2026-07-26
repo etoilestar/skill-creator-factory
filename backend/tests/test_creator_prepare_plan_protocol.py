@@ -725,6 +725,7 @@ def _with_script_purpose(blueprint, target, purpose):
 
 async def _run_semantic_closure_until_graph(
     monkeypatch, *, reviews, replanned_blueprint=None, initial_blueprint=None,
+    allocation_responses=None,
 ):
     import json
 
@@ -745,6 +746,8 @@ async def _run_semantic_closure_until_graph(
         system = str(messages[0].get("content") or "")
         if "requirement coverage projection" in system:
             allocations += 1
+            if allocation_responses is not None:
+                return json.dumps(allocation_responses[allocations - 1])
             return json.dumps({"requirement_allocations": [{
                 "requirement_id": "R1", "requirement": "完成核心责任",
                 "owners": ["scripts/a.py"],
@@ -847,6 +850,45 @@ async def test_semantic_closure_scope_drift_never_calls_graph(monkeypatch):
                 "added_targets": [], "changed_resources": [],
             },
         )
+
+
+@pytest.mark.asyncio
+async def test_ownerless_allocation_drives_replan_then_graph(monkeypatch):
+    initial = _ready_blueprint(_skill_plan_block(
+        "\n" + _script_plan_block("scripts/a.py") + "\n" + _script_plan_block("scripts/b.py")
+    ))
+    revised = _ready_blueprint(_skill_plan_block(
+        "\n" + _script_plan_block("scripts/a.py")
+        + "\n" + _script_plan_block("scripts/b.py")
+        + "\n" + _script_plan_block("scripts/c.py")
+    ))
+    evidence = {"responsibility": "", "outputs": [], "capabilities": []}
+    first_allocations = {"requirement_allocations": [
+        {"requirement_id": "R1", "requirement": "完成 A", "owners": ["scripts/a.py"], "evidence": evidence},
+        {"requirement_id": "R2", "requirement": "完成 B", "owners": ["scripts/b.py"], "evidence": evidence},
+        {"requirement_id": "R3", "requirement": "完成 C", "owners": [], "evidence": evidence},
+    ]}
+    second_allocations = {"requirement_allocations": [
+        *first_allocations["requirement_allocations"][:2],
+        {"requirement_id": "R3", "requirement": "完成 C", "owners": ["scripts/c.py"], "evidence": evidence},
+    ]}
+    result = await _run_semantic_closure_until_graph(
+        monkeypatch,
+        initial_blueprint=initial,
+        allocation_responses=[first_allocations, second_allocations],
+        reviews=[
+            {"passed": False, "issues": [{
+                "issue_type": "requirement_uncovered", "requirement_id": "R3",
+                "affected_targets": [], "reason": "no owner", "repair_guidance": "add responsibility",
+            }]},
+            {"passed": True, "issues": []},
+        ],
+        replanned_blueprint={
+            "internal_blueprint_text": revised,
+            "changed_targets": [], "added_targets": ["scripts/c.py"], "changed_resources": [],
+        },
+    )
+    assert (result["allocations"], result["reviews"], result["replans"], result["graphs"]) == (2, 2, 1, 1)
 
 
 @pytest.mark.asyncio

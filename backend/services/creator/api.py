@@ -6848,9 +6848,25 @@ You are the Blueprint Planner producing a requirement coverage projection before
 the Blueprint is frozen. Semantically identify only the user's explicit core,
 independently verifiable final-capability requirements. Do not mechanically turn
 tone, examples, background, or pleasantries into requirements. Do not use a
-business taxonomy or keyword rules. Allocate each requirement to one or more
-current FilePlan/FunctionItem owners. One owner may cover multiple requirements,
-and multiple owners may cooperate on one requirement.
+business taxonomy or keyword rules. Requirement extraction is based on the
+original user requirement, not on what the current Blueprint already happens to
+implement. Identify every explicit core independently verifiable final-capability
+requirement even when the current Blueprint does not currently provide a
+legitimate FunctionItem owner.
+
+Allocate a requirement only to FunctionItems that genuinely own or co-own that
+responsibility. If no current FunctionItem legitimately owns a core requirement,
+keep that requirement in requirement_allocations, return owners=[], do not omit
+the requirement, do not force an unrelated owner merely to avoid an empty owner
+list, and do not invent a new FunctionItem during requirement allocation.
+owners=[] means only that the current Blueprint has no legitimate owner; it does
+not mean that the requirement is unimportant, ignorable, or already complete.
+
+One FunctionItem may legitimately own multiple requirements. Multiple
+FunctionItems may legitimately cooperate on one requirement. There is no
+one-requirement-to-one-file rule. Do not add, remove, rename, or modify FilePlan
+entries or FunctionItems during requirement allocation. The later semantic
+Reviewer and bounded Blueprint replan own repair.
 
 Return strict JSON only: {"requirement_allocations":[{"requirement_id":"R1",
 "requirement":"...","owners":["..."],"evidence":{"responsibility":"...",
@@ -6893,6 +6909,10 @@ original user requirement, current Blueprint/FilePlan, FunctionItems, and
 requirement_allocations. Decide whether an explicit core requirement is omitted,
 has a real owner, the owner's responsibility is sufficient, capabilities/outputs
 basically match, or a responsibility was invented merely to close structure.
+An ownerless requirement allocation is a legitimate diagnostic state indicating
+that the current Blueprint may have failed to cover a core user requirement. Do
+not treat owners=[] as malformed. Semantic closure must not pass while a genuine
+core requirement remains ownerless.
 Also review declared dependencies/resources: whether each is actually required
 static content, whether it is Creator-generated guidance or pre-existing static
 material, and whether a static dependency lacks a real source/provenance.

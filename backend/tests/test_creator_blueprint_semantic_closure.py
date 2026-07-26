@@ -100,6 +100,37 @@ def test_empty_owner_is_allowed_during_allocation():
     assert allocations[0]["owners"] == []
 
 
+@pytest.mark.asyncio
+async def test_requirement_planner_keeps_ownerless_core_requirement(monkeypatch):
+    captured = []
+
+    async def complete(messages, *_args, **_kwargs):
+        captured.append(messages[0]["content"])
+        return json.dumps({"requirement_allocations": [
+            _allocation("R1", ["scripts/a.py"]),
+            _allocation("R2", ["scripts/b.py"]),
+            _allocation("R3", []),
+        ]})
+
+    monkeypatch.setattr(api, "complete_creator_role_once", complete)
+    allocations = await api._plan_requirement_allocations(
+        request=api.PreparePlanRequest(user_request="用户要求完成 A、B、C"),
+        blueprint_text="blueprint",
+        function_items=[
+            {"target_file": "scripts/a.py"},
+            {"target_file": "scripts/b.py"},
+        ],
+        planner_model="test",
+    )
+
+    assert allocations[2]["owners"] == []
+    planner_prompt = captured[0]
+    assert "return owners=[]" in planner_prompt
+    assert "do not omit" in planner_prompt
+    assert "do not force an unrelated owner" in planner_prompt
+    assert "Do not add, remove, rename, or modify FilePlan" in planner_prompt
+
+
 def test_requirement_ids_are_unique_and_requirements_non_empty():
     with pytest.raises(ValueError, match="duplicate requirement_id"):
         validate_requirement_allocations(

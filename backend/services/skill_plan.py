@@ -29,6 +29,15 @@ FileRole = str
 SCRIPT_ROLES: frozenset[str] = frozenset(get_script_roles())
 
 
+class GraphValidationError(ValueError):
+    """Deterministic graph failure whose routing never depends on prose."""
+
+    def __init__(self, message: str, *, code: str, details: dict[str, object] | None = None) -> None:
+        self.code = code
+        self.details = dict(details or {})
+        super().__init__(message)
+
+
 class MissingCommandArgBindingError(ValueError):
     """Raised when required argv keys have no graph/command binding."""
 
@@ -430,7 +439,11 @@ def normalize_structured_responsibility_edges(raw_edges: object, *, source: str 
     if raw_edges is None:
         return []
     if not isinstance(raw_edges, list):
-        raise ValueError(f"{source}.responsibility_edges must be a list")
+        raise GraphValidationError(
+            f"{source}.responsibility_edges must be a list",
+            code="invalid_edge_schema",
+            details={"actual_type": type(raw_edges).__name__},
+        )
     normalized: list[dict[str, object]] = []
     invalid: list[dict[str, object]] = []
     for index, item in enumerate(raw_edges):
@@ -463,7 +476,11 @@ def normalize_structured_responsibility_edges(raw_edges: object, *, source: str 
         edge["constraints"] = [dict(c) for c in constraints]
         normalized.append(edge)
     if invalid:
-        raise ValueError(f"{source}.responsibility_edges contains invalid edge items: {invalid}")
+        raise GraphValidationError(
+            f"{source}.responsibility_edges contains invalid edge items: {invalid}",
+            code="invalid_edge_schema",
+            details={"invalid_edges": invalid},
+        )
     return normalized
 
 
@@ -482,8 +499,10 @@ def validate_structured_responsibility_edge_transport(
     validate script-local semantic IO or infer mappings.
     """
     if raw_edges is None:
-        raise ValueError(
-            f"{source}.responsibility_edges must not be null"
+        raise GraphValidationError(
+            f"{source}.responsibility_edges must not be null",
+            code="invalid_edge_schema",
+            details={"actual_type": "null"},
         )
 
     normalized_edges = normalize_structured_responsibility_edges(
@@ -568,66 +587,84 @@ def validate_structured_responsibility_edge_transport(
                 if constraint.get("type") == "platform_parameter_binding"
             ]
             if len(parameter_bindings) > 1:
-                raise ValueError(
+                raise GraphValidationError(
                     f"{source}.responsibility_edges structured platform input "
                     "contains multiple platform_parameter_binding constraints; "
-                    f"index={index}"
+                    f"index={index}",
+                    code="invalid_platform_parameter_binding",
+                    details={"edge_index": index, "reason": "multiple_bindings"},
                 )
             if parameter_bindings:
                 binding = parameter_bindings[0]
                 source_key = binding.get("source_key")
                 if not isinstance(source_key, str) or not source_key.strip():
-                    raise ValueError(
+                    raise GraphValidationError(
                         f"{source}.responsibility_edges structured platform input "
-                        f"binding requires non-empty source_key; index={index}"
+                        f"binding requires non-empty source_key; index={index}",
+                        code="invalid_platform_parameter_binding",
+                        details={"edge_index": index, "field": "source_key"},
                     )
                 required = binding.get("required")
                 if not isinstance(required, bool):
-                    raise ValueError(
+                    raise GraphValidationError(
                         f"{source}.responsibility_edges structured platform input "
-                        f"binding requires boolean required; index={index}"
+                        f"binding requires boolean required; index={index}",
+                        code="invalid_platform_parameter_binding",
+                        details={"edge_index": index, "field": "required"},
                     )
                 if not required and "default" not in binding:
-                    raise ValueError(
+                    raise GraphValidationError(
                         f"{source}.responsibility_edges optional structured platform "
-                        f"input binding requires explicit default; index={index}"
+                        f"input binding requires explicit default; index={index}",
+                        code="invalid_platform_parameter_binding",
+                        details={"edge_index": index, "field": "default"},
                     )
 
         if from_node == "platform_output_node":
-            raise ValueError(
+            raise GraphValidationError(
                 f"{source}.responsibility_edges uses platform_output_node "
                 "as an edge source; "
-                f"index={index}"
+                f"index={index}",
+                code="invalid_graph_endpoint",
+                details={"edge_index": index, "from_node": from_node},
             )
 
         if to_node == "platform_input_node":
-            raise ValueError(
+            raise GraphValidationError(
                 f"{source}.responsibility_edges uses platform_input_node "
                 "as an edge target; "
-                f"index={index}"
+                f"index={index}",
+                code="invalid_graph_endpoint",
+                details={"edge_index": index, "to_node": to_node},
             )
 
         if from_node == "platform_input_node" and to_node == "platform_output_node":
-            raise ValueError(
+            raise GraphValidationError(
                 f"{source}.responsibility_edges uses direct platform_input_node "
                 "to platform_output_node edge; "
-                f"index={index}"
+                f"index={index}",
+                code="invalid_graph_endpoint",
+                details={"edge_index": index, "from_node": from_node, "to_node": to_node},
             )
 
         if from_node == "platform_input_node" and from_output not in input_fields:
-            raise ValueError(
+            raise GraphValidationError(
                 f"{source}.responsibility_edges references undefined "
                 "platform input field; "
                 f"index={index}; "
-                f"from_output={from_output}"
+                f"from_output={from_output}",
+                code="invalid_graph_endpoint",
+                details={"edge_index": index, "from_node": from_node, "from_output": from_output},
             )
 
         if to_node == "platform_output_node" and to_input not in output_fields:
-            raise ValueError(
+            raise GraphValidationError(
                 f"{source}.responsibility_edges references undefined "
                 "platform output field; "
                 f"index={index}; "
-                f"to_input={to_input}"
+                f"to_input={to_input}",
+                code="invalid_graph_endpoint",
+                details={"edge_index": index, "to_node": to_node, "to_input": to_input},
             )
 
         if (
@@ -635,11 +672,13 @@ def validate_structured_responsibility_edge_transport(
             and from_node != "platform_input_node"
             and from_node not in function_item_targets
         ):
-            raise ValueError(
+            raise GraphValidationError(
                 f"{source}.responsibility_edges references non-FunctionItem "
                 "source endpoint; "
                 f"index={index}; "
-                f"from_node={from_node}"
+                f"from_node={from_node}",
+                code="invalid_graph_endpoint",
+                details={"edge_index": index, "from_node": from_node},
             )
 
         if (
@@ -647,11 +686,13 @@ def validate_structured_responsibility_edge_transport(
             and to_node != "platform_output_node"
             and to_node not in function_item_targets
         ):
-            raise ValueError(
+            raise GraphValidationError(
                 f"{source}.responsibility_edges references non-FunctionItem "
                 "target endpoint; "
                 f"index={index}; "
-                f"to_node={to_node}"
+                f"to_node={to_node}",
+                code="invalid_graph_endpoint",
+                details={"edge_index": index, "to_node": to_node},
             )
 
         if (
@@ -659,10 +700,12 @@ def validate_structured_responsibility_edge_transport(
             and from_node != "platform_input_node"
             and from_output not in function_item_io[from_node]["outputs"]
         ):
-            raise ValueError(
+            raise GraphValidationError(
                 f"{source}.responsibility_edges references undefined FunctionItem "
                 "source output; "
-                f"index={index}; from_node={from_node}; from_output={from_output}"
+                f"index={index}; from_node={from_node}; from_output={from_output}",
+                code="invalid_graph_endpoint",
+                details={"edge_index": index, "from_node": from_node, "from_output": from_output},
             )
 
         if (
@@ -670,10 +713,12 @@ def validate_structured_responsibility_edge_transport(
             and to_node != "platform_output_node"
             and to_input not in function_item_io[to_node]["inputs"]
         ):
-            raise ValueError(
+            raise GraphValidationError(
                 f"{source}.responsibility_edges references undefined FunctionItem "
                 "target input; "
-                f"index={index}; to_node={to_node}; to_input={to_input}"
+                f"index={index}; to_node={to_node}; to_input={to_input}",
+                code="invalid_graph_endpoint",
+                details={"edge_index": index, "to_node": to_node, "to_input": to_input},
             )
 
         if to_node != "platform_output_node":
@@ -683,9 +728,15 @@ def validate_structured_responsibility_edge_transport(
     for (target_file, target_input), sources in provenance_by_input.items():
         source_kinds = {kind for _index, kind in sources}
         if source_kinds == {"platform", "upstream"}:
-            raise ValueError(
+            raise GraphValidationError(
                 f"conflicting_input_provenance: target_file={target_file}; "
-                f"target_input={target_input}; edge_indexes={[index for index, _kind in sources]}"
+                f"target_input={target_input}; edge_indexes={[index for index, _kind in sources]}",
+                code="conflicting_input_provenance",
+                details={
+                    "target_file": target_file,
+                    "target_input": target_input,
+                    "edge_indexes": [index for index, _kind in sources],
+                },
             )
 
     return normalized_edges
@@ -734,9 +785,11 @@ def validate_structured_responsibility_graph_input_closure(
     )
     if gaps:
         target_file, input_name = gaps[0]
-        raise ValueError(
+        raise GraphValidationError(
             "responsibility graph contains FunctionItem input without declared "
-            f"provenance; target_file={target_file}; input={input_name}"
+            f"provenance; target_file={target_file}; input={input_name}",
+            code="unresolved_input_provenance",
+            details={"target_file": target_file, "target_input": input_name},
         )
 
 
@@ -1917,6 +1970,8 @@ def _implementation_strategy_for_slot(slot: ToolSlot) -> ImplementationStrategy:
 
 def normalize_skill_plan(
     plan: SkillPlan,
+    *,
+    strict: bool = False,
 ) -> SkillPlan:
     """Normalize a parsed SkillPlan without changing business semantics.
 
@@ -2102,20 +2157,16 @@ def normalize_skill_plan(
             )
         ]
 
-        dependencies = [
-            dependency
-            for dependency
-            in _dedupe_paths(
-                list(
-                    entry.dependencies
-                    or []
-                )
-            )
-            if not dependency_is_output_semantic(
-                dependency,
-                prior_outputs,
-            )
-        ]
+        declared_dependencies = _dedupe_paths(list(entry.dependencies or []))
+        dependencies = (
+            declared_dependencies
+            if strict
+            else [
+                dependency
+                for dependency in declared_dependencies
+                if not dependency_is_output_semantic(dependency, prior_outputs)
+            ]
+        )
 
         removed_dependencies = (
             set(
@@ -2201,9 +2252,7 @@ def normalize_skill_plan(
         # This is a platform boundary cleanup, not business
         # capability inference.
         if (
-            cleaned.role
-            in RESOURCE_ROLES
-            or cleaned.file_type
+            cleaned.file_type
             in {
                 "skill_md",
                 "reference",
@@ -2223,15 +2272,12 @@ def normalize_skill_plan(
             )
 
         if (
-            cleaned.role == "asset"
-            or cleaned.file_type == "asset"
+            cleaned.file_type == "asset"
             or path.startswith(
                 "assets/"
             )
         ):
-            if not _is_asset_upload_only(
-                cleaned
-            ):
+            if not strict and not _is_asset_upload_only(cleaned):
                 warnings.append(
                     (
                         "已移除非法 asset 文件计划项 "
@@ -2387,7 +2433,7 @@ def normalize_skill_plan(
     )
 
 
-def validate_file_plan_semantics(plan: SkillPlan) -> list[str]:
+def validate_file_plan_semantics(plan: SkillPlan, *, strict: bool = False) -> list[str]:
     """Return generic semantic file-plan violations after normalization."""
     issues: list[str] = []
     skill_md_count = sum(1 for entry in plan.files if entry.path == "SKILL.md")
@@ -2402,6 +2448,9 @@ def validate_file_plan_semantics(plan: SkillPlan) -> list[str]:
         if str(output).strip()
     }
     prior_outputs: set[str] = set()
+    declared_resource_paths = {
+        entry.path for entry in plan.files if entry.file_type in {"reference", "asset"}
+    }
     for entry in plan.files:
         if entry.path == "SKILL.md" and entry.role != "skill_overview":
             issues.append("SKILL.md role must be skill_overview.")
@@ -2416,9 +2465,11 @@ def validate_file_plan_semantics(plan: SkillPlan) -> list[str]:
         if entry.file_type != "script" and entry.required_capabilities:
             issues.append(f"Resource/meta file must not declare runtime capabilities: {entry.path}")
         for dep in entry.dependencies:
-            if dependency_is_output_semantic(dep, prior_outputs):
+            if strict and dep not in declared_resource_paths:
+                issues.append(f"Static dependency is not a declared FilePlan resource: {entry.path} -> {dep}")
+            elif not strict and dependency_is_output_semantic(dep, prior_outputs):
                 issues.append(f"Dependency cannot be output/dynamic path: {entry.path} -> {dep}")
-        if entry.file_type != "script" and is_runtime_artifact_semantic(entry.path, entry.purpose):
+        if not strict and entry.file_type != "script" and is_runtime_artifact_semantic(entry.path, entry.purpose):
             issues.append(f"Runtime artifact cannot be a Creator file-plan item: {entry.path}")
         if entry.file_type in {"reference", "asset"} and entry.path in runtime_outputs:
             issues.append(

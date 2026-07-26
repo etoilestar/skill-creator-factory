@@ -23,7 +23,7 @@ from .repair import *  # noqa: F403
 from .generation import *  # noqa: F403
 from ..kernel_loader import load_kernel_creator_for_phase
 from ..blueprint_parser import BlueprintShapeError, exact_file_plan_paths_from_strict_skillplan, parse_blueprint, parse_resource_source_from_block, validate_blueprint_shape_for_creator
-from ..skill_plan import file_type_for_path, normalize_structured_function_items, normalize_structured_responsibility_edges, resource_role_source_issue, validate_structured_responsibility_edge_transport, structured_responsibility_graph_input_provenance_gaps
+from ..skill_plan import GraphValidationError, file_type_for_path, normalize_structured_function_items, normalize_structured_responsibility_edges, resource_role_source_issue, validate_structured_responsibility_edge_transport, structured_responsibility_graph_input_provenance_gaps
 
 from .upload_context import save_creator_context_upload, UPLOAD_ROOT, sanitize_session_id
 from .tool_pool_store import (
@@ -6315,7 +6315,7 @@ provenance; every from_output and to_input exists; required final outputs have a
 producer-to-platform_output path; and no input, output, or FunctionItem was added.
 
 Return only strict JSON:
-{"function_items": [...], "responsibility_edges": [...]}
+{"responsibility_edges": [...]}
 """.strip()
     platform_contract = build_platform_io_contract()
     platform_boundary = platform_contract["platform_skill_boundary"]
@@ -6345,20 +6345,19 @@ Return only strict JSON:
         "planner", fallback_model=planner_model,
     )
     data = _parse_prepare_plan_json(text)
-    if set(data) != {"function_items", "responsibility_edges"} or not isinstance(data.get("function_items"), list) or not isinstance(data.get("responsibility_edges"), list):
-        raise ValueError("Responsibility graph alignment repair must return function_items and responsibility_edges")
-    repaired_items = normalize_structured_function_items(
-        data["function_items"], source="planner_graph_repair"
-    )
     frozen_items = normalize_structured_function_items(
         function_items, source="frozen_blueprint"
     )
-    if repaired_items != frozen_items:
-        raise ValueError(
-            "graph repair requires upstream FunctionItem replanning; localized "
-            "repair changed frozen FunctionItems"
+    if set(data) != {"responsibility_edges"} or not isinstance(data.get("responsibility_edges"), list):
+        raise PreparePlanProtocolError(
+            "Responsibility graph alignment repair must return only responsibility_edges"
         )
-    return {"function_items": frozen_items, "responsibility_edges": data["responsibility_edges"]}
+    repaired_edges = validate_structured_responsibility_edge_transport(
+        data["responsibility_edges"],
+        function_items=frozen_items,
+        source="planner_graph_repair",
+    )
+    return {"function_items": frozen_items, "responsibility_edges": repaired_edges}
 
 
 def _build_responsibility_graph_construction_context(
@@ -6370,18 +6369,16 @@ def _build_responsibility_graph_construction_context(
 ) -> dict[str, Any]:
     """Project only frozen structured facts needed to construct graph edges."""
     allowed = set(allowed_function_item_targets)
-    projected_items: list[dict[str, Any]] = []
+    node_contracts: list[dict[str, Any]] = []
     if function_items is not None:
         for item in normalize_structured_function_items(
             function_items, source="graph_construction_context"
         ):
             if item["target_file"] in allowed:
-                projected_items.append({
-                    "target_file": item["target_file"],
-                    "purpose": item["purpose"],
+                node_contracts.append({
+                    "node": item["target_file"],
                     "inputs": list(item["inputs"]),
                     "outputs": list(item["outputs"]),
-                    "static_configuration": list(item["constraints"]),
                 })
     else:
         parsed = parse_blueprint(
@@ -6390,13 +6387,10 @@ def _build_responsibility_graph_construction_context(
         for entry in (parsed.skill_plan.files if parsed.skill_plan else []):
             if entry.path not in allowed:
                 continue
-            projected_items.append({
-                "target_file": entry.path,
-                "purpose": entry.purpose,
+            node_contracts.append({
+                "node": entry.path,
                 "inputs": list(entry.inputs),
                 "outputs": list(entry.outputs),
-                "defaults": dict(entry.default_values),
-                "static_configuration": list(entry.constraints),
             })
 
     platform_boundary = build_platform_io_contract()["platform_skill_boundary"]
@@ -6404,17 +6398,17 @@ def _build_responsibility_graph_construction_context(
         {"from_node": "platform_input_node", "from_output": field}
         for field in platform_boundary["input_envelope_fields"]
     ] + [
-        {"from_node": item["target_file"], "from_output": output}
-        for item in projected_items
+        {"from_node": item["node"], "from_output": output}
+        for item in node_contracts
         for output in item["outputs"]
     ]
     input_source_domains = [
         {
-            "target_file": item["target_file"],
+            "target_file": item["node"],
             "target_input": input_name,
             "legal_sources": list(legal_sources),
         }
-        for item in projected_items
+        for item in node_contracts
         for input_name in item["inputs"]
     ]
     allowed_nodes = [
@@ -6425,16 +6419,16 @@ def _build_responsibility_graph_construction_context(
     allowed_outputs_by_node = {
         "platform_input_node": list(platform_boundary["input_envelope_fields"]),
         **{
-            item["target_file"]: list(item["outputs"])
-            for item in projected_items
+            item["node"]: list(item["outputs"])
+            for item in node_contracts
         },
         "platform_output_node": [],
     }
     allowed_inputs_by_node = {
         "platform_input_node": [],
         **{
-            item["target_file"]: list(item["inputs"])
-            for item in projected_items
+            item["node"]: list(item["inputs"])
+            for item in node_contracts
         },
         "platform_output_node": list(platform_boundary["final_output_fields"]),
     }
@@ -6443,7 +6437,7 @@ def _build_responsibility_graph_construction_context(
         "allowed_outputs_by_node": allowed_outputs_by_node,
         "allowed_inputs_by_node": allowed_inputs_by_node,
         "allowed_function_targets": list(allowed_function_item_targets),
-        "function_items": projected_items,
+        "node_contracts": node_contracts,
         "platform_input_contract": {
             "input_fields": list(platform_boundary["input_envelope_fields"]),
             "preferred_structured_input_root": platform_boundary["preferred_structured_input_root"],
@@ -6475,23 +6469,15 @@ def _graph_failure_fingerprint(issue: dict[str, Any]) -> str:
 def _graph_issue_from_validation_error(error: ValueError) -> dict[str, Any]:
     """Project an existing deterministic validator error into a small issue dict."""
     message = str(error)
-    facts: dict[str, str] = {}
-    for field in _GRAPH_FINGERPRINT_FIELDS:
-        match = re.search(rf"(?:^|[; ]){field}=([^;]+)", message)
-        if match:
-            facts[field] = match.group(1).strip()
-    if message.startswith("conflicting_input_provenance:"):
-        category = "conflicting_input_provenance"
-    elif "endpoint" in message or "references undefined" in message:
-        category = "invalid_graph_endpoint"
-    else:
-        category = "invalid_edge_transport"
+    category = error.code if isinstance(error, GraphValidationError) else "invalid_edge_transport"
+    details = error.details if isinstance(error, GraphValidationError) else {}
+    facts = {field: details[field] for field in _GRAPH_FINGERPRINT_FIELDS if field in details}
     return {
         "id": category,
         "category": category,
         **facts,
         "target_files": [facts["target_file"]] if facts.get("target_file") else [],
-        "affected_edge_indexes": [],
+        "affected_edge_indexes": list(details.get("edge_indexes") or ([details["edge_index"]] if "edge_index" in details else [])),
         "reason": message,
         "evidence": "Deterministic ResponsibilityEdge validation failed.",
         "repair_guidance": "Modify ResponsibilityEdges only, using an exact endpoint from graph_construction_context.",
@@ -6605,8 +6591,8 @@ async def _replan_blueprint_for_graph_closure(
     target_file = str(blocking_issue.get("target_file") or "")
     affected_item = next(
         (
-            item for item in graph_construction_context.get("function_items", [])
-            if item.get("target_file") == target_file
+            item for item in graph_construction_context.get("node_contracts", [])
+            if item.get("node") == target_file
         ),
         {},
     )
@@ -6730,7 +6716,14 @@ def _validate_responsibility_graph_boundary_presence(
     if not has_platform_output:
         missing.append("missing platform output boundary edge")
     if missing:
-        raise ValueError("; ".join(missing))
+        raise GraphValidationError(
+            "; ".join(missing),
+            code="missing_platform_boundary",
+            details={
+                "missing_input_boundary": not has_platform_input,
+                "missing_output_boundary": not has_platform_output,
+            },
+        )
 
 
 def _resolve_allowed_function_item_targets_from_blueprint(
@@ -7893,7 +7886,7 @@ Blueprint Planner 只规划业务责任。
                 except ValueError as exc:
                     deterministic_error = str(exc)
                     current_issues = [_graph_issue_from_validation_error(exc)]
-                    if deterministic_error.startswith("conflicting_input_provenance:"):
+                    if current_issues[0]["category"] == "conflicting_input_provenance":
                         logger.info(
                             "[Creator][graph_closure] resolved_input_count=0 unresolved_inputs=[] conflicting_provenance=%s",
                             deterministic_error,
@@ -10961,7 +10954,9 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
     for path in sorted(candidate_paths):
         if path in base_paths or not path.startswith("references/"):
             continue
-        if is_runtime_artifact_semantic(path, _local_blueprint_text_for_path(path, blueprint_text)):
+        if not request.strict and is_runtime_artifact_semantic(
+            path, _local_blueprint_text_for_path(path, blueprint_text)
+        ):
             extra_path_warnings.append(
                 f"已忽略运行时产物文件计划项 {path}；运行时生成文件只能通过脚本 outputs/stdout metadata 表示。"
             )

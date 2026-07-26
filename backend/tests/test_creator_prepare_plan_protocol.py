@@ -2430,7 +2430,7 @@ async def test_alignment_repair_payload_contains_only_graph_authorities(monkeypa
 
     async def fake_complete_creator_role_once(messages, role, fallback_model):
         captured_messages.extend(messages)
-        return '{"function_items": [], "responsibility_edges": []}'
+        return '{"responsibility_edges": []}'
 
     monkeypatch.setattr(api, "complete_creator_role_once", fake_complete_creator_role_once)
     await api._repair_responsibility_graph_alignment(
@@ -2452,10 +2452,10 @@ async def test_alignment_review_requires_localizable_failure_issues(monkeypatch)
         '{"passed":false,"issues":[{"id":1,"target_files":[],"affected_edge_indexes":[],"reason":"r","evidence":"e","repair_guidance":"g"}]}',
     ])
 
-    async def fake_complete(messages, model):
+    async def fake_complete(messages, role, fallback_model):
         return next(responses)
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    monkeypatch.setattr(api, "complete_creator_role_once", fake_complete)
     kwargs = {
         "request": _request(), "frozen_blueprint_text": "frozen",
         "allowed_function_item_targets": [], "function_items": [],
@@ -2476,13 +2476,13 @@ async def test_alignment_review_and_repair_accept_normal_protocol_outputs(monkey
     issue = {"id": "issue", "target_files": [], "affected_edge_indexes": [], "reason": "r", "evidence": "e", "repair_guidance": "g"}
     responses = iter([
         json.dumps({"passed": False, "issues": [issue]}),
-        json.dumps({"function_items": [], "responsibility_edges": []}),
+        json.dumps({"responsibility_edges": []}),
     ])
 
-    async def fake_complete(messages, model):
+    async def fake_complete(messages, role, fallback_model):
         return next(responses)
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    monkeypatch.setattr(api, "complete_creator_role_once", fake_complete)
     review = await api._review_responsibility_graph_alignment(
         request=_request(), frozen_blueprint_text="frozen", allowed_function_item_targets=[],
         function_items=[], responsibility_edges=[], planner_model="planner",
@@ -2497,11 +2497,11 @@ async def test_alignment_review_and_repair_accept_normal_protocol_outputs(monkey
 
 @pytest.mark.asyncio
 async def test_alignment_repair_rejects_extra_top_level_fields(monkeypatch):
-    async def fake_complete(messages, model):
-        return '{"function_items":[],"responsibility_edges":[],"extra":true}'
+    async def fake_complete(messages, role, fallback_model):
+        return '{"responsibility_edges":[],"extra":true}'
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
-    with pytest.raises(ValueError, match="function_items and responsibility_edges"):
+    monkeypatch.setattr(api, "complete_creator_role_once", fake_complete)
+    with pytest.raises(ValueError, match="only responsibility_edges"):
         await api._repair_responsibility_graph_alignment(
             request=_request(), frozen_blueprint_text="frozen", allowed_function_item_targets=[],
             function_items=[], responsibility_edges=[], review_issues=[], planner_model="planner",
@@ -2514,10 +2514,16 @@ def test_responsibility_graph_boundary_presence_requires_both_platform_ends():
     output_edge = _output_edge("scripts/b.py")
     targets = ["scripts/a.py", "scripts/b.py"]
 
-    with pytest.raises(ValueError, match="input boundary edge; missing platform output boundary edge"):
+    with pytest.raises(api.GraphValidationError, match="input boundary edge; missing platform output boundary edge") as both_missing:
         api._validate_responsibility_graph_boundary_presence([internal_edge], targets)
-    with pytest.raises(ValueError, match="output boundary edge"):
+    assert both_missing.value.code == "missing_platform_boundary"
+    assert both_missing.value.details == {
+        "missing_input_boundary": True,
+        "missing_output_boundary": True,
+    }
+    with pytest.raises(api.GraphValidationError, match="output boundary edge") as output_missing:
         api._validate_responsibility_graph_boundary_presence([input_edge], targets)
+    assert output_missing.value.details["missing_output_boundary"] is True
     with pytest.raises(ValueError, match="input boundary edge"):
         api._validate_responsibility_graph_boundary_presence([output_edge], targets)
     api._validate_responsibility_graph_boundary_presence([input_edge, internal_edge, output_edge], targets)

@@ -9,18 +9,6 @@ from typing import Any
 from .skill_contract import ContractIssue, WorkflowContract, StepContract, OutputSpec
 
 
-HIGH_IMPACT_ROLE_CAPABILITY = {
-    "image_generator": {"image_generation"},
-    "pdf_builder": {"pdf_generation"},
-    "docx_builder": {"docx_generation"},
-    "pptx_builder": {"pptx_generation"},
-    "html_asset_builder": {"html_generation", "html_asset_generation"},
-    "composite_generator": set(),
-    "text_generator": set(),
-    "generic_script": set(),
-}
-
-
 def validate_workflow_contract(contract: WorkflowContract) -> list[ContractIssue]:
     issues: list[ContractIssue] = []
     seen_ids: set[str] = set()
@@ -42,7 +30,6 @@ def validate_workflow_contract(contract: WorkflowContract) -> list[ContractIssue
             issues.append(ContractIssue("duplicate_script_path", f"重复 script_path: {step.script_path}", step_id=step.id, script_path=step.script_path, severity="warning"))
         seen_scripts.add(step.script_path)
 
-        issues.extend(_validate_role_capabilities(step))
         issues.extend(_validate_command_keys(step))
 
         for output_name, spec in step.outputs.items():
@@ -165,32 +152,6 @@ def build_downstream_requirements(contract: WorkflowContract) -> dict[str, dict[
                 req["item_required"] = sorted(item_required)
 
     return result
-
-
-def _validate_role_capabilities(step: StepContract) -> list[ContractIssue]:
-    issues: list[ContractIssue] = []
-    expected = HIGH_IMPACT_ROLE_CAPABILITY.get(step.role, set())
-    caps = set(step.required_capabilities)
-
-    if step.role == "generic_script" and caps.intersection({"image_generation", "pdf_generation", "docx_generation", "pptx_generation", "html_generation", "html_asset_generation"}):
-        issues.append(ContractIssue(
-            "generic_script_high_impact_capability",
-            "generic_script 不允许声明高风险生成能力，请使用明确 role",
-            step_id=step.id,
-            script_path=step.script_path,
-            details={"required_capabilities": sorted(caps)},
-        ))
-
-    missing = expected - caps
-    if missing:
-        issues.append(ContractIssue(
-            "role_missing_required_capability",
-            f"role {step.role} 缺少 required_capabilities: {sorted(missing)}",
-            step_id=step.id,
-            script_path=step.script_path,
-            severity="warning",
-        ))
-    return issues
 
 
 def _validate_command_keys(step: StepContract) -> list[ContractIssue]:

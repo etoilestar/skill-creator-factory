@@ -504,26 +504,6 @@ def validate_blueprint_shape_for_creator(
                     )
                 )
 
-            if (
-                _asset_block_mentions_runtime_artifact(
-                    block
-                )
-                or is_runtime_artifact_semantic(
-                    normalized_path,
-                    "",
-                )
-            ):
-                issues.append(
-                    (
-                        "运行时产物 "
-                        f"`{normalized_path}` "
-                        "不能列入 assets/ 或 "
-                        "Creator 文件计划；"
-                        "运行时生成文件必须声明在"
-                        "脚本 outputs/stdout JSON 中。"
-                    )
-                )
-
     if (
         script_paths
         and "```bash" not in text
@@ -763,7 +743,7 @@ def parse_files_from_blueprint(
 
             return
 
-        if _is_probable_prompt_leaked_script(
+        if not strict and _is_probable_prompt_leaked_script(
             normalized_path,
             purpose=purpose,
             blueprint_text=blueprint_text,
@@ -783,7 +763,7 @@ def parse_files_from_blueprint(
 
             return
 
-        if (
+        if not strict and (
             not (
                 normalized_path.startswith(
                     "assets/"
@@ -1366,6 +1346,7 @@ def build_skill_plan_from_files(
     blueprint_text: str = "",
     function_items: object = None,
     responsibility_edges: object = None,
+    strict: bool = False,
 ) -> SkillPlan:
     """Build the role/contract plan used by Creator generation and validation.
 
@@ -1376,7 +1357,9 @@ def build_skill_plan_from_files(
     entries: list[SkillPlanEntry] = []
     plan_warnings = list(warnings or [])
 
-    for dep_match in re.finditer(r"dependencies\s*[：:=]\s*\[?([^\]\n;]+)\]?", blueprint_text or "", re.I):
+    # Legacy blueprints used prose/path heuristics to distinguish generated
+    # outputs from static dependencies. Confirmed strict blueprints do not.
+    for dep_match in ([] if strict else re.finditer(r"dependencies\s*[：:=]\s*\[?([^\]\n;]+)\]?", blueprint_text or "", re.I)):
         for raw_dep in re.split(r"[,，、]\s*", dep_match.group(1)):
             dep = raw_dep.strip().strip("'\"")
             if dependency_is_output_semantic(dep):
@@ -1395,7 +1378,7 @@ def build_skill_plan_from_files(
     }
 
     for file in files:
-        if _is_probable_prompt_leaked_script(
+        if not strict and _is_probable_prompt_leaked_script(
             file.path,
             purpose=file.purpose,
             blueprint_text=blueprint_text,
@@ -1443,7 +1426,7 @@ def build_skill_plan_from_files(
 
         # If role classification still says low-confidence generic_script and the
         # filename is placeholder-like, remove it instead of entering repair loops.
-        if (
+        if not strict and (
             file.path.startswith("scripts/")
             and entry.role == "generic_script"
             and entry.confidence < 0.7
@@ -1479,8 +1462,8 @@ def build_skill_plan_from_files(
         if structured_edges_present
         else parse_responsibility_edges(blueprint_text)
     )
-    normalized = normalize_skill_plan(SkillPlan(skill_name=skill_name, files=entries, warnings=plan_warnings, function_items=list(structured_function_items or []), responsibility_edges=edges))
-    semantic_issues = validate_file_plan_semantics(normalized)
+    normalized = normalize_skill_plan(SkillPlan(skill_name=skill_name, files=entries, warnings=plan_warnings, function_items=list(structured_function_items or []), responsibility_edges=edges), strict=strict)
+    semantic_issues = validate_file_plan_semantics(normalized, strict=strict)
     # SkillPlan static I/O consumption is an internal workflow dataflow hint, not
     # a blueprint-stage user-visible warning.  First-round Creator validation
     # only reports platform/file-boundary issues; real script-to-script field
@@ -1645,6 +1628,7 @@ def parse_blueprint(
             ),
             responsibility_edges=responsibility_edges,
             function_items=function_items,
+            strict=strict,
         )
     )
 

@@ -4,14 +4,20 @@ import inspect
 import pytest
 
 from backend.services.creator import api, contracts
+from backend.services.blueprint_parser import parse_files_from_blueprint
+from backend.services.creator_tool_registry import capabilities_for_role
 from backend.services.creator.common import (
     _authoritative_blueprint_skill_paths,
     _paths_requiring_skill_md_mentions,
 )
 from backend.services.platform_io_contract import build_platform_io_contract
 from backend.services.skill_plan import (
+    GraphValidationError,
     structured_responsibility_graph_input_provenance_gaps,
     validate_structured_responsibility_edge_transport,
+    SkillPlan,
+    SkillPlanEntry,
+    normalize_skill_plan,
 )
 
 
@@ -93,6 +99,39 @@ def test_prose_script_path_is_not_required_skill_md_mention():
     assert _paths_requiring_skill_md_mentions(blueprint, prefix="scripts/") == []
 
 
+def test_strict_fileplan_preserves_placeholder_like_declared_script_names():
+    blueprint = """### SkillPlan / 文件职责计划
+- path: `scripts/test.py`
+  purpose: run
+- path: `scripts/demo.py`
+  purpose: run
+- path: `scripts/example.py`
+  purpose: run
+"""
+    files, _warnings = parse_files_from_blueprint(blueprint, strict=True)
+    assert {file.path for file in files} == {
+        "scripts/test.py", "scripts/demo.py", "scripts/example.py",
+    }
+
+
+@pytest.mark.parametrize("purpose", ["生成 输出 template static runtime", "plain prose"])
+def test_strict_resource_classification_ignores_purpose_words(purpose):
+    entry = SkillPlanEntry(
+        path="assets/template.png", role="any-display-hint", purpose=purpose,
+        file_type="asset", asset_source="bundled",
+    )
+    normalized = normalize_skill_plan(
+        SkillPlan(skill_name="authority", files=[entry]), strict=True
+    )
+    assert [(item.path, item.file_type, item.asset_source) for item in normalized.files] == [
+        ("assets/template.png", "asset", "bundled")
+    ]
+
+
+def test_role_names_do_not_define_capability_permissions():
+    assert capabilities_for_role("image_generator") == capabilities_for_role("generic_script") == ([], [])
+
+
 def test_structured_dependency_remains_in_authoritative_constraints():
     constraints = contracts._collect_blueprint_skillplan_constraints(
         blueprint_text=_blueprint(),
@@ -139,12 +178,10 @@ def test_graph_construction_context_contains_only_frozen_structured_topology():
         responsibility_edges=[],
     )
     assert context["allowed_function_targets"] == ["scripts/a.py"]
-    assert context["function_items"] == [{
-        "target_file": "scripts/a.py",
-        "purpose": "perform assigned responsibility",
+    assert context["node_contracts"] == [{
+        "node": "scripts/a.py",
         "inputs": ["value"],
         "outputs": ["result"],
-        "static_configuration": [],
     }]
     assert "scripts/extra.py" not in json.dumps(context)
     assert context["platform_input_contract"]["input_fields"]
@@ -166,7 +203,7 @@ def test_blueprint_prompt_includes_lightweight_runtime_contract_self_check():
 
 
 @pytest.mark.asyncio
-async def test_localized_repair_rejects_function_boundary_changes(monkeypatch):
+async def test_localized_repair_rejects_readonly_function_items_in_output(monkeypatch):
     item = _function("scripts/a.py", ["value"], ["result"])
 
     async def repair(*args, **kwargs):
@@ -174,7 +211,7 @@ async def test_localized_repair_rejects_function_boundary_changes(monkeypatch):
         return json.dumps({"function_items": [changed], "responsibility_edges": []})
 
     monkeypatch.setattr(api, "complete_creator_role_once", repair)
-    with pytest.raises(ValueError, match="requires upstream FunctionItem replanning"):
+    with pytest.raises(ValueError, match="only responsibility_edges"):
         await api._repair_responsibility_graph_alignment(
             request=api.PreparePlanRequest(user_request="test"),
             frozen_blueprint_text="frozen",
@@ -198,6 +235,17 @@ def test_upstream_and_platform_binding_for_same_input_conflict():
     ]
     with pytest.raises(ValueError, match="conflicting_input_provenance.*target_input=value"):
         validate_structured_responsibility_edge_transport(edges, function_items=items)
+
+
+def test_graph_validation_error_carries_structured_endpoint_facts():
+    items = [_function("scripts/a.py", [], ["result"])]
+    with pytest.raises(GraphValidationError) as caught:
+        validate_structured_responsibility_edge_transport(
+            [_edge("scripts/a.py", "result", "unknown", "value")],
+            function_items=items,
+        )
+    assert caught.value.code == "invalid_graph_endpoint"
+    assert caught.value.details == {"edge_index": 0, "to_node": "unknown"}
 
 
 @pytest.mark.asyncio

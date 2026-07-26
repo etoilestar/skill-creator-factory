@@ -6,7 +6,7 @@ from backend.services.creator.api import (
     _graph_issue_from_validation_error,
     _should_escalate_graph_failure,
 )
-from backend.services.skill_plan import validate_structured_responsibility_edge_transport
+from backend.services.skill_plan import GraphValidationError, validate_structured_responsibility_edge_transport
 
 
 def _unresolved_issue():
@@ -27,14 +27,20 @@ def test_graph_failure_fingerprint_uses_only_structural_facts():
 
 
 def test_invalid_endpoint_is_graph_local_and_does_not_escalate():
-    issue = _graph_issue_from_validation_error(ValueError(
-        "planner.responsibility_edges references non-FunctionItem target endpoint; "
-        "index=0; to_node=platform_output_contract"
+    issue = _graph_issue_from_validation_error(GraphValidationError(
+        "wording A", code="invalid_graph_endpoint",
+        details={"edge_index": 0, "to_node": "platform_output_contract"},
     ))
     fingerprint = _graph_failure_fingerprint(issue)
 
     assert issue["category"] == "invalid_graph_endpoint"
     assert not _should_escalate_graph_failure([fingerprint] * 3, [issue])
+
+    changed_message = _graph_issue_from_validation_error(GraphValidationError(
+        "wording B", code="invalid_graph_endpoint",
+        details={"edge_index": 0, "to_node": "platform_output_contract"},
+    ))
+    assert _graph_failure_fingerprint(changed_message) == fingerprint
 
 
 def test_unresolved_input_waits_for_repair_and_regeneration_before_escalation():

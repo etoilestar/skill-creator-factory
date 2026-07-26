@@ -186,18 +186,6 @@ class ToolResolveResult:
     warnings: list[str] = field(default_factory=list)
 
 
-_ROLE_FORBIDDEN_CAPABILITIES: dict[str, list[str]] = {
-    "text_generator": ["image_generation", "pdf_generation"],
-    "image_generator": ["text_generation", "pdf_generation"],
-    "composite_generator": [],
-    "generic_script": [],
-    "reference": ["runtime_execution", "image_generation"],
-    "asset": ["runtime_execution", "image_generation"],
-    "skill_overview": ["runtime_execution"],
-}
-
-
-
 def _sample_value_present(value: Any) -> bool:
     if value is None:
         return False
@@ -1904,17 +1892,8 @@ def get_role_pattern() -> str:
 
 
 def capabilities_for_role(role: str, *, only_creator_enabled: bool = True) -> tuple[list[str], list[str]]:
-    caps = list_tool_capabilities()
-    if only_creator_enabled:
-        caps = [cap for cap in caps if cap.enabled_by_default and cap.allow_creator_use]
-    if role == "search_reader" and not any(cap.name == "web_search" for cap in caps):
-        return [], list(_ROLE_FORBIDDEN_CAPABILITIES.get((role or "").strip(), []))
-    required = [cap.name for cap in caps if (role or "").strip() in cap.roles]
-    if role == "search_reader":
-        required = [name for name in required if name == "web_search"]
-    if role == "generic_script" and "deterministic_execution" not in required:
-        required.append("deterministic_execution")
-    return required, list(_ROLE_FORBIDDEN_CAPABILITIES.get((role or "").strip(), []))
+    """Backward-compatible API: roles are display hints, not capability authority."""
+    return [], []
 
 
 def validate_capability_names(names: list[str]) -> list[str]:

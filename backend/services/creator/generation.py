@@ -1193,8 +1193,9 @@ def _script_local_contract_payload(
             )
         ),
         "resource_refs": (
-            canonical_contract.resource_refs
+            canonical_contract.required_resources
         ),
+        "required_resources": canonical_contract.required_resources,
         "output_contract": {
             "stdout_schema": stdout_schema,
             "artifact_contract": (
@@ -1982,7 +1983,7 @@ def _build_script_generate_file_prompt_variant(
             "只根据轻量上下文实现：script_goal、semantic inputs/outputs、"
             "responsibility_requirements、coverage_requirements、"
             "available_tools、compact_code_tools、tool_snippet_prompt、"
-            "resource_refs、output_contract、"
+            "required_resources、output_contract、"
             "runtime_envelope、rules。"
         ),
         (
@@ -2013,9 +2014,10 @@ def _build_script_generate_file_prompt_variant(
             "中的字段交付对应非空结果。"
         ),
         (
-            "如果声明需要读取 reference/resource，"
-            "脚本应在当前职责范围内读取并消费；"
-            "若缺省不影响核心逻辑，应在 guard/default/metadata 中保持自洽。"
+            "required_resources 是 Frozen SkillPlan 对当前脚本已确认资源依赖的唯一权威投影。"
+            "非空时实现必须按当前职责合理消费这些资源；不得创造不存在的 resource path，"
+            "不得从完整 Blueprint prose 重新发现资源，不得把未声明文件当依赖，也不得修改 FilePlan。"
+            "Backend 不规定读取或语义消费方式。"
         ),
         (
             "coverage_requirements 只作为职责约束，"

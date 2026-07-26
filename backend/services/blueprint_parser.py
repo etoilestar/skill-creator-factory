@@ -1372,7 +1372,6 @@ def build_skill_plan_from_files(
     placeholder-like script still has no concrete contract after role resolution,
     remove it from the plan instead of merely marking it low confidence.
     """
-    reference_files = [file.path for file in files if file.path.startswith("references/")]
     entries: list[SkillPlanEntry] = []
     plan_warnings = list(warnings or [])
 
@@ -1414,7 +1413,10 @@ def build_skill_plan_from_files(
             if warning not in plan_warnings:
                 plan_warnings.append(warning)
 
-        refs_for_file = reference_files if file.path == "SKILL.md" or file.path.startswith("scripts/") else []
+        # Resource ownership is file-local.  Do not attach every planned
+        # reference to every script; explicit dependencies/references in the
+        # current block are the authority.
+        refs_for_file: list[str] = []
         entry = build_skill_plan_entry(
             file_path=file.path,
             purpose=file.purpose,
@@ -1423,6 +1425,7 @@ def build_skill_plan_from_files(
             blueprint_summary=blueprint_text,
             reference_files=refs_for_file,
         )
+        entry = SkillPlanEntry(**{**entry.__dict__, "asset_source": file.asset_source})
         structured_item = function_items_by_target.get(file.path)
         if structured_item is not None and file.path.startswith("scripts/"):
             entry = SkillPlanEntry(

@@ -256,6 +256,7 @@ class SkillPlanEntry:
     file_type: FileType
     role: FileRole
     purpose: str
+    asset_source: str = ""
     file_kind: FileKind = "config"
     component_hint: str = ""
     inputs: list[str] = field(default_factory=list)
@@ -1457,15 +1458,33 @@ def build_skill_plan_entry(
         )
     )
 
+    explicit_references = (
+        _explicit_list_field(
+            "references",
+            file_path=file_path,
+            purpose=purpose,
+            blueprint_summary=blueprint_summary,
+        )
+    )
+
     dependencies = _dedupe_paths([
         reference
         for reference in (
             explicit_dependencies
-            or skill_local_references
+            or []
         )
         if _is_skill_local_reference(
             reference
         )
+    ])
+
+    skill_local_references = _dedupe_paths([
+        *skill_local_references,
+        *(
+            reference
+            for reference in (explicit_references or [])
+            if _is_skill_local_reference(reference)
+        ),
     ])
 
     raw_required_capabilities = (
@@ -2359,6 +2378,13 @@ def validate_file_plan_semantics(plan: SkillPlan) -> list[str]:
     if skill_md_count != 1:
         issues.append(f"SKILL.md must be unique; found {skill_md_count}.")
 
+    runtime_outputs = {
+        str(output).strip().replace("\\", "/")
+        for item in (plan.function_items or [])
+        if isinstance(item, dict)
+        for output in (item.get("outputs") or [])
+        if str(output).strip()
+    }
     prior_outputs: set[str] = set()
     for entry in plan.files:
         if entry.path == "SKILL.md" and entry.role != "skill_overview":
@@ -2367,9 +2393,14 @@ def validate_file_plan_semantics(plan: SkillPlan) -> list[str]:
             issues.append(f"Script file must be under scripts/: {entry.path}")
         if entry.file_type == "reference" and not entry.path.startswith("references/"):
             issues.append(f"Reference file must be under references/: {entry.path}")
+        if entry.file_type == "reference" and entry.asset_source in {"user_upload", "bundled"}:
+            issues.append(
+                f"Reference must be Creator-generated and cannot declare static source "
+                f"{entry.asset_source}: {entry.path}"
+            )
         if entry.file_type == "asset" or entry.role == "asset" or entry.path.startswith("assets/"):
-            if not _is_asset_upload_only(entry):
-                issues.append(f"Asset must be upload-only static resource: {entry.path}")
+            if entry.asset_source not in {"user_upload", "bundled"}:
+                issues.append(f"Asset must declare source=user_upload or source=bundled: {entry.path}")
         if entry.file_type != "script" and entry.required_capabilities:
             issues.append(f"Resource/meta file must not declare runtime capabilities: {entry.path}")
         for dep in entry.dependencies:
@@ -2377,6 +2408,10 @@ def validate_file_plan_semantics(plan: SkillPlan) -> list[str]:
                 issues.append(f"Dependency cannot be output/dynamic path: {entry.path} -> {dep}")
         if entry.file_type != "script" and is_runtime_artifact_semantic(entry.path, entry.purpose):
             issues.append(f"Runtime artifact cannot be a Creator file-plan item: {entry.path}")
+        if entry.file_type in {"reference", "asset"} and entry.path in runtime_outputs:
+            issues.append(
+                f"Runtime output cannot also be a static Creator file-plan item: {entry.path}"
+            )
         prior_outputs.update(entry.outputs or [])
     return issues
 

@@ -4845,6 +4845,21 @@ def _preflight_prepare_blueprint_text(
                     )
                 )
 
+        if normalized.startswith("references/"):
+            source_match = re.search(
+                r"(?im)^\s*(?:source|asset_source)\s*:\s*(user_upload|bundled)\s*$",
+                block,
+            )
+            if source_match:
+                issues.append(
+                    _prepare_protocol_issue(
+                        "reference_static_source_conflict",
+                        "Creator-generated reference 不能同时声明 user_upload/bundled source；请修正 FilePlan，Backend 不会自动迁移路径。",
+                        path=path,
+                        field="source",
+                    )
+                )
+
         dependencies = list_field_values(
             block,
             "dependencies",
@@ -6742,6 +6757,14 @@ Do not plan the ResponsibilityGraph in this first pass.
 internal_blueprint_text is the human-readable Blueprint view and must contain the complete SkillPlan file responsibility information: path, role, purpose, inputs, outputs, dependencies, required_capabilities, forbidden_capabilities, references, constraints, and existing file-local metadata.
 
 The first pass only follows the FilePlan protocol. It may plan SKILL.md, scripts/**, references/**, assets/**, and config files.
+
+## Resource role contract（只按来源、生命周期、使用方式判断）
+
+- reference：由 Creator 在创建阶段生成的语义指导材料，例如规则、说明、约束、指南或提示原则；它用于指导脚本实现或运行，不是用户原始上传，也不是运行时产物。
+- asset：已经存在且脚本在运行时直接消费的静态文件。来源必须显式为 source=user_upload 或 source=bundled；Creator 不重新创作其内容。
+- runtime artifact：运行脚本后才产生，属于 FunctionItem outputs、stdout 或 artifact contract；不得进入 Blueprint FilePlan 的 references/** 或 assets/**。
+
+不得根据扩展名、文件名或业务领域词判断资源角色，不得自动迁移资源路径。返回 status=ready 前逐项自检：谁创建该资源；创建发生在 Creator 阶段还是运行时；用户上传/系统预置资源是否误作 reference；运行时产物是否误入 static FilePlan；reference 是否确为 Creator 生成的语义指导材料。
 
 review_summary 只是同一响应中的临时展示摘要。
 后端不会使用 review_summary 重建蓝图。

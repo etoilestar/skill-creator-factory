@@ -8,6 +8,7 @@ import math
 import re
 import shutil
 import traceback
+from dataclasses import asdict
 
 import httpx
 from fastapi.encoders import jsonable_encoder
@@ -4016,6 +4017,7 @@ class PreparePlanRequest(BaseModel):
     model: str | None = None
     responsibility_edges: list[dict[str, Any]] | None = None
     function_items: list[dict[str, Any]] | None = None
+    requirement_allocations: list[dict[str, Any]] | None = None
 
 
 class PreparePlanReviewSummary(BaseModel):
@@ -4063,6 +4065,7 @@ class PreparePlanResponse(BaseModel):
     skill_name: str = ""
     function_items: list[dict[str, Any]] = Field(default_factory=list)
     responsibility_edges: list[dict[str, Any]] = Field(default_factory=list)
+    requirement_allocations: list[dict[str, Any]] = Field(default_factory=list)
 
     files: list[FileSpecOut] = Field(
         default_factory=list
@@ -4277,10 +4280,11 @@ def _sync_prepare_summary_files_from_skill_plan(
     authoritative_upload_assets: list[str] = []
     for file_spec in plan_files or []:
         path = _normalize_skill_path(str(getattr(file_spec, "path", "") or ""))
+        file_type = str(getattr(file_spec, "file_type", "") or "").strip()
         asset_source = str(getattr(file_spec, "asset_source", "") or "").strip()
         if _is_concrete_prepare_summary_file_path(path, asset_source=asset_source) and path not in authoritative:
             authoritative.append(path)
-        if path.startswith("assets/") and asset_source == "user_upload" and path not in authoritative_upload_assets:
+        if file_type == "asset" and asset_source == "user_upload" and path not in authoritative_upload_assets:
             authoritative_upload_assets.append(path)
     summary.files_to_create_or_update = authoritative
     summary.assets_to_upload = authoritative_upload_assets
@@ -6834,6 +6838,250 @@ Return only strict JSON: {"responsibility_edges": [...]}
     }
 
 
+async def _plan_requirement_allocations(
+    *, request: PreparePlanRequest, blueprint_text: str,
+    function_items: list[dict[str, Any]], planner_model: str,
+) -> list[dict[str, Any]]:
+    """Ask the Planner for the semantic requirement-to-owner projection."""
+    prompt = """
+You are the Blueprint Planner producing a requirement coverage projection before
+the Blueprint is frozen. Semantically identify only the user's explicit core,
+independently verifiable final-capability requirements. Do not mechanically turn
+tone, examples, background, or pleasantries into requirements. Do not use a
+business taxonomy or keyword rules. Requirement extraction is based on the
+original user requirement, not on what the current Blueprint already happens to
+implement. Identify every explicit core independently verifiable final-capability
+requirement even when the current Blueprint does not currently provide a
+legitimate FunctionItem owner.
+
+Allocate a requirement only to FunctionItems that genuinely own or co-own that
+responsibility. If no current FunctionItem legitimately owns a core requirement,
+keep that requirement in requirement_allocations, return owners=[], do not omit
+the requirement, do not force an unrelated owner merely to avoid an empty owner
+list, and do not invent a new FunctionItem during requirement allocation.
+owners=[] means only that the current Blueprint has no legitimate owner; it does
+not mean that the requirement is unimportant, ignorable, or already complete.
+
+One FunctionItem may legitimately own multiple requirements. Multiple
+FunctionItems may legitimately cooperate on one requirement. There is no
+one-requirement-to-one-file rule. Do not add, remove, rename, or modify FilePlan
+entries or FunctionItems during requirement allocation. The later semantic
+Reviewer and bounded Blueprint replan own repair.
+
+Return strict JSON only: {"requirement_allocations":[{"requirement_id":"R1",
+"requirement":"...","owners":["..."],"evidence":{"responsibility":"...",
+"outputs":[],"capabilities":[]}}]}. IDs must be unique and stable within this
+plan. Do not add files, FunctionItems, or requirements merely for closure.
+""".strip()
+    payload = {
+        "user_requirement": request.user_request,
+        "conversation_history": request.conversation_history,
+        "human_feedback": request.human_feedback,
+        "current_blueprint": blueprint_text,
+        "function_items": function_items,
+    }
+    text = await complete_creator_role_once(
+        [{"role": "system", "content": prompt},
+         {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
+        "planner", fallback_model=planner_model,
+    )
+    data = _parse_prepare_plan_json(text)
+    if set(data) != {"requirement_allocations"}:
+        raise PreparePlanProtocolError("Planner requirement allocation returned an invalid protocol shape")
+    return validate_requirement_allocations(
+        data["requirement_allocations"],
+        allowed_owner_targets=[
+            str(item.get("target_file") or "").strip()
+            for item in function_items
+        ],
+    )
+
+
+async def _review_blueprint_semantic_closure(
+    *, request: PreparePlanRequest, blueprint_text: str,
+    function_items: list[dict[str, Any]], requirement_allocations: list[dict[str, Any]],
+    planner_model: str,
+) -> dict[str, Any]:
+    """Review requirement coverage and resource meaning; Backend checks shape only."""
+    prompt = """
+You are the Blueprint semantic coverage Reviewer. Review only meaning, using the
+original user requirement, current Blueprint/FilePlan, FunctionItems, and
+requirement_allocations. Decide whether an explicit core requirement is omitted,
+has a real owner, the owner's responsibility is sufficient, capabilities/outputs
+basically match, or a responsibility was invented merely to close structure.
+An ownerless requirement allocation is a legitimate diagnostic state indicating
+that the current Blueprint may have failed to cover a core user requirement. Do
+not treat owners=[] as malformed. Semantic closure must not pass while a genuine
+core requirement remains ownerless.
+Also review declared dependencies/resources: whether each is actually required
+static content, whether it is Creator-generated guidance or pre-existing static
+material, and whether a static dependency lacks a real source/provenance.
+Do not infer from filenames, suffixes, keywords, or a business taxonomy.
+
+Return strict JSON only: {"passed":true,"issues":[]} or a failed result whose
+issue_type is exactly one of requirement_uncovered,
+requirement_partially_covered, responsibility_mismatch,
+resource_semantic_conflict. Every issue includes requirement_id (empty when not
+applicable), affected_targets array, reason, and repair_guidance. A resource
+conflict may additionally include resource.
+""".strip()
+    payload = {
+        "user_requirement": request.user_request,
+        "conversation_history": request.conversation_history,
+        "human_feedback": request.human_feedback,
+        "current_blueprint": blueprint_text,
+        "function_items": function_items,
+        "requirement_allocations": requirement_allocations,
+    }
+    text = await complete_creator_role_once(
+        [{"role": "system", "content": prompt},
+         {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
+        "reviewer", fallback_model=planner_model,
+    )
+    review = validate_blueprint_semantic_review(
+        _parse_prepare_plan_json(text),
+        allowed_function_item_targets=[
+            str(item.get("target_file") or "").strip()
+            for item in function_items
+        ],
+    )
+    if review["passed"]:
+        uncovered_allocation_ids = [
+            str(allocation.get("requirement_id") or "")
+            for allocation in requirement_allocations
+            if not (allocation.get("owners") or [])
+        ]
+        if uncovered_allocation_ids:
+            raise PreparePlanProtocolError(
+                "Blueprint semantic review cannot pass with ownerless requirement allocations; "
+                f"requirement_ids={uncovered_allocation_ids}"
+            )
+    uncovered = [str(i.get("requirement_id") or "") for i in review["issues"] if i["issue_type"] == "requirement_uncovered"]
+    partial = [str(i.get("requirement_id") or "") for i in review["issues"] if i["issue_type"] == "requirement_partially_covered"]
+    covered_count = max(0, len(requirement_allocations) - len(set(uncovered + partial)))
+    logger.info("[Creator][requirement_coverage] requirement_count=%d covered_count=%d uncovered_ids=%s partially_covered_ids=%s",
+                len(requirement_allocations), covered_count, uncovered, partial)
+    resource_issues = [i for i in review["issues"] if i["issue_type"] == "resource_semantic_conflict"]
+    logger.info("[Creator][resource_semantic_review] issue_count=%d affected_resources=%s",
+                len(resource_issues), [str(i.get("resource") or "") for i in resource_issues if i.get("resource")])
+    return review
+
+
+async def _replan_blueprint_for_semantic_closure(
+    *, request: PreparePlanRequest, blueprint_text: str,
+    function_items: list[dict[str, Any]], requirement_allocations: list[dict[str, Any]],
+    blocking_issues: list[dict[str, Any]], planner_model: str,
+) -> str:
+    """Perform the single localized Blueprint semantic repair."""
+    logger.info("[Creator][blueprint_semantic_replan] attempt=1 issue_types=%s affected_targets=%s",
+                [i.get("issue_type") for i in blocking_issues],
+                sorted({str(t) for i in blocking_issues for t in (i.get("affected_targets") or [])}))
+    prompt = """
+You are the Blueprint Planner performing one localized semantic replan. Return a
+complete replacement internal_blueprint_text. Preserve unrelated FilePlan entries
+and FunctionItems. Only modify the minimum Blueprint facts necessary to cover the
+blocking user requirement. Do not redesign unrelated workflow. Do not invent new
+user requirements. Do not add files merely to satisfy a structural checker. If
+an existing FunctionItem can legitimately own the requirement, revise that
+responsibility instead of automatically adding a file. Requirements and files
+have no one-to-one rule. Report the exact structural patch you made. For an
+uncovered requirement with no affected target, you may add new FunctionItems but
+must not modify existing FunctionItems or resources. To modify an existing
+FunctionItem, the Reviewer must name it in affected_targets. Do not remove
+existing paths. Return strict JSON only:
+{"internal_blueprint_text":"...","changed_targets":[],"added_targets":[],"changed_resources":[]}
+""".strip()
+    payload = {"original_user_requirement": request.user_request, "current_blueprint": blueprint_text,
+               "current_function_items": function_items, "requirement_allocations": requirement_allocations,
+               "blocking_issues": blocking_issues}
+    text = await complete_creator_role_once(
+        [{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
+        "planner", fallback_model=planner_model)
+    data = _parse_prepare_plan_json(text)
+    expected_keys = {
+        "internal_blueprint_text", "changed_targets", "added_targets", "changed_resources"
+    }
+    if set(data) != expected_keys or any(
+        not isinstance(data.get(key), list)
+        for key in ("changed_targets", "added_targets", "changed_resources")
+    ):
+        raise PreparePlanProtocolError("Blueprint semantic replan returned an invalid protocol shape")
+    replanned = str(data["internal_blueprint_text"] or "").strip()
+    validate_blueprint_shape_for_creator(replanned)
+    issues = _preflight_prepare_blueprint_text(replanned)
+    if issues:
+        raise PreparePlanProtocolError(f"Blueprint semantic replan failed FilePlan validation: {issues}")
+    _validate_blueprint_semantic_replan_scope(
+        before_blueprint_text=blueprint_text,
+        after_blueprint_text=replanned,
+        blocking_issues=blocking_issues,
+        patch_manifest=data,
+    )
+    return replanned
+
+
+def _blueprint_semantic_structural_facts(blueprint_text: str) -> tuple[str, dict[str, dict[str, Any]]]:
+    plan = parse_blueprint([{"role": "assistant", "content": blueprint_text}], strict=True)
+    return plan.skill_name, {entry.path: asdict(entry) for entry in plan.files}
+
+
+def _validate_blueprint_semantic_replan_scope(
+    *, before_blueprint_text: str, after_blueprint_text: str,
+    blocking_issues: list[dict[str, Any]], patch_manifest: dict[str, Any],
+) -> None:
+    """Match the declared patch to structural diff and reject unrelated drift."""
+    before_name, before = _blueprint_semantic_structural_facts(before_blueprint_text)
+    after_name, after = _blueprint_semantic_structural_facts(after_blueprint_text)
+    if before_name != after_name:
+        raise PreparePlanProtocolError("Blueprint semantic replan changed skill_name")
+
+    before_paths, after_paths = set(before), set(after)
+    added = after_paths - before_paths
+    removed = before_paths - after_paths
+    changed = {path for path in before_paths & after_paths if before[path] != after[path]}
+    before_targets = set(_resolve_allowed_function_item_targets_from_blueprint(before_blueprint_text))
+    after_targets = set(_resolve_allowed_function_item_targets_from_blueprint(after_blueprint_text))
+    actual_added_targets = added & after_targets
+    actual_changed_targets = changed & before_targets
+    actual_changed_resources = (added | removed | changed) - before_targets - after_targets
+    changed_existing_resources = changed - before_targets - after_targets
+
+    declared_changed = {str(value).strip() for value in patch_manifest["changed_targets"]}
+    declared_added = {str(value).strip() for value in patch_manifest["added_targets"]}
+    declared_resources = {str(value).strip() for value in patch_manifest["changed_resources"]}
+    if (declared_changed, declared_added, declared_resources) != (
+        actual_changed_targets, actual_added_targets, actual_changed_resources
+    ):
+        raise PreparePlanProtocolError("Blueprint semantic replan patch manifest does not match structural diff")
+    if removed & before_targets or removed - before_targets:
+        raise PreparePlanProtocolError("Blueprint semantic replan introduced unrelated structural drift by removing paths")
+
+    affected = {
+        str(target).strip()
+        for issue in blocking_issues
+        for target in (issue.get("affected_targets") or [])
+    }
+    uncovered_without_target = any(
+        issue.get("issue_type") == "requirement_uncovered"
+        and not (issue.get("affected_targets") or [])
+        for issue in blocking_issues
+    )
+    if not uncovered_without_target:
+        if actual_changed_targets - affected or actual_added_targets:
+            raise PreparePlanProtocolError("Blueprint semantic replan changed targets outside blocking issue scope")
+        issue_resources = {
+            str(issue.get("resource") or "").strip()
+            for issue in blocking_issues if str(issue.get("resource") or "").strip()
+        }
+        if actual_changed_resources - issue_resources:
+            raise PreparePlanProtocolError("Blueprint semantic replan changed resources outside blocking issue scope")
+    elif actual_changed_targets or changed_existing_resources:
+        raise PreparePlanProtocolError(
+            "Blueprint semantic replan cannot modify existing targets or resources "
+            "for an uncovered requirement without affected_targets"
+        )
+
+
 def _planner_convergence_review_event_from_result(result: dict[str, Any]) -> dict[str, Any]:
     review_summary = result.get("review_summary")
     if not isinstance(review_summary, dict):
@@ -7698,6 +7946,56 @@ Blueprint Planner 只规划业务责任。
                 "allowed_function_item_targets": allowed_function_item_targets,
             })
 
+        # Semantic closure is completed before any ResponsibilityGraph call.
+        # Extraction and ownership are model decisions; Backend validates only
+        # allocation identity/domain/reference integrity and bounds repair to one.
+        semantic_function_items = _frozen_function_items_from_blueprint(
+            frozen_blueprint_text=frozen_blueprint_text,
+            allowed_function_item_targets=allowed_function_item_targets,
+        )
+        requirement_allocations = await _plan_requirement_allocations(
+            request=request, blueprint_text=frozen_blueprint_text,
+            function_items=semantic_function_items, planner_model=route.model,
+        )
+        semantic_review = await _review_blueprint_semantic_closure(
+            request=request, blueprint_text=frozen_blueprint_text,
+            function_items=semantic_function_items,
+            requirement_allocations=requirement_allocations, planner_model=route.model,
+        )
+        if not semantic_review["passed"]:
+            frozen_blueprint_text = await _replan_blueprint_for_semantic_closure(
+                request=request, blueprint_text=frozen_blueprint_text,
+                function_items=semantic_function_items,
+                requirement_allocations=requirement_allocations,
+                blocking_issues=semantic_review["issues"], planner_model=route.model,
+            )
+            allowed_function_item_targets = _resolve_allowed_function_item_targets_from_blueprint(
+                frozen_blueprint_text
+            )
+            semantic_function_items = _frozen_function_items_from_blueprint(
+                frozen_blueprint_text=frozen_blueprint_text,
+                allowed_function_item_targets=allowed_function_item_targets,
+            )
+            requirement_allocations = await _plan_requirement_allocations(
+                request=request, blueprint_text=frozen_blueprint_text,
+                function_items=semantic_function_items, planner_model=route.model,
+            )
+            semantic_review = await _review_blueprint_semantic_closure(
+                request=request, blueprint_text=frozen_blueprint_text,
+                function_items=semantic_function_items,
+                requirement_allocations=requirement_allocations, planner_model=route.model,
+            )
+            if not semantic_review["passed"]:
+                raise PreparePlanProtocolError(
+                    "Blueprint semantic closure failed after exactly one localized replan; "
+                    f"issues={semantic_review['issues']}"
+                )
+        first_planner_result = {
+            **first_planner_result,
+            "internal_blueprint_text": frozen_blueprint_text,
+            "requirement_allocations": requirement_allocations,
+        }
+
         try:
             binding_data = await _bind_executable_responsibility_plan(
                 request=request,
@@ -7726,6 +8024,7 @@ Blueprint Planner 只规划业务责任。
                 normalized_ready_draft = dict(first_planner_result)
                 normalized_ready_draft["function_items"] = normalized_function_items
                 normalized_ready_draft["responsibility_edges"] = normalized_edges
+                normalized_ready_draft["requirement_allocations"] = requirement_allocations
                 normalized_ready_draft["internal_blueprint_text"] = _render_structured_responsibility_view(
                     frozen_blueprint_text,
                     normalized_function_items,
@@ -7786,6 +8085,7 @@ Blueprint Planner 只规划业务责任。
             data = dict(first_planner_result)
             data["function_items"] = normalized_converged_function_items
             data["responsibility_edges"] = normalized_converged_edges
+            data["requirement_allocations"] = requirement_allocations
             data["internal_blueprint_text"] = _render_structured_responsibility_view(
                 frozen_blueprint_text,
                 normalized_converged_function_items,
@@ -9395,6 +9695,16 @@ async def _prepare_plan_impl(
             {"function_items": function_items, "review_summary": (current_prepared or {}).get("review_summary") if isinstance(current_prepared, dict) else {}},
             projected,
         )
+        try:
+            frozen_projection = parse_blueprint(
+                [{"role": "assistant", "content": current_blueprint_text}], strict=True
+            )
+            _sync_prepare_summary_files_from_skill_plan(projected, frozen_projection.files)
+        except Exception:
+            # Protocol validation reports malformed blueprints elsewhere; summary
+            # projection must never become a reverse authority or repair source.
+            projected.files_to_create_or_update = []
+            projected.assets_to_upload = []
         current_blueprint_text = _render_structured_responsibility_view(
             current_blueprint_text,
             function_items,
@@ -9427,6 +9737,10 @@ async def _prepare_plan_impl(
             function_items=function_items,
             responsibility_edges=(
                 responsibility_edges
+            ),
+            requirement_allocations=(
+                list((current_prepared or {}).get("requirement_allocations") or [])
+                if isinstance(current_prepared, dict) else []
             ),
         )
 
@@ -9561,6 +9875,7 @@ async def _prepare_plan_impl(
 
             "skill_name": skill_name,
             "function_items": request.function_items,
+            "requirement_allocations": request.requirement_allocations or [],
 
             "responsibility_edges": (
                 request.responsibility_edges

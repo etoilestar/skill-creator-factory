@@ -34,6 +34,114 @@ class CreatorValidatorReviewError(ValueError):
         self.raw_excerpt = str(raw_excerpt or "")[:1000]
 
 
+_BLUEPRINT_SEMANTIC_ISSUE_TYPES = {
+    "requirement_uncovered",
+    "requirement_partially_covered",
+    "responsibility_mismatch",
+    "resource_semantic_conflict",
+}
+
+
+def validate_requirement_allocations(
+    allocations: Any,
+    *,
+    allowed_owner_targets: Iterable[str],
+) -> list[dict[str, Any]]:
+    """Validate allocation identity and references without deciding semantics."""
+    if not isinstance(allocations, list):
+        raise ValueError("requirement_allocations must be an array")
+    allowed = {str(target).strip() for target in allowed_owner_targets if str(target).strip()}
+    seen: set[str] = set()
+    normalized: list[dict[str, Any]] = []
+    for index, raw in enumerate(allocations):
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"requirement_allocations[{index}] must be an object")
+        if not isinstance(raw.get("requirement_id"), str):
+            raise ValueError(f"requirement_allocations[{index}].requirement_id must be a string")
+        if not isinstance(raw.get("requirement"), str):
+            raise ValueError(f"requirement_allocations[{index}].requirement must be a string")
+        requirement_id = raw["requirement_id"].strip()
+        requirement = raw["requirement"].strip()
+        owners = raw.get("owners")
+        evidence = raw.get("evidence")
+        if not requirement_id:
+            raise ValueError(f"requirement_allocations[{index}].requirement_id must be non-empty")
+        if requirement_id in seen:
+            raise ValueError(f"duplicate requirement_id: {requirement_id}")
+        if not requirement:
+            raise ValueError(f"requirement_allocations[{index}].requirement must be non-empty")
+        if not isinstance(owners, list):
+            raise ValueError(f"requirement_allocations[{index}].owners must be an array")
+        normalized_owners = [str(owner).strip() for owner in owners]
+        invalid = [owner for owner in normalized_owners if not owner or owner not in allowed]
+        if invalid:
+            raise ValueError(
+                "requirement allocation owner is outside current FunctionItem domain; "
+                f"requirement_id={requirement_id}; invalid_owners={invalid}"
+            )
+        if not isinstance(evidence, Mapping):
+            raise ValueError(f"requirement_allocations[{index}].evidence must be an object")
+        if not isinstance(evidence.get("responsibility"), str):
+            raise ValueError(f"requirement_allocations[{index}].evidence.responsibility must be a string")
+        if not isinstance(evidence.get("outputs"), list):
+            raise ValueError(f"requirement_allocations[{index}].evidence.outputs must be an array")
+        if not isinstance(evidence.get("capabilities"), list):
+            raise ValueError(f"requirement_allocations[{index}].evidence.capabilities must be an array")
+        normalized.append({
+            "requirement_id": requirement_id,
+            "requirement": requirement,
+            "owners": normalized_owners,
+            "evidence": {
+                "responsibility": evidence["responsibility"].strip(),
+                "outputs": [str(value) for value in evidence["outputs"]],
+                "capabilities": [str(value) for value in evidence["capabilities"]],
+            },
+        })
+        seen.add(requirement_id)
+    return normalized
+
+
+def validate_blueprint_semantic_review(
+    review: Any,
+    *,
+    allowed_function_item_targets: Iterable[str],
+) -> dict[str, Any]:
+    """Validate the bounded semantic-review envelope, not its conclusions."""
+    if not isinstance(review, Mapping) or not isinstance(review.get("passed"), bool):
+        raise ValueError("blueprint semantic review must contain boolean passed")
+    issues = review.get("issues")
+    if not isinstance(issues, list):
+        raise ValueError("blueprint semantic review issues must be an array")
+    normalized: list[dict[str, Any]] = []
+    allowed_targets = {
+        str(target).strip()
+        for target in allowed_function_item_targets
+        if str(target).strip()
+    }
+    for index, issue in enumerate(issues):
+        if not isinstance(issue, Mapping):
+            raise ValueError(f"blueprint semantic review issue {index} must be an object")
+        issue_type = str(issue.get("issue_type") or "").strip()
+        if issue_type not in _BLUEPRINT_SEMANTIC_ISSUE_TYPES:
+            raise ValueError(f"unsupported blueprint semantic issue_type: {issue_type}")
+        targets = issue.get("affected_targets")
+        if not isinstance(targets, list):
+            raise ValueError(f"blueprint semantic review issue {index} affected_targets must be an array")
+        normalized_targets = [str(target).strip() for target in targets]
+        invalid_targets = [target for target in normalized_targets if not target or target not in allowed_targets]
+        if invalid_targets:
+            raise ValueError(
+                "blueprint semantic review affected_targets are outside current FunctionItem domain; "
+                f"invalid_targets={invalid_targets}"
+            )
+        normalized.append({**dict(issue), "issue_type": issue_type, "affected_targets": normalized_targets})
+    if bool(review["passed"]) and normalized:
+        raise ValueError("passed blueprint semantic review cannot contain issues")
+    if not bool(review["passed"]) and not normalized:
+        raise ValueError("failed blueprint semantic review must contain issues")
+    return {"passed": bool(review["passed"]), "issues": normalized}
+
+
 @dataclass(frozen=True)
 class MarkdownRegions:
     """Two independently repairable regions for generated Markdown files."""

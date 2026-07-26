@@ -6925,6 +6925,17 @@ conflict may additionally include resource.
             for item in function_items
         ],
     )
+    if review["passed"]:
+        uncovered_allocation_ids = [
+            str(allocation.get("requirement_id") or "")
+            for allocation in requirement_allocations
+            if not (allocation.get("owners") or [])
+        ]
+        if uncovered_allocation_ids:
+            raise PreparePlanProtocolError(
+                "Blueprint semantic review cannot pass with ownerless requirement allocations; "
+                f"requirement_ids={uncovered_allocation_ids}"
+            )
     uncovered = [str(i.get("requirement_id") or "") for i in review["issues"] if i["issue_type"] == "requirement_uncovered"]
     partial = [str(i.get("requirement_id") or "") for i in review["issues"] if i["issue_type"] == "requirement_partially_covered"]
     covered_count = max(0, len(requirement_allocations) - len(set(uncovered + partial)))
@@ -6954,9 +6965,10 @@ user requirements. Do not add files merely to satisfy a structural checker. If
 an existing FunctionItem can legitimately own the requirement, revise that
 responsibility instead of automatically adding a file. Requirements and files
 have no one-to-one rule. Report the exact structural patch you made. For an
-uncovered requirement with no affected target, changed_targets/added_targets may
-contain the existing or new FunctionItems you chose; do not remove existing
-paths. Return strict JSON only:
+uncovered requirement with no affected target, you may add new FunctionItems but
+must not modify existing FunctionItems or resources. To modify an existing
+FunctionItem, the Reviewer must name it in affected_targets. Do not remove
+existing paths. Return strict JSON only:
 {"internal_blueprint_text":"...","changed_targets":[],"added_targets":[],"changed_resources":[]}
 """.strip()
     payload = {"original_user_requirement": request.user_request, "current_blueprint": blueprint_text,
@@ -7012,6 +7024,7 @@ def _validate_blueprint_semantic_replan_scope(
     actual_added_targets = added & after_targets
     actual_changed_targets = changed & before_targets
     actual_changed_resources = (added | removed | changed) - before_targets - after_targets
+    changed_existing_resources = changed - before_targets - after_targets
 
     declared_changed = {str(value).strip() for value in patch_manifest["changed_targets"]}
     declared_added = {str(value).strip() for value in patch_manifest["added_targets"]}
@@ -7042,8 +7055,11 @@ def _validate_blueprint_semantic_replan_scope(
         }
         if actual_changed_resources - issue_resources:
             raise PreparePlanProtocolError("Blueprint semantic replan changed resources outside blocking issue scope")
-    elif changed - actual_changed_targets - actual_changed_resources:
-        raise PreparePlanProtocolError("Blueprint semantic replan introduced unrelated structural drift")
+    elif actual_changed_targets or changed_existing_resources:
+        raise PreparePlanProtocolError(
+            "Blueprint semantic replan cannot modify existing targets or resources "
+            "for an uncovered requirement without affected_targets"
+        )
 
 
 def _planner_convergence_review_event_from_result(result: dict[str, Any]) -> dict[str, Any]:

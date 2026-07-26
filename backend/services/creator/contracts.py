@@ -73,10 +73,6 @@ def validate_requirement_allocations(
         if not isinstance(owners, list):
             raise ValueError(f"requirement_allocations[{index}].owners must be an array")
         normalized_owners = [str(owner).strip() for owner in owners]
-        if not normalized_owners:
-            raise ValueError(
-                f"requirement_allocations[{index}].owners must contain at least one FunctionItem target"
-            )
         invalid = [owner for owner in normalized_owners if not owner or owner not in allowed]
         if invalid:
             raise ValueError(

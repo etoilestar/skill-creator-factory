@@ -93,11 +93,11 @@ def test_owner_domain_contains_only_function_item_targets():
     )[0]["owners"] == ["scripts/a.py"]
 
 
-def test_empty_owner_is_rejected():
-    with pytest.raises(ValueError, match="at least one FunctionItem target"):
-        validate_requirement_allocations(
-            [_allocation("R1", [])], allowed_owner_targets=["scripts/a.py"]
-        )
+def test_empty_owner_is_allowed_during_allocation():
+    allocations = validate_requirement_allocations(
+        [_allocation("R1", [])], allowed_owner_targets=["scripts/a.py"]
+    )
+    assert allocations[0]["owners"] == []
 
 
 def test_requirement_ids_are_unique_and_requirements_non_empty():
@@ -148,6 +148,22 @@ async def test_resource_semantic_conflict_is_reported_by_reviewer_not_suffix_log
         requirement_allocations=[_allocation("R1", ["scripts/a.py"])], planner_model="test",
     )
     assert review["issues"][0]["resource"] == "static/content.opaque"
+
+
+@pytest.mark.asyncio
+async def test_semantic_pass_rejects_ownerless_requirement(monkeypatch):
+    async def complete(*_args, **_kwargs):
+        return json.dumps({"passed": True, "issues": []})
+
+    monkeypatch.setattr(api, "complete_creator_role_once", complete)
+    with pytest.raises(api.PreparePlanProtocolError, match="ownerless requirement allocations"):
+        await api._review_blueprint_semantic_closure(
+            request=api.PreparePlanRequest(user_request="完成核心责任"),
+            blueprint_text="blueprint",
+            function_items=[{"target_file": "scripts/a.py"}],
+            requirement_allocations=[_allocation("R1", [])],
+            planner_model="test",
+        )
 
 
 def test_semantic_review_rejects_unknown_target_exactly():
@@ -248,4 +264,20 @@ def test_uncovered_scope_rejects_deletion_and_replacement():
             before_blueprint_text=before, after_blueprint_text=after,
             blocking_issues=[{"issue_type": "requirement_uncovered", "affected_targets": []}],
             patch_manifest={"changed_targets": [], "added_targets": ["scripts/b.py"], "changed_resources": []},
+        )
+
+
+def test_uncovered_scope_requires_affected_target_for_existing_change():
+    before = _blueprint([_entry("scripts/a.py")])
+    after = _blueprint([_entry("scripts/a.py", "revised")])
+    with pytest.raises(api.PreparePlanProtocolError, match="without affected_targets"):
+        api._validate_blueprint_semantic_replan_scope(
+            before_blueprint_text=before,
+            after_blueprint_text=after,
+            blocking_issues=[{"issue_type": "requirement_uncovered", "affected_targets": []}],
+            patch_manifest={
+                "changed_targets": ["scripts/a.py"],
+                "added_targets": [],
+                "changed_resources": [],
+            },
         )

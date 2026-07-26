@@ -45,19 +45,23 @@ _BLUEPRINT_SEMANTIC_ISSUE_TYPES = {
 def validate_requirement_allocations(
     allocations: Any,
     *,
-    frozen_file_plan_paths: Iterable[str],
+    allowed_owner_targets: Iterable[str],
 ) -> list[dict[str, Any]]:
     """Validate allocation identity and references without deciding semantics."""
     if not isinstance(allocations, list):
         raise ValueError("requirement_allocations must be an array")
-    allowed = {str(path).strip() for path in frozen_file_plan_paths if str(path).strip()}
+    allowed = {str(target).strip() for target in allowed_owner_targets if str(target).strip()}
     seen: set[str] = set()
     normalized: list[dict[str, Any]] = []
     for index, raw in enumerate(allocations):
         if not isinstance(raw, Mapping):
             raise ValueError(f"requirement_allocations[{index}] must be an object")
-        requirement_id = str(raw.get("requirement_id") or "").strip()
-        requirement = str(raw.get("requirement") or "").strip()
+        if not isinstance(raw.get("requirement_id"), str):
+            raise ValueError(f"requirement_allocations[{index}].requirement_id must be a string")
+        if not isinstance(raw.get("requirement"), str):
+            raise ValueError(f"requirement_allocations[{index}].requirement must be a string")
+        requirement_id = raw["requirement_id"].strip()
+        requirement = raw["requirement"].strip()
         owners = raw.get("owners")
         evidence = raw.get("evidence")
         if not requirement_id:
@@ -69,29 +73,43 @@ def validate_requirement_allocations(
         if not isinstance(owners, list):
             raise ValueError(f"requirement_allocations[{index}].owners must be an array")
         normalized_owners = [str(owner).strip() for owner in owners]
+        if not normalized_owners:
+            raise ValueError(
+                f"requirement_allocations[{index}].owners must contain at least one FunctionItem target"
+            )
         invalid = [owner for owner in normalized_owners if not owner or owner not in allowed]
         if invalid:
             raise ValueError(
-                "requirement allocation owner is outside frozen FilePlan domain; "
+                "requirement allocation owner is outside current FunctionItem domain; "
                 f"requirement_id={requirement_id}; invalid_owners={invalid}"
             )
         if not isinstance(evidence, Mapping):
             raise ValueError(f"requirement_allocations[{index}].evidence must be an object")
+        if not isinstance(evidence.get("responsibility"), str):
+            raise ValueError(f"requirement_allocations[{index}].evidence.responsibility must be a string")
+        if not isinstance(evidence.get("outputs"), list):
+            raise ValueError(f"requirement_allocations[{index}].evidence.outputs must be an array")
+        if not isinstance(evidence.get("capabilities"), list):
+            raise ValueError(f"requirement_allocations[{index}].evidence.capabilities must be an array")
         normalized.append({
             "requirement_id": requirement_id,
             "requirement": requirement,
             "owners": normalized_owners,
             "evidence": {
-                "responsibility": str(evidence.get("responsibility") or "").strip(),
-                "outputs": [str(value) for value in (evidence.get("outputs") or [])],
-                "capabilities": [str(value) for value in (evidence.get("capabilities") or [])],
+                "responsibility": evidence["responsibility"].strip(),
+                "outputs": [str(value) for value in evidence["outputs"]],
+                "capabilities": [str(value) for value in evidence["capabilities"]],
             },
         })
         seen.add(requirement_id)
     return normalized
 
 
-def validate_blueprint_semantic_review(review: Any) -> dict[str, Any]:
+def validate_blueprint_semantic_review(
+    review: Any,
+    *,
+    allowed_function_item_targets: Iterable[str],
+) -> dict[str, Any]:
     """Validate the bounded semantic-review envelope, not its conclusions."""
     if not isinstance(review, Mapping) or not isinstance(review.get("passed"), bool):
         raise ValueError("blueprint semantic review must contain boolean passed")
@@ -99,6 +117,11 @@ def validate_blueprint_semantic_review(review: Any) -> dict[str, Any]:
     if not isinstance(issues, list):
         raise ValueError("blueprint semantic review issues must be an array")
     normalized: list[dict[str, Any]] = []
+    allowed_targets = {
+        str(target).strip()
+        for target in allowed_function_item_targets
+        if str(target).strip()
+    }
     for index, issue in enumerate(issues):
         if not isinstance(issue, Mapping):
             raise ValueError(f"blueprint semantic review issue {index} must be an object")
@@ -108,7 +131,14 @@ def validate_blueprint_semantic_review(review: Any) -> dict[str, Any]:
         targets = issue.get("affected_targets")
         if not isinstance(targets, list):
             raise ValueError(f"blueprint semantic review issue {index} affected_targets must be an array")
-        normalized.append({**dict(issue), "issue_type": issue_type, "affected_targets": [str(x) for x in targets]})
+        normalized_targets = [str(target).strip() for target in targets]
+        invalid_targets = [target for target in normalized_targets if not target or target not in allowed_targets]
+        if invalid_targets:
+            raise ValueError(
+                "blueprint semantic review affected_targets are outside current FunctionItem domain; "
+                f"invalid_targets={invalid_targets}"
+            )
+        normalized.append({**dict(issue), "issue_type": issue_type, "affected_targets": normalized_targets})
     if bool(review["passed"]) and normalized:
         raise ValueError("passed blueprint semantic review cannot contain issues")
     if not bool(review["passed"]) and not normalized:

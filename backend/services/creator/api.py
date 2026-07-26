@@ -8,6 +8,7 @@ import math
 import re
 import shutil
 import traceback
+from dataclasses import asdict
 
 import httpx
 from fastapi.encoders import jsonable_encoder
@@ -6873,7 +6874,10 @@ plan. Do not add files, FunctionItems, or requirements merely for closure.
         raise PreparePlanProtocolError("Planner requirement allocation returned an invalid protocol shape")
     return validate_requirement_allocations(
         data["requirement_allocations"],
-        frozen_file_plan_paths=_extract_prepare_skill_plan_paths(blueprint_text),
+        allowed_owner_targets=[
+            str(item.get("target_file") or "").strip()
+            for item in function_items
+        ],
     )
 
 
@@ -6914,7 +6918,13 @@ conflict may additionally include resource.
          {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
         "reviewer", fallback_model=planner_model,
     )
-    review = validate_blueprint_semantic_review(_parse_prepare_plan_json(text))
+    review = validate_blueprint_semantic_review(
+        _parse_prepare_plan_json(text),
+        allowed_function_item_targets=[
+            str(item.get("target_file") or "").strip()
+            for item in function_items
+        ],
+    )
     uncovered = [str(i.get("requirement_id") or "") for i in review["issues"] if i["issue_type"] == "requirement_uncovered"]
     partial = [str(i.get("requirement_id") or "") for i in review["issues"] if i["issue_type"] == "requirement_partially_covered"]
     covered_count = max(0, len(requirement_allocations) - len(set(uncovered + partial)))
@@ -6943,8 +6953,11 @@ blocking user requirement. Do not redesign unrelated workflow. Do not invent new
 user requirements. Do not add files merely to satisfy a structural checker. If
 an existing FunctionItem can legitimately own the requirement, revise that
 responsibility instead of automatically adding a file. Requirements and files
-have no one-to-one rule. Return strict JSON only:
-{"internal_blueprint_text":"..."}
+have no one-to-one rule. Report the exact structural patch you made. For an
+uncovered requirement with no affected target, changed_targets/added_targets may
+contain the existing or new FunctionItems you chose; do not remove existing
+paths. Return strict JSON only:
+{"internal_blueprint_text":"...","changed_targets":[],"added_targets":[],"changed_resources":[]}
 """.strip()
     payload = {"original_user_requirement": request.user_request, "current_blueprint": blueprint_text,
                "current_function_items": function_items, "requirement_allocations": requirement_allocations,
@@ -6953,14 +6966,84 @@ have no one-to-one rule. Return strict JSON only:
         [{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
         "planner", fallback_model=planner_model)
     data = _parse_prepare_plan_json(text)
-    if set(data) != {"internal_blueprint_text"}:
+    expected_keys = {
+        "internal_blueprint_text", "changed_targets", "added_targets", "changed_resources"
+    }
+    if set(data) != expected_keys or any(
+        not isinstance(data.get(key), list)
+        for key in ("changed_targets", "added_targets", "changed_resources")
+    ):
         raise PreparePlanProtocolError("Blueprint semantic replan returned an invalid protocol shape")
     replanned = str(data["internal_blueprint_text"] or "").strip()
     validate_blueprint_shape_for_creator(replanned)
     issues = _preflight_prepare_blueprint_text(replanned)
     if issues:
         raise PreparePlanProtocolError(f"Blueprint semantic replan failed FilePlan validation: {issues}")
+    _validate_blueprint_semantic_replan_scope(
+        before_blueprint_text=blueprint_text,
+        after_blueprint_text=replanned,
+        blocking_issues=blocking_issues,
+        patch_manifest=data,
+    )
     return replanned
+
+
+def _blueprint_semantic_structural_facts(blueprint_text: str) -> tuple[str, dict[str, dict[str, Any]]]:
+    plan = parse_blueprint([{"role": "assistant", "content": blueprint_text}], strict=True)
+    return plan.skill_name, {entry.path: asdict(entry) for entry in plan.files}
+
+
+def _validate_blueprint_semantic_replan_scope(
+    *, before_blueprint_text: str, after_blueprint_text: str,
+    blocking_issues: list[dict[str, Any]], patch_manifest: dict[str, Any],
+) -> None:
+    """Match the declared patch to structural diff and reject unrelated drift."""
+    before_name, before = _blueprint_semantic_structural_facts(before_blueprint_text)
+    after_name, after = _blueprint_semantic_structural_facts(after_blueprint_text)
+    if before_name != after_name:
+        raise PreparePlanProtocolError("Blueprint semantic replan changed skill_name")
+
+    before_paths, after_paths = set(before), set(after)
+    added = after_paths - before_paths
+    removed = before_paths - after_paths
+    changed = {path for path in before_paths & after_paths if before[path] != after[path]}
+    before_targets = set(_resolve_allowed_function_item_targets_from_blueprint(before_blueprint_text))
+    after_targets = set(_resolve_allowed_function_item_targets_from_blueprint(after_blueprint_text))
+    actual_added_targets = added & after_targets
+    actual_changed_targets = changed & before_targets
+    actual_changed_resources = (added | removed | changed) - before_targets - after_targets
+
+    declared_changed = {str(value).strip() for value in patch_manifest["changed_targets"]}
+    declared_added = {str(value).strip() for value in patch_manifest["added_targets"]}
+    declared_resources = {str(value).strip() for value in patch_manifest["changed_resources"]}
+    if (declared_changed, declared_added, declared_resources) != (
+        actual_changed_targets, actual_added_targets, actual_changed_resources
+    ):
+        raise PreparePlanProtocolError("Blueprint semantic replan patch manifest does not match structural diff")
+    if removed & before_targets or removed - before_targets:
+        raise PreparePlanProtocolError("Blueprint semantic replan introduced unrelated structural drift by removing paths")
+
+    affected = {
+        str(target).strip()
+        for issue in blocking_issues
+        for target in (issue.get("affected_targets") or [])
+    }
+    uncovered_without_target = any(
+        issue.get("issue_type") == "requirement_uncovered"
+        and not (issue.get("affected_targets") or [])
+        for issue in blocking_issues
+    )
+    if not uncovered_without_target:
+        if actual_changed_targets - affected or actual_added_targets:
+            raise PreparePlanProtocolError("Blueprint semantic replan changed targets outside blocking issue scope")
+        issue_resources = {
+            str(issue.get("resource") or "").strip()
+            for issue in blocking_issues if str(issue.get("resource") or "").strip()
+        }
+        if actual_changed_resources - issue_resources:
+            raise PreparePlanProtocolError("Blueprint semantic replan changed resources outside blocking issue scope")
+    elif changed - actual_changed_targets - actual_changed_resources:
+        raise PreparePlanProtocolError("Blueprint semantic replan introduced unrelated structural drift")
 
 
 def _planner_convergence_review_event_from_result(result: dict[str, Any]) -> dict[str, Any]:

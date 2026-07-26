@@ -684,6 +684,171 @@ def _output_edge(path: str) -> dict:
     }
 
 
+def _semantic_closure_response(messages):
+    """Return default semantic protocol responses without consuming graph mocks."""
+    import json
+
+    system = str(messages[0].get("content") or "") if messages else ""
+    if "requirement coverage projection" in system:
+        payload = json.loads(messages[1]["content"])
+        owners = [
+            item["target_file"]
+            for item in payload.get("function_items") or []
+            if item.get("target_file")
+        ]
+        return {"requirement_allocations": [{
+            "requirement_id": "R1", "requirement": "完成核心责任",
+            "owners": owners,
+            "evidence": {"responsibility": "完成责任", "outputs": [], "capabilities": []},
+        }]}
+    if "semantic coverage Reviewer" in system:
+        return {"passed": True, "issues": []}
+    return None
+
+
+def _mock_creator_completion(monkeypatch, fake_complete):
+    async def fake_role(messages, role, fallback_model):
+        return await fake_complete(messages, fallback_model)
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    monkeypatch.setattr(api, "complete_creator_role_once", fake_role)
+
+
+class _SemanticClosureGraphCalled(BaseException):
+    pass
+
+
+def _with_script_purpose(blueprint, target, purpose):
+    marker = f"- path: `{target}`\n  role: generic_script"
+    return blueprint.replace(marker, marker + f"\n  purpose: {purpose}")
+
+
+async def _run_semantic_closure_until_graph(
+    monkeypatch, *, reviews, replanned_blueprint=None, initial_blueprint=None,
+):
+    import json
+
+    initial = initial_blueprint or _ready_blueprint(
+        _skill_plan_block("\n" + _script_plan_block("scripts/a.py"))
+    )
+    allocations = 0
+    review_calls = 0
+    replan_calls = 0
+    graph_calls = 0
+    blueprint_calls = 0
+
+    async def initial_planner(messages, model):
+        return json.dumps(_ready_payload(initial))
+
+    async def semantic_models(messages, role, fallback_model):
+        nonlocal allocations, review_calls, replan_calls, blueprint_calls
+        system = str(messages[0].get("content") or "")
+        if "requirement coverage projection" in system:
+            allocations += 1
+            return json.dumps({"requirement_allocations": [{
+                "requirement_id": "R1", "requirement": "完成核心责任",
+                "owners": ["scripts/a.py"],
+                "evidence": {"responsibility": "完成责任", "outputs": [], "capabilities": []},
+            }]})
+        if "semantic coverage Reviewer" in system:
+            result = reviews[review_calls]
+            review_calls += 1
+            return json.dumps(result)
+        if "localized semantic replan" in system:
+            replan_calls += 1
+            return json.dumps(replanned_blueprint)
+        if blueprint_calls == 0:
+            blueprint_calls += 1
+            return json.dumps(_ready_payload(initial))
+        raise AssertionError("Unexpected model call occurred before graph binding sentinel")
+
+    async def graph(**kwargs):
+        nonlocal graph_calls
+        graph_calls += 1
+        raise _SemanticClosureGraphCalled()
+
+    monkeypatch.setattr(api, "complete_chat_once", initial_planner)
+    monkeypatch.setattr(api, "complete_creator_role_once", semantic_models)
+    monkeypatch.setattr(api, "_bind_executable_responsibility_plan", graph)
+    try:
+        await api._generate_internal_blueprint_or_questions(_request())
+    except _SemanticClosureGraphCalled:
+        pass
+    return {
+        "initial": initial, "allocations": allocations, "reviews": review_calls,
+        "replans": replan_calls, "graphs": graph_calls,
+    }
+
+
+@pytest.mark.asyncio
+async def test_semantic_closure_pass_calls_graph_once_without_replan(monkeypatch):
+    result = await _run_semantic_closure_until_graph(
+        monkeypatch, reviews=[{"passed": True, "issues": []}],
+    )
+    assert result == {**result, "allocations": 1, "reviews": 1, "replans": 0, "graphs": 1}
+
+
+@pytest.mark.asyncio
+async def test_semantic_closure_replans_once_then_calls_graph(monkeypatch):
+    initial = _ready_blueprint(_skill_plan_block("\n" + _script_plan_block("scripts/a.py")))
+    revised = _with_script_purpose(initial, "scripts/a.py", "revised responsibility")
+    result = await _run_semantic_closure_until_graph(
+        monkeypatch,
+        reviews=[
+            {"passed": False, "issues": [{
+                "issue_type": "responsibility_mismatch", "requirement_id": "R1",
+                "affected_targets": ["scripts/a.py"], "reason": "mismatch", "repair_guidance": "revise",
+            }]},
+            {"passed": True, "issues": []},
+        ],
+        replanned_blueprint={
+            "internal_blueprint_text": revised, "changed_targets": ["scripts/a.py"],
+            "added_targets": [], "changed_resources": [],
+        },
+    )
+    assert (result["allocations"], result["reviews"], result["replans"], result["graphs"]) == (2, 2, 1, 1)
+
+
+@pytest.mark.asyncio
+async def test_semantic_closure_second_failure_never_calls_graph(monkeypatch):
+    initial = _ready_blueprint(_skill_plan_block("\n" + _script_plan_block("scripts/a.py")))
+    revised = _with_script_purpose(initial, "scripts/a.py", "revised responsibility")
+    failed = {"passed": False, "issues": [{
+        "issue_type": "responsibility_mismatch", "requirement_id": "R1",
+        "affected_targets": ["scripts/a.py"], "reason": "mismatch", "repair_guidance": "revise",
+    }]}
+    with pytest.raises(api.PreparePlanProtocolError, match="exactly one localized replan"):
+        await _run_semantic_closure_until_graph(
+            monkeypatch, reviews=[failed, failed], replanned_blueprint={
+                "internal_blueprint_text": revised, "changed_targets": ["scripts/a.py"],
+                "added_targets": [], "changed_resources": [],
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_semantic_closure_scope_drift_never_calls_graph(monkeypatch):
+    initial = _ready_blueprint(_skill_plan_block(
+        "\n" + _script_plan_block("scripts/a.py") + "\n" + _script_plan_block("scripts/b.py")
+    ))
+    drifted = _with_script_purpose(
+        _with_script_purpose(initial, "scripts/a.py", "revised responsibility"),
+        "scripts/b.py", "unrelated change",
+    )
+    failed = {"passed": False, "issues": [{
+        "issue_type": "responsibility_mismatch", "requirement_id": "R1",
+        "affected_targets": ["scripts/a.py"], "reason": "mismatch", "repair_guidance": "revise",
+    }]}
+    with pytest.raises(api.PreparePlanProtocolError, match="outside blocking issue scope"):
+        await _run_semantic_closure_until_graph(
+            monkeypatch, reviews=[failed], initial_blueprint=initial, replanned_blueprint={
+                "internal_blueprint_text": drifted,
+                "changed_targets": ["scripts/a.py", "scripts/b.py"],
+                "added_targets": [], "changed_resources": [],
+            },
+        )
+
+
 @pytest.mark.asyncio
 async def test_binding_and_convergence_are_edge_only_over_frozen_function_items(monkeypatch):
     import json
@@ -768,13 +933,14 @@ async def test_incomplete_binding_target_set_does_not_emit_draft_and_convergence
     ]
     events = []
 
-    async def fake_complete(messages, model):
-        return json.dumps(responses.pop(0))
+    async def fake_complete(messages, model, **kwargs):
+        semantic = _semantic_closure_response(messages)
+        return json.dumps(semantic if semantic is not None else responses.pop(0))
 
     async def emit(event):
         events.append(event)
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    _mock_creator_completion(monkeypatch, fake_complete)
     monkeypatch.setattr(api, "_review_responsibility_graph_alignment", lambda **kwargs: _async_result({"passed": True, "issues": []}))
     monkeypatch.setattr(api, "_validate_responsibility_graph_boundary_presence", lambda *args: None)
     result = await api._generate_internal_blueprint_or_questions(_request(), event_emitter=emit)
@@ -803,13 +969,14 @@ async def test_incomplete_binding_target_set_does_not_fallback_when_convergence_
     ]
     events = []
 
-    async def fake_complete(messages, model):
-        return json.dumps(responses.pop(0))
+    async def fake_complete(messages, model, **kwargs):
+        semantic = _semantic_closure_response(messages)
+        return json.dumps(semantic if semantic is not None else responses.pop(0))
 
     async def emit(event):
         events.append(event)
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    _mock_creator_completion(monkeypatch, fake_complete)
     with pytest.raises(api.PreparePlanProtocolError):
         await api._generate_internal_blueprint_or_questions(_request(), event_emitter=emit)
 
@@ -835,13 +1002,14 @@ async def test_unexpected_binding_target_does_not_emit_draft_or_fallback(monkeyp
     ]
     events = []
 
-    async def fake_complete(messages, model):
-        return json.dumps(responses.pop(0))
+    async def fake_complete(messages, model, **kwargs):
+        semantic = _semantic_closure_response(messages)
+        return json.dumps(semantic if semantic is not None else responses.pop(0))
 
     async def emit(event):
         events.append(event)
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    _mock_creator_completion(monkeypatch, fake_complete)
     with pytest.raises(api.PreparePlanProtocolError):
         await api._generate_internal_blueprint_or_questions(_request(), event_emitter=emit)
 
@@ -884,11 +1052,12 @@ async def test_binding_uses_post_repair_file_plan_targets(monkeypatch):
         },
     ]
 
-    async def fake_complete(messages, model):
+    async def fake_complete(messages, model, **kwargs):
         calls.append(messages)
-        return json.dumps(responses.pop(0))
+        semantic = _semantic_closure_response(messages)
+        return json.dumps(semantic if semantic is not None else responses.pop(0))
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    _mock_creator_completion(monkeypatch, fake_complete)
     monkeypatch.setattr(api, "_review_responsibility_graph_alignment", lambda **kwargs: _async_result({"passed": True, "issues": []}))
     monkeypatch.setattr(api, "_validate_responsibility_graph_boundary_presence", lambda *args: None)
     result = await api._generate_internal_blueprint_or_questions(_request())
@@ -924,7 +1093,7 @@ async def test_fileplan_repair_failure_stops_before_freeze_or_binding(monkeypatc
     calls = []
     events = []
 
-    async def fake_complete(messages, model):
+    async def fake_complete(messages, model, **kwargs):
         calls.append(messages)
         return json.dumps(_ready_payload(pre_repair_blueprint))
 
@@ -934,7 +1103,7 @@ async def test_fileplan_repair_failure_stops_before_freeze_or_binding(monkeypatc
     async def emit(event):
         events.append(event)
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    _mock_creator_completion(monkeypatch, fake_complete)
     monkeypatch.setattr(api, "_repair_prepare_blueprint_protocol", fail_repair)
 
     with pytest.raises(api.PreparePlanProtocolError) as exc_info:
@@ -948,11 +1117,11 @@ async def test_fileplan_repair_failure_stops_before_freeze_or_binding(monkeypatc
 async def test_blueprint_planner_prompt_includes_constraints_serialization_contract(monkeypatch):
     captured = []
 
-    async def fake_complete(messages, model):
+    async def fake_complete(messages, model, **kwargs):
         captured.extend(messages)
         return '{"status":"needs_clarification","clarifying_questions":["输入来源？A. 粘贴 B. 上传"],"blockers":[]}'
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    _mock_creator_completion(monkeypatch, fake_complete)
     await api._generate_internal_blueprint_or_questions(_request())
 
     prompt = captured[0]["content"]
@@ -967,11 +1136,11 @@ async def test_blueprint_planner_prompt_includes_constraints_serialization_contr
 async def test_blueprint_planner_prompt_preserves_confirmed_decision_contract(monkeypatch):
     captured = []
 
-    async def fake_complete(messages, model):
+    async def fake_complete(messages, model, **kwargs):
         captured.extend(messages)
         return '{"status":"needs_clarification","clarifying_questions":["输入来源？A. 粘贴 B. 上传"],"blockers":[]}'
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    _mock_creator_completion(monkeypatch, fake_complete)
     await api._generate_internal_blueprint_or_questions(_request())
 
     prompt = captured[0]["content"]
@@ -986,11 +1155,11 @@ async def test_blueprint_planner_prompt_preserves_confirmed_decision_contract(mo
 async def test_blueprint_planner_prompt_requires_explicit_constraints_field(monkeypatch):
     captured = []
 
-    async def fake_complete(messages, model):
+    async def fake_complete(messages, model, **kwargs):
         captured.extend(messages)
         return '{"status":"needs_clarification","clarifying_questions":["输入来源？A. 粘贴 B. 上传"],"blockers":[]}'
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    _mock_creator_completion(monkeypatch, fake_complete)
     await api._generate_internal_blueprint_or_questions(_request())
 
     prompt = captured[0]["content"]
@@ -1003,11 +1172,11 @@ async def test_blueprint_planner_prompt_requires_explicit_constraints_field(monk
 async def test_blueprint_planner_prompt_requires_final_delivery_closure(monkeypatch):
     captured = []
 
-    async def fake_complete(messages, model):
+    async def fake_complete(messages, model, **kwargs):
         captured.extend(messages)
         return '{"status":"needs_clarification","clarifying_questions":["输入来源？A. 粘贴 B. 上传"],"blockers":[]}'
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    _mock_creator_completion(monkeypatch, fake_complete)
     await api._generate_internal_blueprint_or_questions(_request())
 
     prompt = captured[0]["content"]
@@ -1022,11 +1191,11 @@ async def test_blueprint_planner_prompt_requires_final_delivery_closure(monkeypa
 async def test_blueprint_planner_defines_script_only_responsibility_graph(monkeypatch):
     captured = []
 
-    async def fake_complete(messages, model):
+    async def fake_complete(messages, model, **kwargs):
         captured.extend(messages)
         return '{"status":"needs_clarification","clarifying_questions":["输入来源？A. 粘贴 B. 上传"],"blockers":[]}'
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    _mock_creator_completion(monkeypatch, fake_complete)
     await api._generate_internal_blueprint_or_questions(_request())
 
     prompt = captured[0]["content"]
@@ -1044,11 +1213,11 @@ async def test_blueprint_planner_defines_script_only_responsibility_graph(monkey
 async def test_planner_requires_responsibility_edges_and_graph_replay(monkeypatch):
     captured = []
 
-    async def fake_complete(messages, model):
+    async def fake_complete(messages, model, **kwargs):
         captured.extend(messages)
         return '{"status":"needs_clarification","clarifying_questions":["输入来源？A. 粘贴 B. 上传"],"blockers":[]}'
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    _mock_creator_completion(monkeypatch, fake_complete)
     await api._generate_internal_blueprint_or_questions(_request())
     prompt = captured[0]["content"]
 
@@ -1167,9 +1336,9 @@ def test_structured_edge_empty_endpoint_fails_fast():
 
 def test_ready_planner_response_requires_structured_responsibility_edges(monkeypatch):
     import pytest
-    async def fake_complete(messages, model):
+    async def fake_complete(messages, model, **kwargs):
         return '{"status":"ready","internal_blueprint_text":"## 📋 Skill 架构蓝图","skill_name":"demo-skill","blockers":[]}'
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    _mock_creator_completion(monkeypatch, fake_complete)
     with pytest.raises(ValueError, match='responsibility_edges'):
         import asyncio
         asyncio.run(api._generate_internal_blueprint_or_questions(_request()))
@@ -1213,11 +1382,11 @@ async def test_ready_planner_result_runs_one_convergence_revision(monkeypatch):
     calls = []
     edge = {"from_node":"scripts/a.py","from_output":"alpha","to_node":"platform_output_node","to_input":"file_outputs","purpose":"deliver","constraints":[]}
 
-    async def fake_complete(messages, model):
+    async def fake_complete(messages, model, **kwargs):
         calls.append(messages)
         return '{"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"draft","skill_name":"demo","blockers":[],"responsibility_edges":[' + __import__('json').dumps(edge) + ']}'
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    _mock_creator_completion(monkeypatch, fake_complete)
     await api._generate_internal_blueprint_or_questions(_request())
     assert len(calls) == 2
 
@@ -1241,10 +1410,11 @@ async def test_planner_convergence_replaces_draft_with_complete_revised_plan(mon
         {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"revised","skill_name":"demo","blockers":[],"responsibility_edges":revised_edges},
     ]
 
-    async def fake_complete(messages, model):
-        return json.dumps(responses.pop(0))
+    async def fake_complete(messages, model, **kwargs):
+        semantic = _semantic_closure_response(messages)
+        return json.dumps(semantic if semantic is not None else responses.pop(0))
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    _mock_creator_completion(monkeypatch, fake_complete)
     result = await api._generate_internal_blueprint_or_questions(_request())
     assert result["internal_blueprint_text"] == "revised"
     assert result["responsibility_edges"] == revised_edges
@@ -1260,10 +1430,11 @@ async def test_planner_convergence_uses_structured_edges_as_source_of_truth(monk
         {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":legacy_text,"skill_name":"demo","blockers":[],"responsibility_edges":[structured]},
     ]
 
-    async def fake_complete(messages, model):
-        return json.dumps(responses.pop(0))
+    async def fake_complete(messages, model, **kwargs):
+        semantic = _semantic_closure_response(messages)
+        return json.dumps(semantic if semantic is not None else responses.pop(0))
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    _mock_creator_completion(monkeypatch, fake_complete)
     result = await api._generate_internal_blueprint_or_questions(_request())
     assert result["responsibility_edges"] == [structured]
 
@@ -1277,10 +1448,11 @@ async def test_creator_does_not_add_missing_responsibility_edges_itself(monkeypa
         {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"unchanged","skill_name":"demo","blockers":[],"responsibility_edges":[edge]},
     ]
 
-    async def fake_complete(messages, model):
-        return json.dumps(responses.pop(0))
+    async def fake_complete(messages, model, **kwargs):
+        semantic = _semantic_closure_response(messages)
+        return json.dumps(semantic if semantic is not None else responses.pop(0))
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    _mock_creator_completion(monkeypatch, fake_complete)
     result = await api._generate_internal_blueprint_or_questions(_request())
     assert result["responsibility_edges"] == [edge]
 
@@ -1304,10 +1476,11 @@ async def test_planner_convergence_missing_responsibility_edges_keeps_draft(monk
         {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"incomplete","skill_name":"demo","blockers":[]},
     ]
 
-    async def fake_complete(messages, model):
-        return json.dumps(responses.pop(0))
+    async def fake_complete(messages, model, **kwargs):
+        semantic = _semantic_closure_response(messages)
+        return json.dumps(semantic if semantic is not None else responses.pop(0))
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    _mock_creator_completion(monkeypatch, fake_complete)
     result = await api._generate_internal_blueprint_or_questions(_request())
     assert result["internal_blueprint_text"] == "draft"
     assert result["responsibility_edges"] == [draft_edge]
@@ -1323,10 +1496,11 @@ async def test_planner_convergence_incomplete_transport_fields_keeps_draft(monke
         {"status":"ready","clarifying_questions":[],"internal_blueprint_text":"incomplete","skill_name":"demo","blockers":[],"responsibility_edges":[revised_edge]},
     ]
 
-    async def fake_complete(messages, model):
-        return json.dumps(responses.pop(0))
+    async def fake_complete(messages, model, **kwargs):
+        semantic = _semantic_closure_response(messages)
+        return json.dumps(semantic if semantic is not None else responses.pop(0))
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    _mock_creator_completion(monkeypatch, fake_complete)
     result = await api._generate_internal_blueprint_or_questions(_request())
     assert result["internal_blueprint_text"] == "draft"
     assert result["responsibility_edges"] == [draft_edge]
@@ -1341,10 +1515,11 @@ async def test_planner_convergence_null_responsibility_edges_keeps_draft(monkeyp
         {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"null edges","skill_name":"demo","blockers":[],"responsibility_edges":None},
     ]
 
-    async def fake_complete(messages, model):
-        return json.dumps(responses.pop(0))
+    async def fake_complete(messages, model, **kwargs):
+        semantic = _semantic_closure_response(messages)
+        return json.dumps(semantic if semantic is not None else responses.pop(0))
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    _mock_creator_completion(monkeypatch, fake_complete)
     result = await api._generate_internal_blueprint_or_questions(_request())
     assert result["internal_blueprint_text"] == "draft"
     assert result["responsibility_edges"] == [draft_edge]
@@ -1359,10 +1534,11 @@ async def test_planner_convergence_invalid_transport_shape_keeps_draft(monkeypat
         {"status":"ready","clarifying_questions":"not-a-list","review_summary":[],"internal_blueprint_text":"bad shape","skill_name":"demo","blockers":{},"responsibility_edges":[]},
     ]
 
-    async def fake_complete(messages, model):
-        return json.dumps(responses.pop(0))
+    async def fake_complete(messages, model, **kwargs):
+        semantic = _semantic_closure_response(messages)
+        return json.dumps(semantic if semantic is not None else responses.pop(0))
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    _mock_creator_completion(monkeypatch, fake_complete)
     result = await api._generate_internal_blueprint_or_questions(_request())
     assert result["internal_blueprint_text"] == "draft"
     assert result["responsibility_edges"] == [draft_edge]
@@ -1377,10 +1553,11 @@ async def test_planner_convergence_empty_blueprint_keeps_draft(monkeypatch):
         {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"   ","skill_name":"demo","blockers":[],"responsibility_edges":[]},
     ]
 
-    async def fake_complete(messages, model):
-        return json.dumps(responses.pop(0))
+    async def fake_complete(messages, model, **kwargs):
+        semantic = _semantic_closure_response(messages)
+        return json.dumps(semantic if semantic is not None else responses.pop(0))
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    _mock_creator_completion(monkeypatch, fake_complete)
     result = await api._generate_internal_blueprint_or_questions(_request())
     assert result["internal_blueprint_text"] == "good draft"
     assert result["responsibility_edges"] == [draft_edge]
@@ -1409,11 +1586,12 @@ async def test_invalid_ready_edge_shape_runs_same_planner_convergence(monkeypatc
         {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"revised","skill_name":"demo","blockers":[],"responsibility_edges":[second_edge]},
     ]
 
-    async def fake_complete(messages, model):
+    async def fake_complete(messages, model, **kwargs):
         calls.append(messages)
-        return json.dumps(responses.pop(0))
+        semantic = _semantic_closure_response(messages)
+        return json.dumps(semantic if semantic is not None else responses.pop(0))
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    _mock_creator_completion(monkeypatch, fake_complete)
     result = await api._generate_internal_blueprint_or_questions(_request())
     assert len(calls) == 2
     assert result["internal_blueprint_text"] == "revised"
@@ -1451,10 +1629,11 @@ async def test_invalid_ready_edge_shape_and_failed_convergence_never_keeps_raw_d
         {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"still bad","skill_name":"demo","blockers":[],"responsibility_edges":[bad_edge]},
     ]
 
-    async def fake_complete(messages, model):
-        return json.dumps(responses.pop(0))
+    async def fake_complete(messages, model, **kwargs):
+        semantic = _semantic_closure_response(messages)
+        return json.dumps(semantic if semantic is not None else responses.pop(0))
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    _mock_creator_completion(monkeypatch, fake_complete)
     response = await api.prepare_plan(_request())
     assert response.status == "blocked"
     assert response.prepare_stage == "blueprint_protocol_failed"
@@ -1471,10 +1650,11 @@ async def test_valid_ready_edge_shape_and_failed_convergence_keeps_draft(monkeyp
         {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"bad","skill_name":"demo","blockers":[],"responsibility_edges":[bad_edge]},
     ]
 
-    async def fake_complete(messages, model):
-        return json.dumps(responses.pop(0))
+    async def fake_complete(messages, model, **kwargs):
+        semantic = _semantic_closure_response(messages)
+        return json.dumps(semantic if semantic is not None else responses.pop(0))
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    _mock_creator_completion(monkeypatch, fake_complete)
     result = await api._generate_internal_blueprint_or_questions(_request())
     assert result["internal_blueprint_text"] == "draft"
     assert result["responsibility_edges"] == [draft_edge]
@@ -1508,11 +1688,12 @@ async def test_ready_draft_invalid_platform_input_boundary_runs_same_planner_con
         {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"revised","skill_name":"demo","blockers":[],"responsibility_edges":[second_edge]},
     ]
 
-    async def fake_complete(messages, model):
+    async def fake_complete(messages, model, **kwargs):
         calls.append(messages)
-        return json.dumps(responses.pop(0))
+        semantic = _semantic_closure_response(messages)
+        return json.dumps(semantic if semantic is not None else responses.pop(0))
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    _mock_creator_completion(monkeypatch, fake_complete)
     result = await api._generate_internal_blueprint_or_questions(_request())
     assert len(calls) == 2
     convergence_payload = json.loads(calls[1][1]["content"])
@@ -1533,11 +1714,12 @@ async def test_ready_draft_invalid_platform_output_boundary_runs_same_planner_co
         {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"revised","skill_name":"demo","blockers":[],"responsibility_edges":[second_edge]},
     ]
 
-    async def fake_complete(messages, model):
+    async def fake_complete(messages, model, **kwargs):
         calls.append(messages)
-        return json.dumps(responses.pop(0))
+        semantic = _semantic_closure_response(messages)
+        return json.dumps(semantic if semantic is not None else responses.pop(0))
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    _mock_creator_completion(monkeypatch, fake_complete)
     result = await api._generate_internal_blueprint_or_questions(_request())
     assert len(calls) == 2
     assert result["internal_blueprint_text"] == "revised"
@@ -1553,10 +1735,11 @@ async def test_invalid_platform_boundary_after_convergence_is_protocol_blocked(m
         {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"still bad","skill_name":"demo","blockers":[],"responsibility_edges":[bad_edge]},
     ]
 
-    async def fake_complete(messages, model):
-        return json.dumps(responses.pop(0))
+    async def fake_complete(messages, model, **kwargs):
+        semantic = _semantic_closure_response(messages)
+        return json.dumps(semantic if semantic is not None else responses.pop(0))
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    _mock_creator_completion(monkeypatch, fake_complete)
     response = await api.prepare_plan(_request())
     assert response.status == "blocked"
     assert response.prepare_stage == "blueprint_protocol_failed"
@@ -1573,11 +1756,12 @@ async def test_ready_draft_missing_responsibility_edges_runs_same_planner_conver
         {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"revised","skill_name":"demo","blockers":[],"responsibility_edges":[second_edge]},
     ]
 
-    async def fake_complete(messages, model):
+    async def fake_complete(messages, model, **kwargs):
         calls.append(messages)
-        return json.dumps(responses.pop(0))
+        semantic = _semantic_closure_response(messages)
+        return json.dumps(semantic if semantic is not None else responses.pop(0))
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    _mock_creator_completion(monkeypatch, fake_complete)
     result = await api._generate_internal_blueprint_or_questions(_request())
     assert len(calls) == 2
     assert result["responsibility_edges"] == [second_edge]
@@ -1593,11 +1777,12 @@ async def test_ready_draft_null_responsibility_edges_runs_same_planner_convergen
         {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"revised","skill_name":"demo","blockers":[],"responsibility_edges":[second_edge]},
     ]
 
-    async def fake_complete(messages, model):
+    async def fake_complete(messages, model, **kwargs):
         calls.append(messages)
-        return json.dumps(responses.pop(0))
+        semantic = _semantic_closure_response(messages)
+        return json.dumps(semantic if semantic is not None else responses.pop(0))
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    _mock_creator_completion(monkeypatch, fake_complete)
     result = await api._generate_internal_blueprint_or_questions(_request())
     assert len(calls) == 2
     assert result["responsibility_edges"] == [second_edge]
@@ -1918,11 +2103,11 @@ def test_filter_unconfirmed_asset_plan_reference_only_upload_does_not_allow_asse
 async def test_executable_binding_prompt_explains_real_execution_ownership(monkeypatch):
     captured = []
 
-    async def fake_complete(messages, model):
+    async def fake_complete(messages, model, **kwargs):
         captured.extend(messages)
         return '{"function_items":[],"responsibility_edges":[]}'
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    _mock_creator_completion(monkeypatch, fake_complete)
     await api._bind_executable_responsibility_plan(
         request=_request(),
         current_planner_result={},
@@ -1947,7 +2132,7 @@ async def test_executable_binding_prompt_explains_real_execution_ownership(monke
 async def test_convergence_prompt_requires_executable_ownership_closure(monkeypatch):
     captured = []
 
-    async def fake_complete(messages, model):
+    async def fake_complete(messages, model, **kwargs):
         captured.extend(messages)
         return (
             '{"status":"ready","clarifying_questions":[],"review_summary":{},'
@@ -1955,7 +2140,7 @@ async def test_convergence_prompt_requires_executable_ownership_closure(monkeypa
             '"function_items":[],"responsibility_edges":[]}'
         )
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    _mock_creator_completion(monkeypatch, fake_complete)
     await api._converge_ready_executable_plan(
         request=_request(),
         current_planner_result={},
@@ -2003,10 +2188,10 @@ async def test_same_planner_convergence_adopts_complete_ownership_revision(monke
         {"status": "ready", "clarifying_questions": [], "review_summary": {}, "internal_blueprint_text": "revised", "skill_name": "demo", "blockers": [], "function_items": revised_items, "responsibility_edges": revised_edges},
     ])
 
-    async def fake_complete(messages, model):
+    async def fake_complete(messages, model, **kwargs):
         return json.dumps(next(responses))
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    _mock_creator_completion(monkeypatch, fake_complete)
     binding = await api._bind_executable_responsibility_plan(
         request=_request(),
         current_planner_result={},
@@ -2042,10 +2227,10 @@ def test_executable_ownership_prompts_add_no_backend_semantic_classifier():
 
 @pytest.mark.asyncio
 async def test_responsibility_graph_alignment_review_is_read_only(monkeypatch):
-    async def fake_complete(messages, model):
+    async def fake_complete(messages, model, **kwargs):
         return '{"passed":false,"issues":[],"function_items":[]}'
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    _mock_creator_completion(monkeypatch, fake_complete)
     with pytest.raises(ValueError, match="passed and issues"):
         await api._review_responsibility_graph_alignment(
             request=_request(), frozen_blueprint_text="frozen", allowed_function_item_targets=[],
@@ -2065,7 +2250,7 @@ async def _run_ready_graph_alignment_flow(monkeypatch, review, repair=None, init
     if initial_edges is not None:
         edges = initial_edges
 
-    async def fake_complete(messages, model):
+    async def fake_complete(messages, model, **kwargs):
         return json.dumps(_ready_payload(blueprint))
 
     async def bind(**kwargs):
@@ -2075,9 +2260,12 @@ async def _run_ready_graph_alignment_flow(monkeypatch, review, repair=None, init
         return {**_ready_payload("converged"), "function_items": [item], "responsibility_edges": edges}
 
     async def fake_complete_creator_role_once(messages, role, fallback_model):
+        semantic = _semantic_closure_response(messages)
+        if semantic is not None:
+            return json.dumps(semantic)
         return await fake_complete(messages, fallback_model)
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    _mock_creator_completion(monkeypatch, fake_complete)
     monkeypatch.setattr(api, "complete_creator_role_once", fake_complete_creator_role_once)
     monkeypatch.setattr(api, "_bind_executable_responsibility_plan", bind)
     monkeypatch.setattr(api, "_converge_ready_executable_plan", converge)

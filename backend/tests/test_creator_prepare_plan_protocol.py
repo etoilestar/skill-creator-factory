@@ -2514,10 +2514,16 @@ def test_responsibility_graph_boundary_presence_requires_both_platform_ends():
     output_edge = _output_edge("scripts/b.py")
     targets = ["scripts/a.py", "scripts/b.py"]
 
-    with pytest.raises(ValueError, match="input boundary edge; missing platform output boundary edge"):
+    with pytest.raises(api.GraphValidationError, match="input boundary edge; missing platform output boundary edge") as both_missing:
         api._validate_responsibility_graph_boundary_presence([internal_edge], targets)
-    with pytest.raises(ValueError, match="output boundary edge"):
+    assert both_missing.value.code == "missing_platform_boundary"
+    assert both_missing.value.details == {
+        "missing_input_boundary": True,
+        "missing_output_boundary": True,
+    }
+    with pytest.raises(api.GraphValidationError, match="output boundary edge") as output_missing:
         api._validate_responsibility_graph_boundary_presence([input_edge], targets)
+    assert output_missing.value.details["missing_output_boundary"] is True
     with pytest.raises(ValueError, match="input boundary edge"):
         api._validate_responsibility_graph_boundary_presence([output_edge], targets)
     api._validate_responsibility_graph_boundary_presence([input_edge, internal_edge, output_edge], targets)

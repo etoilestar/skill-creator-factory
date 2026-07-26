@@ -6716,7 +6716,14 @@ def _validate_responsibility_graph_boundary_presence(
     if not has_platform_output:
         missing.append("missing platform output boundary edge")
     if missing:
-        raise ValueError("; ".join(missing))
+        raise GraphValidationError(
+            "; ".join(missing),
+            code="missing_platform_boundary",
+            details={
+                "missing_input_boundary": not has_platform_input,
+                "missing_output_boundary": not has_platform_output,
+            },
+        )
 
 
 def _resolve_allowed_function_item_targets_from_blueprint(

@@ -186,6 +186,19 @@ class ToolResolveResult:
     warnings: list[str] = field(default_factory=list)
 
 
+# Compatibility metadata for the read-only /tool-roles catalogue. It is not
+# consumed by Creator planning, validation, tool selection, or authorization.
+_LEGACY_DISPLAY_ROLE_FORBIDDEN_CAPABILITIES: dict[str, list[str]] = {
+    "text_generator": ["image_generation", "pdf_generation"],
+    "image_generator": ["text_generation", "pdf_generation"],
+    "composite_generator": [],
+    "generic_script": [],
+    "reference": ["runtime_execution", "image_generation"],
+    "asset": ["runtime_execution", "image_generation"],
+    "skill_overview": ["runtime_execution"],
+}
+
+
 def _sample_value_present(value: Any) -> bool:
     if value is None:
         return False
@@ -1892,8 +1905,30 @@ def get_role_pattern() -> str:
 
 
 def capabilities_for_role(role: str, *, only_creator_enabled: bool = True) -> tuple[list[str], list[str]]:
-    """Backward-compatible API: roles are display hints, not capability authority."""
-    return [], []
+    """Project registry metadata for display/legacy compatibility only.
+
+    Creator compilation does not call this helper to authorize, require, forbid,
+    or select tools. Strict capability authority remains the explicit Blueprint
+    contract plus ToolCapability metadata.
+    """
+    normalized_role = (role or "").strip()
+    capabilities = list_tool_capabilities()
+    if only_creator_enabled:
+        capabilities = [
+            capability
+            for capability in capabilities
+            if capability.enabled_by_default and capability.allow_creator_use
+        ]
+    required = [
+        capability.name
+        for capability in capabilities
+        if normalized_role in capability.roles
+    ]
+    if normalized_role == "search_reader":
+        required = [name for name in required if name == "web_search"]
+    return required, list(
+        _LEGACY_DISPLAY_ROLE_FORBIDDEN_CAPABILITIES.get(normalized_role, [])
+    )
 
 
 def validate_capability_names(names: list[str]) -> list[str]:

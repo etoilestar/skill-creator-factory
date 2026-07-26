@@ -5,7 +5,6 @@ import pytest
 
 from backend.services.creator import api, contracts
 from backend.services.blueprint_parser import parse_files_from_blueprint
-from backend.services.creator_tool_registry import capabilities_for_role
 from backend.services.creator.common import (
     _authoritative_blueprint_skill_paths,
     _paths_requiring_skill_md_mentions,
@@ -18,6 +17,7 @@ from backend.services.skill_plan import (
     SkillPlan,
     SkillPlanEntry,
     normalize_skill_plan,
+    capabilities_for_role,
 )
 
 
@@ -246,6 +246,24 @@ def test_graph_validation_error_carries_structured_endpoint_facts():
         )
     assert caught.value.code == "invalid_graph_endpoint"
     assert caught.value.details == {"edge_index": 0, "to_node": "unknown"}
+
+
+@pytest.mark.parametrize(
+    ("edges", "code", "detail"),
+    [
+        (None, "invalid_edge_schema", ("actual_type", "null")),
+        ([{"bad": "shape"}], "invalid_edge_schema", ("invalid_edges", None)),
+        ([_edge("platform_output_node", "result", "scripts/a.py", "value")], "invalid_graph_endpoint", ("from_node", "platform_output_node")),
+    ],
+)
+def test_all_deterministic_graph_transport_failures_are_structured(edges, code, detail):
+    items = [_function("scripts/a.py", ["value"], ["result"])]
+    with pytest.raises(GraphValidationError) as caught:
+        validate_structured_responsibility_edge_transport(edges, function_items=items)
+    assert caught.value.code == code
+    assert detail[0] in caught.value.details
+    if detail[1] is not None:
+        assert caught.value.details[detail[0]] == detail[1]
 
 
 @pytest.mark.asyncio

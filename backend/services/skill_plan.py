@@ -439,7 +439,11 @@ def normalize_structured_responsibility_edges(raw_edges: object, *, source: str 
     if raw_edges is None:
         return []
     if not isinstance(raw_edges, list):
-        raise ValueError(f"{source}.responsibility_edges must be a list")
+        raise GraphValidationError(
+            f"{source}.responsibility_edges must be a list",
+            code="invalid_edge_schema",
+            details={"actual_type": type(raw_edges).__name__},
+        )
     normalized: list[dict[str, object]] = []
     invalid: list[dict[str, object]] = []
     for index, item in enumerate(raw_edges):
@@ -472,7 +476,11 @@ def normalize_structured_responsibility_edges(raw_edges: object, *, source: str 
         edge["constraints"] = [dict(c) for c in constraints]
         normalized.append(edge)
     if invalid:
-        raise ValueError(f"{source}.responsibility_edges contains invalid edge items: {invalid}")
+        raise GraphValidationError(
+            f"{source}.responsibility_edges contains invalid edge items: {invalid}",
+            code="invalid_edge_schema",
+            details={"invalid_edges": invalid},
+        )
     return normalized
 
 
@@ -491,8 +499,10 @@ def validate_structured_responsibility_edge_transport(
     validate script-local semantic IO or infer mappings.
     """
     if raw_edges is None:
-        raise ValueError(
-            f"{source}.responsibility_edges must not be null"
+        raise GraphValidationError(
+            f"{source}.responsibility_edges must not be null",
+            code="invalid_edge_schema",
+            details={"actual_type": "null"},
         )
 
     normalized_edges = normalize_structured_responsibility_edges(
@@ -577,50 +587,64 @@ def validate_structured_responsibility_edge_transport(
                 if constraint.get("type") == "platform_parameter_binding"
             ]
             if len(parameter_bindings) > 1:
-                raise ValueError(
+                raise GraphValidationError(
                     f"{source}.responsibility_edges structured platform input "
                     "contains multiple platform_parameter_binding constraints; "
-                    f"index={index}"
+                    f"index={index}",
+                    code="invalid_platform_parameter_binding",
+                    details={"edge_index": index, "reason": "multiple_bindings"},
                 )
             if parameter_bindings:
                 binding = parameter_bindings[0]
                 source_key = binding.get("source_key")
                 if not isinstance(source_key, str) or not source_key.strip():
-                    raise ValueError(
+                    raise GraphValidationError(
                         f"{source}.responsibility_edges structured platform input "
-                        f"binding requires non-empty source_key; index={index}"
+                        f"binding requires non-empty source_key; index={index}",
+                        code="invalid_platform_parameter_binding",
+                        details={"edge_index": index, "field": "source_key"},
                     )
                 required = binding.get("required")
                 if not isinstance(required, bool):
-                    raise ValueError(
+                    raise GraphValidationError(
                         f"{source}.responsibility_edges structured platform input "
-                        f"binding requires boolean required; index={index}"
+                        f"binding requires boolean required; index={index}",
+                        code="invalid_platform_parameter_binding",
+                        details={"edge_index": index, "field": "required"},
                     )
                 if not required and "default" not in binding:
-                    raise ValueError(
+                    raise GraphValidationError(
                         f"{source}.responsibility_edges optional structured platform "
-                        f"input binding requires explicit default; index={index}"
+                        f"input binding requires explicit default; index={index}",
+                        code="invalid_platform_parameter_binding",
+                        details={"edge_index": index, "field": "default"},
                     )
 
         if from_node == "platform_output_node":
-            raise ValueError(
+            raise GraphValidationError(
                 f"{source}.responsibility_edges uses platform_output_node "
                 "as an edge source; "
-                f"index={index}"
+                f"index={index}",
+                code="invalid_graph_endpoint",
+                details={"edge_index": index, "from_node": from_node},
             )
 
         if to_node == "platform_input_node":
-            raise ValueError(
+            raise GraphValidationError(
                 f"{source}.responsibility_edges uses platform_input_node "
                 "as an edge target; "
-                f"index={index}"
+                f"index={index}",
+                code="invalid_graph_endpoint",
+                details={"edge_index": index, "to_node": to_node},
             )
 
         if from_node == "platform_input_node" and to_node == "platform_output_node":
-            raise ValueError(
+            raise GraphValidationError(
                 f"{source}.responsibility_edges uses direct platform_input_node "
                 "to platform_output_node edge; "
-                f"index={index}"
+                f"index={index}",
+                code="invalid_graph_endpoint",
+                details={"edge_index": index, "from_node": from_node, "to_node": to_node},
             )
 
         if from_node == "platform_input_node" and from_output not in input_fields:
@@ -761,9 +785,11 @@ def validate_structured_responsibility_graph_input_closure(
     )
     if gaps:
         target_file, input_name = gaps[0]
-        raise ValueError(
+        raise GraphValidationError(
             "responsibility graph contains FunctionItem input without declared "
-            f"provenance; target_file={target_file}; input={input_name}"
+            f"provenance; target_file={target_file}; input={input_name}",
+            code="unresolved_input_provenance",
+            details={"target_file": target_file, "target_input": input_name},
         )
 
 

@@ -59,6 +59,49 @@ def test_script_and_skill_normalization_behaviors_remain_path_specific():
     assert _normalize_generated_file_content("SKILL.md", "```markdown\n# Skill\n```") == "# Skill"
 
 
+def test_required_resources_project_declared_dependencies_only_for_current_script():
+    entry = _entry(
+        path="scripts/a.py",
+        dependencies=["references/rules.data", "assets/static.data"],
+    )
+
+    payload = _script_local_contract_payload(
+        file_path=entry.path,
+        purpose=entry.purpose,
+        plan_entry=entry,
+        stdout_schema={"type": "object", "required": ["result"], "properties": {"result": {}}},
+    )
+
+    assert payload["required_resources"] == ["references/rules.data", "assets/static.data"]
+    assert payload["resource_refs"] == payload["required_resources"]
+
+
+def test_required_resources_do_not_scan_blueprint_prose_or_other_script_entries():
+    # Prose is intentionally absent from the frozen entry and therefore cannot
+    # contaminate its contract.  A different script's declaration is likewise
+    # not an input to this per-file projection.
+    prose = "例如 references/example.data"
+    other = _entry(path="scripts/b.py", dependencies=["references/b.data"], purpose=prose)
+    current = _entry(path="scripts/a.py", dependencies=["references/a.data"], purpose=prose)
+
+    current_payload = _script_local_contract_payload(
+        file_path=current.path,
+        purpose=current.purpose,
+        plan_entry=current,
+        stdout_schema={"type": "object", "required": ["result"], "properties": {"result": {}}},
+    )
+    other_payload = _script_local_contract_payload(
+        file_path=other.path,
+        purpose=other.purpose,
+        plan_entry=other,
+        stdout_schema={"type": "object", "required": ["result"], "properties": {"result": {}}},
+    )
+
+    assert current_payload["required_resources"] == ["references/a.data"]
+    assert other_payload["required_resources"] == ["references/b.data"]
+    assert "references/example.data" not in current_payload["required_resources"]
+
+
 def test_script_local_contract_merges_structured_tool_binding_with_explicit_values():
     clear_registered_tool_capabilities()
     register_tool_capability(ToolCapability(

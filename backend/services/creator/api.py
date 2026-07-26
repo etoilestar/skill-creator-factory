@@ -22,8 +22,8 @@ from .e2e import *  # noqa: F403
 from .repair import *  # noqa: F403
 from .generation import *  # noqa: F403
 from ..kernel_loader import load_kernel_creator_for_phase
-from ..blueprint_parser import BlueprintShapeError, exact_file_plan_paths_from_strict_skillplan, parse_blueprint, validate_blueprint_shape_for_creator
-from ..skill_plan import normalize_structured_function_items, normalize_structured_responsibility_edges, validate_structured_responsibility_edge_transport, structured_responsibility_graph_input_provenance_gaps
+from ..blueprint_parser import BlueprintShapeError, exact_file_plan_paths_from_strict_skillplan, parse_blueprint, parse_resource_source_from_block, validate_blueprint_shape_for_creator
+from ..skill_plan import file_type_for_path, normalize_structured_function_items, normalize_structured_responsibility_edges, resource_role_source_issue, validate_structured_responsibility_edge_transport, structured_responsibility_graph_input_provenance_gaps
 
 from .upload_context import save_creator_context_upload, UPLOAD_ROOT, sanitize_session_id
 from .tool_pool_store import (
@@ -4798,30 +4798,7 @@ def _preflight_prepare_blueprint_text(
                 )
             )
 
-        if normalized.startswith(
-            "assets/"
-        ):
-            if not re.search(
-                (
-                    r"(?im)"
-                    r"^\s*source\s*:\s*"
-                    r"(user_upload|bundled)\s*$"
-                ),
-                block,
-            ):
-                issues.append(
-                    _prepare_protocol_issue(
-                        "asset_missing_source",
-                        (
-                            "assets path 必须声明 "
-                            "source=user_upload "
-                            "或 source=bundled。"
-                        ),
-                        path=path,
-                        field="source",
-                    )
-                )
-
+        if normalized.startswith("assets/"):
             if re.search(
                 (
                     r"运行时|每次上传|用户输入|"
@@ -4844,6 +4821,20 @@ def _preflight_prepare_blueprint_text(
                         path=path,
                     )
                 )
+
+        source_issue = (
+            resource_role_source_issue(
+                file_type_for_path(normalized),
+                parse_resource_source_from_block(block),
+            )
+            if normalized.startswith(("references/", "assets/"))
+            else None
+        )
+        if source_issue:
+            code, message = source_issue
+            issues.append(
+                _prepare_protocol_issue(code, message, path=path, field="source")
+            )
 
         dependencies = list_field_values(
             block,
@@ -4945,6 +4936,24 @@ def _preflight_prepare_blueprint_text(
                         field="references",
                     )
                 )
+
+    # Concrete paths mentioned outside SkillPlan remain invalid topology, but
+    # never become plan entries or generation resources. File extensions are
+    # used only to distinguish a concrete file-shaped path from a directory.
+    concrete_declared = {
+        path
+        for path in _extract_declared_skill_paths(text)
+        if path.startswith(("scripts/", "references/", "assets/"))
+        and _has_file_extension(path)
+    }
+    for undeclared_path in sorted(concrete_declared - plan_path_set):
+        issues.append(
+            _prepare_protocol_issue(
+                "directory_or_text_path_missing_from_skill_plan",
+                f"蓝图中出现的具体文件 {undeclared_path} 必须在 SkillPlan path 中声明。",
+                path=undeclared_path,
+            )
+        )
 
     return issues
 
@@ -6742,6 +6751,14 @@ Do not plan the ResponsibilityGraph in this first pass.
 internal_blueprint_text is the human-readable Blueprint view and must contain the complete SkillPlan file responsibility information: path, role, purpose, inputs, outputs, dependencies, required_capabilities, forbidden_capabilities, references, constraints, and existing file-local metadata.
 
 The first pass only follows the FilePlan protocol. It may plan SKILL.md, scripts/**, references/**, assets/**, and config files.
+
+## Resource role contract（只按来源、生命周期、使用方式判断）
+
+- reference：由 Creator 在创建阶段生成的语义指导材料，例如规则、说明、约束、指南或提示原则；它用于指导脚本实现或运行，不是用户原始上传，也不是运行时产物。
+- asset：已经存在且脚本在运行时直接消费的静态文件。来源必须显式为 source=user_upload 或 source=bundled；Creator 不重新创作其内容。
+- runtime artifact：运行脚本后才产生，属于 FunctionItem outputs、stdout 或 artifact contract；不得进入 Blueprint FilePlan 的 references/** 或 assets/**。
+
+不得根据扩展名、文件名或业务领域词判断资源角色，不得自动迁移资源路径。返回 status=ready 前逐项自检：谁创建该资源；创建发生在 Creator 阶段还是运行时；用户上传/系统预置资源是否误作 reference；运行时产物是否误入 static FilePlan；reference 是否确为 Creator 生成的语义指导材料。
 
 review_summary 只是同一响应中的临时展示摘要。
 后端不会使用 review_summary 重建蓝图。

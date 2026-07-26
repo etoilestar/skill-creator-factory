@@ -97,6 +97,22 @@ def test_preflight_rejects_runtime_input_assets_and_missing_skillplan_path():
     assert "directory_or_text_path_missing_from_skill_plan" in codes
 
 
+def test_preflight_resource_source_uses_structured_parser_for_both_field_names():
+    asset = _ready_blueprint(
+        "- path: `assets/static.resource`\n  role: asset\n  asset_source: user_upload"
+    )
+    reference = _ready_blueprint(
+        "- path: `references/guide.resource`\n  role: reference\n  source: bundled"
+    )
+
+    assert "asset_missing_source" not in {
+        issue["code"] for issue in api._preflight_prepare_blueprint_text(asset)
+    }
+    assert "reference_static_source_conflict" in {
+        issue["code"] for issue in api._preflight_prepare_blueprint_text(reference)
+    }
+
+
 @pytest.mark.asyncio
 async def test_needs_clarification_response_has_one_optioned_question(monkeypatch):
     async def fake_generate(_request):

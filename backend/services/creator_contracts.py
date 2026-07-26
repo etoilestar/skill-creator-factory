@@ -66,6 +66,7 @@ class CanonicalFileContract:
     capability_requirements: list[CapabilityRequirement] = field(default_factory=list)
     side_effects: list[str] = field(default_factory=list)
     resource_refs: list[str] = field(default_factory=list)
+    required_resources: list[str] = field(default_factory=list)
     declared_dependencies: list[str] = field(default_factory=list)
     upstream_dependencies: list[str] = field(default_factory=list)
     downstream_consumers: list[str] = field(default_factory=list)
@@ -144,11 +145,26 @@ def callable_manifest_from_capability(cap: ToolCapability) -> list[CallableToolM
     return manifests
 
 
+def project_required_resources(entry: SkillPlanEntry) -> list[str]:
+    """Project only this frozen entry's explicitly declared static resources."""
+    projected: list[str] = []
+    for value in [
+        *(entry.dependencies or []),
+        *(entry.reference_files or []),
+        *(entry.skill_local_references or []),
+    ]:
+        path = str(getattr(value, "path", value) or "").strip().replace("\\", "/")
+        if path.startswith(("references/", "assets/")) and path not in projected:
+            projected.append(path)
+    return projected
+
+
 def compile_canonical_file_contract(entry: SkillPlanEntry, stdout_schema: dict[str, Any]) -> CanonicalFileContract:
     requirements = _capability_requirements_from_entry(entry)
     artifact_contract = getattr(entry, "artifact_contract", {}) or {"stdout_fields": list(entry.outputs or [])}
     inputs = [key for key in (entry.inputs or []) if _is_script_io_key(key)]
     outputs = [key for key in (entry.outputs or []) if _is_script_io_key(key)]
+    required_resources = project_required_resources(entry)
     return CanonicalFileContract(
         file_path=entry.path,
         file_kind=getattr(entry, "file_kind", entry.file_type),
@@ -159,7 +175,10 @@ def compile_canonical_file_contract(entry: SkillPlanEntry, stdout_schema: dict[s
         functional_requirements=_functional_requirements_from_entry(entry),
         capability_requirements=requirements,
         side_effects=list(getattr(entry, "side_effects", []) or []),
-        resource_refs=[getattr(r, "path", str(r)) for r in (getattr(entry, "resources", []) or [])],
+        # resource_refs remains a compatibility alias. required_resources is
+        # the authoritative per-file generation projection.
+        resource_refs=required_resources,
+        required_resources=required_resources,
         declared_dependencies=[str(dep) for dep in (entry.dependencies or []) if _is_declared_dependency(dep)],
         upstream_dependencies=list(getattr(entry, "upstream_dependencies", []) or []),
         downstream_consumers=list(getattr(entry, "downstream_consumers", []) or []),

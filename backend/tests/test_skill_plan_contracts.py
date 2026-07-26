@@ -958,6 +958,51 @@ def test_skill_plan_separates_creator_internal_from_skill_local_references():
     assert "kernel/references/workflows.md" not in entry.dependencies
 
 
+def test_resource_roles_use_declared_source_and_lifecycle_not_extension():
+    from backend.services.skill_plan import SkillPlan, SkillPlanEntry, validate_file_plan_semantics
+
+    overview = SkillPlanEntry(path="SKILL.md", role="skill_overview", file_type="skill_md", purpose="overview")
+    upload = SkillPlanEntry(
+        path="assets/arbitrary.resource",
+        role="asset",
+        file_type="asset",
+        purpose="existing static input",
+        asset_source="user_upload",
+    )
+    reference = SkillPlanEntry(
+        path="references/arbitrary.resource",
+        role="reference",
+        file_type="reference",
+        purpose="Creator-generated guidance",
+    )
+
+    issues = validate_file_plan_semantics(SkillPlan(skill_name="resource-roles", files=[overview, upload, reference]))
+
+    assert not any("assets/arbitrary.resource" in issue for issue in issues)
+    assert not any("references/arbitrary.resource" in issue for issue in issues)
+
+
+def test_runtime_output_conflicting_with_static_resource_is_reported():
+    from backend.services.skill_plan import SkillPlan, SkillPlanEntry, validate_file_plan_semantics
+
+    overview = SkillPlanEntry(path="SKILL.md", role="skill_overview", file_type="skill_md", purpose="overview")
+    static = SkillPlanEntry(
+        path="references/result.resource",
+        role="reference",
+        file_type="reference",
+        purpose="Creator-generated guidance",
+    )
+    plan = SkillPlan(
+        skill_name="conflict",
+        files=[overview, static],
+        function_items=[{"target_file": "scripts/main.py", "outputs": ["references/result.resource"]}],
+    )
+
+    assert validate_file_plan_semantics(plan) == [
+        "Runtime output cannot also be a static Creator file-plan item: references/result.resource"
+    ]
+
+
 def test_social_card_blueprint_capabilities_are_normalized_to_runtime_needs():
     from backend.services.blueprint_parser import parse_blueprint
 

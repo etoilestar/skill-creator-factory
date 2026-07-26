@@ -180,6 +180,22 @@ def _dedupe_paths(paths: list[str]) -> list[str]:
     return result
 
 
+def resource_role_source_issue(file_type: str, source: str) -> tuple[str, str] | None:
+    """Validate an already-parsed resource source without re-parsing Blueprint text."""
+    normalized_source = str(source or "").strip()
+    if file_type == "asset" and normalized_source not in {"user_upload", "bundled"}:
+        return (
+            "asset_missing_source",
+            "Asset must declare source=user_upload or source=bundled.",
+        )
+    if file_type == "reference" and normalized_source in {"user_upload", "bundled"}:
+        return (
+            "reference_static_source_conflict",
+            "Creator-generated reference cannot declare a user_upload/bundled static source.",
+        )
+    return None
+
+
 @dataclass(frozen=True)
 class RoleClassification:
     """Classifier output for a single file role decision."""
@@ -2393,14 +2409,10 @@ def validate_file_plan_semantics(plan: SkillPlan) -> list[str]:
             issues.append(f"Script file must be under scripts/: {entry.path}")
         if entry.file_type == "reference" and not entry.path.startswith("references/"):
             issues.append(f"Reference file must be under references/: {entry.path}")
-        if entry.file_type == "reference" and entry.asset_source in {"user_upload", "bundled"}:
-            issues.append(
-                f"Reference must be Creator-generated and cannot declare static source "
-                f"{entry.asset_source}: {entry.path}"
-            )
-        if entry.file_type == "asset" or entry.role == "asset" or entry.path.startswith("assets/"):
-            if entry.asset_source not in {"user_upload", "bundled"}:
-                issues.append(f"Asset must declare source=user_upload or source=bundled: {entry.path}")
+        resource_source_issue = resource_role_source_issue(entry.file_type, entry.asset_source)
+        if resource_source_issue:
+            _code, message = resource_source_issue
+            issues.append(f"{message} {entry.path}")
         if entry.file_type != "script" and entry.required_capabilities:
             issues.append(f"Resource/meta file must not declare runtime capabilities: {entry.path}")
         for dep in entry.dependencies:

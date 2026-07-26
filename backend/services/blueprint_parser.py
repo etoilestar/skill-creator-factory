@@ -212,7 +212,8 @@ def _list_field_from_block(block: str, field: str) -> list[str]:
     return values
 
 
-def _normalized_asset_source_from_block(block: str) -> str:
+def parse_resource_source_from_block(block: str) -> str:
+    """Parse the canonical resource source once at the structured parser layer."""
     source = _scalar_field_from_block(block, "source") or _scalar_field_from_block(block, "asset_source")
     source = source.strip().lower().replace("-", "_")
     aliases = {
@@ -482,7 +483,7 @@ def validate_blueprint_shape_for_creator(
             "assets/"
         ):
             source = (
-                _normalized_asset_source_from_block(
+                parse_resource_source_from_block(
                     block
                 )
             )
@@ -921,7 +922,7 @@ def parse_files_from_blueprint(
         block = path_blocks[path]
 
         source = (
-            _normalized_asset_source_from_block(
+            parse_resource_source_from_block(
                 block
             )
             if path.startswith(

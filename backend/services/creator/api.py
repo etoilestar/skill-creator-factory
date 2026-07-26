@@ -22,8 +22,8 @@ from .e2e import *  # noqa: F403
 from .repair import *  # noqa: F403
 from .generation import *  # noqa: F403
 from ..kernel_loader import load_kernel_creator_for_phase
-from ..blueprint_parser import BlueprintShapeError, exact_file_plan_paths_from_strict_skillplan, parse_blueprint, validate_blueprint_shape_for_creator
-from ..skill_plan import normalize_structured_function_items, normalize_structured_responsibility_edges, validate_structured_responsibility_edge_transport, structured_responsibility_graph_input_provenance_gaps
+from ..blueprint_parser import BlueprintShapeError, exact_file_plan_paths_from_strict_skillplan, parse_blueprint, parse_resource_source_from_block, validate_blueprint_shape_for_creator
+from ..skill_plan import file_type_for_path, normalize_structured_function_items, normalize_structured_responsibility_edges, resource_role_source_issue, validate_structured_responsibility_edge_transport, structured_responsibility_graph_input_provenance_gaps
 
 from .upload_context import save_creator_context_upload, UPLOAD_ROOT, sanitize_session_id
 from .tool_pool_store import (
@@ -4798,30 +4798,7 @@ def _preflight_prepare_blueprint_text(
                 )
             )
 
-        if normalized.startswith(
-            "assets/"
-        ):
-            if not re.search(
-                (
-                    r"(?im)"
-                    r"^\s*source\s*:\s*"
-                    r"(user_upload|bundled)\s*$"
-                ),
-                block,
-            ):
-                issues.append(
-                    _prepare_protocol_issue(
-                        "asset_missing_source",
-                        (
-                            "assets path 必须声明 "
-                            "source=user_upload "
-                            "或 source=bundled。"
-                        ),
-                        path=path,
-                        field="source",
-                    )
-                )
-
+        if normalized.startswith("assets/"):
             if re.search(
                 (
                     r"运行时|每次上传|用户输入|"
@@ -4845,20 +4822,19 @@ def _preflight_prepare_blueprint_text(
                     )
                 )
 
-        if normalized.startswith("references/"):
-            source_match = re.search(
-                r"(?im)^\s*(?:source|asset_source)\s*:\s*(user_upload|bundled)\s*$",
-                block,
+        source_issue = (
+            resource_role_source_issue(
+                file_type_for_path(normalized),
+                parse_resource_source_from_block(block),
             )
-            if source_match:
-                issues.append(
-                    _prepare_protocol_issue(
-                        "reference_static_source_conflict",
-                        "Creator-generated reference 不能同时声明 user_upload/bundled source；请修正 FilePlan，Backend 不会自动迁移路径。",
-                        path=path,
-                        field="source",
-                    )
-                )
+            if normalized.startswith(("references/", "assets/"))
+            else None
+        )
+        if source_issue:
+            code, message = source_issue
+            issues.append(
+                _prepare_protocol_issue(code, message, path=path, field="source")
+            )
 
         dependencies = list_field_values(
             block,
@@ -4960,6 +4936,24 @@ def _preflight_prepare_blueprint_text(
                         field="references",
                     )
                 )
+
+    # Concrete paths mentioned outside SkillPlan remain invalid topology, but
+    # never become plan entries or generation resources. File extensions are
+    # used only to distinguish a concrete file-shaped path from a directory.
+    concrete_declared = {
+        path
+        for path in _extract_declared_skill_paths(text)
+        if path.startswith(("scripts/", "references/", "assets/"))
+        and _has_file_extension(path)
+    }
+    for undeclared_path in sorted(concrete_declared - plan_path_set):
+        issues.append(
+            _prepare_protocol_issue(
+                "directory_or_text_path_missing_from_skill_plan",
+                f"蓝图中出现的具体文件 {undeclared_path} 必须在 SkillPlan path 中声明。",
+                path=undeclared_path,
+            )
+        )
 
     return issues
 

@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from backend.services.creator import e2e
 
 
@@ -41,3 +43,58 @@ def test_same_file_error_and_function_with_only_expression_change_is_not_progres
     before = _failure(step=3, layer="script_exit", code="script_exit", source='open("references/a.md")')
     after = _failure(step=3, layer="script_exit", code="script_exit", source='open("../references/a.md")')
     assert e2e._e2e_candidate_improved([before], [after], target_file="scripts/x.py") is False
+
+
+@pytest.mark.asyncio
+async def test_skill_failure_uses_failed_command_script_argv_schema(tmp_path, monkeypatch):
+    skill_dir = tmp_path / "demo"
+    (skill_dir / "scripts").mkdir(parents=True)
+    command = "python scripts/x.py '{\"max_images\":{{max_images}}}'"
+    (skill_dir / "SKILL.md").write_text(f"```bash\n{command}\n```\n", encoding="utf-8")
+    (skill_dir / "scripts/x.py").write_text(
+        "def parse(payload):\n"
+        "    return strict_json_argv_guard(payload, {'max_images': {'type': int, 'required': False, 'default': 5}})\n",
+        encoding="utf-8",
+    )
+    session = e2e._create_e2e_session("demo", source_skill_dir=skill_dir)
+    captured = {}
+
+    def complete(messages, *_args):
+        captured.update(json.loads(messages[1]["content"].split("\nReturn ", 1)[0]))
+        return json.dumps({"repair_target": "SKILL.md", "root_cause_hypothesis": "argv mismatch"})
+
+    monkeypatch.setattr(e2e, "_complete_chat_once_sync_for_e2e", complete)
+    failure = "E2E_STRUCTURED_FAILURE=" + json.dumps({
+        "target_file": "SKILL.md", "failed_command": command, "details": {},
+    })
+    await e2e._diagnose_e2e_failure_for_repair(
+        skill_name="demo", skill_dir=skill_dir, e2e_errors=[failure], e2e_session=session,
+    )
+    schema = captured["argv_interface_provenance_facts"]["script_actual_argv_contract"]
+    assert schema["optional_keys"] == ["max_images"]
+    assert schema["expected_types"] == {"max_images": "int"}
+
+
+@pytest.mark.asyncio
+async def test_diagnosis_uses_recorded_subprocess_cwd(tmp_path, monkeypatch):
+    skill_dir = tmp_path / "demo"
+    (skill_dir / "scripts").mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("```bash\npython scripts/x.py '{}'\n```\n", encoding="utf-8")
+    (skill_dir / "scripts/x.py").write_text("print({})\n", encoding="utf-8")
+    session = e2e._create_e2e_session("demo", source_skill_dir=skill_dir)
+    captured = {}
+
+    def complete(messages, *_args):
+        captured.update(json.loads(messages[1]["content"].split("\nReturn ", 1)[0]))
+        return json.dumps({"repair_target": "scripts/x.py", "root_cause_hypothesis": "path base"})
+
+    monkeypatch.setattr(e2e, "_complete_chat_once_sync_for_e2e", complete)
+    subprocess_cwd = str(session.workspace_dir / "scripts")
+    failure = "E2E_STRUCTURED_FAILURE=" + json.dumps({
+        "target_file": "scripts/x.py",
+        "details": {"filesystem_trace": {"current_working_directory": subprocess_cwd}},
+    })
+    await e2e._diagnose_e2e_failure_for_repair(
+        skill_name="demo", skill_dir=skill_dir, e2e_errors=[failure], e2e_session=session,
+    )
+    assert captured["runtime_filesystem_facts"]["current_working_directory"] == subprocess_cwd

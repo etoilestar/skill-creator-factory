@@ -1,7 +1,6 @@
 """E2E workflow validation, script static checks, and trial-run helpers."""
 
 import hashlib
-import os
 import uuid
 from collections import Counter
 
@@ -3120,6 +3119,7 @@ def _parse_e2e_stdout_json(
             for created in created_files
         )
     filesystem_trace = {
+        "current_working_directory": str((trial_skill_dir / "scripts").resolve()),
         "reported_paths": reported_paths,
         "resolved_reported_paths": resolved_reported_paths,
         "created_files": created_files,
@@ -4290,15 +4290,30 @@ async def _diagnose_e2e_failure_for_repair(*, skill_name: str, skill_dir: Path, 
         "exists_in_workspace": (workspace / rel).exists(),
         "resolved_workspace_absolute_path": str((workspace / rel).resolve()),
     } for rel in declared_paths]
-    script_path = workspace / symptom
+    diagnosed_script = symptom
+    if symptom == "SKILL.md":
+        failed_command = str(failure.get("failed_command") or "").strip()
+        commands = _extract_e2e_workflow_commands(workspace, skill_text)
+        matched_command = next(
+            (command for command in commands if command.raw_command.strip() == failed_command),
+            None,
+        )
+        if matched_command is not None:
+            diagnosed_script = matched_command.script_path
+    script_path = workspace / diagnosed_script
     script_schema = {}
-    if symptom.startswith("scripts/") and script_path.is_file():
+    if diagnosed_script.startswith("scripts/") and script_path.is_file():
         try:
             script_schema = extract_python_strict_argv_schema(script_path.read_text(encoding="utf-8"))
         except Exception:
             script_schema = {}
     runtime_filesystem_facts = {
-        "workspace_root": str(workspace.resolve()), "current_working_directory": os.getcwd(),
+        "workspace_root": str(workspace.resolve()),
+        "current_working_directory": str(
+            (details.get("filesystem_trace") or {}).get("current_working_directory")
+            or details.get("subprocess_cwd")
+            or (workspace / "scripts").resolve()
+        ),
         "current_script_path": str(script_path.resolve()), "current_script_directory": str(script_path.resolve().parent),
         "declared_dependencies": declared_paths, "declared_reference_paths": [p for p in declared_paths if p.startswith("references/")],
         "declared_asset_paths": [p for p in declared_paths if p.startswith("assets/")], "declared_resources": resource_facts,

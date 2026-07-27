@@ -4627,11 +4627,7 @@ def _preflight_prepare_blueprint_text(
         or ""
     )
 
-    plan_paths = (
-        _extract_prepare_skill_plan_paths(
-            text
-        )
-    )
+    plan_paths = exact_file_plan_paths_from_strict_skillplan(text)
 
     plan_path_set = set(
         plan_paths
@@ -4957,24 +4953,6 @@ def _preflight_prepare_blueprint_text(
                         field="references",
                     )
                 )
-
-    # Concrete paths mentioned outside SkillPlan remain invalid topology, but
-    # never become plan entries or generation resources. File extensions are
-    # used only to distinguish a concrete file-shaped path from a directory.
-    concrete_declared = {
-        path
-        for path in _extract_declared_skill_paths(text)
-        if path.startswith(("scripts/", "references/", "assets/"))
-        and _has_file_extension(path)
-    }
-    for undeclared_path in sorted(concrete_declared - plan_path_set):
-        issues.append(
-            _prepare_protocol_issue(
-                "directory_or_text_path_missing_from_skill_plan",
-                f"蓝图中出现的具体文件 {undeclared_path} 必须在 SkillPlan path 中声明。",
-                path=undeclared_path,
-            )
-        )
 
     return issues
 

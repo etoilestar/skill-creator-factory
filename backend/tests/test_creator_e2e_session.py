@@ -104,6 +104,51 @@ def test_seed_initial_e2e_payload_populates_typed_fields_from_script_schema(tmp_
     assert rendered[dynamic_key] == provided_value
 
 
+def test_e2e_seed_uses_frozen_platform_input_provenance_and_default(tmp_path):
+    skill_dir = tmp_path / "frozen-input"
+    skill_dir.mkdir()
+    edge = {
+        "from_node": "platform_input_node",
+        "from_output": "root_A",
+        "to_node": "scripts/x.py",
+        "to_input": "arg_B",
+        "purpose": "provide frozen runtime input",
+        "constraints": [{
+            "type": "platform_parameter_binding",
+            "source_key": "arg_B",
+            "required": False,
+            "default": 7,
+        }],
+    }
+    (skill_dir / "SKILL.md").write_text(
+        "# Frozen input\nResponsibilityEdges: " + json.dumps([edge]),
+        encoding="utf-8",
+    )
+    command = E2EWorkflowCommand(
+        1,
+        "SKILL.md",
+        "scripts/x.py",
+        "python scripts/x.py '{}'",
+        "python",
+        {"arg_B": "{{root_A.arg_B}}"},
+    )
+    requirements = {
+        "scripts/x.py": [
+            e2e.RequirementItem(target_file="scripts/x.py", inputs=["arg_B: int"])
+        ]
+    }
+
+    payload = e2e._seed_initial_e2e_payload(
+        [command],
+        skill_dir=skill_dir,
+        requirements_by_file=requirements,
+    )
+
+    assert payload["root_A"]["arg_B"] == 7
+    assert "root_B" not in payload
+    assert e2e._render_e2e_command_payload(command, payload=payload) == {"arg_B": 7}
+
+
 def test_checkpoint_saved_and_resume_from_changed_step(tmp_path, monkeypatch):
     skill_dir = _make_skill(tmp_path)
     _patch_fast_e2e(monkeypatch)

@@ -169,6 +169,25 @@ def test_platform_input_binding_resolves_input():
     assert structured_responsibility_graph_input_provenance_gaps(items, edges) == []
 
 
+def test_frozen_default_resolves_input_without_platform_edge():
+    items = [_function("scripts/a.py", ["arg_A", "arg_B=3"], ["result"])]
+    edges = [_edge("platform_input_node", "user_request", "scripts/a.py", "arg_A")]
+    assert structured_responsibility_graph_input_provenance_gaps(items, edges) == []
+    context = api._build_responsibility_graph_construction_context(
+        frozen_blueprint_text="", allowed_function_item_targets=["scripts/a.py"],
+        function_items=items, responsibility_edges=edges,
+    )
+    assert context["node_contracts"][0]["frozen_defaults"] == {"arg_B": "3"}
+    assert [domain["target_input"] for domain in context["input_source_domains"]] == ["arg_A"]
+
+
+def test_graph_rejects_external_provenance_for_frozen_default():
+    items = [_function("scripts/a.py", ["arg_B=3"], ["result"])]
+    edges = [_edge("platform_input_node", "user_request", "scripts/a.py", "arg_B")]
+    with pytest.raises(Exception, match="provenance_class_conflict"):
+        validate_structured_responsibility_edge_transport(edges, function_items=items)
+
+
 def test_graph_construction_context_contains_only_frozen_structured_topology():
     item = _function("scripts/a.py", ["value"], ["result"])
     context = api._build_responsibility_graph_construction_context(

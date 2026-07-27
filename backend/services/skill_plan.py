@@ -358,6 +358,12 @@ def _normalize_string_array(value: object, *, source: str, index: int, field: st
     return [item for item in value]
 
 
+def _function_input_identity(value: str) -> tuple[str, bool]:
+    """Return the argv identity and whether ``name=value`` freezes it locally."""
+    name, separator, _default = str(value).partition("=")
+    return name.strip(), bool(separator and name.strip())
+
+
 def normalize_structured_function_items(raw_items: object, *, source: str = "planner") -> list[dict[str, object]]:
     """Normalize structured planner FunctionItems without semantic repair."""
     if not isinstance(raw_items, list):
@@ -550,7 +556,7 @@ def validate_structured_responsibility_edge_transport(
         function_item_io = {
             str(item.get("target_file") or "").strip(): {
                 "inputs": {
-                    str(value)
+                    _function_input_identity(str(value))[0]
                     for value in (item.get("inputs") or [])
                     if str(value or "").strip()
                 },
@@ -571,6 +577,12 @@ def validate_structured_responsibility_edge_transport(
     ).strip()
 
     provenance_by_input: dict[tuple[str, str], list[tuple[int, str]]] = {}
+    locally_defaulted_inputs = {
+        (str(item.get("target_file") or ""), _function_input_identity(str(value))[0])
+        for item in (normalized_function_items if function_items is not None else [])
+        for value in (item.get("inputs") or [])
+        if _function_input_identity(str(value))[1]
+    }
     for index, edge in enumerate(normalized_edges):
         from_node = str(edge.get("from_node") or "")
         from_output = str(edge.get("from_output") or "")
@@ -723,6 +735,13 @@ def validate_structured_responsibility_edge_transport(
 
         if to_node != "platform_output_node":
             source_kind = "platform" if from_node == "platform_input_node" else "upstream"
+            if (to_node, to_input) in locally_defaulted_inputs:
+                raise GraphValidationError(
+                    f"provenance_class_conflict: target_file={to_node}; target_input={to_input}; "
+                    "FunctionItem declares a local frozen default but graph declares incoming provenance",
+                    code="provenance_class_conflict",
+                    details={"target_file": to_node, "target_input": to_input, "edge_index": index},
+                )
             provenance_by_input.setdefault((to_node, to_input), []).append((index, source_kind))
 
     for (target_file, target_input), sources in provenance_by_input.items():
@@ -765,11 +784,18 @@ def structured_responsibility_graph_input_provenance_gaps(
         (str(edge.get("to_node") or ""), str(edge.get("to_input") or ""))
         for edge in normalized_edges
     }
-    return [
-        (str(item["target_file"]), input_name)
+    defaults = {
+        (str(item["target_file"]), _function_input_identity(input_name)[0])
         for item in normalized_function_items
         for input_name in item["inputs"]
-        if (str(item["target_file"]), input_name) not in incoming
+        if _function_input_identity(input_name)[1]
+    }
+    return [
+        (str(item["target_file"]), _function_input_identity(input_name)[0])
+        for item in normalized_function_items
+        for input_name in item["inputs"]
+        if (str(item["target_file"]), _function_input_identity(input_name)[0]) not in incoming
+        and (str(item["target_file"]), _function_input_identity(input_name)[0]) not in defaults
     ]
 
 

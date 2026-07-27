@@ -136,8 +136,10 @@ def _build_e2e_callable_repair_context(
             "input_schema": tool.get("input_schema"),
             "output_schema": tool.get("output_schema"),
             "return_contract": tool.get("return_contract"),
-            "example_call": tool.get("call_template"),
-            "common_mistakes": tool.get("common_mistakes"),
+            "example_call": tool.get("example_call") or tool.get("call_template"),
+            "example_return": tool.get("example_return"),
+            "example_stdout": tool.get("example_stdout"),
+            "common_mistakes": tool.get("common_mistakes") or [],
         })
     if not compact_tools:
         return {}
@@ -5150,9 +5152,16 @@ async def _repair_prepare_blueprint_protocol(
         protocol_errors or []
     )
 
-    for _ in range(
+    previous_errors: list[dict[str, Any]] = []
+    for repair_index in range(
         MAX_PREPARE_BLUEPRINT_REPAIR_ROUNDS
     ):
+        issue_codes = [str(item.get("code") or "") for item in current_errors if isinstance(item, dict)]
+        issue_paths = [str(item.get("path") or item.get("field") or "") for item in current_errors if isinstance(item, dict)]
+        logger.info(
+            "[Creator][blueprint_repair] attempt=%d issue_codes=%s issue_paths=%s",
+            repair_index + 1, issue_codes, issue_paths,
+        )
         prompt = (
             load_kernel_creator_for_phase(
                 "prepare_plan"
@@ -5177,10 +5186,15 @@ async def _repair_prepare_blueprint_protocol(
 修复要求：
 
 - 只根据 protocol_errors 修复对应协议问题。
+- protocol_errors 中的 code、path、message、actual 是本轮必须直接消除的 validator 反馈。
 - 保留已经正确的业务目标。
 - 保留已经正确的文件职责。
 - 保留已经正确的脚本文件拓扑。
 - 不新增与 protocol_errors 无关的业务流程。
+
+这是 Blueprint 返修，不是重新规划 Skill。必须保持已经正确的用户核心需求、Script 划分、
+Script responsibility、inputs/outputs、workflow 主线和 FilePlan。优先只修 validator 指出的
+问题及必要关联内容；不得因局部格式错误重命名所有字段、重新拆 Script、新增 resources 或改变核心 workflow。
 
 Creator 协议边界：
 
@@ -5226,6 +5240,13 @@ Creator 协议边界：
                             "protocol_errors": (
                                 current_errors
                             ),
+                            "remaining_issues_from_previous_repair": (
+                                previous_errors if repair_index else []
+                            ),
+                            "repair_directive": (
+                                "The listed issue remains unresolved; directly eliminate it and do not repeat an almost identical Blueprint."
+                                if repair_index and previous_errors else "Fix the listed validator issues only."
+                            ),
                         },
                         ensure_ascii=False,
                         default=str,
@@ -5266,6 +5287,7 @@ Creator 协议边界：
             repaired
         )
 
+        previous_errors = current_errors
         current_errors = (
             _preflight_prepare_blueprint_text(
                 repaired
@@ -5274,6 +5296,13 @@ Creator 协议边界：
 
         if not current_errors:
             break
+
+    if current_errors:
+        logger.warning(
+            "[Creator][blueprint_repair] remaining_issue_codes=%s remaining_issue_paths=%s",
+            [str(item.get("code") or "") for item in current_errors if isinstance(item, dict)],
+            [str(item.get("path") or item.get("field") or "") for item in current_errors if isinstance(item, dict)],
+        )
 
     return repaired
 
@@ -7593,6 +7622,24 @@ Blueprint Planner 只规划业务责任。
 不得通过修改 Blueprint 业务目标来规避工具缺失。
 
 ## 规划约束
+
+- inputs / outputs 必须只包含纯字段名。正确：inputs: [story_theme, max_paragraphs]；
+  错误：inputs: [story_theme, max_paragraphs=5]。正确：outputs: [story_text, story_sections]；
+  错误：outputs: [story_text:string, story_sections=[]]。默认值和类型不得写进 field identity。
+
+- workflow 必须覆盖每一个 substantive script 的核心责任，顺序与主要数据依赖一致。
+
+- 只有用户需求或实际 Script responsibility 明确需要持久资源时才创建 references/assets；
+  能直接由 Script 或 Tool 完成的内容，不要额外创建静态模板、logo 或说明资源。
+
+- Script 声明的 references/assets 必须已经属于当前 FilePlan。
+
+- 只有缺失信息会实质改变核心输入、核心输出、核心 workflow，或“用户提供资源 vs Skill 自动生成”时，
+  才使用 needs_clarification。内部变量名、默认文件名前缀、普通默认值、实现细节和局部格式选择应合理默认。
+
+- 输出 status=ready 前内部检查：workflow 覆盖全部 substantive scripts；inputs/outputs 均为纯字段名；
+  Script resources 均在 FilePlan；没有无必要 resources；workflow 顺序符合主要 I/O；ready 时不再提 clarification。
+  只输出最终结果，不输出检查过程。
 
 - status=ready 前先判断需求成熟度。
 
@@ -13747,6 +13794,17 @@ async def generate_file(request: GenerateFileRequest):
                         )
 
                         workflow_allocation_summary = _load_workflow_allocation_summary(skill_name)
+                        try:
+                            reviewer_tool_usage = _build_e2e_callable_repair_context(
+                                skill_name=skill_name,
+                                target_file=request.file_path,
+                            )
+                        except Exception as tool_usage_exc:
+                            logger.warning(
+                                "[Creator][responsibility_judge_tool_usage_unavailable] skill=%s file=%s error=%s",
+                                skill_name, request.file_path, tool_usage_exc,
+                            )
+                            reviewer_tool_usage = {}
                         logger.info(
                             "[Creator][responsibility_judge_tool_pool] skill=%s file=%s summary=%s",
                             skill_name,
@@ -13775,6 +13833,11 @@ async def generate_file(request: GenerateFileRequest):
                                 ),
                                 "current_skill_tool_binding": current_skill_binding_payload,
                                 "current_file_tool_binding": current_skill_binding_payload,
+                                "tool_usage_contracts": reviewer_tool_usage.get("resolved_tools") or [],
+                                "tool_usage_review_rule": (
+                                    "不得推测 Tool 参数或返回字段。脚本读取返回字段时只能依据 supplied Tool contract；"
+                                    "contract 未声明的字段不得要求脚本读取。"
+                                ),
                                 "deterministic_issues": list(boundary_violations),
                                 "tool_readiness_observations": list(tool_readiness_observations),
                                 "requirement_graph": request.requirement_graph,
@@ -14991,18 +15054,11 @@ async def validate_skill(request: SkillActionRequest):
             e2e_callable_repair_context: dict[str, Any] | None = None
             if target_path.startswith("scripts/"):
                 try:
-                    structured_e2e_failure = _structured_failure_from_errors(blocking_errors)
                     candidate_callable_context = _build_e2e_callable_repair_context(
                         skill_name=skill_name,
                         target_file=target_path,
                     )
-                    if (
-                        candidate_callable_context
-                        and _is_callable_runtime_failure(
-                            structured_e2e_failure,
-                            candidate_callable_context,
-                        )
-                    ):
+                    if candidate_callable_context:
                         e2e_callable_repair_context = candidate_callable_context
                 except Exception as callable_context_exc:
                     logger.warning(

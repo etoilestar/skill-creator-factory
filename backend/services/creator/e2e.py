@@ -4149,6 +4149,33 @@ def _called_identities(tree: ast.AST) -> Counter[tuple[str, str]]:
     return identities
 
 
+def _called_registry_tool_context(source: str, context: dict[str, Any] | None) -> dict[str, Any]:
+    """Project frozen Registry facts to callables actually used by source."""
+    if not isinstance(context, dict):
+        return {}
+    try:
+        called = set(_called_identities(ast.parse(source)))
+    except (SyntaxError, ValueError):
+        return {}
+    owners = _registry_callable_owners(context)
+    used_tool_ids = {tool_id for identity in called for tool_id in owners.get(identity, set())}
+    resolved = [
+        tool for tool in (context.get("resolved_tools") or [])
+        if isinstance(tool, dict)
+        and (str(tool.get("import_path") or ""), str(tool.get("function_name") or "")) in called
+    ]
+    if not resolved:
+        return {}
+    return {
+        "authorization_scope": context.get("authorization_scope", "skill"),
+        "read_only": True,
+        "binding_digest": context.get("binding_digest"),
+        "selected_tool_ids": context.get("selected_tool_ids") or [],
+        "used_tool_ids": sorted(used_tool_ids),
+        "resolved_tools": resolved,
+    }
+
+
 def _callable_owner_counter(
     calls: Counter[tuple[str, str]],
     owners: dict[tuple[str, str], set[str]],
@@ -4248,6 +4275,10 @@ async def _diagnose_e2e_failure_for_repair(*, skill_name: str, skill_dir: Path, 
     rejected = [a for a in e2e_session.debug_attempts if a.get("result") == "no_progress"]
     prompt = {"structured_failure": failure, "symptom_file": symptom, "layer": failure.get("layer"), "filesystem_trace": details.get("filesystem_trace", {}), "runtime_binding_trace": details.get("runtime_binding_trace", {}), "previous_step_traces": traces, "skill_files": related, "platform_io_facts": _platform_io_repair_summary(), "read_only_callable_context": read_only_callable_context or {}, "previous_debug_attempts": rejected, "retry_reason": retry_reason}
     callable_boundary = (
+        " When the failing script calls a Registry Tool, first locate the traceback/runtime line, read its signature, "
+        "return_contract, and example_return, then compare arguments, return-field reads, and actual stdout/stderr. "
+        "Tool usage is read-only evidence, not permission to add, remove, switch, or rediscover tools. If evidence "
+        "already identifies the root cause, do not propose only changing exception text, debug prints, logging, or traceback output. "
         " For import, name, or signature failures, do not infer a replacement callable from traceback wording or "
         "follow Python 'Did you mean' suggestions as authorization. Do not use semantic or naming similarity, "
         "source-code autocomplete, module discovery, or general model knowledge. A callable identity change is valid "
@@ -4306,6 +4337,10 @@ async def _repair_existing_file_for_e2e_failure(
     standalone_repair = e2e_session is None
     if e2e_session is None:
         e2e_session = _create_e2e_session(skill_name, source_skill_dir=skill_dir)
+    if target_path.startswith("scripts/") and read_only_callable_context:
+        source_path = e2e_session.workspace_dir / target_path
+        source = source_path.read_text(encoding="utf-8", errors="replace") if source_path.is_file() else ""
+        read_only_callable_context = _called_registry_tool_context(source, read_only_callable_context)
     if _is_imported_callable_identity_failure(e2e_errors) and not read_only_callable_context:
         return {
             "status": "still_failed_same_target",
@@ -4755,9 +4790,9 @@ async def _repair_existing_file_for_e2e_failure(
             "不得检查 required_capabilities 或 coverage_requirements。\n"
             "不得重新选择、扩展、删除或重排 ToolPool；不得重新判断工具是否应该承担当前职责；"
             "不得请求工具探索或 tool_pool_patch。\n"
-            "当且仅当真实 traceback 是 import/name/signature 错误时，可以读取 read_only_callable_context "
-            "中已经授权的 Registry callable facts（含 binding_digest、resolved_tools、import_path、signature），"
-            "修正当前报错调用的 import_path、function_name、signature、参数名或返回字段读取。\n"
+            "如果当前失败脚本调用 Registry Tool，无论异常类型，都必须先读取 read_only_callable_context "
+            "中的 signature、input_schema、return_contract、output_schema、example_return 和 common_mistakes，"
+            "对照当前参数传递与返回字段读取后再修根因。该上下文只是当前源码已调用 Tool 的只读说明。\n"
             "该 context 不是新的工具选择建议。\n"
             "Only modify callable identity to an exact Registry callable contained in read_only_callable_context.\n"
             "Do not invent, infer, autocomplete, substitute, or choose a callable outside that context.\n"
@@ -4767,6 +4802,7 @@ async def _repair_existing_file_for_e2e_failure(
             "如果当前脚本的核心动作依赖一个已经授权的 callable，不得通过删除 import 但保留未定义调用、"
             "fixed text、返回示例文本、fake path、写入空文件、注释掉核心调用、mock / placeholder / simulated 实现来绕过 ImportError 或调用错误。\n"
             "应优先依据 read_only_callable_context 修正准确 import path、函数名、参数和返回字段。\n"
+            "已有 runtime evidence 足够定位时，不得只增强 exception message、Got result、debug print、logger 或 traceback 输出；这些不解决根因。\n"
             "若只读合同中没有可完成该核心动作的 callable，不要伪造实现；保留阻塞状态，让上层重新进入第一轮工具规划或人工修复。\n"
             "不得改其它文件或已通过步骤。\n"
             "优先输出 edits old_lines/new_lines exact_replace patch。"

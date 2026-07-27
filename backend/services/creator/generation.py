@@ -1803,6 +1803,10 @@ def _build_script_generate_file_prompt_variant(
             "return_contract": tool.get("return_contract"),
             "artifact_outputs": tool.get("artifact_outputs") or [],
             "side_effects": tool.get("side_effects") or [],
+            "example_call": tool.get("example_call") or tool.get("call_template"),
+            "example_return": tool.get("example_return"),
+            "example_stdout": tool.get("example_stdout"),
+            "common_mistakes": tool.get("common_mistakes") or [],
         }
         if tool.get("usage_policy"):
             compact_tool["usage_policy"] = tool["usage_policy"]
@@ -1981,6 +1985,18 @@ def _build_script_generate_file_prompt_variant(
             "output_contract.stdout_schema.required 组织。"
         ),
         (
+            "调用 Tool 前必须按顺序读取当前 compact Tool contract："
+            "1. import_path/function_name；2. signature；3. input_schema；"
+            "4. return_contract/output_schema；5. example_call；"
+            "6. example_return；7. common_mistakes。"
+            "不得根据函数名、模型常识或其它 Tool 的示例猜测参数或返回字段。"
+        ),
+        (
+            "Tool helper return 只是中间结果；output_contract.stdout_schema "
+            "才是当前 Script 的最终 stdout contract。不得从 Script stdout required fields "
+            "反推 Tool 必须返回同名字段；先按 Tool return contract 读取结果，再在脚本本地映射 stdout。"
+        ),
+        (
             "如果工具返回结构与 stdout_schema.required 不一致，"
             "脚本需要在本地完成语义映射、聚合或格式整理；"
             "只有字段名和语义都满足 required schema 时才能直接转发。"
@@ -2129,6 +2145,10 @@ def _build_script_generate_file_prompt_variant(
         (
             "动态工具 Snippet 指南（从 registry/manifest 读取，"
             "不硬编码工具名）："
+        ),
+        (
+            "Tool contract 决定真实函数调用方式；Snippet 仅为辅助示例，"
+            "不得覆盖 signature、input_schema 或 return_contract。Snippet 缺失时仍以 compact contract 为准。"
         ),
         str(
             local_contract.get(

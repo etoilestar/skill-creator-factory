@@ -291,7 +291,7 @@ def generate_stable_diffusion_image(
     topic: str,
     *,
     output_dir: str | os.PathLike[str] | None = None,
-    filename_prefix: str = "image",
+    filename_prefix: str = "generated",
     size: str | None = None,
 ) -> dict[str, Any]:
     """Generate an image with the platform Stable Diffusion model.
@@ -313,6 +313,7 @@ def generate_stable_diffusion_image(
             "prompt": english_prompt,
             "model": _required_env("IMAGE_MODEL"),
             "image_path": str(image_path),
+            "file_outputs": [str(image_path)],
             "source": "trial",
         }
 
@@ -362,6 +363,7 @@ def generate_stable_diffusion_image(
         "model": image_model,
         "size": image_size,
         "image_path": str(image_path),
+        "file_outputs": [str(image_path)],
         "mime_type": mime_type,
         "source": source,
     }

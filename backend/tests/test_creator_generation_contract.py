@@ -554,9 +554,24 @@ def test_script_prompt_deduplicates_equivalent_graph_and_tool_binding_representa
         assert registry_tool["example_stdout"] == "EXAMPLE_STDOUT_SENTINEL"
         assert registry_tool["common_mistakes"] == ["COMMON_MISTAKE_SENTINEL"]
         assert registry_tool["required_secrets"] == ["REQUIRED_SECRET_SENTINEL"]
-        assert "EXAMPLE_RETURN_SENTINEL" not in prompt
-        assert "EXAMPLE_STDOUT_SENTINEL" not in prompt
-        assert "COMMON_MISTAKE_SENTINEL" not in prompt
+        assert "EXAMPLE_RETURN_SENTINEL" in prompt
+        assert "EXAMPLE_STDOUT_SENTINEL" in prompt
+        assert "COMMON_MISTAKE_SENTINEL" in prompt
         assert "REQUIRED_SECRET_SENTINEL" not in prompt
     finally:
         clear_registered_tool_capabilities()
+
+
+def test_stable_diffusion_helper_returns_manifest_file_outputs_in_trial_mode(tmp_path, monkeypatch):
+    from backend.services.skill_runtime import generate_stable_diffusion_image
+
+    monkeypatch.setenv("SKILL_TRIAL_RUN", "1")
+    monkeypatch.setenv("IMAGE_MODEL", "fixture-image-model")
+
+    result = generate_stable_diffusion_image(
+        "A generic geometric illustration",
+        output_dir=tmp_path,
+    )
+
+    assert result["file_outputs"] == [result["image_path"]]
+    assert result["image_path"].endswith(".png")

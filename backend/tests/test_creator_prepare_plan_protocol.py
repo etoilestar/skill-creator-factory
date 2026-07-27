@@ -1,3 +1,4 @@
+import json
 import re
 
 import pytest
@@ -11,6 +12,43 @@ def _request(**kwargs):
     data = {"user_request": "做一个工具", "human_feedback": "", "model": None}
     data.update(kwargs)
     return api.PreparePlanRequest(**data)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("second_issue", "expected_repeated"),
+    [
+        ({"code": "issue_a", "path": "scripts/a.py", "message": "still invalid"}, True),
+        ({"code": "issue_b", "path": "workflow", "message": "new issue"}, False),
+    ],
+)
+async def test_blueprint_repair_marks_only_truly_repeated_issues_unresolved(
+    monkeypatch, second_issue, expected_repeated,
+):
+    initial_issue = {"code": "issue_a", "path": "scripts/a.py", "message": "invalid field"}
+    prompts = []
+    responses = iter(["candidate one", "candidate two"])
+
+    async def fake_complete(messages, *_args, **_kwargs):
+        prompts.append(json.loads(messages[1]["content"]))
+        return json.dumps({"internal_blueprint_text": next(responses)})
+
+    validation_results = iter([[second_issue], []])
+    monkeypatch.setattr(api, "complete_creator_role_once", fake_complete)
+    monkeypatch.setattr(api, "_prepare_repair_candidate_is_valid", lambda _candidate: True)
+    monkeypatch.setattr(api, "_normalize_prepare_blueprint_references", lambda candidate: candidate)
+    monkeypatch.setattr(api, "_preflight_prepare_blueprint_text", lambda _candidate: next(validation_results))
+
+    repaired = await api._repair_prepare_blueprint_protocol(
+        request=_request(),
+        blueprint_text="original blueprint",
+        protocol_errors=[initial_issue],
+    )
+
+    assert repaired == "candidate two"
+    repeated = prompts[1]["remaining_issues_from_previous_repair"]
+    assert bool(repeated) is expected_repeated
+    assert ("remains unresolved" in prompts[1]["repair_directive"]) is expected_repeated
 
 
 async def _async_result(value):

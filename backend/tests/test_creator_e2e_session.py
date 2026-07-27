@@ -765,34 +765,74 @@ def test_e2e_missing_import_runs_real_subprocess_without_import_guard_failure(tm
 
 
 @pytest.mark.asyncio
-async def test_import_error_repair_prompt_receives_read_only_callable_context(tmp_path, monkeypatch):
+async def test_value_error_repair_uses_workspace_current_called_tool_context(tmp_path, monkeypatch):
     root = tmp_path / "skills"
     skill_dir = root / "demo"
     (skill_dir / "scripts").mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text("# Demo\n", encoding="utf-8")
-    (skill_dir / "scripts" / "one.py").write_text("print('before')\n", encoding="utf-8")
+    (skill_dir / "scripts" / "one.py").write_text(
+        "from tests.fixtures.creator_tools import stale_callable\nstale_callable(text='old')\n",
+        encoding="utf-8",
+    )
     monkeypatch.setattr(e2e.settings, "skills_path", root)
     monkeypatch.setattr(e2e, "_skill_plan_entry_for_file", _generic_python_entry)
 
+    session = e2e._create_e2e_session("demo", source_skill_dir=skill_dir)
+    workspace_script = session.workspace_dir / "scripts" / "one.py"
+    workspace_script.write_text(
+        "from tests.fixtures.creator_tools import real_callable_name\n"
+        "result = real_callable_name(text='current')\n"
+        "if 'path' not in result:\n    raise ValueError('missing path')\n",
+        encoding="utf-8",
+    )
     captured = {}
+
+    async def fake_diagnose(**kwargs):
+        captured["diagnosis_context"] = kwargs["read_only_callable_context"]
+        return {
+            "repair_target": "scripts/one.py",
+            "symptom_file": "scripts/one.py",
+            "root_cause_hypothesis": "The script reads a field outside the helper return contract.",
+            "evidence": ["ValueError: missing path"],
+            "repair_instruction": "Use the declared path field.",
+            "confidence": "high",
+            "hypothesis_key": "scripts/one.py|return field",
+        }
 
     async def fake_patch(**kwargs):
         captured["task_context"] = kwargs["task_context"]
-        return None, "print('after')\n", {"changed_line_count": 1, "applied": [{"fallback_type": "test"}]}
+        return None, kwargs["current_content"].replace(
+            "if 'path' not in result:\n    raise ValueError('missing path')",
+            "path = result.get('path')",
+        ), {
+            "changed_line_count": 1,
+            "applied": [{"fallback_type": "test"}],
+        }
 
     monkeypatch.setattr(e2e, "_request_and_apply_repair_patch", fake_patch)
+    monkeypatch.setattr(e2e, "_diagnose_e2e_failure_for_repair", fake_diagnose)
     monkeypatch.setattr(e2e, "_run_e2e_sandbox_acceptance_gate", lambda **kwargs: {"accepted": True, "errors": []})
 
     context = _callable_context()
-    failure = {"stderr": "ImportError: cannot import name X from Y"}
-    from backend.services.creator import api
-    assert api._is_callable_runtime_failure(failure, context) is True
+    context["selected_tool_ids"] = ["fixture_tool.real_callable_name", "fixture_tool.unused_callable"]
+    context["resolved_tools"][0].update({
+        "input_schema": {"type": "object", "required": ["text"]},
+        "example_return": {"path": "outputs/value.txt"},
+        "common_mistakes": ["Do not read file_outputs."],
+    })
+    context["resolved_tools"].append({
+        "tool_id": "fixture_tool.unused_callable",
+        "function_name": "unused_callable",
+        "import_path": "tests.fixtures.creator_tools",
+        "signature": "unused_callable() -> dict",
+    })
 
     result = await e2e._repair_existing_file_for_e2e_failure(
         skill_name="demo",
         target_path="scripts/one.py",
-        e2e_errors=["E2E_REPAIR_TARGET=scripts/one.py\nE2E_LAYER=script_exit\nImportError: cannot import name X from Y"],
+        e2e_errors=["E2E_REPAIR_TARGET=scripts/one.py\nE2E_LAYER=script_exit\nValueError: missing path"],
         read_only_callable_context=context,
+        e2e_session=session,
     )
 
     assert result["status"] == "repaired"
@@ -802,6 +842,11 @@ async def test_import_error_repair_prompt_receives_read_only_callable_context(tm
     assert "resolved_tools" in prompt
     assert "tests.fixtures.creator_tools" in prompt
     assert "real_callable_name(text: str) -> dict" in prompt
+    assert "outputs/value.txt" in prompt
+    assert "Do not read file_outputs." in prompt
+    assert "unused_callable() -> dict" not in prompt
+    assert "stale_callable" not in prompt
+    assert captured["diagnosis_context"]["resolved_tools"][0]["function_name"] == "real_callable_name"
 
 
 def test_callable_import_change_accepts_exact_selected_registry_identity():

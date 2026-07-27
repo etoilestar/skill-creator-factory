@@ -78,3 +78,17 @@ def parse(payload):
     assert snapshot["actual_argv_schema"]["keys"] == ["arg_A", "arg_B"]
     assert snapshot["frozen_defaults"] == {"arg_B": 3}
     assert "arg_B" not in snapshot["unresolved_target_keys"]
+
+
+def test_snapshot_confirms_exact_platform_parameter_source_key():
+    snapshot = build_command_alignment_snapshot(
+        script_path="scripts/x.py", script_content=SCRIPT,
+        platform_input_fields=["fields"],
+        function_execution_context={"incoming_edges": [{
+            "from_node": "platform_input_node", "from_output": "fields",
+            "to_input": "content", "constraints": [{
+                "type": "platform_parameter_binding", "source_key": "topic",
+            }],
+        }]},
+    )
+    assert snapshot["confirmed_bindings"] == {"content": "fields.topic"}

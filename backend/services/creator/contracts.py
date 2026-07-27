@@ -506,16 +506,37 @@ def _explicit_alignment_sources(function_execution_context: Mapping[str, Any] | 
     for edge in ctx.get("incoming_edges") or []:
         if not isinstance(edge, Mapping):
             continue
-        source = str(edge.get("from_output") or "").strip()
+        source = _frozen_edge_source_identity(edge)
         if source:
             sources.add(source)
     for binding in ctx.get("input_bindings") or ctx.get("explicit_input_bindings") or []:
         if not isinstance(binding, Mapping):
             continue
-        source = str(binding.get("source") or binding.get("source_field") or "").strip()
+        source = str(
+            _whole_value_placeholder_source(binding.get("value_template"))
+            or binding.get("source")
+            or binding.get("source_field")
+            or ""
+        ).strip()
         if source:
             sources.add(source)
     return sources
+
+
+def _frozen_edge_source_identity(edge: Mapping[str, Any]) -> str:
+    """Read the exact source identity stated by one frozen graph edge."""
+    root = str(edge.get("from_output") or "").strip()
+    if not root:
+        return ""
+    for constraint in edge.get("constraints") or []:
+        if not isinstance(constraint, Mapping):
+            continue
+        if str(constraint.get("type") or "") != "platform_parameter_binding":
+            continue
+        source_key = str(constraint.get("source_key") or "").strip()
+        if source_key:
+            return f"{root}.{source_key}"
+    return root
 
 
 def _explicit_graph_confirmed_bindings(
@@ -528,15 +549,24 @@ def _explicit_graph_confirmed_bindings(
         if not isinstance(edge, Mapping):
             continue
         target = str(edge.get("to_input") or "").strip()
-        source = str(edge.get("from_output") or "").strip()
-        if target and source:
+        source = _frozen_edge_source_identity(edge)
+        if target and source and not (
+            "." in bindings.get(target, "") and "." not in source
+        ):
             bindings[target] = source
     for binding in ctx.get("input_bindings") or ctx.get("explicit_input_bindings") or []:
         if not isinstance(binding, Mapping):
             continue
         target = str(binding.get("target") or binding.get("target_key") or binding.get("to_input") or "").strip()
-        source = str(binding.get("source") or binding.get("source_field") or "").strip()
-        if target and source:
+        source = str(
+            _whole_value_placeholder_source(binding.get("value_template"))
+            or binding.get("source")
+            or binding.get("source_field")
+            or ""
+        ).strip()
+        if target and source and not (
+            "." in bindings.get(target, "") and "." not in source
+        ):
             bindings[target] = source
     return bindings
 
@@ -2581,10 +2611,10 @@ def _reconcile_block_review_with_runtime_contract(
                 _append_check(value_checks, obj=key_text, passed=False, evidence="whole-value placeholder root is not in available_source_fields", message="placeholder source is not available", category="unknown_source")
                 continue
             expected_source = exact_bindings.get(key_text)
-            if expected_source and root != _placeholder_root(expected_source):
+            if expected_source and str(source).strip() != expected_source:
                 _append_check(
                     value_checks, obj=key_text, passed=False,
-                    evidence=f"placeholder source {root!r} differs from frozen provenance {expected_source!r}",
+                    evidence=f"placeholder source {source!r} differs from frozen provenance {expected_source!r}",
                     message="command_provenance_mismatch", category="command_provenance_mismatch",
                 )
                 continue
@@ -2723,11 +2753,9 @@ async def _review_skill_md_command_block_with_model(
     incoming_edges = function_context.get("incoming_edges") if isinstance(function_context, dict) else []
     function_item = (function_context or {}).get("function_item", {}) if isinstance(function_context, dict) else {}
     frozen_defaults = function_item.get("default_values", {}) if isinstance(function_item, Mapping) else {}
-    expected_bindings = {
-        str(edge.get("to_input")): str(edge.get("from_output"))
-        for edge in (incoming_edges or [])
-        if isinstance(edge, Mapping) and edge.get("to_input") and edge.get("from_output")
-    }
+    expected_bindings = _explicit_graph_confirmed_bindings(
+        function_context if isinstance(function_context, Mapping) else {}
+    )
     available_source_fields = _available_source_fields_for_block_review(
         prior_stdout=prior_stdout,
         incoming_edges=incoming_edges,

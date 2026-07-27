@@ -4092,6 +4092,74 @@ def test_skill_md_block_reconcile_rejects_wrong_frozen_provenance():
     assert {check.get("category") for check in failed} == {"command_provenance_mismatch"}
 
 
+@pytest.mark.parametrize(
+    ("target", "expected", "actual", "passed"),
+    [
+        ("arg_A", "fields.story_theme", "fields.story_theme", True),
+        ("arg_A", "fields.story_theme", "fields.output_filename", False),
+        ("story_theme", "fields.topic", "fields.topic", True),
+        ("story_theme", "fields.topic", "fields.story_theme", False),
+        ("payload", "payload", "payload", True),
+        ("arg_A", "fields.topic", "options.topic", False),
+        ("image_paths", "generated_paths", "images", False),
+    ],
+)
+def test_skill_md_block_reconcile_compares_exact_frozen_source_identity(
+    target, expected, actual, passed
+):
+    from backend.services.creator import contracts
+
+    review = {
+        "passed": True, "target_script_path": "scripts/current.py",
+        "key_checks": [], "value_checks": [], "type_checks": [], "issues": [],
+        "repair_suggestions": "",
+    }
+    result = contracts._reconcile_block_review_with_runtime_contract(
+        review,
+        command_block=f'python scripts/current.py \'{{"{target}":"{{{{{actual}}}}}"}}\'',
+        script_path="scripts/current.py",
+        argv_schema={"allowed_keys": [target], "required_keys": [target]},
+        available_source_fields=[expected, actual],
+        expected_bindings={target: expected},
+    )
+    assert result["passed"] is passed
+    if not passed:
+        assert any(
+            not check["passed"] and check.get("category") == "command_provenance_mismatch"
+            for check in result["value_checks"]
+        )
+
+
+def test_frozen_platform_parameter_binding_uses_source_key_not_target_name():
+    from backend.services.creator import contracts
+
+    context = {
+        "incoming_edges": [{
+            "from_node": "platform_input_node", "from_output": "fields",
+            "to_node": "scripts/x.py", "to_input": "story_theme",
+            "constraints": [{"type": "platform_parameter_binding", "source_key": "topic"}],
+        }]
+    }
+    assert contracts._explicit_graph_confirmed_bindings(context) == {
+        "story_theme": "fields.topic"
+    }
+
+
+@pytest.mark.parametrize(("value", "passed"), [("3", True), ('"{{fields.arg_B}}"', False)])
+def test_skill_md_block_reconcile_preserves_frozen_default_priority(value, passed):
+    from backend.services.creator import contracts
+
+    result = contracts._reconcile_block_review_with_runtime_contract(
+        {"passed": True, "target_script_path": "scripts/x.py", "key_checks": [],
+         "value_checks": [], "type_checks": [], "issues": [], "repair_suggestions": ""},
+        command_block=f"python scripts/x.py '{{\"arg_B\":{value}}}'",
+        script_path="scripts/x.py",
+        argv_schema={"allowed_keys": ["arg_B"], "required_keys": ["arg_B"]},
+        available_source_fields=["fields"], frozen_defaults={"arg_B": 3},
+    )
+    assert result["passed"] is passed
+
+
 def test_skill_md_block_reconcile_supports_production_argv_schema_shape():
     from backend.services.creator import contracts
 

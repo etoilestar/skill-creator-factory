@@ -1,6 +1,7 @@
 """E2E workflow validation, script static checks, and trial-run helpers."""
 
 import hashlib
+import os
 import uuid
 from collections import Counter
 
@@ -2315,7 +2316,12 @@ def _e2e_failure_identity(error: str, *, target_file: str = "") -> dict[str, Any
 
 def _e2e_breakpoint_changed(before: dict[str, Any], after: dict[str, Any]) -> bool:
     """Return whether evidence shows a material new breakpoint, not noise."""
-    structural_fields = ("exception_type", "traceback_function", "traceback_source_line", "error_code", "target_region")
+    # A changed source expression is not a new breakpoint when the same
+    # operation still fails with the same category/exception/function.
+    stable_boundary = ("failed_step_index", "target_file", "layer", "error_code", "exception_type", "traceback_function")
+    if all(before.get(key) == after.get(key) for key in stable_boundary):
+        return False
+    structural_fields = ("exception_type", "traceback_function", "error_code", "target_region")
     for key in structural_fields:
         if before.get(key) and after.get(key) and before[key] != after[key]:
             return True
@@ -2353,9 +2359,15 @@ def _e2e_candidate_improved(original_errors: list[str], new_errors: list[str], *
     old_pos, new_pos = _e2e_failure_position(old_error), _e2e_failure_position(new_error)
     if old_pos == new_pos and is_artifact_failure:
         return _artifact_runtime_state_improved(_artifact_runtime_state(old_fs), _artifact_runtime_state(new_fs))
-    if new_pos > old_pos:
-        return True
     before, after = _e2e_failure_identity(old_error, target_file=target_file), _e2e_failure_identity(new_error, target_file=target_file)
+    interface_markers = {"external_input_missing", "missing_placeholder", "argv_schema_error", "argv_guard", "runtime_interface", "command_interface", "runtime_binding"}
+    same_interface_boundary = (
+        before["target_file"] == after["target_file"]
+        and (before["layer"] in interface_markers or before["error_code"] in interface_markers)
+        and (after["layer"] in interface_markers or after["error_code"] in interface_markers)
+    )
+    if new_pos > old_pos and not same_interface_boundary:
+        return True
     if (before["failed_step_index"], before["target_file"], before["layer"]) == (after["failed_step_index"], after["target_file"], after["layer"]):
         return _e2e_breakpoint_changed(before, after)
     old_target, new_target = _e2e_repair_target_from_errors(original_errors or []), _e2e_repair_target_from_errors(new_errors or [])
@@ -4271,9 +4283,40 @@ async def _diagnose_e2e_failure_for_repair(*, skill_name: str, skill_dir: Path, 
         for path in sorted(scripts_dir.glob("*.py")):
             rel = path.relative_to(workspace).as_posix()
             related[rel] = path.read_text(encoding="utf-8", errors="replace")[-(12000 if rel == symptom else 4000):]
+    skill_text = related["SKILL.md"]
+    declared_paths = sorted(set(re.findall(r"(?<![\w.-])((?:references|assets)/[^\s)`'\"]+)", skill_text)))
+    resource_facts = [{
+        "relative_path": rel,
+        "exists_in_workspace": (workspace / rel).exists(),
+        "resolved_workspace_absolute_path": str((workspace / rel).resolve()),
+    } for rel in declared_paths]
+    script_path = workspace / symptom
+    script_schema = {}
+    if symptom.startswith("scripts/") and script_path.is_file():
+        try:
+            script_schema = extract_python_strict_argv_schema(script_path.read_text(encoding="utf-8"))
+        except Exception:
+            script_schema = {}
+    runtime_filesystem_facts = {
+        "workspace_root": str(workspace.resolve()), "current_working_directory": os.getcwd(),
+        "current_script_path": str(script_path.resolve()), "current_script_directory": str(script_path.resolve().parent),
+        "declared_dependencies": declared_paths, "declared_reference_paths": [p for p in declared_paths if p.startswith("references/")],
+        "declared_asset_paths": [p for p in declared_paths if p.startswith("assets/")], "declared_resources": resource_facts,
+    }
+    argv_provenance_facts = {
+        "current_skill_command_argv": failure.get("failed_command") or "",
+        "script_actual_argv_contract": script_schema,
+        "available_platform_input_fields": _platform_io_repair_summary(),
+        "available_previous_step_stdout_fields": traces,
+        "responsibility_graph_provenance": (read_only_callable_context or {}).get("function_execution_context", {}),
+        "missing_placeholder_paths": details.get("missing_placeholders") or details.get("missing_placeholder_paths") or [],
+        "missing_placeholder_roots": details.get("missing_placeholder_roots") or [],
+        "runtime_payload_shape": failure.get("rendered_payload") or details.get("rendered_payload") or {},
+    }
     route = route_creator_file_model(file_path=symptom, purpose="E2E failure debug diagnosis only; select one repair target", requested_model=requested_model)
     rejected = [a for a in e2e_session.debug_attempts if a.get("result") == "no_progress"]
-    prompt = {"structured_failure": failure, "symptom_file": symptom, "layer": failure.get("layer"), "filesystem_trace": details.get("filesystem_trace", {}), "runtime_binding_trace": details.get("runtime_binding_trace", {}), "previous_step_traces": traces, "skill_files": related, "platform_io_facts": _platform_io_repair_summary(), "read_only_callable_context": read_only_callable_context or {}, "previous_debug_attempts": rejected, "retry_reason": retry_reason}
+    prompt = {"structured_failure": failure, "symptom_file": symptom, "layer": failure.get("layer"), "filesystem_trace": details.get("filesystem_trace", {}), "runtime_filesystem_facts": runtime_filesystem_facts, "argv_interface_provenance_facts": argv_provenance_facts, "runtime_binding_trace": details.get("runtime_binding_trace", {}), "previous_step_traces": traces, "skill_files": related, "platform_io_facts": _platform_io_repair_summary(), "read_only_callable_context": read_only_callable_context or {}, "previous_debug_attempts": rejected, "retry_reason": retry_reason}
+    logger.info("[Creator][e2e_diagnosis] source_digest=%s", _stable_json_hash(related))
     callable_boundary = (
         " When the failing script calls a Registry Tool, first locate the traceback/runtime line, read its signature, "
         "return_contract, and example_return, then compare arguments, return-field reads, and actual stdout/stderr. "
@@ -4876,6 +4919,10 @@ async def _repair_existing_file_for_e2e_failure(
         "第二轮硬性边界：只根据真实 E2E 运行失败申错改错；"
         "不得重新判断脚本职责、required_capabilities、coverage_requirements 或 helper permission；"
         "不得重新选择、扩展、删除或重排 ToolPool，不得请求工具探索或 tool_pool_patch。",
+        "",
+        "Parameter provenance rules: platform/runtime input uses its exact runtime placeholder; previous-step output uses a graph-backed placeholder; only a user/frozen-contract constant may use a literal; a script-local optional default should preferably be omitted. A literal appearing only in the failing SKILL.md command is not provenance.",
+        "Every placeholder introduced in NEW must have current runtime provenance from a platform input, previous successful stdout, frozen graph provenance, or another explicitly supplied runtime field. Do not invent options.*, fields.*, payload.*, or config.* unless that exact path exists in runtime evidence. A syntactically valid placeholder with no runtime producer is invalid.",
+        "The patch must concretely implement the supplied repair instruction. Before returning compare OLD and NEW, confirm they differ, materially change the diagnosed behavior, and correct the failing expression/interface. Do not return no-op, comments-only, logging-only, or diagnostic-only edits.",
     ])
 
 
@@ -4941,6 +4988,12 @@ async def _repair_existing_file_for_e2e_failure(
                 base_task_context
                 + "\n\n当前失败 command block：\n"
                 + str(minimal_repair_context.get("failed_command") or "")[:4000]
+            )
+
+        if "proposal_noop" in repair_feedback:
+            effective_task_context += (
+                "\n\nThe previous patch was rejected because it did not materially change "
+                "the failing behavior. Do not repeat the same edit."
             )
 
         current_repair_state = (
@@ -5485,6 +5538,14 @@ async def _repair_existing_file_for_e2e_failure(
                             "candidate_retained": candidate_retained, "candidate_rolled_back": candidate_rolled_back,
                             "experiment_key": experiment_key}
                 logger.info("[Creator][E2E][candidate_progress_decision] %s", json.dumps(decision, ensure_ascii=False, sort_keys=True, default=str))
+                before_digest = _stable_json_hash(previous_session_content)
+                candidate_digest = _stable_json_hash(session_target.read_text(encoding="utf-8"))
+                active_digest = candidate_digest if candidate_retained else before_digest
+                logger.info(
+                    "[Creator][e2e_candidate] before_revision_digest=%s candidate_revision_digest=%s decision=%s active_revision_digest=%s rollback_target_digest=%s reason=%s",
+                    before_digest, candidate_digest, "retain" if candidate_retained else "rollback",
+                    active_digest, before_digest if candidate_rolled_back else "", progress_reason,
+                )
                 if e2e_session.events:
                     e2e_session.events[-1].update(decision)
                 attempt_record = {"symptom_file": diagnosis["symptom_file"], "repair_target": target_path,

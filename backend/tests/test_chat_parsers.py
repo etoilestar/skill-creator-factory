@@ -4070,6 +4070,28 @@ def test_skill_md_block_reconcile_whole_value_placeholder_preserves_native_type(
     assert "source type is unknown" in reconciled["type_checks"][-1]["evidence"]
 
 
+def test_skill_md_block_reconcile_rejects_wrong_frozen_provenance():
+    from backend.services.creator import contracts
+
+    review = {
+        "passed": True, "target_script_path": "scripts/current.py",
+        "key_checks": [], "value_checks": [], "type_checks": [], "issues": [],
+        "repair_suggestions": "",
+    }
+    reconciled = contracts._reconcile_block_review_with_runtime_contract(
+        review,
+        command_block='python scripts/current.py \'{"arg_A":"{{other}}","arg_B":"{{fields.arg_B}}"}\'',
+        script_path="scripts/current.py",
+        argv_schema={"allowed_keys": ["arg_A", "arg_B"], "required_keys": ["arg_A", "arg_B"]},
+        available_source_fields=["user_request", "other", "fields"],
+        frozen_defaults={"arg_B": 3},
+        expected_bindings={"arg_A": "user_request"},
+    )
+    assert reconciled["passed"] is False
+    failed = [check for check in reconciled["value_checks"] if not check["passed"]]
+    assert {check.get("category") for check in failed} == {"command_provenance_mismatch"}
+
+
 def test_skill_md_block_reconcile_supports_production_argv_schema_shape():
     from backend.services.creator import contracts
 

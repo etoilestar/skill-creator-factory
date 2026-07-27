@@ -6439,15 +6439,12 @@ def _build_responsibility_graph_construction_context(
             function_items, source="graph_construction_context"
         ):
             if item["target_file"] in allowed:
-                input_contracts = [str(value).partition("=") for value in item["inputs"]]
                 node_contract = {
                     "node": item["target_file"],
-                    "inputs": [name.strip() for name, _sep, _value in input_contracts],
+                    "inputs": list(item["inputs"]),
                     "outputs": list(item["outputs"]),
                 }
-                frozen_defaults = {
-                    name.strip(): value for name, sep, value in input_contracts if sep and name.strip()
-                }
+                frozen_defaults = dict(item.get("default_values") or {})
                 if frozen_defaults:
                     node_contract["frozen_defaults"] = frozen_defaults
                 node_contracts.append(node_contract)
@@ -6458,11 +6455,14 @@ def _build_responsibility_graph_construction_context(
         for entry in (parsed.skill_plan.files if parsed.skill_plan else []):
             if entry.path not in allowed:
                 continue
-            node_contracts.append({
+            node_contract = {
                 "node": entry.path,
                 "inputs": list(entry.inputs),
                 "outputs": list(entry.outputs),
-            })
+            }
+            if entry.default_values:
+                node_contract["frozen_defaults"] = dict(entry.default_values)
+            node_contracts.append(node_contract)
 
     platform_boundary = build_platform_io_contract()["platform_skill_boundary"]
     legal_sources = [
@@ -6587,6 +6587,7 @@ def _frozen_function_items_from_blueprint(
             "outputs": list(entry.outputs),
             "required_capabilities": list(entry.required_capabilities),
             "constraints": list(entry.constraints),
+            "default_values": dict(entry.default_values),
         }
         for entry in (parsed.skill_plan.files if parsed.skill_plan else [])
         if entry.path in allowed
@@ -7310,7 +7311,7 @@ Do not emit FunctionItems in this first pass.
 Do not emit ResponsibilityEdges in this first pass.
 Do not plan the ResponsibilityGraph in this first pass.
 
-internal_blueprint_text is the human-readable Blueprint view and must contain the complete SkillPlan file responsibility information: path, role, purpose, inputs, outputs, dependencies, required_capabilities, forbidden_capabilities, references, constraints, and existing file-local metadata.
+internal_blueprint_text is the human-readable Blueprint view and must contain the complete SkillPlan file responsibility information: path, role, purpose, inputs, outputs, default_values, dependencies, required_capabilities, forbidden_capabilities, references, constraints, and existing file-local metadata. Any input decided as internal_default, constant, or creation-time fixed must be recorded in that script entry's structured default_values with its native JSON type; prose-only defaults are invalid.
 
 The first pass only follows the FilePlan protocol. It may plan SKILL.md, scripts/**, references/**, assets/**, and config files.
 
@@ -7538,7 +7539,7 @@ Blueprint / FilePlan 中必须存在真正拥有并执行该 action 的 scripts/
 
 ## file-local responsibility metadata
 
-每个 SkillPlan entry 都必须显式包含 path、role、purpose、inputs、outputs、dependencies、required_capabilities、forbidden_capabilities、references、constraints 以及现有 file-local metadata。
+每个 SkillPlan entry 都必须显式包含 path、role、purpose、inputs、outputs、default_values、dependencies、required_capabilities、forbidden_capabilities、references、constraints 以及现有 file-local metadata。internal_default、constant 或 creation-time fixed input 必须以原生 JSON 类型写入该脚本的 structured default_values，不能只写在 prose。
 
 每个 script 必须具有一个清晰的主要业务职责。
 

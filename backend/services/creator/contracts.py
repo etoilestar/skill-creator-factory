@@ -596,6 +596,10 @@ def build_command_alignment_snapshot(
         set(str(k) for k in (required or []) if str(k or "").strip())
         | set(str(k) for k in (run_analysis.get("required_read_keys") or []))
     )
+    frozen_defaults = dict(script_defaults) if isinstance(script_defaults, Mapping) else {}
+    frozen_defaults = {
+        str(key): value for key, value in frozen_defaults.items() if str(key) in set(target_keys)
+    }
 
     accepted_targets = set(target_keys)
     sources: set[str] = set()
@@ -633,13 +637,19 @@ def build_command_alignment_snapshot(
 
     unresolved = [
         key for key in required_target_keys
-        if key not in confirmed
+        if key not in confirmed and key not in frozen_defaults
     ]
 
     return {
         "script_path": script_path,
         "target_keys": target_keys,
         "required_target_keys": required_target_keys,
+        "actual_argv_schema": {
+            "keys": target_keys,
+            "required_keys": required_target_keys,
+            "expected_types": dict(schema.get("expected_types") or {}),
+        },
+        "frozen_defaults": frozen_defaults,
         "available_sources": sorted(sources),
         "confirmed_bindings": {key: confirmed[key] for key in sorted(confirmed)},
         "candidate_bindings": {key: candidates[key] for key in sorted(candidates)},
@@ -2523,6 +2533,8 @@ def _reconcile_block_review_with_runtime_contract(
     argv_schema: Any,
     available_source_fields: list[str],
     available_source_types: Mapping[str, str] | None = None,
+    frozen_defaults: Mapping[str, Any] | None = None,
+    expected_bindings: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     signature = _command_signature(command_block, script_path) or {}
     argv = signature.get("json_payload") if isinstance(signature.get("json_payload"), dict) else {}
@@ -2532,6 +2544,8 @@ def _reconcile_block_review_with_runtime_contract(
     accepted_keys = set(normalized_schema["allowed_keys"])
     expected_types = dict(normalized_schema["expected_types"])
     source_types = {str(key): str(value) for key, value in (available_source_types or {}).items() if str(key or "").strip() and str(value or "").strip()}
+    local_defaults = {str(key): value for key, value in (frozen_defaults or {}).items()}
+    exact_bindings = {str(key): str(value) for key, value in (expected_bindings or {}).items()}
 
     original_key_checks = list(review.get("key_checks") or [])
     original_value_checks = list(review.get("value_checks") or [])
@@ -2552,12 +2566,27 @@ def _reconcile_block_review_with_runtime_contract(
         key_text = str(key)
         expected_type = str(expected_types.get(key_text) or "")
         source = _whole_value_placeholder_source(value)
+        if key_text in local_defaults and value != local_defaults[key_text]:
+            _append_check(
+                value_checks, obj=key_text, passed=False,
+                evidence="command value does not equal the frozen local default",
+                message="command_provenance_mismatch", category="command_provenance_mismatch",
+            )
+            continue
         if source:
             root = _placeholder_root(source)
             value_checks = [check for check in value_checks if not _review_item_matches_key(check, key_text)]
             type_checks = [check for check in type_checks if not _review_item_matches_key(check, key_text)]
             if root not in available_roots:
                 _append_check(value_checks, obj=key_text, passed=False, evidence="whole-value placeholder root is not in available_source_fields", message="placeholder source is not available", category="unknown_source")
+                continue
+            expected_source = exact_bindings.get(key_text)
+            if expected_source and root != _placeholder_root(expected_source):
+                _append_check(
+                    value_checks, obj=key_text, passed=False,
+                    evidence=f"placeholder source {root!r} differs from frozen provenance {expected_source!r}",
+                    message="command_provenance_mismatch", category="command_provenance_mismatch",
+                )
                 continue
             _append_check(value_checks, obj=key_text, passed=True, evidence="whole-value placeholder source root exists in available_source_fields", category="source_available")
             compatibility = _json_type_compatible(source_types.get(root, ""), expected_type)
@@ -2692,6 +2721,13 @@ async def _review_skill_md_command_block_with_model(
     }
     function_context = local.get("function_execution_context") or {}
     incoming_edges = function_context.get("incoming_edges") if isinstance(function_context, dict) else []
+    function_item = (function_context or {}).get("function_item", {}) if isinstance(function_context, dict) else {}
+    frozen_defaults = function_item.get("default_values", {}) if isinstance(function_item, Mapping) else {}
+    expected_bindings = {
+        str(edge.get("to_input")): str(edge.get("from_output"))
+        for edge in (incoming_edges or [])
+        if isinstance(edge, Mapping) and edge.get("to_input") and edge.get("from_output")
+    }
     available_source_fields = _available_source_fields_for_block_review(
         prior_stdout=prior_stdout,
         incoming_edges=incoming_edges,
@@ -2716,6 +2752,8 @@ async def _review_skill_md_command_block_with_model(
         "prior_available_stdout": prior_stdout,
         "available_source_fields": available_source_fields,
         "available_source_types": available_source_types,
+        "frozen_defaults": frozen_defaults,
+        "exact_target_provenance": expected_bindings,
         "placeholder_runtime_contract": {
             "syntax": "{{source}}",
             "whole_value_preserves_native_type": True,
@@ -2798,6 +2836,8 @@ async def _review_skill_md_command_block_with_model(
                     argv_schema=local.get("strict_json_argv_schema") or {},
                     available_source_fields=available_source_fields,
                     available_source_types=available_source_types,
+                    frozen_defaults=frozen_defaults if isinstance(frozen_defaults, Mapping) else {},
+                    expected_bindings=expected_bindings,
                 )
                 # Preserve backend-established source facts for the narrowly
                 # scoped command-block repair context.

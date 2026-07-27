@@ -2096,6 +2096,11 @@ def _build_script_generate_file_prompt_variant(
             "试运行输入只用于验证处理能力，不应写成业务常量。"
         ),
         (
+            "Do not assume that the process working directory equals the Skill root. "
+            "When accessing declared references/assets at runtime, resolve the dependency consistently with the current script location, the Skill-relative declared path, and supplied runtime workspace facts. "
+            "Do not depend on launcher cwd accidentally matching the Skill root."
+        ),
+        (
             "第一轮生成时应尽量保持当前 Script contract、argv、stdout "
             "和已知上下游字段一致。E2E probe 用于观察真实执行映射并发现"
             "生成阶段未预见的问题，不是主动偏离当前已知接口的理由。"

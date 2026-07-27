@@ -1747,29 +1747,52 @@ def _seed_initial_e2e_payload(
             if isinstance(constraint, dict)
             and constraint.get("type") == "platform_parameter_binding"
         ]
-        if not root or len(bindings) != 1:
+        if not root or len(bindings) > 1:
             continue
-        binding = bindings[0]
-        source_key = str(binding.get("source_key") or "").strip()
-        if not source_key:
+        binding = bindings[0] if bindings else None
+        source_key = str((binding or {}).get("source_key") or "").strip()
+        if binding is None:
+            expr = next((
+                _whole_e2e_placeholder_expr(command.argv_template.get(target_input))
+                for command in commands
+                if command.script_path == target_file
+                and target_input in command.argv_template
+            ), None)
+            expr_parts = str(expr or "").split(".")
+            if len(expr_parts) < 2 or expr_parts[0] != root:
+                continue
+            source_key = ".".join(expr_parts[1:])
+            key_parts = expr_parts[1:]
+        elif not source_key:
             continue
+        else:
+            key_parts = [source_key]
         container = payload.get(root)
         if not isinstance(container, dict):
             if _json_value_non_empty(container):
                 continue
             container = {}
             payload[root] = container
-        if _json_value_non_empty(container.get(source_key)):
+        for key_part in key_parts[:-1]:
+            child = container.get(key_part)
+            if not isinstance(child, dict):
+                if _json_value_non_empty(child):
+                    container = None
+                    break
+                child = {}
+                container[key_part] = child
+            container = child
+        if container is None or _json_value_non_empty(container.get(key_parts[-1])):
             continue
-        if "default" in binding and binding.get("default") is not None:
-            container[source_key] = binding["default"]
+        if binding is not None and "default" in binding and binding.get("default") is not None:
+            container[key_parts[-1]] = binding["default"]
             continue
-        if "sample" in binding and binding.get("sample") is not None:
-            container[source_key] = binding["sample"]
+        if binding is not None and "sample" in binding and binding.get("sample") is not None:
+            container[key_parts[-1]] = binding["sample"]
             continue
         spec = typed_specs_by_target.get((target_file, target_input))
         if spec is not None:
-            container[source_key] = _materialize_e2e_sample_value(
+            container[key_parts[-1]] = _materialize_e2e_sample_value(
                 spec,
                 skill_dir=skill_dir,
             )

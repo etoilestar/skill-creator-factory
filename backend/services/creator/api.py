@@ -5156,6 +5156,23 @@ async def _repair_prepare_blueprint_protocol(
     for repair_index in range(
         MAX_PREPARE_BLUEPRINT_REPAIR_ROUNDS
     ):
+        current_issue_identities = {
+            (
+                str(item.get("code") or ""),
+                str(item.get("path") or item.get("field") or ""),
+            )
+            for item in current_errors
+            if isinstance(item, dict)
+        }
+        repeated_errors = [
+            item
+            for item in previous_errors
+            if isinstance(item, dict)
+            and (
+                str(item.get("code") or ""),
+                str(item.get("path") or item.get("field") or ""),
+            ) in current_issue_identities
+        ]
         issue_codes = [str(item.get("code") or "") for item in current_errors if isinstance(item, dict)]
         issue_paths = [str(item.get("path") or item.get("field") or "") for item in current_errors if isinstance(item, dict)]
         logger.info(
@@ -5240,12 +5257,11 @@ Creator 协议边界：
                             "protocol_errors": (
                                 current_errors
                             ),
-                            "remaining_issues_from_previous_repair": (
-                                previous_errors if repair_index else []
-                            ),
+                            "remaining_issues_from_previous_repair": repeated_errors,
                             "repair_directive": (
                                 "The listed issue remains unresolved; directly eliminate it and do not repeat an almost identical Blueprint."
-                                if repair_index and previous_errors else "Fix the listed validator issues only."
+                                if repair_index and repeated_errors
+                                else "Fix the listed validator issues only."
                             ),
                         },
                         ensure_ascii=False,
@@ -7623,9 +7639,9 @@ Blueprint Planner 只规划业务责任。
 
 ## 规划约束
 
-- inputs / outputs 必须只包含纯字段名。正确：inputs: [story_theme, max_paragraphs]；
-  错误：inputs: [story_theme, max_paragraphs=5]。正确：outputs: [story_text, story_sections]；
-  错误：outputs: [story_text:string, story_sections=[]]。默认值和类型不得写进 field identity。
+- inputs / outputs 必须只包含纯字段名。正确：inputs: [input_text, max_items]；
+  错误：inputs: [input_text, max_items=5]。正确：outputs: [result_text, result_sections]；
+  错误：outputs: [result_text:string, result_sections=[]]。默认值和类型不得写进 field identity。
 
 - workflow 必须覆盖每一个 substantive script 的核心责任，顺序与主要数据依赖一致。
 

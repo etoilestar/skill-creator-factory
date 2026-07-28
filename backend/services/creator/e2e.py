@@ -2470,6 +2470,8 @@ def _e2e_candidate_improved(original_errors: list[str], new_errors: list[str], *
     old_code, new_code = _failure_code_from_structured(old_structured), _failure_code_from_structured(new_structured)
     is_artifact_failure = old_code.startswith("artifact_") or new_code.startswith("artifact_")
     old_pos, new_pos = _e2e_failure_position(old_error), _e2e_failure_position(new_error)
+    if new_pos[0] == old_pos[0] and new_pos[1] < old_pos[1]:
+        return False
     if old_pos == new_pos and is_artifact_failure:
         return _artifact_runtime_state_improved(_artifact_runtime_state(old_fs), _artifact_runtime_state(new_fs))
     before, after = _e2e_failure_identity(old_error, target_file=target_file), _e2e_failure_identity(new_error, target_file=target_file)
@@ -3038,11 +3040,13 @@ def _extract_failed_argv_keys(text: str) -> list[str]:
 
 def _argv_schema_error_kind(stderr: str, stdout: str) -> str | None:
     text = f"{stderr}\n{stdout}".lower()
+    if "unexpected keyword argument" in text:
+        return None
     if "argv json must be an object" in text or "json argv must be an object" in text:
         return "non_object_argv"
     if "missing json argv" in text:
         return "missing_json_argv"
-    if "unknown key" in text or "unknown argv" in text or "unexpected key" in text or "extra key" in text:
+    if re.search(r"\b(?:unknown|unexpected|extra)\s+(?:argv\s+)?keys?\b", text, re.I):
         return "unknown_key"
     if "missing required" in text or "missing key" in text:
         return "missing_required"

@@ -1536,6 +1536,43 @@ def _structured_runtime_error(*, workspace: str, exception: str, source: str, st
     return "E2E_STRUCTURED_FAILURE=" + json.dumps(failure)
 
 
+def test_unexpected_keyword_argument_is_not_an_argv_schema_error():
+    stderr = (
+        "Traceback (most recent call last):\n"
+        "  ...\n"
+        "TypeError: example_callable() got an unexpected keyword argument 'prompt'"
+    )
+
+    assert e2e._argv_schema_error_kind(stderr, "") is None
+
+
+def test_unknown_argv_key_remains_an_argv_schema_error():
+    assert e2e._argv_schema_error_kind("ValueError: unknown argv keys: ['foo']", "") == "unknown_key"
+
+
+def test_same_step_layer_regression_is_not_debug_progress():
+    before = _structured_runtime_error(
+        workspace="/tmp/creator-e2e-session-a", exception="TypeError", source="run_tool()",
+    )
+    after_data = json.loads(before.removeprefix("E2E_STRUCTURED_FAILURE="))
+    after_data.update(layer="argv_schema_error", stderr="ValueError: unknown argv keys: ['foo']")
+    after_data["details"] = {"failure_code": "argv_schema_error"}
+    after = "E2E_STRUCTURED_FAILURE=" + json.dumps(after_data)
+
+    assert e2e._e2e_candidate_improved([before], [after], target_file="scripts/generate_images.py") is False
+
+
+def test_next_step_failure_remains_debug_progress():
+    before = _structured_runtime_error(
+        workspace="/tmp/creator-e2e-session-a", exception="TypeError", source="run_tool()", step=2,
+    )
+    after = _structured_runtime_error(
+        workspace="/tmp/creator-e2e-session-b", exception="TypeError", source="run_tool()", step=3,
+    )
+
+    assert e2e._e2e_candidate_improved([before], [after], target_file="scripts/generate_images.py") is True
+
+
 def test_same_step_new_runtime_breakpoint_is_debug_progress():
     before = _structured_runtime_error(
         workspace="/tmp/creator-e2e-session-a", exception="TypeError", source='response["text"]',

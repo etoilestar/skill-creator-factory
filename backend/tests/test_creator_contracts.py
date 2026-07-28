@@ -950,6 +950,140 @@ async def test_skill_md_reviewer_prompt_forbids_inventing_runtime_images_as_asse
     assert "不得把“Blueprint 未声明”解释为“SKILL.md 遗漏”" in prompt
 
 
+async def _run_skill_md_resource_review(monkeypatch, payload, *, content="candidate", skill_plan_entry=None):
+    from backend.services.creator import contracts
+
+    class Route:
+        model = "unit-test-model"
+
+    monkeypatch.setattr(contracts, "route_model", lambda *a, **k: Route())
+
+    async def fake_complete(_messages, _role, fallback_model):
+        return json.dumps(payload)
+
+    monkeypatch.setattr(contracts, "complete_creator_role_once", fake_complete)
+    return await contracts._review_skill_md_blueprint_intent_with_model(
+        skill_name="demo",
+        content=content,
+        blueprint_text=(
+            "Blueprint prose mentions references/parse_rules.md, "
+            "assets/template.docx, and assets/logo.png."
+        ),
+        skill_plan_entry=skill_plan_entry or {"files": [{"path": "scripts/a.py", "file_type": "script"}]},
+        requirement_graph={"requirements": [{"target_file": "scripts/a.py", "depends_on": []}]},
+    )
+
+
+def _unsupported_resource_issue(message, *, repair_target="SKILL.md"):
+    return {
+        "severity": "error",
+        "blocking": True,
+        "category": "unsupported_resource_claim",
+        "field": "resources",
+        "repair_target": repair_target,
+        "message": message,
+        "expected": "Remove the unsupported claim from SKILL.md.",
+        "minimal_edit": "Delete only the unsupported resource description.",
+        "repair_ops": [{"op": "delete", "anchor": "resource claim", "text": ""}],
+    }
+
+
+@pytest.mark.asyncio
+async def test_skill_md_unsupported_resource_claim_survives_authority_filter_and_is_repairable(monkeypatch):
+    from backend.services.creator.contracts import _skill_md_blueprint_review_to_contract_results
+
+    issue = _unsupported_resource_issue(
+        "SKILL.md claims references/parse_rules.md, assets/template.docx, and assets/logo.png without authority."
+    )
+    review = await _run_skill_md_resource_review(monkeypatch, {
+        "passed": False,
+        "reviewers": {"resource_reviewer": {"passed": False, "issues": [issue]}},
+        "issues": [issue],
+    })
+
+    assert review["passed"] is False
+    assert review["issues"][0]["blocking"] is True
+    results = _skill_md_blueprint_review_to_contract_results(review)
+    assert len(results) == 1
+    assert results[0].target.startswith("SKILL.md:")
+    assert results[0].layer == "skill_md_blueprint_alignment"
+
+
+@pytest.mark.asyncio
+async def test_skill_md_resource_removal_finding_is_not_reviewer_overreach(monkeypatch):
+    issue = _unsupported_resource_issue(
+        "SKILL.md mentions a template absent from authoritative_assets; remove that claim from SKILL.md."
+    )
+    review = await _run_skill_md_resource_review(monkeypatch, {
+        "passed": False,
+        "reviewers": {"resource_reviewer": {"passed": False, "issues": [issue]}},
+        "issues": [issue],
+    })
+
+    assert review["passed"] is False
+    assert review["issues"] == [issue]
+
+
+@pytest.mark.asyncio
+async def test_skill_md_resource_authority_expansion_remains_reviewer_overreach(monkeypatch):
+    issue = _unsupported_resource_issue(
+        "Add assets/template.docx to FilePlan.", repair_target="FilePlan"
+    )
+    review = await _run_skill_md_resource_review(monkeypatch, {
+        "passed": False,
+        "reviewers": {"resource_reviewer": {"passed": False, "issues": [issue]}},
+        "issues": [issue],
+    })
+
+    assert review["passed"] is True
+    assert review["issues"] == []
+
+
+@pytest.mark.asyncio
+async def test_skill_md_optional_unsupported_resource_claim_is_blocking(monkeypatch):
+    from backend.services.creator.contracts import _skill_md_blueprint_review_to_contract_results
+
+    issue = _unsupported_resource_issue("可选使用预置 Word 模板，但 authoritative_assets 为空。")
+    review = await _run_skill_md_resource_review(
+        monkeypatch,
+        {"passed": False, "issues": [issue], "reviewers": {"resource_reviewer": {"passed": False, "issues": [issue]}}},
+        content="可选使用预置 Word 模板。",
+    )
+
+    assert len(_skill_md_blueprint_review_to_contract_results(review)) == 1
+
+
+@pytest.mark.asyncio
+async def test_skill_md_authoritative_resource_passes_without_repair(monkeypatch):
+    from backend.services.creator.contracts import _skill_md_blueprint_review_to_contract_results
+
+    review = await _run_skill_md_resource_review(
+        monkeypatch,
+        {"passed": True, "issues": [], "reviewers": {"resource_reviewer": {"passed": True, "issues": []}}},
+        content="使用 references/rules.md 作为规则来源。",
+        skill_plan_entry={"files": [{"path": "references/rules.md", "file_type": "reference"}]},
+    )
+
+    assert review["passed"] is True
+    assert _skill_md_blueprint_review_to_contract_results(review) == []
+
+
+@pytest.mark.asyncio
+async def test_skill_md_implicit_unsupported_resource_claim_enters_localized_repair(monkeypatch):
+    from backend.services.creator.contracts import _skill_md_blueprint_review_to_contract_results
+
+    issue = _unsupported_resource_issue("内置品牌素材和预置文档版式没有 authoritative resource contract。")
+    review = await _run_skill_md_resource_review(
+        monkeypatch,
+        {"passed": False, "issues": [issue], "reviewers": {"resource_reviewer": {"passed": False, "issues": [issue]}}},
+        content="生成文档时使用内置品牌 Logo 和预置 Word 模板。",
+    )
+
+    results = _skill_md_blueprint_review_to_contract_results(review)
+    assert len(results) == 1
+    assert results[0].layer == "skill_md_blueprint_alignment"
+
+
 def test_skill_md_review_ignores_explicit_command_mapping_evidence():
     from backend.services.creator.contracts import _skill_md_blueprint_review_to_contract_results
 

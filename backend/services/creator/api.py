@@ -4623,8 +4623,133 @@ def _extract_prepare_skill_plan_paths(blueprint_text: str) -> list[str]:
     return paths
 
 
+def _is_prepare_resource_path(path: str) -> bool:
+    normalized = _normalize_skill_path(str(path or ""))
+    return normalized.startswith(("references/", "assets/")) and _has_file_extension(normalized)
+
+
+def _build_prepare_allowed_resource_paths(
+    *,
+    request: PreparePlanRequest,
+    review_summary: Any = None,
+    existing_skill_context: dict[str, Any] | None = None,
+) -> set[str]:
+    """Freeze resource authority from facts available before Blueprint repair."""
+    allowed: set[str] = set()
+    _ = review_summary  # Display/planning data is not resource provenance.
+    allowed.update(_extract_user_explicit_prepare_resource_paths(request))
+
+    for item in request.uploaded_files or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("asset_decision") or "") == "include_as_asset":
+            path = _normalize_skill_path(str(item.get("asset_target_path") or ""))
+            if path.startswith("assets/") and _is_prepare_resource_path(path):
+                allowed.add(path)
+
+    context = existing_skill_context or {}
+    for key in ("references", "assets"):
+        for raw_path in context.get(key) or []:
+            path = _normalize_skill_path(str(raw_path or ""))
+            if _is_prepare_resource_path(path):
+                allowed.add(path)
+    return allowed
+
+
+def _extract_user_explicit_prepare_resource_paths(request: PreparePlanRequest) -> set[str]:
+    """Extract literal concrete resource paths only from user-authored text."""
+    texts = [str(request.user_request or ""), str(request.human_feedback or "")]
+    texts.extend(
+        str(item.get("content") or "")
+        for item in request.conversation_history or []
+        if isinstance(item, dict) and str(item.get("role") or "").lower() == "user"
+    )
+    paths: set[str] = set()
+    for text in texts:
+        for match in re.finditer(r"(?<![\w/])(?:references|assets)/[A-Za-z0-9_.@+\-/]+", text):
+            path = _normalize_skill_path(match.group(0).rstrip("./"))
+            if _is_prepare_resource_path(path):
+                paths.add(path)
+    return paths
+
+
+def _remove_unauthorized_prepare_resources(
+    blueprint_text: str,
+    allowed_resource_paths: set[str],
+) -> tuple[str, list[str]]:
+    """Deterministically remove resource entries/references without authority."""
+    rejected: set[str] = set()
+    block_re = re.compile(
+        r"(?ims)^\s*-\s*path\s*:\s*`?([^`\n]+?)`?\s*$[\s\S]*?(?=^\s*-\s*path\s*:|^\s*#{1,6}\s+|\Z)"
+    )
+
+    def clean_block(match: re.Match[str]) -> str:
+        path = _normalize_skill_path(match.group(1).strip().strip("'\""))
+        if _is_prepare_resource_path(path) and path not in allowed_resource_paths:
+            rejected.add(path)
+            return ""
+        block = match.group(0)
+
+        def clean_field(field_match: re.Match[str]) -> str:
+            values = []
+            for raw in re.split(r"[,，、]\s*", str(field_match.group(3) or "")):
+                value = _normalize_skill_path(raw.strip().strip("'\"`"))
+                if _is_prepare_resource_path(value) and value not in allowed_resource_paths:
+                    rejected.add(value)
+                    continue
+                if value:
+                    values.append(value)
+            return f"{field_match.group(1)}{field_match.group(2)}: [{', '.join(values)}]"
+
+        return re.sub(
+            r"(?im)^(\s*)(dependencies|references)\s*:\s*\[?([^\]\n]*)\]?\s*$",
+            clean_field,
+            block,
+        )
+
+    cleaned = block_re.sub(clean_block, str(blueprint_text or ""))
+    return cleaned.strip(), sorted(rejected)
+
+
+def _enforce_prepare_plan_resource_authority(
+    plan: AnalyzeBlueprintResponse,
+    allowed_resource_paths: set[str],
+) -> list[str]:
+    rejected: set[str] = set()
+    kept_files = []
+    for file_spec in plan.files or []:
+        path = _normalize_skill_path(str(getattr(file_spec, "path", "") or ""))
+        if _is_prepare_resource_path(path) and path not in allowed_resource_paths:
+            rejected.add(path)
+            continue
+        for field in ("dependencies", "reference_files", "references"):
+            values = getattr(file_spec, field, None)
+            if not isinstance(values, list):
+                continue
+            kept = []
+            for raw in values:
+                resource = _normalize_skill_path(str(raw or ""))
+                if _is_prepare_resource_path(resource) and resource not in allowed_resource_paths:
+                    rejected.add(resource)
+                else:
+                    kept.append(raw)
+            setattr(file_spec, field, kept)
+        kept_files.append(file_spec)
+    plan.files = kept_files
+    kept_assets = []
+    for item in plan.asset_requirements or []:
+        path = _normalize_skill_path(str(getattr(item, "path", "") or ""))
+        if _is_prepare_resource_path(path) and path not in allowed_resource_paths:
+            rejected.add(path)
+            continue
+        kept_assets.append(item)
+    plan.asset_requirements = kept_assets
+    return sorted(rejected)
+
+
 def _preflight_prepare_blueprint_text(
     blueprint_text: str,
+    allowed_resource_paths: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Validate explicit SkillPlan protocol fields without semantic reconstruction.
 
@@ -4648,6 +4773,17 @@ def _preflight_prepare_blueprint_text(
     plan_path_set = set(
         plan_paths
     )
+
+    if allowed_resource_paths is not None:
+        for path in plan_paths:
+            normalized = _normalize_skill_path(path)
+            if _is_prepare_resource_path(normalized) and normalized not in allowed_resource_paths:
+                issues.append(_prepare_protocol_issue(
+                    "unjustified_resource_reference",
+                    "Resource path has no frozen upstream authority. Remove this SkillPlan entry; source=bundled is not provenance.",
+                    path=normalized,
+                    field="SkillPlan",
+                ))
 
     dynamic_re = re.compile(
         (
@@ -4906,6 +5042,19 @@ def _preflight_prepare_blueprint_text(
             )
 
             if (
+                allowed_resource_paths is not None
+                and _is_prepare_resource_path(normalized_dependency)
+                and normalized_dependency not in allowed_resource_paths
+            ):
+                issues.append(_prepare_protocol_issue(
+                    "unjustified_resource_reference",
+                    "Resource path has no frozen upstream authority. Remove this dependency from the owning script; do not add a resource SkillPlan entry or invent source=bundled.",
+                    path=normalized_dependency,
+                    field="dependencies",
+                ))
+                continue
+
+            if (
                 normalized_dependency.startswith(
                     (
                         "references/",
@@ -4940,6 +5089,19 @@ def _preflight_prepare_blueprint_text(
                     reference
                 )
             )
+
+            if (
+                allowed_resource_paths is not None
+                and _is_prepare_resource_path(normalized_reference)
+                and normalized_reference not in allowed_resource_paths
+            ):
+                issues.append(_prepare_protocol_issue(
+                    "unjustified_resource_reference",
+                    "Resource path has no frozen upstream authority. Remove this reference from the owning script; do not add a resource SkillPlan entry or invent source=bundled.",
+                    path=normalized_reference,
+                    field="references",
+                ))
+                continue
 
             if (
                 normalized_reference.startswith(
@@ -5078,6 +5240,7 @@ def _insert_prepare_reference_plan_blocks(blueprint_text: str, blocks: list[str]
 
 def _normalize_prepare_blueprint_references(
     blueprint_text: str,
+    allowed_resource_paths: set[str] | None = None,
 ) -> str:
     """Ensure explicit SkillPlan reference dependencies have file blocks.
 
@@ -5106,6 +5269,10 @@ def _normalize_prepare_blueprint_references(
             text
         )
         if path not in plan_paths
+        and (
+            allowed_resource_paths is None
+            or path in allowed_resource_paths
+        )
     )
 
     if not missing:
@@ -5127,6 +5294,7 @@ async def _repair_prepare_blueprint_protocol(
     request: PreparePlanRequest,
     blueprint_text: str,
     protocol_errors: list[dict[str, Any]],
+    allowed_resource_paths: set[str] | None = None,
 ) -> str:
     """Repair Creator blueprint hard-protocol violations only.
 
@@ -5218,6 +5386,7 @@ Creator 协议边界：
 - 运行时产物只能出现在脚本 outputs/stdout/file_outputs。
 - resources 只能引用 SkillPlan 已声明的 references/assets。
 - references/*.md 引用必须对应 SkillPlan path。
+- unjustified_resource_reference 必须从所属脚本删除 dependency/reference，并删除对应资源 entry；不得新增 reference/asset entry，不得编造 source=bundled。
 - 不得把 kernel/protocol 示例 reference path 复制成业务文件。
 - required_capabilities 只能表达抽象语义能力。
 - 不得填写具体 Registry tool_id。
@@ -5278,10 +5447,20 @@ Creator 协议边界：
         ).strip()
 
         candidate = (
-            _normalize_prepare_blueprint_references(
-                candidate
-            )
+            _normalize_prepare_blueprint_references(candidate, allowed_resource_paths)
+            if allowed_resource_paths is not None
+            else _normalize_prepare_blueprint_references(candidate)
         )
+        if allowed_resource_paths is not None:
+            candidate, rejected = _remove_unauthorized_prepare_resources(
+                candidate,
+                allowed_resource_paths,
+            )
+            if rejected:
+                logger.info(
+                    "[Creator][resource_authority] allowed_resources=%s rejected_resources=%s",
+                    sorted(allowed_resource_paths), rejected,
+                )
 
         if not _prepare_repair_candidate_is_valid(
             candidate
@@ -5299,9 +5478,9 @@ Creator 协议边界：
 
         previous_errors = current_errors
         current_errors = (
-            _preflight_prepare_blueprint_text(
-                repaired
-            )
+            _preflight_prepare_blueprint_text(repaired, allowed_resource_paths)
+            if allowed_resource_paths is not None
+            else _preflight_prepare_blueprint_text(repaired)
         )
 
         if not current_errors:
@@ -8004,6 +8183,11 @@ Blueprint Planner 只规划业务责任。
     data.pop("function_items", None)
     data.pop("responsibility_edges", None)
     first_planner_result = dict(data)
+    allowed_resource_paths = _build_prepare_allowed_resource_paths(
+        request=request,
+        review_summary=first_planner_result.get("review_summary"),
+        existing_skill_context=existing_context,
+    )
     frozen_blueprint_text = str(
         first_planner_result.get("internal_blueprint_text")
         or ""
@@ -8048,7 +8232,8 @@ Blueprint Planner 只规划业务责任。
             )
         protocol_errors.extend(
             _preflight_prepare_blueprint_text(
-                frozen_blueprint_text
+                frozen_blueprint_text,
+                allowed_resource_paths,
             )
         )
         repair_index = -1
@@ -8060,6 +8245,7 @@ Blueprint Planner 只规划业务责任。
                     request=request,
                     blueprint_text=frozen_blueprint_text,
                     protocol_errors=protocol_errors,
+                    allowed_resource_paths=allowed_resource_paths,
                 )
             except Exception as exc:
                 raise PreparePlanProtocolError(
@@ -8076,7 +8262,10 @@ Blueprint Planner 只规划业务责任。
                     "invalid_strict_blueprint_shape", str(exc),
                     field="internal_blueprint_text",
                 ))
-            protocol_errors.extend(_preflight_prepare_blueprint_text(frozen_blueprint_text))
+            protocol_errors.extend(_preflight_prepare_blueprint_text(
+                frozen_blueprint_text,
+                allowed_resource_paths,
+            ))
         if protocol_errors:
             raise PreparePlanProtocolError(
                 "Planner ready Blueprint failed strict FilePlan preflight "
@@ -8091,6 +8280,14 @@ Blueprint Planner 只规划业务责任。
             }
             data = dict(first_planner_result)
 
+        frozen_blueprint_text, rejected_resources = _remove_unauthorized_prepare_resources(
+            frozen_blueprint_text,
+            allowed_resource_paths,
+        )
+        logger.info(
+            "[Creator][resource_authority] allowed_resources=%s rejected_resources=%s",
+            sorted(allowed_resource_paths), rejected_resources,
+        )
         authoritative_paths = _extract_prepare_skill_plan_paths(frozen_blueprint_text)
         logger.info(
             "[Creator][file_plan_authority] authoritative_scripts=%s authoritative_references=%s authoritative_assets=%s",
@@ -8133,6 +8330,29 @@ Blueprint Planner 只规划业务责任。
                 requirement_allocations=requirement_allocations,
                 blocking_issues=semantic_review["issues"], planner_model=route.model,
             )
+            frozen_blueprint_text, rejected_resources = _remove_unauthorized_prepare_resources(
+                frozen_blueprint_text,
+                allowed_resource_paths,
+            )
+            logger.info(
+                "[Creator][resource_authority] allowed_resources=%s rejected_resources=%s",
+                sorted(allowed_resource_paths), rejected_resources,
+            )
+            try:
+                validate_blueprint_shape_for_creator(frozen_blueprint_text)
+            except BlueprintShapeError as exc:
+                raise PreparePlanProtocolError(
+                    f"Blueprint semantic replan failed strict shape after resource authority enforcement: {exc}"
+                ) from exc
+            protocol_errors = _preflight_prepare_blueprint_text(
+                frozen_blueprint_text,
+                allowed_resource_paths,
+            )
+            if protocol_errors:
+                raise PreparePlanProtocolError(
+                    "Blueprint semantic replan failed protocol after resource authority enforcement; "
+                    f"errors={protocol_errors}"
+                )
             allowed_function_item_targets = _resolve_allowed_function_item_targets_from_blueprint(
                 frozen_blueprint_text
             )
@@ -10465,13 +10685,26 @@ async def _prepare_plan_impl(
     # No business planner and no review_summary -> blueprint conversion.
     # ------------------------------------------------------------------
 
+    allowed_resource_paths = _build_prepare_allowed_resource_paths(
+        request=request,
+        existing_skill_context=(
+            _read_prepare_existing_skill_context(skill_name)
+            if request.mode == "revise"
+            else {}
+        ),
+    )
+
     blueprint_text = (
         _normalize_prepare_blueprint_references(
-            blueprint_text
+            blueprint_text,
+            allowed_resource_paths,
         )
     )
 
-    protocol_errors = _preflight_prepare_blueprint_text(blueprint_text)
+    protocol_errors = _preflight_prepare_blueprint_text(
+        blueprint_text,
+        allowed_resource_paths,
+    )
     repair_index = -1
     for repair_index in range(2):
         if not protocol_errors:
@@ -10480,14 +10713,20 @@ async def _prepare_plan_impl(
             blueprint_text = await _repair_prepare_blueprint_protocol(
                 request=request, blueprint_text=blueprint_text,
                 protocol_errors=protocol_errors,
+                allowed_resource_paths=allowed_resource_paths,
             )
         except Exception as exc:
             raise PreparePlanProtocolError(
                 "Confirmed Blueprint protocol repair failed; "
                 f"repair_index={repair_index}; error={type(exc).__name__}: {exc}"
             ) from exc
-        blueprint_text = _normalize_prepare_blueprint_references(blueprint_text)
-        protocol_errors = _preflight_prepare_blueprint_text(blueprint_text)
+        blueprint_text = _normalize_prepare_blueprint_references(
+            blueprint_text, allowed_resource_paths
+        )
+        protocol_errors = _preflight_prepare_blueprint_text(
+            blueprint_text,
+            allowed_resource_paths,
+        )
 
     if protocol_errors:
         summary = await project_summary(blueprint_text, prepared)
@@ -10550,7 +10789,8 @@ async def _prepare_plan_impl(
     for attempt in range(3):
         blueprint_text = (
             _normalize_prepare_blueprint_references(
-                blueprint_text
+                blueprint_text,
+                allowed_resource_paths,
             )
         )
 
@@ -10624,12 +10864,14 @@ async def _prepare_plan_impl(
                                 ),
                             }
                         ],
+                        allowed_resource_paths=allowed_resource_paths,
                     )
                 )
 
                 blueprint_text = (
                     _normalize_prepare_blueprint_references(
-                        blueprint_text
+                        blueprint_text,
+                        allowed_resource_paths,
                     )
                 )
 
@@ -10638,7 +10880,8 @@ async def _prepare_plan_impl(
 
             protocol_errors = (
                 _preflight_prepare_blueprint_text(
-                    blueprint_text
+                    blueprint_text,
+                    allowed_resource_paths,
                 )
             )
 
@@ -10651,12 +10894,15 @@ async def _prepare_plan_impl(
                         request=request,
                         blueprint_text=blueprint_text,
                         protocol_errors=protocol_errors,
+                        allowed_resource_paths=allowed_resource_paths,
                     )
                     blueprint_text = _normalize_prepare_blueprint_references(
-                        blueprint_text
+                        blueprint_text,
+                        allowed_resource_paths,
                     )
                     protocol_errors = _preflight_prepare_blueprint_text(
-                        blueprint_text
+                        blueprint_text,
+                        allowed_resource_paths,
                     )
                     analyze_errors = protocol_errors
                 except Exception:
@@ -10675,6 +10921,15 @@ async def _prepare_plan_impl(
                 field="analyze_blueprint",
             )],
         )
+
+    rejected_resources = _enforce_prepare_plan_resource_authority(
+        plan,
+        allowed_resource_paths,
+    )
+    logger.info(
+        "[Creator][resource_authority] allowed_resources=%s rejected_resources=%s",
+        sorted(allowed_resource_paths), rejected_resources,
+    )
 
     (
         confirmed_uploaded_assets,

@@ -1732,6 +1732,13 @@ def _seed_initial_e2e_payload(
         (spec.target_file, spec.name): spec
         for spec in typed_specs
     }
+    defaults_by_target = {
+        (target_file, str(input_name)): default_value
+        for target_file, entry in (skill_plan_entries or {}).items()
+        for input_name, default_value in (
+            getattr(entry, "default_values", {}) or {}
+        ).items()
+    }
     responsibility_edges = parse_responsibility_edges(
         _read_e2e_skill_md_for_samples(skill_dir)
     )
@@ -1787,6 +1794,10 @@ def _seed_initial_e2e_payload(
         if binding is not None and "default" in binding and binding.get("default") is not None:
             container[key_parts[-1]] = binding["default"]
             continue
+        target_default = (target_file, target_input)
+        if target_default in defaults_by_target:
+            container[key_parts[-1]] = defaults_by_target[target_default]
+            continue
         if binding is not None and "sample" in binding and binding.get("sample") is not None:
             container[key_parts[-1]] = binding["sample"]
             continue
@@ -1796,6 +1807,39 @@ def _seed_initial_e2e_payload(
                 spec,
                 skill_dir=skill_dir,
             )
+
+    platform_edge_targets = {
+        (
+            str(edge.get("to_node") or "").strip(),
+            str(edge.get("to_input") or "").strip(),
+        )
+        for edge in responsibility_edges
+        if str(edge.get("from_node") or "") == "platform_input_node"
+    }
+    for (target_file, input_name), default_value in defaults_by_target.items():
+        if (target_file, input_name) in platform_edge_targets:
+            continue
+        expr = next((
+            _whole_e2e_placeholder_expr(command.argv_template.get(input_name))
+            for command in commands
+            if command.script_path == target_file
+            and input_name in command.argv_template
+        ), None)
+        path_parts = str(expr or "").split(".")
+        if len(path_parts) < 2:
+            continue
+        container = payload
+        for path_part in path_parts[:-1]:
+            child = container.get(path_part)
+            if not isinstance(child, dict):
+                if _json_value_non_empty(child):
+                    container = None
+                    break
+                child = {}
+                container[path_part] = child
+            container = child
+        if container is not None and not _json_value_non_empty(container.get(path_parts[-1])):
+            container[path_parts[-1]] = default_value
 
     platform_roots = {"user_request", "input", "text", "payload", "fields", "options", "input_files", "files", "resources"}
     for spec in typed_specs:

@@ -696,6 +696,77 @@ def test_preflight_missing_skill_plan_message_includes_path():
     assert "references/test-missing-preflight.md" in issue["message"]
 
 
+def test_resource_authority_removes_hallucinated_entries_and_script_links():
+    script = (
+        "- path: `scripts/a.py`\n  role: script\n  inputs: []\n  outputs: []\n"
+        "  dependencies: [references/foo.md, assets/template.docx]\n"
+        "  required_capabilities: []\n  forbidden_capabilities: []\n"
+        "  references: [references/foo.md]"
+    )
+    resources = (
+        "\n- path: `references/foo.md`\n  role: reference\n  source: bundled"
+        "\n- path: `assets/template.docx`\n  role: asset\n  source: bundled"
+    )
+    cleaned, rejected = api._remove_unauthorized_prepare_resources(
+        _ready_blueprint(script + resources),
+        set(),
+    )
+
+    assert rejected == ["assets/template.docx", "references/foo.md"]
+    assert "- path: `references/foo.md`" not in cleaned
+    assert "- path: `assets/template.docx`" not in cleaned
+    script_block = cleaned[cleaned.index("- path: `scripts/a.py`"):cleaned.index("### 宿主执行方式")]
+    assert "dependencies: []" in script_block
+    assert "references: []" in script_block
+
+
+def test_resource_authority_keeps_upstream_declared_reference():
+    summary = {"files_to_create_or_update": ["SKILL.md", "references/foo.md"]}
+    allowed = api._build_prepare_allowed_resource_paths(
+        request=_request(),
+        review_summary=summary,
+    )
+    blueprint = _ready_blueprint(
+        "- path: `scripts/a.py`\n  role: script\n  inputs: []\n  outputs: []\n"
+        "  dependencies: []\n  required_capabilities: []\n  forbidden_capabilities: []\n"
+        "  references: [references/foo.md]\n"
+        "- path: `references/foo.md`\n  role: reference\n  source: bundled"
+    )
+    cleaned, rejected = api._remove_unauthorized_prepare_resources(blueprint, allowed)
+
+    assert allowed == {"references/foo.md"}
+    assert rejected == []
+    assert "references: [references/foo.md]" in cleaned
+    assert "- path: `references/foo.md`" in cleaned
+
+
+@pytest.mark.asyncio
+async def test_blueprint_repair_cannot_expand_frozen_resource_authority(monkeypatch):
+    initial = _ready_blueprint(
+        "- path: `scripts/a.py`\n  role: script\n  inputs: []\n  outputs: []\n"
+        "  dependencies: []\n  required_capabilities: []\n  forbidden_capabilities: []\n"
+        "  references: [references/a.md]"
+    )
+    repaired_candidate = initial.replace(
+        "references: [references/a.md]",
+        "references: [references/a.md, references/b.md]",
+    ) + "\n- path: `references/b.md`\n  role: reference\n  source: bundled\n"
+
+    async def fake_complete(*_args, **_kwargs):
+        return json.dumps({"internal_blueprint_text": repaired_candidate})
+
+    monkeypatch.setattr(api, "complete_creator_role_once", fake_complete)
+    repaired = await api._repair_prepare_blueprint_protocol(
+        request=_request(),
+        blueprint_text=initial,
+        protocol_errors=[{"code": "issue", "path": "scripts/a.py"}],
+        allowed_resource_paths={"references/a.md"},
+    )
+
+    assert "references/a.md" in repaired
+    assert "references/b.md" not in repaired
+
+
 def _script_plan_block(path: str) -> str:
     return (
         f"- path: `{path}`\n"

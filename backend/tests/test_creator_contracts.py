@@ -1025,7 +1025,9 @@ async def test_skill_md_resource_removal_finding_is_not_reviewer_overreach(monke
 
 
 @pytest.mark.asyncio
-async def test_skill_md_resource_authority_expansion_remains_reviewer_overreach(monkeypatch):
+async def test_skill_md_resource_authority_expansion_sanitizes_repair_but_keeps_blocking_finding(monkeypatch):
+    from backend.services.creator.contracts import _skill_md_blueprint_review_to_contract_results
+
     issue = _unsupported_resource_issue(
         "Add assets/template.docx to FilePlan.", repair_target="FilePlan"
     )
@@ -1035,8 +1037,19 @@ async def test_skill_md_resource_authority_expansion_remains_reviewer_overreach(
         "issues": [issue],
     })
 
-    assert review["passed"] is True
-    assert review["issues"] == []
+    assert review["passed"] is False
+    assert len(review["issues"]) == 1
+    sanitized = review["issues"][0]
+    assert sanitized["category"] == "unsupported_resource_claim"
+    assert sanitized["blocking"] is True
+    assert sanitized["repair_target"] == "SKILL.md"
+    assert sanitized["repair_ops"] == []
+    results = _skill_md_blueprint_review_to_contract_results(review)
+    assert len(results) == 1
+    repair_instruction = results[0].minimal_edit
+    assert "Add assets/template.docx to FilePlan" not in repair_instruction
+    assert "Add assets/template.docx to FilePlan" not in json.dumps(results[0].details)
+    assert "不得修改 Blueprint、FilePlan" in repair_instruction
 
 
 @pytest.mark.asyncio

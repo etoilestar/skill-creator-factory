@@ -2134,15 +2134,47 @@ async def _review_skill_md_blueprint_intent_with_model(
         data["issues"] = reviewer_issues
 
     data["issues"] = _dedupe_review_issues(data["issues"])
+    reviewer_repair_overreach = False
     for issue in data["issues"]:
         if isinstance(issue, dict) and _skill_md_issue_is_unsupported_resource_claim(issue):
+            proposed_target = str(issue.get("repair_target") or "").strip()
+            repair_ops = issue.get("repair_ops")
+            invalid_repair_ops = isinstance(repair_ops, list) and any(
+                not isinstance(op, dict)
+                or str(op.get("op") or "").strip() not in {"delete", "replace"}
+                for op in repair_ops
+            )
+            if proposed_target not in {"", "SKILL.md"} or invalid_repair_ops:
+                reviewer_repair_overreach = True
+                logger.warning(
+                    "[Creator][skill_md][reviewer_repair_overreach] target=%s repair_ops=%s",
+                    proposed_target,
+                    repair_ops,
+                )
+                issue["message"] = "SKILL.md contains a resource claim unsupported by authoritative contracts."
+                issue["evidence"] = "The semantic resource reviewer identified an unsupported claim in SKILL.md."
+                issue["expected"] = "Remove the unsupported claim from SKILL.md without changing resource authority."
+                issue["minimal_edit"] = "Delete only the unsupported resource claim from SKILL.md."
+                issue["repair_ops"] = []
+                for field in ("fix", "suggested_fix", "repair_suggestions"):
+                    issue.pop(field, None)
             issue["severity"] = "error"
             issue["blocking"] = True
-            issue.setdefault("repair_target", "SKILL.md")
+            issue["repair_target"] = "SKILL.md"
             data["passed"] = False
             resource_reviewer = data["reviewers"].get("resource_reviewer")
             if isinstance(resource_reviewer, dict):
                 resource_reviewer["passed"] = False
+    if reviewer_repair_overreach:
+        data["repair_suggestions"] = ""
+    sanitized_resource_issues = [
+        dict(issue)
+        for issue in data["issues"]
+        if _skill_md_issue_is_unsupported_resource_claim(issue)
+    ]
+    resource_reviewer = data["reviewers"].get("resource_reviewer")
+    if sanitized_resource_issues and isinstance(resource_reviewer, dict):
+        resource_reviewer["issues"] = sanitized_resource_issues
     if data.get("passed") is not True and any(str(issue.get("severity") or "error").lower() in {"error", "blocking", "blocker"} for issue in data["issues"] if isinstance(issue, dict)):
         data["passed"] = False
 

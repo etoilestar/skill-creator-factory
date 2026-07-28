@@ -851,6 +851,7 @@ def _build_skill_md_contract_text(blueprint_text: str) -> str:
         "- 多场景、多图片、多页 PDF 等循环应由脚本实现；SKILL.md 第一轮只需保持命令块静态可解析。",
         "",
         "E. references/assets:",
+        "- 不得编造或保留 authoritative resource/file contracts 未支持的 references、assets、模板、静态文件或其它资源依赖；Blueprint prose 只是描述上下文，不能授权新增资源。",
         "- references/*.md 为只读参考资料，可按需由相关脚本按路径只读加载，用于获取格式、布局、模板或规则说明。",
         "- references/*.md 不作为独立执行步骤，不被修改，不产出文件，不作为上传素材，也不作为最终 artifact。",
         "- 如果脚本不需要运行时读取 reference，也可以说明其内容已在脚本设计阶段被吸收为实现规范。",
@@ -1629,7 +1630,36 @@ def _compact_requirement_graph_for_skill_md_review(raw_graph: Any) -> dict[str, 
     return {"requirements": requirements}
 
 
+def _skill_md_issue_is_unsupported_resource_claim(issue: Any) -> bool:
+    return (
+        isinstance(issue, dict)
+        and str(issue.get("category") or issue.get("claim_type") or "").strip().lower()
+        == "unsupported_resource_claim"
+    )
+
+
+def _skill_md_issue_is_authorized_resource_removal(issue: dict[str, Any]) -> bool:
+    """Allow findings that only remove a claim from SKILL.md, never authority edits."""
+    if not _skill_md_issue_is_unsupported_resource_claim(issue):
+        return False
+    if str(issue.get("repair_target") or "").strip() != "SKILL.md":
+        return False
+    repair_ops = issue.get("repair_ops")
+    if not isinstance(repair_ops, list):
+        return True
+    return all(
+        isinstance(op, dict) and str(op.get("op") or "").strip() in {"delete", "replace"}
+        for op in repair_ops
+    )
+
+
 def _skill_md_overall_semantic_repair_scope(issue: dict[str, Any]) -> str:
+    if _skill_md_issue_is_unsupported_resource_claim(issue):
+        return (
+            "修复目标只能是 SKILL.md：删除 unsupported resource claim，或仅依据 authoritative contracts 改写；"
+            "不得修改 Blueprint、FilePlan、FunctionItems、references 或 assets。"
+            "把 unsupported resource 改成可选、建议或必要时使用不算修复，必须彻底删除该 claim。"
+        )
     return (
         "只允许修改 SKILL.md 的说明文字、职责说明、文件清单、资源说明和最终产物说明；"
         "不得修改任何 ```bash/sh/shell fenced command block。"
@@ -1705,6 +1735,8 @@ def _command_block_failure_details(
 def _skill_md_reviewer_issue_contradicts_passed_true(issue: Any) -> bool:
     if not isinstance(issue, dict):
         return False
+    if _skill_md_issue_is_unsupported_resource_claim(issue):
+        return True
     severity = str(issue.get("severity") or "").strip().lower()
     return issue.get("blocking") is True or (severity == "error" and issue.get("blocking") is not False)
 
@@ -1728,6 +1760,14 @@ def _skill_md_reviewer_schema_error(data: Any) -> str:
         return "SKILL.md semantic reviewer JSON field issues must be list when present."
     if "repair_suggestions" in data and not isinstance(data.get("repair_suggestions"), str):
         return "SKILL.md semantic reviewer JSON field repair_suggestions must be string when present."
+    issue_groups = [data.get("issues") or []]
+    for reviewer_result in (data.get("reviewers") or {}).values():
+        if isinstance(reviewer_result, dict):
+            issue_groups.append(reviewer_result.get("issues") or [])
+    for issues in issue_groups:
+        for issue in issues if isinstance(issues, list) else []:
+            if _skill_md_issue_is_unsupported_resource_claim(issue) and not str(issue.get("repair_target") or "").strip():
+                return "SKILL.md unsupported_resource_claim must declare repair_target."
     if data.get("passed") is True:
         for issue in data.get("issues") or []:
             if _skill_md_reviewer_issue_contradicts_passed_true(issue):
@@ -1898,7 +1938,12 @@ async def _review_skill_md_blueprint_intent_with_model(
         skill_name=skill_name,
     )
 
-    parser_paths = list(constraints["declared_paths"])
+    authoritative_manifest = {
+        "authoritative_scripts": list(constraints["declared_scripts"]),
+        "authoritative_references": list(constraints["declared_references"]),
+        "authoritative_assets": list(constraints["declared_assets"]),
+        "function_item_resource_contracts": graph_context.get("requirements") or [],
+    }
 
     prompt = (
         "你是 superskills Creator 的第一轮 SKILL.md 语义覆盖审查器，只输出严格 JSON object。\n\n"
@@ -1910,6 +1955,9 @@ async def _review_skill_md_blueprint_intent_with_model(
         "若 Blueprint 已明确某个文件、目录、字段或产物的角色或数据流，只能检查 SKILL.md 是否与其一致，不得自行重新分类或重新设计。\n"
         "repair_suggestions 和 repair_ops 也必须遵守上述边界：只能修复 SKILL.md 与 Blueprint 已有事实之间的差异，不得通过 append 或 replace 注入 Blueprint 未声明的路径、资源角色、业务规则或输出约束。\n"
         "审查目标是“与 Blueprint 一致且足够执行”，不是“尽可能完整”；只要 SKILL.md 已正确表达 Blueprint 要求，不得因为还能增加更多说明而判定失败。\n"
+        "Authoritative FilePlan is immutable. SKILL.md may describe only resources supported by the authoritative FilePlan or the provided FunctionItem/resource contracts. Blueprint prose is descriptive context, not authority for adding resources.\n"
+        "检查 SKILL.md 的显式和隐式资源依赖，包括参考资料、规则文件、模板、静态/预置/品牌素材及运行前读取的外部文件；即使没有写出具体路径，只要 authoritative contracts 无支持，也必须报告 category=unsupported_resource_claim。资源语义识别由你完成，Backend 不做关键词判断。\n"
+        "任何 unsupported_resource_claim 必须 severity=error、blocking=true、repair_target=SKILL.md，并令整体 passed=false、resource_reviewer.passed=false。只能建议从 SKILL.md 删除该 claim，或按 authoritative contracts 改写；不得建议向 Blueprint/FilePlan 增加或创建资源。把 unsupported resource 从 required 改成 optional 不构成修复。\n"
         "第一轮整体语义只看：这个 skill 是做什么的、用户输入是什么、大致执行哪些脚本、文件计划是否完整、脚本职责和执行顺序是否合理、references/assets 职责是否正确、最终产物是什么、是否引入蓝图外能力或文件。\n"
         "不得审查 command JSON key、placeholder、argv schema、stdout 字段、incoming/outgoing edge 字段映射、类型序列化、静态值或动态值来源。\n"
         "不要检查或裁决单个 bash command block 的 argv key、placeholder、字段来源、字段类型、JSON quoting 或 shell quoting；这些问题由后续单 command block Reviewer 单独处理。即使发现 block 字段问题，也不得将整体语义审查判定为格式失败。\n"
@@ -1939,7 +1987,8 @@ async def _review_skill_md_blueprint_intent_with_model(
         "- blocking 可选；若该问题不影响资源角色/最终产物契约/用户关键要求传递，必须明确 blocking=false。\n"
         "- contract_impact 可选 object；只用布尔字段表达是否影响 resource_role/final_artifact/user_requirement_transfer。\n"
         "- resource_role 仅在资源职责问题时填写 reference|asset，否则可省略。\n"
-        "- category 可选；不得使用 command_mapping_explicit_evidence，整体 reviewer 不处理 command mapping。\n"
+        "- category 可选；unsupported resource 必须使用 unsupported_resource_claim；不得使用 command_mapping_explicit_evidence，整体 reviewer 不处理 command mapping。\n"
+        "- repair_target 对 unsupported_resource_claim 必须固定为 SKILL.md。\n"
         "- repair_ops 可选；只能定位非 command 说明区域，不能把自然语言 minimal_edit 当 repair_ops。\n\n"
 
         "真实文件和资源角色判断原则：\n"
@@ -1967,7 +2016,8 @@ async def _review_skill_md_blueprint_intent_with_model(
         '      "severity": "error|warning",\n'
         '      "blocking": true,\n'
         '      "contract_impact": {"execution_closure": false, "resource_role": false, "platform_io": false, "final_artifact": false, "user_requirement_transfer": false},\n'
-        '      "category": "semantic_alignment|null",\n'
+        '      "category": "semantic_alignment|unsupported_resource_claim|null",\n'
+        '      "repair_target": "SKILL.md|null",\n'
         '      "field": "intent|file_plan|workflow|capabilities|resources|user_facing",\n'
         '      "message": "不一致点",\n'
         '      "evidence": "引用 SKILL.md 或蓝图中的证据",\n'
@@ -1987,7 +2037,7 @@ async def _review_skill_md_blueprint_intent_with_model(
         f"{json.dumps(constraints, ensure_ascii=False, indent=2, default=str)[:12000]}\n\n"
 
         "【Backend authoritative file manifest；Reviewer 不得扩展】\n"
-        f"{json.dumps(parser_paths, ensure_ascii=False, indent=2, default=str)}\n\n"
+        f"{json.dumps(authoritative_manifest, ensure_ascii=False, indent=2, default=str)}\n\n"
 
         "【compact requirement_graph 上下文，仅用于大致理解流程；不得用于阻断跨步骤精确字段/placeholder 来源】\n"
         f"{json.dumps(graph_context, ensure_ascii=False, indent=2, default=str)[:12000]}\n\n"
@@ -2054,8 +2104,8 @@ async def _review_skill_md_blueprint_intent_with_model(
         for reviewer_name, reviewer_result in data["reviewers"].items():
             if not isinstance(reviewer_result, dict):
                 continue
-            if reviewer_result.get("passed") is False:
-                for issue in reviewer_result.get("issues") or []:
+            for issue in reviewer_result.get("issues") or []:
+                if reviewer_result.get("passed") is False or _skill_md_issue_is_unsupported_resource_claim(issue):
                     if isinstance(issue, dict):
                         reviewer_issues.append({
                             "severity": issue.get("severity", "error"),
@@ -2064,6 +2114,10 @@ async def _review_skill_md_blueprint_intent_with_model(
                             "evidence": issue.get("evidence", ""),
                             "expected": issue.get("expected", "该审查角度应与蓝图一致。"),
                             "minimal_edit": issue.get("minimal_edit", "只修改 SKILL.md 中相关区域。"),
+                            "blocking": issue.get("blocking"),
+                            "category": issue.get("category"),
+                            "contract_impact": issue.get("contract_impact"),
+                            "repair_target": issue.get("repair_target"),
                             "resource_role": issue.get("resource_role"),
                             "claim_type": issue.get("claim_type"),
                             "repair_ops": issue.get("repair_ops") if isinstance(issue.get("repair_ops"), list) else [],
@@ -2080,6 +2134,47 @@ async def _review_skill_md_blueprint_intent_with_model(
         data["issues"] = reviewer_issues
 
     data["issues"] = _dedupe_review_issues(data["issues"])
+    reviewer_repair_overreach = False
+    for issue in data["issues"]:
+        if isinstance(issue, dict) and _skill_md_issue_is_unsupported_resource_claim(issue):
+            proposed_target = str(issue.get("repair_target") or "").strip()
+            repair_ops = issue.get("repair_ops")
+            invalid_repair_ops = isinstance(repair_ops, list) and any(
+                not isinstance(op, dict)
+                or str(op.get("op") or "").strip() not in {"delete", "replace"}
+                for op in repair_ops
+            )
+            if proposed_target not in {"", "SKILL.md"} or invalid_repair_ops:
+                reviewer_repair_overreach = True
+                logger.warning(
+                    "[Creator][skill_md][reviewer_repair_overreach] target=%s repair_ops=%s",
+                    proposed_target,
+                    repair_ops,
+                )
+                issue["message"] = "SKILL.md contains a resource claim unsupported by authoritative contracts."
+                issue["evidence"] = "The semantic resource reviewer identified an unsupported claim in SKILL.md."
+                issue["expected"] = "Remove the unsupported claim from SKILL.md without changing resource authority."
+                issue["minimal_edit"] = "Delete only the unsupported resource claim from SKILL.md."
+                issue["repair_ops"] = []
+                for field in ("fix", "suggested_fix", "repair_suggestions"):
+                    issue.pop(field, None)
+            issue["severity"] = "error"
+            issue["blocking"] = True
+            issue["repair_target"] = "SKILL.md"
+            data["passed"] = False
+            resource_reviewer = data["reviewers"].get("resource_reviewer")
+            if isinstance(resource_reviewer, dict):
+                resource_reviewer["passed"] = False
+    if reviewer_repair_overreach:
+        data["repair_suggestions"] = ""
+    sanitized_resource_issues = [
+        dict(issue)
+        for issue in data["issues"]
+        if _skill_md_issue_is_unsupported_resource_claim(issue)
+    ]
+    resource_reviewer = data["reviewers"].get("resource_reviewer")
+    if sanitized_resource_issues and isinstance(resource_reviewer, dict):
+        resource_reviewer["issues"] = sanitized_resource_issues
     if data.get("passed") is not True and any(str(issue.get("severity") or "error").lower() in {"error", "blocking", "blocker"} for issue in data["issues"] if isinstance(issue, dict)):
         data["passed"] = False
 
@@ -2122,7 +2217,7 @@ async def _review_skill_md_blueprint_intent_with_model(
             )
         )
         unauthorized_paths = sorted(mentioned_paths - authoritative_paths)
-        if unauthorized_paths:
+        if unauthorized_paths and not _skill_md_issue_is_authorized_resource_removal(issue):
             issue_overreach.append({"paths": unauthorized_paths, "issue": issue})
             continue
         contained_issues.append(issue)
@@ -3103,6 +3198,9 @@ def _review_issue_is_blocking(issue: dict[str, Any]) -> bool:
     only obvious semantic responsibility failures; proof/detail/internal-field and
     runtime-closure requests are advisory and must not trigger localized patches.
     """
+    if _skill_md_issue_is_unsupported_resource_claim(issue):
+        return True
+
     severity = str(issue.get("severity") or "error").strip().lower()
     if severity in {"warning", "info", "note", "advisory"}:
         return False

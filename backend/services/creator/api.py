@@ -4636,24 +4636,15 @@ def _build_prepare_allowed_resource_paths(
 ) -> set[str]:
     """Freeze resource authority from facts available before Blueprint repair."""
     allowed: set[str] = set()
-    summary = _coerce_prepare_summary(review_summary)
-    for raw_path in [
-        *summary.files_to_create_or_update,
-        *summary.assets_to_upload,
-    ]:
-        path = _normalize_skill_path(str(raw_path or ""))
-        if _is_prepare_resource_path(path):
-            allowed.add(path)
+    _ = review_summary  # Display/planning data is not resource provenance.
+    allowed.update(_extract_user_explicit_prepare_resource_paths(request))
 
     for item in request.uploaded_files or []:
         if not isinstance(item, dict):
             continue
-        upload_keys = ["reference_target_path", "target_path", "skill_path"]
         if str(item.get("asset_decision") or "") == "include_as_asset":
-            upload_keys.append("asset_target_path")
-        for key in upload_keys:
-            path = _normalize_skill_path(str(item.get(key) or ""))
-            if _is_prepare_resource_path(path):
+            path = _normalize_skill_path(str(item.get("asset_target_path") or ""))
+            if path.startswith("assets/") and _is_prepare_resource_path(path):
                 allowed.add(path)
 
     context = existing_skill_context or {}
@@ -4665,17 +4656,21 @@ def _build_prepare_allowed_resource_paths(
     return allowed
 
 
-def _first_prepare_review_summary_from_history(history: list[dict[str, Any]] | None) -> Any:
-    for item in history or []:
-        if not isinstance(item, dict):
-            continue
-        summary = item.get("review_summary")
-        if isinstance(summary, dict):
-            return summary
-        content = item.get("content")
-        if isinstance(content, dict) and isinstance(content.get("review_summary"), dict):
-            return content["review_summary"]
-    return None
+def _extract_user_explicit_prepare_resource_paths(request: PreparePlanRequest) -> set[str]:
+    """Extract literal concrete resource paths only from user-authored text."""
+    texts = [str(request.user_request or ""), str(request.human_feedback or "")]
+    texts.extend(
+        str(item.get("content") or "")
+        for item in request.conversation_history or []
+        if isinstance(item, dict) and str(item.get("role") or "").lower() == "user"
+    )
+    paths: set[str] = set()
+    for text in texts:
+        for match in re.finditer(r"(?<![\w/])(?:references|assets)/[A-Za-z0-9_.@+\-/]+", text):
+            path = _normalize_skill_path(match.group(0).rstrip("./"))
+            if _is_prepare_resource_path(path):
+                paths.add(path)
+    return paths
 
 
 def _remove_unauthorized_prepare_resources(
@@ -4697,17 +4692,17 @@ def _remove_unauthorized_prepare_resources(
 
         def clean_field(field_match: re.Match[str]) -> str:
             values = []
-            for raw in re.split(r"[,，、]\s*", str(field_match.group(2) or "")):
+            for raw in re.split(r"[,，、]\s*", str(field_match.group(3) or "")):
                 value = _normalize_skill_path(raw.strip().strip("'\"`"))
                 if _is_prepare_resource_path(value) and value not in allowed_resource_paths:
                     rejected.add(value)
                     continue
                 if value:
                     values.append(value)
-            return f"{field_match.group(1)}: [{', '.join(values)}]"
+            return f"{field_match.group(1)}{field_match.group(2)}: [{', '.join(values)}]"
 
         return re.sub(
-            r"(?im)^\s*(dependencies|references)\s*:\s*\[?([^\]\n]*)\]?\s*$",
+            r"(?im)^(\s*)(dependencies|references)\s*:\s*\[?([^\]\n]*)\]?\s*$",
             clean_field,
             block,
         )
@@ -8335,6 +8330,29 @@ Blueprint Planner 只规划业务责任。
                 requirement_allocations=requirement_allocations,
                 blocking_issues=semantic_review["issues"], planner_model=route.model,
             )
+            frozen_blueprint_text, rejected_resources = _remove_unauthorized_prepare_resources(
+                frozen_blueprint_text,
+                allowed_resource_paths,
+            )
+            logger.info(
+                "[Creator][resource_authority] allowed_resources=%s rejected_resources=%s",
+                sorted(allowed_resource_paths), rejected_resources,
+            )
+            try:
+                validate_blueprint_shape_for_creator(frozen_blueprint_text)
+            except BlueprintShapeError as exc:
+                raise PreparePlanProtocolError(
+                    f"Blueprint semantic replan failed strict shape after resource authority enforcement: {exc}"
+                ) from exc
+            protocol_errors = _preflight_prepare_blueprint_text(
+                frozen_blueprint_text,
+                allowed_resource_paths,
+            )
+            if protocol_errors:
+                raise PreparePlanProtocolError(
+                    "Blueprint semantic replan failed protocol after resource authority enforcement; "
+                    f"errors={protocol_errors}"
+                )
             allowed_function_item_targets = _resolve_allowed_function_item_targets_from_blueprint(
                 frozen_blueprint_text
             )
@@ -10669,9 +10687,6 @@ async def _prepare_plan_impl(
 
     allowed_resource_paths = _build_prepare_allowed_resource_paths(
         request=request,
-        review_summary=_first_prepare_review_summary_from_history(
-            request.conversation_history
-        ),
         existing_skill_context=(
             _read_prepare_existing_skill_context(skill_name)
             if request.mode == "revise"

@@ -721,10 +721,9 @@ def test_resource_authority_removes_hallucinated_entries_and_script_links():
 
 
 def test_resource_authority_keeps_upstream_declared_reference():
-    summary = {"files_to_create_or_update": ["SKILL.md", "references/foo.md"]}
     allowed = api._build_prepare_allowed_resource_paths(
-        request=_request(),
-        review_summary=summary,
+        request=_request(user_request="请创建 references/foo.md 并让脚本使用它"),
+        review_summary={"files_to_create_or_update": ["SKILL.md"]},
     )
     blueprint = _ready_blueprint(
         "- path: `scripts/a.py`\n  role: script\n  inputs: []\n  outputs: []\n"
@@ -738,6 +737,65 @@ def test_resource_authority_keeps_upstream_declared_reference():
     assert rejected == []
     assert "references: [references/foo.md]" in cleaned
     assert "- path: `references/foo.md`" in cleaned
+
+
+def test_planner_review_summary_cannot_self_authorize_resource():
+    allowed = api._build_prepare_allowed_resource_paths(
+        request=_request(),
+        review_summary={
+            "files_to_create_or_update": [
+                "SKILL.md", "scripts/a.py", "references/hallucinated.md",
+            ],
+        },
+    )
+
+    assert "references/hallucinated.md" not in allowed
+
+
+def test_user_literal_resource_path_is_authorized():
+    allowed = api._build_prepare_allowed_resource_paths(
+        request=_request(user_request="请创建 references/foo.md 并让脚本使用它"),
+    )
+
+    assert "references/foo.md" in allowed
+
+
+def test_only_include_as_asset_upload_grants_resource_authority():
+    reference_only = {
+        "asset_decision": "reference_only",
+        "asset_target_path": "assets/foo.docx",
+        "target_path": "references/foo.md",
+    }
+    assert api._build_prepare_allowed_resource_paths(
+        request=_request(uploaded_files=[reference_only]),
+    ) == set()
+
+    included = {
+        "asset_decision": "include_as_asset",
+        "asset_target_path": "assets/foo.docx",
+    }
+    assert api._build_prepare_allowed_resource_paths(
+        request=_request(uploaded_files=[included]),
+    ) == {"assets/foo.docx"}
+
+
+def test_resource_cleanup_preserves_blueprint_field_indentation_and_shape():
+    script = _script_plan_block("scripts/a.py").replace(
+        "  dependencies: []",
+        "  dependencies: [references/foo.md]",
+    ).replace(
+        "  references: []",
+        "  references: [references/foo.md]",
+    )
+    blueprint = _ready_blueprint(
+        _skill_plan_block("\n" + script + "\n" + api._prepare_reference_plan_block("references/foo.md"))
+    )
+    cleaned, rejected = api._remove_unauthorized_prepare_resources(blueprint, set())
+
+    assert rejected == ["references/foo.md"]
+    assert "  dependencies: []" in cleaned
+    assert "  references: []" in cleaned
+    api.validate_blueprint_shape_for_creator(cleaned)
 
 
 @pytest.mark.asyncio
@@ -882,6 +940,7 @@ async def _run_semantic_closure_until_graph(
     review_calls = 0
     replan_calls = 0
     graph_calls = 0
+    graph_blueprint = ""
     blueprint_calls = 0
 
     async def initial_planner(messages, model):
@@ -912,8 +971,11 @@ async def _run_semantic_closure_until_graph(
         raise AssertionError("Unexpected model call occurred before graph binding sentinel")
 
     async def graph(**kwargs):
-        nonlocal graph_calls
+        nonlocal graph_calls, graph_blueprint
         graph_calls += 1
+        graph_blueprint = str(
+            (kwargs.get("current_planner_result") or {}).get("internal_blueprint_text") or ""
+        )
         raise _SemanticClosureGraphCalled()
 
     monkeypatch.setattr(api, "complete_chat_once", initial_planner)
@@ -925,7 +987,7 @@ async def _run_semantic_closure_until_graph(
         pass
     return {
         "initial": initial, "allocations": allocations, "reviews": review_calls,
-        "replans": replan_calls, "graphs": graph_calls,
+        "replans": replan_calls, "graphs": graph_calls, "graph_blueprint": graph_blueprint,
     }
 
 
@@ -956,6 +1018,42 @@ async def test_semantic_closure_replans_once_then_calls_graph(monkeypatch):
         },
     )
     assert (result["allocations"], result["reviews"], result["replans"], result["graphs"]) == (2, 2, 1, 1)
+
+
+@pytest.mark.asyncio
+async def test_semantic_replan_cannot_reintroduce_unauthorized_resource(monkeypatch):
+    initial = _ready_blueprint(_skill_plan_block("\n" + _script_plan_block("scripts/a.py")))
+    injected_script = _script_plan_block("scripts/a.py").replace(
+        "  references: []", "  references: [references/injected.md]"
+    )
+    injected = _ready_blueprint(
+        _skill_plan_block(
+            "\n" + injected_script + "\n"
+            + api._prepare_reference_plan_block("references/injected.md")
+        )
+    )
+
+    async def fake_replan(**_kwargs):
+        return injected
+
+    monkeypatch.setattr(api, "_replan_blueprint_for_semantic_closure", fake_replan)
+    result = await _run_semantic_closure_until_graph(
+        monkeypatch,
+        initial_blueprint=initial,
+        reviews=[
+            {"passed": False, "issues": [{
+                "issue_type": "responsibility_mismatch",
+                "requirement_id": "R1",
+                "affected_targets": ["scripts/a.py"],
+                "reason": "mismatch",
+                "repair_guidance": "revise",
+            }]},
+            {"passed": True, "issues": []},
+        ],
+    )
+
+    assert result["graphs"] == 1
+    assert "references/injected.md" not in result["graph_blueprint"]
 
 
 @pytest.mark.asyncio

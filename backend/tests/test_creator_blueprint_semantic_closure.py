@@ -138,6 +138,12 @@ async def test_requirement_planner_keeps_ownerless_core_requirement(monkeypatch)
     assert "do not omit" in planner_prompt
     assert "do not force an unrelated owner" in planner_prompt
     assert "Do not add, remove, rename, or modify FilePlan" in planner_prompt
+    assert "negative constraint" in planner_prompt
+    normalized_prompt = " ".join(planner_prompt.split())
+    assert "do not mechanically assign every constraint" in normalized_prompt
+    assert "Backend performs no keyword" in normalized_prompt
+    assert "prohibitions, and responsibility boundaries" in planner_prompt
+    assert "Do not return owners=[] merely because" in planner_prompt
 
 
 def test_requirement_ids_are_unique_and_requirements_non_empty():
@@ -368,14 +374,137 @@ def test_uncovered_scope_rejects_deletion_and_replacement():
         )
 
 
-def test_uncovered_scope_requires_affected_target_for_existing_change():
+def test_uncovered_scope_allows_explicit_existing_target_clarification():
     before = _blueprint([_entry("scripts/a.py")])
     after = _blueprint([_entry("scripts/a.py", "revised")])
-    with pytest.raises(api.PreparePlanProtocolError, match="without affected_targets"):
+    api._validate_blueprint_semantic_replan_scope(
+        before_blueprint_text=before,
+        after_blueprint_text=after,
+        blocking_issues=[{"issue_type": "requirement_uncovered", "affected_targets": []}],
+        patch_manifest={
+            "changed_targets": ["scripts/a.py"],
+            "added_targets": [],
+            "changed_resources": [],
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_real_ownerless_replan_clarifies_existing_function_item(monkeypatch):
+    before = _blueprint([_entry("scripts/a.py")])
+    clarified = _entry("scripts/a.py", "Capability A responsibility").replace(
+        "inputs: []", "inputs: [request]"
+    ).replace("outputs: [result]", "outputs: [capability_result]")
+    after = _blueprint([clarified])
+
+    async def complete(*_args, **_kwargs):
+        return json.dumps({
+            "internal_blueprint_text": after,
+            "changed_targets": ["scripts/a.py"],
+            "added_targets": [],
+            "changed_resources": [],
+        })
+
+    monkeypatch.setattr(api, "complete_creator_role_once", complete)
+    result = await api._replan_blueprint_for_semantic_closure(
+        request=api.PreparePlanRequest(user_request="Complete capability A"),
+        blueprint_text=before,
+        function_items=[{"target_file": "scripts/a.py"}],
+        requirement_allocations=[_allocation("R1", [])],
+        blocking_issues=[{"issue_type": "requirement_uncovered", "requirement_id": "R1", "affected_targets": []}],
+        planner_model="test",
+    )
+    assert result == after.strip()
+    assert "scripts/b.py" not in result
+
+
+@pytest.mark.asyncio
+async def test_real_ownerless_replan_clarifies_multiple_existing_function_items(monkeypatch):
+    before = _blueprint([_entry("scripts/a.py"), _entry("scripts/b.py")])
+    after = _blueprint([
+        _entry("scripts/a.py", "Produce shared capability data"),
+        _entry("scripts/b.py", "Consume shared capability data"),
+    ])
+
+    async def complete(*_args, **_kwargs):
+        return json.dumps({
+            "internal_blueprint_text": after,
+            "changed_targets": ["scripts/a.py", "scripts/b.py"],
+            "added_targets": [],
+            "changed_resources": [],
+        })
+
+    monkeypatch.setattr(api, "complete_creator_role_once", complete)
+    result = await api._replan_blueprint_for_semantic_closure(
+        request=api.PreparePlanRequest(user_request="Complete capability A"),
+        blueprint_text=before,
+        function_items=[{"target_file": "scripts/a.py"}, {"target_file": "scripts/b.py"}],
+        requirement_allocations=[_allocation("R1", [])],
+        blocking_issues=[{"issue_type": "requirement_uncovered", "requirement_id": "R1", "affected_targets": []}],
+        planner_model="test",
+    )
+    assert result == after.strip()
+
+
+@pytest.mark.asyncio
+async def test_real_ownerless_replan_allows_minimum_new_responsibility_carrier(monkeypatch):
+    before = _blueprint([_entry("scripts/a.py")])
+    after = _blueprint([_entry("scripts/a.py"), _entry("scripts/c.py", "Capability A responsibility")])
+
+    async def complete(*_args, **_kwargs):
+        return json.dumps({
+            "internal_blueprint_text": after,
+            "changed_targets": [],
+            "added_targets": ["scripts/c.py"],
+            "changed_resources": [],
+        })
+
+    monkeypatch.setattr(api, "complete_creator_role_once", complete)
+    result = await api._replan_blueprint_for_semantic_closure(
+        request=api.PreparePlanRequest(user_request="Complete capability A"),
+        blueprint_text=before,
+        function_items=[{"target_file": "scripts/a.py"}],
+        requirement_allocations=[_allocation("R1", [])],
+        blocking_issues=[{"issue_type": "requirement_uncovered", "requirement_id": "R1", "affected_targets": []}],
+        planner_model="test",
+    )
+    assert result == after.strip()
+
+
+def test_ownerless_replan_rejects_unrelated_resource_change():
+    before = _blueprint([_entry("scripts/a.py")])
+    after = _blueprint([
+        _entry("scripts/a.py"),
+        _entry("references/r.md", "Unrelated resource", "reference"),
+    ])
+    with pytest.raises(api.PreparePlanProtocolError, match="resources outside"):
         api._validate_blueprint_semantic_replan_scope(
             before_blueprint_text=before,
             after_blueprint_text=after,
-            blocking_issues=[{"issue_type": "requirement_uncovered", "affected_targets": []}],
+            blocking_issues=[{"issue_type": "requirement_uncovered", "requirement_id": "R1", "affected_targets": []}],
+            patch_manifest={
+                "changed_targets": [],
+                "added_targets": [],
+                "changed_resources": ["references/r.md"],
+            },
+        )
+
+
+def test_ownerless_replan_rejects_undeclared_existing_target_change():
+    before = _blueprint([_entry("scripts/a.py"), _entry("scripts/c.py")])
+    after = _blueprint([
+        _entry("scripts/a.py", "Capability A responsibility"),
+        _entry("scripts/c.py", "Unrelated responsibility change"),
+    ])
+    with pytest.raises(api.PreparePlanProtocolError, match="patch manifest"):
+        api._validate_blueprint_semantic_replan_scope(
+            before_blueprint_text=before,
+            after_blueprint_text=after,
+            blocking_issues=[{
+                "issue_type": "requirement_uncovered",
+                "requirement_id": "R1",
+                "affected_targets": [],
+            }],
             patch_manifest={
                 "changed_targets": ["scripts/a.py"],
                 "added_targets": [],

@@ -7169,6 +7169,14 @@ internal parameter, file split, file name, intermediate output, model-selected
 quantity, layout choice, template choice, or helper strategy is not a
 requirement unless the user explicitly requested it. For example, a Blueprint
 default max_images=5 does not mean the user requested configurable max_images.
+Explicit limitations, prohibitions, and responsibility boundaries may still be
+core user requirements. When one or more existing FunctionItems genuinely meet
+such a requirement through their constraints or forbidden boundaries, allocate
+it to those actual FunctionItems. Do not return owners=[] merely because a
+requirement is a negative constraint, and do not mechanically assign every
+constraint to every script. Judge ownership semantically from the original
+request and the supplied FunctionItem content; the Backend performs no keyword
+classification.
 
 Allocate a requirement only to FunctionItems that genuinely own or co-own that
 responsibility. One requirement may be jointly covered by one or more existing
@@ -7404,10 +7412,11 @@ genuinely missing responsibility carrier when no legitimate existing owner exist
 Do not modify unrelated targets, remove or replace unrelated FilePlan entries, or
 add resources, tools, or capabilities unrelated to a blocking issue. Requirements and files
 have no one-to-one rule. Report the exact structural patch you made. For an
-uncovered requirement with no affected target, you may add new FunctionItems but
-must not modify existing FunctionItems or resources. To modify an existing
-FunctionItem, the Reviewer must name it in affected_targets. Do not remove
-existing paths. Return strict JSON only:
+uncovered requirement with no preidentified affected target, explicitly declare
+the minimum existing targets whose purpose, inputs, outputs, or constraints you
+clarify, or add a minimum new responsibility carrier only when no existing target
+can legitimately cover the requirement. Do not remove existing paths. Return
+strict JSON only:
 
 This is coverage repair, not Skill redesign. Repair only the supplied blocking
 issues. Every requirement coverage repair must correspond to an existing
@@ -7502,11 +7511,29 @@ def _validate_blueprint_semantic_replan_scope(
         }
         if actual_changed_resources - issue_resources:
             raise PreparePlanProtocolError("Blueprint semantic replan changed resources outside blocking issue scope")
-    elif actual_changed_targets or changed_existing_resources:
-        raise PreparePlanProtocolError(
-            "Blueprint semantic replan cannot modify existing targets or resources "
-            "for an uncovered requirement without affected_targets"
-        )
+    else:
+        allowed_clarification_fields = {"purpose", "inputs", "outputs", "constraints"}
+        invalid_changed_fields = {
+            path: sorted(
+                key for key in set(before[path]) | set(after[path])
+                if before[path].get(key) != after[path].get(key)
+                and key not in allowed_clarification_fields
+            )
+            for path in actual_changed_targets
+        }
+        invalid_changed_fields = {
+            path: fields for path, fields in invalid_changed_fields.items() if fields
+        }
+        if invalid_changed_fields:
+            raise PreparePlanProtocolError(
+                "Blueprint semantic replan changed existing target fields outside "
+                f"the minimum responsibility clarification scope: {invalid_changed_fields}"
+            )
+        if actual_changed_resources or changed_existing_resources:
+            raise PreparePlanProtocolError(
+                "Blueprint semantic replan changed resources outside an ownerless "
+                "requirement repair scope"
+            )
 
 
 def _planner_convergence_review_event_from_result(result: dict[str, Any]) -> dict[str, Any]:

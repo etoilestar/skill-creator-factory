@@ -1178,21 +1178,18 @@ async def test_ownerless_reviewer_pass_enters_exactly_one_replan(monkeypatch):
         "owners": owners,
         "evidence": {"responsibility": "Capability A", "outputs": [], "capabilities": []},
     }]}
-    replan_calls = 0
-
-    async def replan_once(**_kwargs):
-        nonlocal replan_calls
-        replan_calls += 1
-        return revised
-
-    monkeypatch.setattr(api, "_replan_blueprint_for_semantic_closure", replan_once)
     result = await _run_semantic_closure_until_graph(
         monkeypatch,
         reviews=[{"passed": True, "issues": []}, {"passed": True, "issues": []}],
         allocation_responses=[allocation([]), allocation(["scripts/a.py"])],
+        replanned_blueprint={
+            "internal_blueprint_text": revised,
+            "changed_targets": ["scripts/a.py"],
+            "added_targets": [],
+            "changed_resources": [],
+        },
     )
-    assert (result["allocations"], result["reviews"], result["graphs"]) == (2, 2, 1)
-    assert replan_calls == 1
+    assert (result["allocations"], result["reviews"], result["replans"], result["graphs"]) == (2, 2, 1, 1)
 
 
 @pytest.mark.asyncio

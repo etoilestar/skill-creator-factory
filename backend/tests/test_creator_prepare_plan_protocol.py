@@ -1170,6 +1170,54 @@ async def test_semantic_closure_replans_once_then_calls_graph(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_ownerless_reviewer_pass_enters_exactly_one_replan(monkeypatch):
+    initial = _ready_blueprint(_skill_plan_block("\n" + _script_plan_block("scripts/a.py")))
+    revised = _with_script_purpose(initial, "scripts/a.py", "Capability A responsibility")
+    allocation = lambda owners: {"requirement_allocations": [{
+        "requirement_id": "R1", "requirement": "Complete capability A",
+        "owners": owners,
+        "evidence": {"responsibility": "Capability A", "outputs": [], "capabilities": []},
+    }]}
+    result = await _run_semantic_closure_until_graph(
+        monkeypatch,
+        reviews=[{"passed": True, "issues": []}, {"passed": True, "issues": []}],
+        allocation_responses=[allocation([]), allocation(["scripts/a.py"])],
+        replanned_blueprint={
+            "internal_blueprint_text": revised,
+            "changed_targets": ["scripts/a.py"],
+            "added_targets": [],
+            "changed_resources": [],
+        },
+    )
+    assert (result["allocations"], result["reviews"], result["replans"], result["graphs"]) == (2, 2, 1, 1)
+
+
+@pytest.mark.asyncio
+async def test_ownerless_after_replan_uses_existing_failure_exit(monkeypatch):
+    initial = _ready_blueprint(_skill_plan_block("\n" + _script_plan_block("scripts/a.py")))
+    allocation = {"requirement_allocations": [{
+        "requirement_id": "R1", "requirement": "Complete capability A",
+        "owners": [],
+        "evidence": {"responsibility": "Capability A", "outputs": [], "capabilities": []},
+    }]}
+    replan_calls = 0
+
+    async def replan_once(**_kwargs):
+        nonlocal replan_calls
+        replan_calls += 1
+        return initial
+
+    monkeypatch.setattr(api, "_replan_blueprint_for_semantic_closure", replan_once)
+    with pytest.raises(api.PreparePlanProtocolError, match="exactly one localized replan"):
+        await _run_semantic_closure_until_graph(
+            monkeypatch,
+            reviews=[{"passed": True, "issues": []}, {"passed": True, "issues": []}],
+            allocation_responses=[allocation, allocation],
+        )
+    assert replan_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_semantic_replan_cannot_reintroduce_unauthorized_resource(monkeypatch):
     initial = _ready_blueprint(_skill_plan_block("\n" + _script_plan_block("scripts/a.py")))
     injected_script = _script_plan_block("scripts/a.py").replace(
@@ -3310,11 +3358,11 @@ def test_responsibility_graph_runtime_input_provenance_accepts_upstream_function
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("reviewed_id", "expected_passed"),
-    [("", True), ("R999", True), ("R2", False)],
+    ("reviewed_id", "is_valid"),
+    [("", False), ("R999", False), ("R2", True)],
 )
 async def test_requirement_coverage_blocks_only_supplied_ids(
-    monkeypatch, reviewed_id, expected_passed,
+    monkeypatch, reviewed_id, is_valid,
 ):
     issue = {
         "issue_type": "requirement_uncovered",
@@ -3333,16 +3381,21 @@ async def test_requirement_coverage_blocks_only_supplied_ids(
          "owners": ["scripts/a.py"], "evidence": {}}
         for requirement_id in ("R1", "R2")
     ]
-    review = await api._review_blueprint_semantic_closure(
-        request=_request(), blueprint_text="blueprint",
-        function_items=[_function_item("scripts/a.py")],
-        requirement_allocations=allocations, planner_model="test",
-    )
-
-    assert review["passed"] is expected_passed
-    assert [item["requirement_id"] for item in review["issues"]] == (
-        [] if expected_passed else ["R2"]
-    )
+    if not is_valid:
+        with pytest.raises(api.PreparePlanProtocolError, match="requirement allocation domain"):
+            await api._review_blueprint_semantic_closure(
+                request=_request(), blueprint_text="blueprint",
+                function_items=[_function_item("scripts/a.py")],
+                requirement_allocations=allocations, planner_model="test",
+            )
+    else:
+        review = await api._review_blueprint_semantic_closure(
+            request=_request(), blueprint_text="blueprint",
+            function_items=[_function_item("scripts/a.py")],
+            requirement_allocations=allocations, planner_model="test",
+        )
+        assert review["passed"] is False
+        assert [item["requirement_id"] for item in review["issues"]] == ["R2"]
 
 
 def test_requirement_allocation_owner_requires_exact_authoritative_path():

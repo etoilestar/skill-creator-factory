@@ -7171,7 +7171,10 @@ requirement unless the user explicitly requested it. For example, a Blueprint
 default max_images=5 does not mean the user requested configurable max_images.
 
 Allocate a requirement only to FunctionItems that genuinely own or co-own that
-responsibility. If no current FunctionItem legitimately owns a core requirement,
+responsibility. One requirement may be jointly covered by one or more existing
+FunctionItems. Collaboration, data transfer, or separation of responsibilities
+across FunctionItems must not produce owners=[] merely because the requirement
+is workflow-level. If no current FunctionItem legitimately owns a core requirement,
 keep that requirement in requirement_allocations, return owners=[], do not omit
 the requirement, do not force an unrelated owner merely to avoid an empty owner
 list, and do not invent a new FunctionItem during requirement allocation.
@@ -7181,9 +7184,9 @@ not mean that the requirement is unimportant, ignorable, or already complete.
 authoritative_scripts is the complete owner identity domain. Every owners value
 MUST be copied verbatim from authoritative_scripts. Do not output a role,
 basename, capability, shorthand, or custom identifier, and do not infer aliases.
-For authoritative_scripts=["scripts/a.py", "scripts/b.py"], owners=["scripts/a.py"]
-is valid; owners=["a"], owners=["text_generator"], and owners=["generator"] are
-invalid.
+Never guess ownership from a file name, role, capability, path keyword, or file
+suffix. For FunctionItem A and FunctionItem B, select only their exact target
+identities as supplied in authoritative_scripts.
 
 One FunctionItem may legitimately own multiple requirements. Multiple
 FunctionItems may legitimately cooperate on one requirement. There is no
@@ -7223,6 +7226,59 @@ plan. Do not add files, FunctionItems, or requirements merely for closure.
             for item in function_items
         ],
     )
+
+
+def _normalize_semantic_review_against_allocations(
+    review: dict[str, Any],
+    requirement_allocations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Make ownerless allocations blocking without inferring semantic ownership."""
+    normalized_review = copy.deepcopy(review)
+    allocations = copy.deepcopy(requirement_allocations)
+    issues = normalized_review.get("issues") or []
+
+    deduplicated_issues: list[dict[str, Any]] = []
+    seen_issues: set[str] = set()
+    for issue in issues:
+        identity = json.dumps(issue, ensure_ascii=False, sort_keys=True, default=str)
+        if identity not in seen_issues:
+            seen_issues.add(identity)
+            deduplicated_issues.append(issue)
+
+    coverage_issue_types = {
+        "requirement_uncovered", "requirement_partially_covered"
+    }
+    reported_ownerless_ids = {
+        str(issue.get("requirement_id") or "").strip()
+        for issue in deduplicated_issues
+        if issue.get("issue_type") in coverage_issue_types
+    }
+    ownerless_ids = [
+        str(allocation.get("requirement_id") or "").strip()
+        for allocation in allocations
+        if not (allocation.get("owners") or [])
+    ]
+    for requirement_id in ownerless_ids:
+        if requirement_id in reported_ownerless_ids:
+            continue
+        deduplicated_issues.append({
+            "issue_type": "requirement_uncovered",
+            "requirement_id": requirement_id,
+            "affected_targets": [],
+            "reason": (
+                "The current Blueprint has no legitimate FunctionItem owner "
+                "for this requirement."
+            ),
+            "repair_guidance": (
+                "Clarify the minimum existing FunctionItem responsibilities or add "
+                "only the minimum genuinely missing responsibility."
+            ),
+        })
+        reported_ownerless_ids.add(requirement_id)
+
+    normalized_review["issues"] = deduplicated_issues
+    normalized_review["passed"] = not deduplicated_issues
+    return normalized_review
 
 
 async def _review_blueprint_semantic_closure(
@@ -7299,26 +7355,22 @@ conflict may additionally include resource.
         for allocation in requirement_allocations
         if str(allocation.get("requirement_id") or "").strip()
     }
-    coverage_issue_types = {
-        "requirement_uncovered", "requirement_partially_covered"
-    }
-    review["issues"] = [
-        issue for issue in review["issues"]
-        if issue["issue_type"] not in coverage_issue_types
-        or str(issue.get("requirement_id") or "").strip() in valid_requirement_ids
+    invalid_requirement_ids = [
+        str(issue.get("requirement_id") or "").strip()
+        for issue in review["issues"]
+        if issue["issue_type"] in {
+            "requirement_uncovered", "requirement_partially_covered"
+        }
+        and str(issue.get("requirement_id") or "").strip() not in valid_requirement_ids
     ]
-    review["passed"] = not review["issues"]
-    if review["passed"]:
-        uncovered_allocation_ids = [
-            str(allocation.get("requirement_id") or "")
-            for allocation in requirement_allocations
-            if not (allocation.get("owners") or [])
-        ]
-        if uncovered_allocation_ids:
-            raise PreparePlanProtocolError(
-                "Blueprint semantic review cannot pass with ownerless requirement allocations; "
-                f"requirement_ids={uncovered_allocation_ids}"
-            )
+    if invalid_requirement_ids:
+        raise PreparePlanProtocolError(
+            "Blueprint semantic review referenced requirement_id outside the "
+            f"requirement allocation domain: requirement_ids={invalid_requirement_ids}"
+        )
+    review = _normalize_semantic_review_against_allocations(
+        review, requirement_allocations
+    )
     uncovered = [str(i.get("requirement_id") or "") for i in review["issues"] if i["issue_type"] == "requirement_uncovered"]
     partial = [str(i.get("requirement_id") or "") for i in review["issues"] if i["issue_type"] == "requirement_partially_covered"]
     covered_count = max(0, len(requirement_allocations) - len(set(uncovered + partial)))
@@ -7345,8 +7397,12 @@ complete replacement internal_blueprint_text. Preserve unrelated FilePlan entrie
 and FunctionItems. Only modify the minimum Blueprint facts necessary to cover the
 blocking user requirement. Do not redesign unrelated workflow. Do not invent new
 user requirements. Do not add files merely to satisfy a structural checker. If
-an existing FunctionItem can legitimately own the requirement, revise that
-responsibility instead of automatically adding a file. Requirements and files
+an existing FunctionItem can legitimately own the requirement, first make the
+minimum clarification to its purpose, inputs, outputs, or constraints. Multiple
+existing FunctionItems may jointly cover one requirement. Only add the minimum
+genuinely missing responsibility carrier when no legitimate existing owner exists.
+Do not modify unrelated targets, remove or replace unrelated FilePlan entries, or
+add resources, tools, or capabilities unrelated to a blocking issue. Requirements and files
 have no one-to-one rule. Report the exact structural patch you made. For an
 uncovered requirement with no affected target, you may add new FunctionItems but
 must not modify existing FunctionItems or resources. To modify an existing

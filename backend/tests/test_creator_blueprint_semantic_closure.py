@@ -12,7 +12,7 @@ from backend.services.creator.contracts import (
 def _allocation(requirement_id, owners):
     return {
         "requirement_id": requirement_id,
-        "requirement": f"完成 {requirement_id}",
+        "requirement": f"Complete capability {requirement_id}",
         "owners": owners,
         "evidence": {"responsibility": "完成责任", "outputs": ["result"], "capabilities": ["operation"]},
     }
@@ -72,11 +72,20 @@ def test_multiple_function_items_may_cooperate_on_one_requirement():
     assert result[0]["owners"] == ["scripts/a.py", "scripts/b.py"]
 
 
-def test_invalid_owner_is_rejected_without_path_guessing():
+@pytest.mark.parametrize("invalid_owner", [
+    "SKILL.md",
+    "references/r.md",
+    "assets/a.bin",
+    "scripts/not-exists.py",
+    "a.py",
+    "generic_script",
+    "text_generation",
+])
+def test_invalid_owner_is_rejected_without_path_guessing(invalid_owner):
     with pytest.raises(ValueError, match="outside current FunctionItem domain"):
         validate_requirement_allocations(
-            [_allocation("R1", ["scripts/not_exists.py"])],
-            allowed_owner_targets=["scripts/exists.py"],
+            [_allocation("R1", [invalid_owner])],
+            allowed_owner_targets=["scripts/a.py", "scripts/b.py"],
         )
 
 
@@ -144,7 +153,7 @@ def test_requirement_ids_are_unique_and_requirements_non_empty():
 
 
 @pytest.mark.asyncio
-async def test_generic_missing_core_requirement_is_reviewer_failure(monkeypatch):
+async def test_reviewer_unknown_requirement_is_protocol_invalid(monkeypatch):
     async def complete(messages, *_args, **_kwargs):
         payload = json.loads(messages[1]["content"])
         assert payload["user_requirement"] == "用户需要完成 A、B、C 三项责任"
@@ -154,14 +163,13 @@ async def test_generic_missing_core_requirement_is_reviewer_failure(monkeypatch)
             "affected_targets": [], "reason": "C 没有责任 owner", "repair_guidance": "补足 C 的真实责任",
         }]})
     monkeypatch.setattr(api, "complete_creator_role_once", complete)
-    review = await api._review_blueprint_semantic_closure(
-        request=api.PreparePlanRequest(user_request="用户需要完成 A、B、C 三项责任"),
-        blueprint_text="blueprint",
-        requirement_allocations=[_allocation("R1", ["scripts/a.py"]), _allocation("R2", ["scripts/a.py"])],
-        function_items=[{"target_file": "scripts/a.py"}], planner_model="test",
-    )
-    assert review["passed"] is False
-    assert review["issues"][0]["issue_type"] == "requirement_uncovered"
+    with pytest.raises(api.PreparePlanProtocolError, match="requirement allocation domain"):
+        await api._review_blueprint_semantic_closure(
+            request=api.PreparePlanRequest(user_request="用户需要完成 A、B、C 三项责任"),
+            blueprint_text="blueprint",
+            requirement_allocations=[_allocation("R1", ["scripts/a.py"]), _allocation("R2", ["scripts/a.py"])],
+            function_items=[{"target_file": "scripts/a.py"}], planner_model="test",
+        )
 
 
 @pytest.mark.asyncio
@@ -182,19 +190,81 @@ async def test_resource_semantic_conflict_is_reported_by_reviewer_not_suffix_log
 
 
 @pytest.mark.asyncio
-async def test_semantic_pass_rejects_ownerless_requirement(monkeypatch):
+async def test_semantic_pass_normalizes_ownerless_requirement_to_issue(monkeypatch):
     async def complete(*_args, **_kwargs):
         return json.dumps({"passed": True, "issues": []})
 
     monkeypatch.setattr(api, "complete_creator_role_once", complete)
-    with pytest.raises(api.PreparePlanProtocolError, match="ownerless requirement allocations"):
-        await api._review_blueprint_semantic_closure(
-            request=api.PreparePlanRequest(user_request="完成核心责任"),
-            blueprint_text="blueprint",
-            function_items=[{"target_file": "scripts/a.py"}],
-            requirement_allocations=[_allocation("R1", [])],
-            planner_model="test",
-        )
+    review = await api._review_blueprint_semantic_closure(
+        request=api.PreparePlanRequest(user_request="Complete capability A"),
+        blueprint_text="blueprint",
+        function_items=[{"target_file": "scripts/a.py"}],
+        requirement_allocations=[_allocation("R1", [])],
+        planner_model="test",
+    )
+    assert review["passed"] is False
+    assert [(issue["issue_type"], issue["requirement_id"])
+            for issue in review["issues"]] == [("requirement_uncovered", "R1")]
+
+
+def test_normalization_does_not_duplicate_reported_ownerless_coverage_issue():
+    issue = {
+        "issue_type": "requirement_partially_covered",
+        "requirement_id": "R1",
+        "affected_targets": [],
+        "reason": "Incomplete coverage.",
+        "repair_guidance": "Clarify responsibility.",
+    }
+    normalized = api._normalize_semantic_review_against_allocations(
+        {"passed": False, "issues": [issue, dict(issue)]},
+        [_allocation("R1", [])],
+    )
+    assert normalized == {"passed": False, "issues": [issue]}
+
+
+@pytest.mark.parametrize(
+    "owners",
+    [["scripts/a.py"], ["scripts/a.py", "scripts/b.py"]],
+)
+def test_normalization_preserves_legal_owned_allocations(owners):
+    allocations = [_allocation("R1", owners)]
+    normalized = api._normalize_semantic_review_against_allocations(
+        {"passed": True, "issues": []}, allocations
+    )
+    assert normalized == {"passed": True, "issues": []}
+    assert allocations[0]["owners"] == owners
+
+
+def test_normalization_adds_all_ownerless_issues_in_allocation_order():
+    normalized = api._normalize_semantic_review_against_allocations(
+        {"passed": True, "issues": []},
+        [_allocation("R1", []), _allocation("R2", [])],
+    )
+    assert [issue["requirement_id"] for issue in normalized["issues"]] == ["R1", "R2"]
+    assert all(issue["issue_type"] == "requirement_uncovered"
+               for issue in normalized["issues"])
+
+
+def test_normalization_preserves_mixed_reviewer_issues():
+    issues = [
+        {"issue_type": "responsibility_mismatch", "requirement_id": "R1"},
+        {"issue_type": "resource_semantic_conflict", "requirement_id": ""},
+        {"issue_type": "requirement_uncovered", "requirement_id": "R1"},
+    ]
+    normalized = api._normalize_semantic_review_against_allocations(
+        {"passed": False, "issues": issues}, [_allocation("R1", [])]
+    )
+    assert normalized["issues"] == issues
+
+
+def test_normalization_does_not_mutate_inputs():
+    review = {"passed": True, "issues": []}
+    allocations = [_allocation("R1", [])]
+    original_review = json.loads(json.dumps(review))
+    original_allocations = json.loads(json.dumps(allocations))
+    api._normalize_semantic_review_against_allocations(review, allocations)
+    assert review == original_review
+    assert allocations == original_allocations
 
 
 def test_semantic_review_rejects_unknown_target_exactly():

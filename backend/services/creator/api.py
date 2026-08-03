@@ -50,6 +50,7 @@ from .basic_format import check_patch_candidate_basic_format
 from .command_normalizer import _effective_command_lines
 from .command_normalizer import parse_skill_md_bash_command_blocks
 from . import contracts as creator_contracts
+from .responsibility_graph_expansion import expand_responsibility_graph
 
 
 def _tool_binding_digest(binding: dict[str, Any]) -> str:
@@ -7088,7 +7089,7 @@ async def _bind_executable_responsibility_plan(
     planner_model: str,
     allowed_function_item_targets: list[str],
 ) -> dict[str, Any]:
-    """Ask Planner for initial edges over Backend-materialized frozen FunctionItems."""
+    """Expand edges incrementally over Backend-materialized frozen FunctionItems."""
     frozen_blueprint_text = str(
         current_planner_result.get("internal_blueprint_text") or ""
     )
@@ -7096,53 +7097,25 @@ async def _bind_executable_responsibility_plan(
         frozen_blueprint_text=frozen_blueprint_text,
         allowed_function_item_targets=allowed_function_item_targets,
     )
-    graph_context = _build_responsibility_graph_construction_context(
-        frozen_blueprint_text=frozen_blueprint_text,
-        allowed_function_item_targets=allowed_function_item_targets,
+    async def select_sources(messages: list[dict[str, str]], model: str) -> str:
+        return await complete_creator_role_once(
+            messages, "planner", fallback_model=model,
+        )
+
+    responsibility_edges = await expand_responsibility_graph(
         function_items=frozen_function_items,
+        platform_contract=build_platform_io_contract(),
+        planner_model=planner_model,
+        model_call=select_sources,
+        goal_context={
+            "user_request": request.user_request,
+            "confirmed_blueprint": frozen_blueprint_text,
+            "skill_name": current_planner_result.get("skill_name", ""),
+        },
     )
-    prompt = """
-You are the Blueprint Planner binding the initial ResponsibilityGraph over frozen
-FunctionItems. Blueprint defines responsibilities; Graph connects them.
-
-Return a complete responsibility_edges array only. Do not return or redesign
-FunctionItems, files, target_file, inputs, outputs, purpose, capabilities, or
-constraints. Use graph_construction_context as the only topology and endpoint
-authority. For each target input, choose the semantically correct provenance
-from its supplied legal_sources. Backend supplies only the structurally legal
-source domain; it does not choose the semantic mapping.
-
-Use exact canonical ResponsibilityEdge fields: from_node, from_output, to_node,
-to_input, purpose, constraints. Platform endpoints and slots must come from the
-supplied platform contracts. Do not infer aliases or invent endpoints.
-
-Before returning, replay the complete graph and verify:
-0. Valid node identities are only platform_input_node,
-   platform_output_node, and exact authoritative script paths. Never use a
-   role, basename, capability, shorthand, or other alias.
-1. Every declared runtime input has exactly one legal provenance.
-2. Every from_output exists in the supplied legal source domain.
-3. Every to_input exists on the frozen target FunctionItem.
-4. Every required final output has a producer-to-platform_output path.
-5. No input, output, FunctionItem, file, or platform slot was invented.
-
-Return only strict JSON: {"responsibility_edges": [...]}
-""".strip()
-    payload = {
-        "task": "bind_responsibility_graph_edges",
-        "graph_construction_context": graph_context,
-    }
-    text = await complete_creator_role_once(
-        [{"role": "system", "content": prompt},
-         {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
-        "planner", fallback_model=planner_model,
-    )
-    data = _parse_prepare_plan_json(text)
-    if set(data) != {"responsibility_edges"} or not isinstance(data.get("responsibility_edges"), list):
-        raise ValueError("Planner binding must return only responsibility_edges")
     return {
         "function_items": frozen_function_items,
-        "responsibility_edges": data["responsibility_edges"],
+        "responsibility_edges": responsibility_edges,
     }
 
 
@@ -8930,349 +8903,41 @@ Blueprint Planner 只规划业务责任。
             "requirement_channels": requirement_channels,
         }
 
-        try:
-            binding_data = (
-                await _bind_executable_responsibility_plan(
-                    request=request,
-                    current_planner_result=first_planner_result,
-                    planner_model=route.model,
-                    allowed_function_item_targets=allowed_function_item_targets,
-                )
-                if allowed_function_item_targets
-                else {"function_items": [], "responsibility_edges": []}
-            )
-            candidate_function_items = normalize_structured_function_items(
-                binding_data.get("function_items"),
-                source="planner",
-            )
-            _validate_function_item_targets_in_allowed_domain(
-                candidate_function_items,
-                allowed_function_item_targets,
-            )
-            normalized_function_items = candidate_function_items
-        except Exception as exc:
-            draft_function_item_error = exc
-        try:
-            normalized_edges = validate_structured_responsibility_edge_transport(
-                binding_data.get("responsibility_edges"),
-                function_items=normalized_function_items,
-                source="planner",
-            )
-            if normalized_function_items is not None:
-                normalized_ready_draft = dict(first_planner_result)
-                normalized_ready_draft["function_items"] = normalized_function_items
-                normalized_ready_draft["responsibility_edges"] = normalized_edges
-                normalized_ready_draft["requirement_allocations"] = requirement_allocations
-                normalized_ready_draft["internal_blueprint_text"] = _render_structured_responsibility_view(
-                    frozen_blueprint_text,
-                    normalized_function_items,
-                    normalized_edges,
-                )
-                if event_emitter is not None:
-                    await event_emitter({
-                        "event": "planner_draft",
-                        "function_items": normalized_function_items,
-                        "responsibility_edges": normalized_edges,
-                    })
-            logger.info(
-                "[Creator][structured_plan][planner_draft] %s",
-                json.dumps({
-                    "event": "creator_structured_plan_planner_draft",
-                    "skill_name": str(data.get("skill_name") or request.skill_name or ""),
-                    "function_item_count": len(normalized_function_items or []),
-                    "function_item_targets": [item.get("target_file") for item in (normalized_function_items or [])],
-                    "edge_count": len(normalized_edges),
-                    "endpoint_pairs": [
-                        [edge.get("from_node"), edge.get("to_node")]
-                        for edge in normalized_edges
-                    ],
-                    "constraint_count": sum(len(edge.get("constraints") or []) for edge in normalized_edges),
-                }, ensure_ascii=False, default=str),
-            )
-        except Exception as exc:
-            draft_edge_error = exc
-
-        convergence_input = (
-            normalized_ready_draft
-            if normalized_ready_draft is not None
-            else data
-        )
-        try:
-            convergence_result = await _converge_ready_executable_plan(
+        binding_data = (
+            await _bind_executable_responsibility_plan(
                 request=request,
-                current_planner_result=convergence_input,
+                current_planner_result=first_planner_result,
                 planner_model=route.model,
                 allowed_function_item_targets=allowed_function_item_targets,
-                frozen_blueprint_text=frozen_blueprint_text,
-                draft_transport_error=(
-                    "; ".join(
-                        part for part in [
-                            f"function_items: {draft_function_item_error}" if draft_function_item_error is not None else "",
-                            f"responsibility_edges: {draft_edge_error}" if draft_edge_error is not None else "",
-                        ]
-                        if part
-                    )
-                ),
             )
-            normalized_converged_function_items = list(
-                convergence_result.get("function_items") or []
-            )
-            normalized_converged_edges = list(
-                convergence_result.get("responsibility_edges") or []
-            )
-            data = dict(first_planner_result)
-            data["function_items"] = normalized_converged_function_items
-            data["responsibility_edges"] = normalized_converged_edges
-            data["requirement_allocations"] = requirement_allocations
-            data["requirement_channels"] = requirement_channels
-            data["internal_blueprint_text"] = _render_structured_responsibility_view(
-                frozen_blueprint_text,
-                normalized_converged_function_items,
-                normalized_converged_edges,
-            )
-            if event_emitter is not None:
-                await event_emitter(_planner_convergence_review_event_from_result(convergence_result))
-                await event_emitter({
-                    "event": "planner_converged",
-                    "function_items": data.get("function_items") or [],
-                    "responsibility_edges": data.get("responsibility_edges") or [],
-                })
-        except Exception as exc:
-            if normalized_ready_draft is not None:
-                data = normalized_ready_draft
-                logger.warning(
-                    "[Creator][planner_convergence_failed] skill=%s error=%s",
-                    str(data.get("skill_name") or request.skill_name or ""),
-                    f"{type(exc).__name__}: {exc}",
-                )
-            else:
-                raise PreparePlanProtocolError(
-                    "Planner ready responsibility_edges were invalid and "
-                    "same-Planner convergence did not produce a valid "
-                    "canonical plan; "
-                    f"draft_error={draft_edge_error}; "
-                    f"convergence_error={exc}"
-                ) from exc
-
-        try:
-            current_function_items = list(data.get("function_items") or [])
-            current_edges = list(data.get("responsibility_edges") or [])
-            frozen_function_items = normalize_structured_function_items(
-                current_function_items, source="frozen_blueprint"
-            )
-            current_issues: list[dict[str, Any]] = []
-            blocking_fingerprints: list[str] = []
-            last_error = ""
-            for repair_index in range(3):
-                current_issues = []
-                deterministic_error = ""
-                try:
-                    current_function_items = normalize_structured_function_items(
-                        current_function_items, source="planner"
-                    )
-                    _validate_function_item_targets_in_allowed_domain(
-                        current_function_items, allowed_function_item_targets
-                    )
-                    current_edges = validate_structured_responsibility_edge_transport(
-                        current_edges, function_items=current_function_items, source="planner"
-                    )
-                    provenance_gaps = structured_responsibility_graph_input_provenance_gaps(
-                        current_function_items, current_edges, source="planner"
-                    )
-                    declared_input_count = sum(
-                        len(item.get("inputs") or []) for item in current_function_items
-                    )
-                    logger.info(
-                        "[Creator][graph_closure] resolved_input_count=%d unresolved_inputs=%s conflicting_provenance=[]",
-                        declared_input_count - len(provenance_gaps),
-                        [
-                            {"target_file": target_file, "target_input": input_name}
-                            for target_file, input_name in provenance_gaps
-                        ],
-                    )
-                    if provenance_gaps:
-                        current_issues = [
-                            {
-                                "id": "responsibility_input_provenance",
-                                "category": "unresolved_input_provenance",
-                                "target_file": target_file,
-                                "target_input": input_name,
-                                "target_files": [target_file],
-                                "affected_edge_indexes": [],
-                                "reason": "Declared FunctionItem input has no runtime provenance.",
-                                "evidence": f"target_file={target_file}; input={input_name}",
-                                "available_incoming_edges": [
-                                    edge for edge in current_edges
-                                    if edge.get("to_node") == target_file
-                                ],
-                                "available_platform_bindings": [
-                                    edge for edge in current_edges
-                                    if edge.get("to_node") == target_file
-                                    and edge.get("from_node") == "platform_input_node"
-                                ],
-                                "repair_guidance": "Provide an explicit upstream/platform binding or remove it from runtime inputs only if the confirmed Blueprint makes it creation-time fixed configuration.",
-                            }
-                            for target_file, input_name in provenance_gaps
-                        ]
-                        deterministic_error = (
-                            "declared FunctionItem inputs without runtime provenance; "
-                            f"gap_count={len(provenance_gaps)}"
-                        )
-                    else:
-                        _validate_responsibility_graph_boundary_presence(
-                            current_edges, allowed_function_item_targets
-                        )
-                except ValueError as exc:
-                    deterministic_error = str(exc)
-                    current_issues = [_graph_issue_from_validation_error(exc)]
-                    if current_issues[0]["category"] == "conflicting_input_provenance":
-                        logger.info(
-                            "[Creator][graph_closure] resolved_input_count=0 unresolved_inputs=[] conflicting_provenance=%s",
-                            deterministic_error,
-                        )
-                if current_issues:
-                    fingerprint = _graph_failure_fingerprint(current_issues[0])
-                    blocking_fingerprints.append(fingerprint)
-                    logger.info(
-                        "[Creator][graph_failure_fingerprint] category=%s target_file=%s target_input=%s fingerprint=%s",
-                        current_issues[0].get("category", ""),
-                        current_issues[0].get("target_file", ""),
-                        current_issues[0].get("target_input", ""),
-                        fingerprint,
-                    )
-
-                if deterministic_error:
-                    last_error = deterministic_error
-                    if not current_issues:
-                        current_issues = [{
-                            "id": "responsibility_graph_candidate_validation",
-                            "target_files": [], "affected_edge_indexes": [],
-                            "reason": deterministic_error,
-                            "evidence": "The latest responsibility graph failed deterministic protocol validation.",
-                            "repair_guidance": "Repair only the invalid FunctionItem or ResponsibilityEdge fields identified by the validator. Preserve the frozen FilePlan.",
-                        }]
-                else:
-                    alignment_review = await _review_responsibility_graph_alignment(
-                        request=request, frozen_blueprint_text=frozen_blueprint_text,
-                        allowed_function_item_targets=allowed_function_item_targets,
-                        function_items=current_function_items, responsibility_edges=current_edges,
-                        planner_model=route.model,
-                    )
-                    current_issues = list(alignment_review["issues"])
-                    if alignment_review["passed"]:
-                        data["function_items"] = current_function_items
-                        data["responsibility_edges"] = current_edges
-                        data["internal_blueprint_text"] = _render_structured_responsibility_view(
-                            frozen_blueprint_text, current_function_items, current_edges)
-                        break
-                    last_error = "semantic responsibility graph alignment review failed"
-
-                if repair_index >= 2:
-                    if _should_escalate_graph_failure(
-                        blocking_fingerprints, current_issues
-                    ):
-                        blocking_issue = current_issues[0]
-                        logger.info(
-                            "[Creator][planning_owner_escalation] from=responsibility_graph to=blueprint reason=frozen_runtime_contract_cannot_close fingerprint=%s",
-                            blocking_fingerprints[-1],
-                        )
-                        logger.info(
-                            "[Creator][blueprint_replan] attempt=1 affected_targets=%s",
-                            [blocking_issue.get("target_file")],
-                        )
-                        old_context = _build_responsibility_graph_construction_context(
-                            frozen_blueprint_text=frozen_blueprint_text,
-                            allowed_function_item_targets=allowed_function_item_targets,
-                            function_items=frozen_function_items,
-                            responsibility_edges=current_edges,
-                        )
-                        frozen_blueprint_text = await _replan_blueprint_for_graph_closure(
-                            request=request,
-                            frozen_blueprint_text=frozen_blueprint_text,
-                            blocking_issue=blocking_issue,
-                            graph_construction_context=old_context,
-                            planner_model=route.model,
-                        )
-                        allowed_function_item_targets = _resolve_allowed_function_item_targets_from_blueprint(
-                            frozen_blueprint_text
-                        )
-                        rebuilt = await _bind_executable_responsibility_plan(
-                            request=request,
-                            current_planner_result={
-                                **first_planner_result,
-                                "internal_blueprint_text": frozen_blueprint_text,
-                            },
-                            planner_model=route.model,
-                            allowed_function_item_targets=allowed_function_item_targets,
-                        )
-                        rebuilt_items = normalize_structured_function_items(
-                            rebuilt["function_items"], source="blueprint_replan_freeze"
-                        )
-                        rebuilt_edges = validate_structured_responsibility_edge_transport(
-                            rebuilt["responsibility_edges"],
-                            function_items=rebuilt_items,
-                            source="blueprint_replan_graph",
-                        )
-                        rebuilt_gaps = structured_responsibility_graph_input_provenance_gaps(
-                            rebuilt_items, rebuilt_edges, source="blueprint_replan_graph"
-                        )
-                        if rebuilt_gaps:
-                            raise PreparePlanProtocolError(
-                                "Blueprint replan attempt 1 produced a ResponsibilityGraph "
-                                f"that still lacks required input provenance: {rebuilt_gaps}"
-                            )
-                        _validate_responsibility_graph_boundary_presence(
-                            rebuilt_edges, allowed_function_item_targets
-                        )
-                        rebuilt_review = await _review_responsibility_graph_alignment(
-                            request=request,
-                            frozen_blueprint_text=frozen_blueprint_text,
-                            allowed_function_item_targets=allowed_function_item_targets,
-                            function_items=rebuilt_items,
-                            responsibility_edges=rebuilt_edges,
-                            planner_model=route.model,
-                        )
-                        if not rebuilt_review["passed"]:
-                            raise PreparePlanProtocolError(
-                                "Blueprint replan attempt 1 produced a graph that failed full validation; "
-                                f"issues={rebuilt_review['issues']}"
-                            )
-                        data["function_items"] = rebuilt_items
-                        data["responsibility_edges"] = rebuilt_edges
-                        data["internal_blueprint_text"] = _render_structured_responsibility_view(
-                            frozen_blueprint_text, rebuilt_items, rebuilt_edges
-                        )
-                        break
-                    raise PreparePlanProtocolError(
-                        "Responsibility graph alignment remained unresolved after one localized repair and one full graph regeneration; "
-                        f"last_error={last_error}; issues={current_issues}; "
-                        f"function_items={current_function_items}; responsibility_edges={current_edges}"
-                    )
-                if repair_index == 0:
-                    repaired_graph = await _repair_responsibility_graph_alignment(
-                        request=request, frozen_blueprint_text=frozen_blueprint_text,
-                        allowed_function_item_targets=allowed_function_item_targets,
-                        function_items=frozen_function_items, responsibility_edges=current_edges,
-                        review_issues=current_issues, planner_model=route.model,
-                    )
-                    current_function_items = list(repaired_graph["function_items"])
-                    current_edges = list(repaired_graph["responsibility_edges"])
-                else:
-                    regenerated_graph = await _regenerate_responsibility_graph(
-                        frozen_blueprint_text=frozen_blueprint_text,
-                        allowed_function_item_targets=allowed_function_item_targets,
-                        function_items=current_function_items,
-                        failed_issues=current_issues,
-                        planner_model=route.model,
-                    )
-                    current_edges = list(regenerated_graph["responsibility_edges"])
-        except PreparePlanProtocolError:
-            raise
-        except Exception as exc:
-            raise PreparePlanProtocolError(
-                "Responsibility graph alignment review, localized repair, or full regeneration failed; "
-                f"error={type(exc).__name__}: {exc}"
-            ) from exc
+            if allowed_function_item_targets
+            else {"function_items": [], "responsibility_edges": []}
+        )
+        normalized_function_items = normalize_structured_function_items(
+            binding_data.get("function_items"), source="graph_expansion"
+        )
+        _validate_function_item_targets_in_allowed_domain(
+            normalized_function_items, allowed_function_item_targets
+        )
+        normalized_edges = validate_structured_responsibility_edge_transport(
+            binding_data.get("responsibility_edges"),
+            function_items=normalized_function_items,
+            source="graph_expansion",
+        )
+        data = dict(first_planner_result)
+        data["function_items"] = normalized_function_items
+        data["responsibility_edges"] = normalized_edges
+        data["requirement_allocations"] = requirement_allocations
+        data["requirement_channels"] = requirement_channels
+        data["internal_blueprint_text"] = _render_structured_responsibility_view(
+            frozen_blueprint_text, normalized_function_items, normalized_edges
+        )
+        if event_emitter is not None:
+            await event_emitter({
+                "event": "planner_converged",
+                "function_items": normalized_function_items,
+                "responsibility_edges": normalized_edges,
+            })
 
     return data
 

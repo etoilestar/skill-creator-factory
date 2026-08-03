@@ -1,33 +1,48 @@
-"""Incremental construction of ResponsibilityEdges over frozen FunctionItems.
+"""Goal-driven ResponsibilityGraph expansion over immutable FunctionItems.
 
-The backend owns endpoint legality and edge materialization.  The model sees
-opaque candidate identifiers and owns only the semantic choice among them.
+The model only selects opaque identifiers. Endpoint domains, edge materialization,
+transactional validation, and activation state are owned by the backend.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+from collections import deque
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from typing import Any
 
 from ..skill_plan import (
     GraphValidationError,
     normalize_structured_function_items,
-    structured_responsibility_graph_input_provenance_gaps,
     validate_structured_responsibility_edge_transport,
 )
 
-
 logger = logging.getLogger(__name__)
-
-GRAPH_EXPANSION_BATCH_SIZE = 3
 PLATFORM_INPUT_NODE = "platform_input_node"
 PLATFORM_OUTPUT_NODE = "platform_output_node"
+_EDGE_PURPOSE = "Bind a declared source endpoint to a required target endpoint."
+ModelCall = Callable[[list[dict[str, str]], str], Awaitable[str]]
 
 
 class ResponsibilityGraphExpansionError(GraphValidationError):
-    """A machine-readable binding or selection protocol failure."""
+    """A machine-readable terminal, binding, or graph validation failure."""
+
+
+@dataclass
+class GraphExpansionState:
+    """The single authority for a goal-driven graph expansion."""
+
+    active_nodes: set[str] = field(default_factory=set)
+    committed_edges: list[dict] = field(default_factory=list)
+    frontier: deque[dict] = field(default_factory=deque)
+    resolved_obligation_ids: set[str] = field(default_factory=set)
+    enqueued_inputs: set[tuple[str, str]] = field(default_factory=set)
+    activation_order: list[str] = field(default_factory=list)
+    next_obligation_number: int = 1
+    terminal_binding_ids: list[str] = field(default_factory=list)
+    inactive_function_items: list[str] = field(default_factory=list)
 
 
 def _boundary(platform_contract: dict[str, Any]) -> dict[str, Any]:
@@ -44,61 +59,160 @@ def _port(value: Any) -> tuple[str, str, dict[str, Any]]:
     return str(value or "").strip(), "", {}
 
 
-def _required_final_outputs(platform_contract: dict[str, Any]) -> list[Any]:
+def _final_output_fields(platform_contract: dict[str, Any]) -> list[Any]:
     boundary = _boundary(platform_contract)
-    explicit = boundary.get("required_final_output_fields")
-    if isinstance(explicit, list):
-        return explicit
-    # The current runtime contract exposes an ordered set of alternative final
-    # slots rather than an explicit required subset.  Its first canonical slot
-    # is the required generic terminal until the runtime supplies a subset.
-    fields = boundary.get("final_output_fields") or []
-    return list(fields[:1]) if isinstance(fields, list) else []
+    required = boundary.get("required_final_output_fields")
+    if isinstance(required, list):
+        return list(required)
+    fields = boundary.get("final_output_fields")
+    return list(fields) if isinstance(fields, list) else []
 
 
-def build_responsibility_binding_obligations(
+def _edge(from_node: str, from_output: str, to_node: str, to_input: str) -> dict:
+    return {
+        "from_node": from_node,
+        "from_output": from_output,
+        "to_node": to_node,
+        "to_input": to_input,
+        "purpose": _EDGE_PURPOSE,
+        "constraints": [],
+    }
+
+
+def build_terminal_binding_candidates(
     *, function_items: list[dict], platform_contract: dict,
 ) -> list[dict]:
-    """Create one open obligation per non-defaulted input and required terminal."""
-    normalized = normalize_structured_function_items(function_items, source="graph_expansion")
-    obligations: list[dict] = []
-    for item in normalized:
-        defaults = item.get("default_values") or {}
-        for value in item.get("inputs") or []:
-            port_id, description, contract = _port(value)
-            if not port_id or port_id in defaults:
+    """Build the declared FunctionItem-output × platform-terminal product."""
+    items = normalize_structured_function_items(function_items, source="graph_expansion")
+    targets = _final_output_fields(platform_contract)
+    candidates: list[dict] = []
+    for item in items:
+        for raw_output in item.get("outputs") or []:
+            output_name, description, output_contract = _port(raw_output)
+            if not output_name:
                 continue
-            obligations.append({
-                "obligation_id": f"O{len(obligations) + 1:04d}",
-                "target": {"node_id": item["target_file"], "port_id": port_id},
-                "target_context": {
-                    "node_purpose": item.get("purpose", ""),
-                    "input_description": description,
-                    "input_contract": contract,
-                },
-            })
-    for value in _required_final_outputs(platform_contract):
-        port_id, description, contract = _port(value)
-        if not port_id:
+            for raw_target in targets:
+                target_name, target_description, target_contract = _port(raw_target)
+                if not target_name or _types_conflict(output_contract, target_contract):
+                    continue
+                candidates.append({
+                    "binding_id": f"T{len(candidates) + 1:04d}",
+                    "source": {"node_id": item["target_file"], "port_id": output_name},
+                    "target": {"node_id": PLATFORM_OUTPUT_NODE, "port_id": target_name},
+                    "edge": _edge(str(item["target_file"]), output_name, PLATFORM_OUTPUT_NODE, target_name),
+                    "source_context": {
+                        "node_purpose": item.get("purpose", ""),
+                        "output_name": output_name,
+                        "output_description": description,
+                        "output_contract": output_contract,
+                    },
+                    "target_context": {
+                        "platform_output_field": target_name,
+                        "output_description": target_description,
+                        "output_contract": target_contract,
+                    },
+                })
+    return candidates
+
+
+def _parse_json_object(text: str, *, code: str) -> dict[str, Any]:
+    try:
+        value = json.loads(text)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ResponsibilityGraphExpansionError("model response must be strict JSON", code=code) from exc
+    if not isinstance(value, dict):
+        raise ResponsibilityGraphExpansionError("model response must be a JSON object", code=code)
+    return value
+
+
+def validate_terminal_selection_protocol(*, candidates: list[dict], response: Any) -> list[str]:
+    if not isinstance(response, dict) or set(response) != {"terminal_binding_ids"}:
+        raise ResponsibilityGraphExpansionError("terminal response must contain only terminal_binding_ids", code="invalid_terminal_selection_protocol")
+    ids = response.get("terminal_binding_ids")
+    if not isinstance(ids, list) or not ids or not all(isinstance(value, str) for value in ids):
+        raise ResponsibilityGraphExpansionError("terminal_binding_ids must be a non-empty string list", code="invalid_terminal_selection_protocol")
+    if len(ids) != len(set(ids)):
+        raise ResponsibilityGraphExpansionError("terminal_binding_ids must not contain duplicates", code="invalid_terminal_selection_protocol")
+    registry = {candidate["binding_id"]: candidate for candidate in candidates}
+    unknown = [value for value in ids if value not in registry]
+    if unknown:
+        raise ResponsibilityGraphExpansionError("terminal binding is outside the candidate domain", code="invalid_terminal_selection_protocol", details={"unknown_binding_ids": unknown})
+    target_slots = [registry[value]["target"]["port_id"] for value in ids]
+    if len(target_slots) != len(set(target_slots)):
+        raise ResponsibilityGraphExpansionError("a platform output slot may have only one source", code="invalid_terminal_selection_protocol")
+    return ids
+
+
+async def select_terminal_bindings(
+    *, candidates: list[dict], goal_context: dict, planner_model: str,
+    model_call: ModelCall,
+) -> list[str]:
+    """Ask the planner for the smallest goal-satisfying terminal set."""
+    if not candidates:
+        raise ResponsibilityGraphExpansionError("no terminal binding candidate exists", code="unresolved_terminal_binding", details={"issue_type": "unresolved_terminal_binding"})
+    public_candidates = [
+        {"binding_id": item["binding_id"], "source_context": item["source_context"], "target_context": item["target_context"]}
+        for item in candidates
+    ]
+    prompt = (
+        "Select the minimum terminal binding set that satisfies the user's final delivery goal. "
+        "The backend owns every legal endpoint and binding. Return strict JSON containing only "
+        "terminal_binding_ids. Do not return nodes, ports, edges, explanations, or IDs outside the candidates."
+    )
+    text = await model_call([
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": json.dumps({"goal_context": goal_context, "terminal_candidates": public_candidates}, ensure_ascii=False)},
+    ], planner_model)
+    return validate_terminal_selection_protocol(candidates=candidates, response=_parse_json_object(text, code="invalid_terminal_selection_protocol"))
+
+
+def enqueue_required_inputs_for_node(
+    *, node_id: str, function_items: list[dict], state: GraphExpansionState,
+) -> None:
+    """Append unresolved non-default inputs of one newly active node."""
+    if node_id not in state.active_nodes:
+        return
+    items = normalize_structured_function_items(function_items, source="graph_expansion")
+    item = next((value for value in items if value["target_file"] == node_id), None)
+    if item is None:
+        return
+    defaults = item.get("default_values") or {}
+    incoming = {(edge["to_node"], edge["to_input"]) for edge in state.committed_edges}
+    for input_name in item.get("inputs") or []:
+        key = (node_id, str(input_name))
+        if input_name in defaults or key in incoming or key in state.enqueued_inputs:
             continue
-        obligations.append({
-            "obligation_id": f"O{len(obligations) + 1:04d}",
-            "target": {"node_id": PLATFORM_OUTPUT_NODE, "port_id": port_id},
-            "target_context": {
-                "output_description": description,
-                "output_contract": contract,
-            },
+        state.frontier.append({
+            "obligation_id": f"O{state.next_obligation_number:04d}",
+            "target": {"node_id": node_id, "port_id": str(input_name)},
+            "target_context": {"node_purpose": item.get("purpose", ""), "input_name": str(input_name), "input_contract": {}},
         })
-    return obligations
+        state.next_obligation_number += 1
+        state.enqueued_inputs.add(key)
+
+
+def initialize_state_from_terminals(
+    *, terminal_ids: list[str], candidates: list[dict], function_items: list[dict],
+) -> GraphExpansionState:
+    registry = {candidate["binding_id"]: candidate for candidate in candidates}
+    state = GraphExpansionState(terminal_binding_ids=list(terminal_ids))
+    for binding_id in terminal_ids:
+        candidate = registry[binding_id]
+        node_id = candidate["source"]["node_id"]
+        state.committed_edges.append(dict(candidate["edge"]))
+        if node_id not in state.active_nodes:
+            state.active_nodes.add(node_id)
+            state.activation_order.append(node_id)
+            enqueue_required_inputs_for_node(node_id=node_id, function_items=function_items, state=state)
+    return state
 
 
 def _would_cycle(edges: list[dict], source: str, target: str) -> bool:
-    if source in (PLATFORM_INPUT_NODE, PLATFORM_OUTPUT_NODE) or target == PLATFORM_OUTPUT_NODE:
+    if source == PLATFORM_INPUT_NODE or target == PLATFORM_OUTPUT_NODE:
         return False
     adjacency: dict[str, set[str]] = {}
     for edge in edges:
-        left, right = str(edge.get("from_node") or ""), str(edge.get("to_node") or "")
-        adjacency.setdefault(left, set()).add(right)
+        adjacency.setdefault(str(edge["from_node"]), set()).add(str(edge["to_node"]))
     pending, seen = [target], set()
     while pending:
         node = pending.pop()
@@ -117,170 +231,234 @@ def _definite_type(contract: dict[str, Any]) -> str | None:
     return None
 
 
-def build_legal_sources_for_obligation(
+def _types_conflict(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    left_type, right_type = _definite_type(left), _definite_type(right)
+    return bool(left_type and right_type and left_type != right_type)
+
+
+def build_binding_candidates_for_obligation(
     *, obligation: dict, function_items: list[dict], platform_contract: dict,
-    committed_edges: list[dict],
+    state: GraphExpansionState,
 ) -> list[dict]:
-    """Enumerate only structurally legal declared source endpoints."""
-    normalized = normalize_structured_function_items(function_items, source="graph_expansion")
+    """Build backend-owned complete edges for one current frontier input."""
+    items = normalize_structured_function_items(function_items, source="graph_expansion")
+    item_by_node = {str(item["target_file"]): item for item in items}
     target = obligation.get("target") or {}
     target_node, target_port = str(target.get("node_id") or ""), str(target.get("port_id") or "")
-    item_by_node = {str(item["target_file"]): item for item in normalized}
-    boundary = _boundary(platform_contract)
-    valid_target = (
-        target_node == PLATFORM_OUTPUT_NODE
-        and target_port in {_port(value)[0] for value in _required_final_outputs(platform_contract)}
-    ) or (
-        target_node in item_by_node and target_port in set(item_by_node[target_node].get("inputs") or [])
-    )
-    if not valid_target:
+    if target_node not in state.active_nodes or target_node not in item_by_node or target_port not in item_by_node[target_node]["inputs"]:
         return []
-
-    raw_sources: list[tuple[str, str, dict[str, Any]]] = []
-    for value in boundary.get("input_envelope_fields") or []:
-        port_id, description, contract = _port(value)
-        raw_sources.append((PLATFORM_INPUT_NODE, port_id, {
-            "output_description": description, "output_contract": contract,
+    target_contract = (obligation.get("target_context") or {}).get("input_contract") or {}
+    sources: list[tuple[str, str, dict[str, Any]]] = []
+    for raw_port in _boundary(platform_contract).get("input_envelope_fields") or []:
+        port_id, description, contract = _port(raw_port)
+        sources.append((PLATFORM_INPUT_NODE, port_id, {
+            "platform_input_field": port_id,
+            "output_description": description,
+            "output_contract": contract,
         }))
-    for item in normalized:
-        for value in item.get("outputs") or []:
-            port_id, description, contract = _port(value)
-            raw_sources.append((str(item["target_file"]), port_id, {
-                "node_purpose": item.get("purpose", ""),
+    for item in items:
+        for raw_port in item.get("outputs") or []:
+            port_id, description, contract = _port(raw_port)
+            sources.append((str(item["target_file"]), port_id, {
+                "node_purpose": item.get("purpose", ""), "output_name": port_id,
                 "output_description": description, "output_contract": contract,
             }))
-
-    target_contract = (obligation.get("target_context") or {}).get("input_contract") or (obligation.get("target_context") or {}).get("output_contract") or {}
     candidates: list[dict] = []
-    for source_node, source_port, source_context in raw_sources:
+    for source_node, source_port, source_context in sources:
         if not source_port or source_node == target_node:
             continue
-        if target_node == PLATFORM_OUTPUT_NODE and source_node == PLATFORM_INPUT_NODE:
+        if _would_cycle(state.committed_edges, source_node, target_node):
             continue
-        if _would_cycle(committed_edges, source_node, target_node):
-            continue
-        source_type = _definite_type(source_context.get("output_contract") or {})
-        target_type = _definite_type(target_contract)
-        if source_type and target_type and source_type != target_type:
+        if _types_conflict(source_context.get("output_contract") or {}, target_contract):
             continue
         candidates.append({
-            "source_id": f"{obligation['obligation_id']}-C{len(candidates) + 1:04d}",
-            "endpoint": {"node_id": source_node, "port_id": source_port},
+            "candidate_id": f"{obligation['obligation_id']}-C{len(candidates) + 1:04d}",
+            "edge": _edge(source_node, source_port, target_node, target_port),
             "source_context": source_context,
+            "target_context": dict(obligation.get("target_context") or {}),
         })
     return candidates
 
 
-def validate_selection_protocol(*, obligations: list[dict], response: Any) -> list[dict]:
-    """Accept exactly one opaque source selection for every supplied obligation."""
-    if not isinstance(response, dict) or set(response) != {"selections"} or not isinstance(response["selections"], list):
-        raise ResponsibilityGraphExpansionError("selection response must contain only selections", code="invalid_binding_selection_protocol")
-    expected = {item["obligation_id"]: item for item in obligations}
-    seen: set[str] = set()
-    selections: list[dict] = []
-    for selection in response["selections"]:
-        if not isinstance(selection, dict) or set(selection) != {"obligation_id", "source_id"}:
-            raise ResponsibilityGraphExpansionError("selection must contain only obligation_id and source_id", code="invalid_binding_selection_protocol")
-        obligation_id = selection.get("obligation_id")
-        if obligation_id not in expected or obligation_id in seen:
-            raise ResponsibilityGraphExpansionError("unknown or duplicate obligation_id", code="invalid_binding_selection_protocol", details={"obligation_id": obligation_id})
-        legal_ids = {source["source_id"] for source in expected[obligation_id].get("legal_sources") or []}
-        if selection.get("source_id") not in legal_ids:
-            raise ResponsibilityGraphExpansionError("source_id is outside the legal candidate domain", code="invalid_binding_selection_protocol", details={"obligation_id": obligation_id, "source_id": selection.get("source_id")})
-        seen.add(obligation_id)
-        selections.append(dict(selection))
-    missing = sorted(set(expected) - seen)
-    if missing:
-        raise ResponsibilityGraphExpansionError("selection response omitted obligations", code="invalid_binding_selection_protocol", details={"missing_obligation_ids": missing})
-    return selections
+def validate_binding_selection_protocol(*, obligation: dict, candidates: list[dict], response: Any) -> str:
+    if not isinstance(response, dict) or set(response) != {"selection"} or not isinstance(response["selection"], dict):
+        raise ResponsibilityGraphExpansionError("binding response must contain only selection", code="invalid_binding_selection_protocol")
+    selection = response["selection"]
+    if set(selection) != {"obligation_id", "candidate_id"} or selection.get("obligation_id") != obligation.get("obligation_id"):
+        raise ResponsibilityGraphExpansionError("selection must identify only the current obligation and candidate", code="invalid_binding_selection_protocol")
+    candidate_id = selection.get("candidate_id")
+    if candidate_id not in {candidate["candidate_id"] for candidate in candidates}:
+        raise ResponsibilityGraphExpansionError("candidate_id is outside the legal candidate domain", code="invalid_binding_selection_protocol", details={"candidate_id": candidate_id})
+    return str(candidate_id)
 
 
-def materialize_selected_edges(*, obligations: list[dict], selections: list[dict]) -> list[dict]:
-    """Deterministically expand opaque IDs into the existing edge wire schema."""
-    registry = {item["obligation_id"]: item for item in obligations}
-    edges: list[dict] = []
-    for selection in selections:
-        obligation = registry[selection["obligation_id"]]
-        source = next(item for item in obligation["legal_sources"] if item["source_id"] == selection["source_id"])
-        edges.append({
-            "from_node": source["endpoint"]["node_id"],
-            "from_output": source["endpoint"]["port_id"],
-            "to_node": obligation["target"]["node_id"],
-            "to_input": obligation["target"]["port_id"],
-            "purpose": "Bind a declared source endpoint to a required target endpoint.",
-            "constraints": [],
-        })
-    return edges
+async def _select_binding_candidate(
+    *, obligation: dict, candidates: list[dict], goal_context: dict,
+    committed_edges: list[dict], planner_model: str, model_call: ModelCall,
+    validation_issue: dict[str, Any] | None = None,
+) -> str:
+    public_candidates = [
+        {"candidate_id": item["candidate_id"], "source_context": item["source_context"], "target_context": item["target_context"]}
+        for item in candidates
+    ]
+    payload: dict[str, Any] = {
+        "goal_context": goal_context,
+        "current_partial_graph": {"committed_edges": committed_edges},
+        "obligation": obligation,
+        "binding_candidates": public_candidates,
+    }
+    if validation_issue:
+        payload.update(validation_issue)
+    prompt = (
+        "Select one semantic source for only the current input obligation. The backend has fixed all legal candidates. "
+        "Return strict JSON containing only selection with obligation_id and candidate_id. Do not create or modify "
+        "nodes, ports, edges, candidates, or committed structure; do not return explanations."
+    )
+    text = await model_call([
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+    ], planner_model)
+    return validate_binding_selection_protocol(
+        obligation=obligation, candidates=candidates,
+        response=_parse_json_object(text, code="invalid_binding_selection_protocol"),
+    )
 
 
-def _validate_acyclic(edges: list[dict]) -> None:
-    for edge in edges:
-        if _would_cycle([candidate for candidate in edges if candidate is not edge], str(edge["from_node"]), str(edge["to_node"])):
+def _validate_transaction(candidate_graph: list[dict], function_items: list[dict]) -> None:
+    validate_structured_responsibility_edge_transport(candidate_graph, function_items=function_items, source="graph_expansion")
+    for edge in candidate_graph:
+        others = [value for value in candidate_graph if value is not edge]
+        if _would_cycle(others, str(edge["from_node"]), str(edge["to_node"])):
             raise ResponsibilityGraphExpansionError("responsibility graph contains a directed cycle", code="responsibility_graph_cycle")
+    incoming: set[tuple[str, str]] = set()
+    for edge in candidate_graph:
+        if edge["to_node"] == PLATFORM_OUTPUT_NODE:
+            continue
+        key = (str(edge["to_node"]), str(edge["to_input"]))
+        if key in incoming:
+            raise ResponsibilityGraphExpansionError("input has duplicate provenance", code="duplicate_input_provenance")
+        incoming.add(key)
+
+
+def _finalize_graph(
+    *, state: GraphExpansionState, function_items: list[dict], platform_contract: dict,
+    terminal_candidates: list[dict],
+) -> list[dict]:
+    _validate_transaction(state.committed_edges, function_items)
+    terminal_registry = {candidate["binding_id"]: candidate["edge"] for candidate in terminal_candidates}
+    expected_terminals = [terminal_registry[value] for value in state.terminal_binding_ids]
+    actual_terminals = [edge for edge in state.committed_edges if edge["to_node"] == PLATFORM_OUTPUT_NODE]
+    if actual_terminals != expected_terminals or not actual_terminals:
+        raise ResponsibilityGraphExpansionError("final terminal set changed during expansion", code="invalid_terminal_closure")
+    items = {item["target_file"]: item for item in normalize_structured_function_items(function_items, source="graph_expansion")}
+    incoming = {(edge["to_node"], edge["to_input"]) for edge in state.committed_edges}
+    unresolved = [
+        (node, input_name)
+        for node in state.activation_order
+        for input_name in items[node]["inputs"]
+        if input_name not in (items[node].get("default_values") or {}) and (node, input_name) not in incoming
+    ]
+    if unresolved:
+        raise ResponsibilityGraphExpansionError("active graph has unresolved required inputs", code="unresolved_binding_obligation", details={"unresolved": unresolved})
+    reverse: dict[str, set[str]] = {}
+    for edge in state.committed_edges:
+        reverse.setdefault(str(edge["from_node"]), set()).add(str(edge["to_node"]))
+    for node in state.active_nodes:
+        pending, seen, reachable = [node], set(), False
+        while pending:
+            current = pending.pop()
+            if current == PLATFORM_OUTPUT_NODE:
+                reachable = True
+                break
+            if current not in seen:
+                seen.add(current)
+                pending.extend(reverse.get(current, ()))
+        if not reachable:
+            raise ResponsibilityGraphExpansionError("active node cannot reach a platform terminal", code="inactive_graph_component", details={"target": node})
+    state.inactive_function_items = sorted(set(items) - state.active_nodes)
+    return list(state.committed_edges)
 
 
 async def expand_responsibility_graph(
     *, function_items: list[dict], platform_contract: dict, planner_model: str,
-    model_call: Callable[[list[dict[str, str]], str], Awaitable[str]] | None = None,
+    goal_context: dict | None = None, model_call: ModelCall | None = None,
 ) -> list[dict]:
-    """Resolve obligations in bounded batches, retrying only a failing batch once."""
+    """Select terminals, then close activated inputs one at a time in reverse."""
     if model_call is None:
         from ..creator_model_profiles import complete_creator_role_once
 
         async def model_call(messages: list[dict[str, str]], model: str) -> str:
             return await complete_creator_role_once(messages, "planner", fallback_model=model)
 
-    obligations = build_responsibility_binding_obligations(function_items=function_items, platform_contract=platform_contract)
-    logger.info("[Creator][graph_expansion] obligation_count=%d", len(obligations))
-    committed: list[dict] = []
-    model_calls = protocol_retries = 0
-    for offset in range(0, len(obligations), GRAPH_EXPANSION_BATCH_SIZE):
-        batch = obligations[offset:offset + GRAPH_EXPANSION_BATCH_SIZE]
-        logger.info("[Creator][graph_expansion] batch_index=%d batch_size=%d", offset // GRAPH_EXPANSION_BATCH_SIZE, len(batch))
-        enriched: list[dict] = []
-        for obligation in batch:
-            legal = build_legal_sources_for_obligation(obligation=obligation, function_items=function_items, platform_contract=platform_contract, committed_edges=committed)
-            if not legal:
+    normalized = normalize_structured_function_items(function_items, source="graph_expansion")
+    context = dict(goal_context or {})
+    terminal_candidates = build_terminal_binding_candidates(function_items=normalized, platform_contract=platform_contract)
+    logger.info("[Creator][graph_expansion] terminal_candidate_count=%d", len(terminal_candidates))
+    model_call_count = 0
+    selection_retry_count = 0
+    try:
+        if terminal_candidates:
+            model_call_count += 1
+        terminal_ids = await select_terminal_bindings(candidates=terminal_candidates, goal_context=context, planner_model=planner_model, model_call=model_call)
+        logger.info("[Creator][graph_expansion] selected_terminal_binding_ids=%s", terminal_ids)
+        state = initialize_state_from_terminals(terminal_ids=terminal_ids, candidates=terminal_candidates, function_items=normalized)
+        logger.info("[Creator][graph_expansion] active_node_count=%d", len(state.active_nodes))
+        logger.info("[Creator][graph_expansion] frontier_size=%d", len(state.frontier))
+        while state.frontier:
+            obligation = state.frontier.popleft()
+            logger.info("[Creator][graph_expansion] resolving_obligation_id=%s", obligation["obligation_id"])
+            candidates = build_binding_candidates_for_obligation(
+                obligation=obligation, function_items=normalized,
+                platform_contract=platform_contract, state=state,
+            )
+            logger.info("[Creator][graph_expansion] candidate_count=%d", len(candidates))
+            if not candidates:
                 details = {"issue_type": "unresolved_binding_obligation", "obligation_id": obligation["obligation_id"], "target_node": obligation["target"]["node_id"], "target_port": obligation["target"]["port_id"], "reason": "no structurally legal source exists"}
-                logger.info("[Creator][graph_expansion] unresolved_count=1")
-                logger.info("[Creator][graph_expansion] graph_valid=false")
                 raise ResponsibilityGraphExpansionError(json.dumps(details, ensure_ascii=False), code="unresolved_binding_obligation", details=details)
-            enriched.append({**obligation, "legal_sources": legal})
-        logger.info("[Creator][graph_expansion] candidate_counts=%s", [len(item["legal_sources"]) for item in enriched])
-        error: str | None = None
-        for attempt in range(2):
-            payload = {"current_partial_graph": {"nodes": [item["target_file"] for item in function_items], "committed_edges": committed}, "obligations": enriched}
-            if error:
-                payload["protocol_error"] = error
-            prompt = """你只做当前批次的语义来源选择。后端已经确定所有合法节点、端口和候选。不要创建、重命名或修改任何结构。不要推断候选集合之外的来源。Return strict JSON containing only selections; each item must contain only obligation_id and source_id. Return every obligation exactly once, with no explanation."""
-            text = await model_call([{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}], planner_model)
-            model_calls += 1
-            try:
-                response = json.loads(text)
-                selections = validate_selection_protocol(obligations=enriched, response=response)
-                proposed = materialize_selected_edges(obligations=enriched, selections=selections)
-                candidate_graph = committed + proposed
-                validate_structured_responsibility_edge_transport(candidate_graph, function_items=function_items, source="graph_expansion_batch")
-                _validate_acyclic(candidate_graph)
-                committed = candidate_graph
-                break
-            except (ValueError, KeyError, StopIteration, json.JSONDecodeError) as exc:
-                error = f"{type(exc).__name__}: {exc}"
-                if attempt == 0:
-                    protocol_retries += 1
+            issue = None
+            candidate_id = ""
+            for attempt in range(2):
+                try:
+                    model_call_count += 1
+                    candidate_id = await _select_binding_candidate(
+                        obligation=obligation, candidates=candidates, goal_context=context,
+                        committed_edges=state.committed_edges, planner_model=planner_model,
+                        model_call=model_call, validation_issue=issue,
+                    )
+                    candidate = next(value for value in candidates if value["candidate_id"] == candidate_id)
+                    _validate_transaction(state.committed_edges + [candidate["edge"]], normalized)
+                except ValueError as exc:
+                    # A protocol or structural failure is local to this input;
+                    # committed state remains untouched until validation passes.
+                    if attempt:
+                        raise ResponsibilityGraphExpansionError("current obligation failed after one retry", code="graph_expansion_selection_failed", details={"obligation_id": obligation["obligation_id"], "validation_error": str(exc)}) from exc
+                    selection_retry_count += 1
+                    issue = {
+                        "previous_candidate_id": candidate_id,
+                        "validation_issue": {"code": getattr(exc, "code", "invalid_edge_transport"), "affected_obligation_id": obligation["obligation_id"]},
+                    }
                     continue
-                logger.info("[Creator][graph_expansion] model_call_count=%d", model_calls)
-                logger.info("[Creator][graph_expansion] protocol_retry_count=%d", protocol_retries)
-                logger.info("[Creator][graph_expansion] graph_valid=false")
-                raise ResponsibilityGraphExpansionError("graph expansion batch failed after one retry", code="graph_expansion_batch_failed", details={"obligation_ids": [item["obligation_id"] for item in enriched], "validation_error": error}) from exc
-        logger.info("[Creator][graph_expansion] committed_edge_count=%d", len(committed))
-    validated = validate_structured_responsibility_edge_transport(committed, function_items=function_items, source="graph_expansion_final")
-    _validate_acyclic(validated)
-    gaps = structured_responsibility_graph_input_provenance_gaps(function_items, validated, source="graph_expansion_final")
-    if gaps:
-        raise ResponsibilityGraphExpansionError("final graph has unresolved input obligations", code="unresolved_binding_obligation", details={"unresolved": gaps})
-    logger.info("[Creator][graph_expansion] unresolved_count=0")
-    logger.info("[Creator][graph_expansion] model_call_count=%d", model_calls)
-    logger.info("[Creator][graph_expansion] protocol_retry_count=%d", protocol_retries)
-    logger.info("[Creator][graph_expansion] graph_valid=true")
-    return validated
+                state.committed_edges.append(dict(candidate["edge"]))
+                state.resolved_obligation_ids.add(obligation["obligation_id"])
+                source_node = candidate["edge"]["from_node"]
+                if source_node != PLATFORM_INPUT_NODE and source_node not in state.active_nodes:
+                    state.active_nodes.add(source_node)
+                    state.activation_order.append(source_node)
+                    enqueue_required_inputs_for_node(node_id=source_node, function_items=normalized, state=state)
+                    logger.info("[Creator][graph_expansion] activated_node=%s", source_node)
+                break
+            logger.info("[Creator][graph_expansion] committed_edge_count=%d", len(state.committed_edges))
+            logger.info("[Creator][graph_expansion] active_node_count=%d", len(state.active_nodes))
+            logger.info("[Creator][graph_expansion] frontier_size=%d", len(state.frontier))
+        edges = _finalize_graph(state=state, function_items=normalized, platform_contract=platform_contract, terminal_candidates=terminal_candidates)
+        diagnostic = {"issue_type": "inactive_frozen_function_items", "targets": state.inactive_function_items, "reason": "Frozen FunctionItems were not selected on any path to a required terminal."}
+        logger.info("[Creator][graph_expansion] inactive_function_items=%s", json.dumps(diagnostic, ensure_ascii=False))
+        logger.info("[Creator][graph_expansion] model_call_count=%d", model_call_count)
+        logger.info("[Creator][graph_expansion] selection_retry_count=%d", selection_retry_count)
+        logger.info("[Creator][graph_expansion] graph_valid=true")
+        return edges
+    except Exception:
+        logger.info("[Creator][graph_expansion] model_call_count=%d", model_call_count)
+        logger.info("[Creator][graph_expansion] selection_retry_count=%d", selection_retry_count)
+        logger.info("[Creator][graph_expansion] graph_valid=false")
+        raise

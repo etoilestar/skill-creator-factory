@@ -7107,6 +7107,11 @@ async def _bind_executable_responsibility_plan(
         platform_contract=build_platform_io_contract(),
         planner_model=planner_model,
         model_call=select_sources,
+        goal_context={
+            "user_request": request.user_request,
+            "confirmed_blueprint": frozen_blueprint_text,
+            "skill_name": current_planner_result.get("skill_name", ""),
+        },
     )
     return {
         "function_items": frozen_function_items,

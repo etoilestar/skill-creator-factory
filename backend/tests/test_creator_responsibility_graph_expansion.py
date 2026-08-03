@@ -110,16 +110,16 @@ async def test_branch_merge_activates_only_goal_ancestors(caplog):
         item("scripts/c.py", ["left", "right"], ["c_out"]),
         item("scripts/d.py", ["unused"], ["d_out"]),
     ]
-    edges = await expand_responsibility_graph(
-        function_items=items, platform_contract=contract(), planner_model="p",
-        model_call=scripted_model("scripts/c.py", "c_out", "image_path", [
-            ("scripts/a.py", "a_out"), ("scripts/b.py", "b_out"),
-            ("platform_input_node", "input"), ("platform_input_node", "payload"),
-        ]), goal_context={},
-    )
-    nodes = {edge["from_node"] for edge in edges} | {edge["to_node"] for edge in edges}
-    assert "scripts/d.py" not in nodes
-    assert {("scripts/a.py", "scripts/c.py"), ("scripts/b.py", "scripts/c.py")} <= {(e["from_node"], e["to_node"]) for e in edges}
+    with pytest.raises(ResponsibilityGraphExpansionError) as raised:
+        await expand_responsibility_graph(
+            function_items=items, platform_contract=contract(), planner_model="p",
+            model_call=scripted_model("scripts/c.py", "c_out", "image_path", [
+                ("scripts/a.py", "a_out"), ("scripts/b.py", "b_out"),
+                ("platform_input_node", "input"), ("platform_input_node", "payload"),
+            ]), goal_context={},
+        )
+    assert raised.value.code == "inactive_frozen_function_items"
+    assert raised.value.details["targets"] == ["scripts/d.py"]
     assert "scripts/d.py" in caplog.text
 
 
@@ -147,6 +147,29 @@ def test_terminal_protocol_rejects_unknown_duplicate_slots_and_edge_fields():
     for response in cases:
         with pytest.raises(ResponsibilityGraphExpansionError):
             validate_terminal_selection_protocol(candidates=candidates, response=response)
+
+
+def test_terminal_protocol_requires_every_explicit_required_output():
+    items = [item("scripts/a.py", [], ["z"])]
+    required_contract = contract(["pdf_path", "docx_path"])
+    required_contract["platform_skill_boundary"]["required_final_output_fields"] = [
+        "pdf_path", "docx_path"
+    ]
+    candidates = build_terminal_binding_candidates(
+        function_items=items, platform_contract=required_contract
+    )
+    pdf = next(
+        value for value in candidates if value["target"]["port_id"] == "pdf_path"
+    )
+    with pytest.raises(ResponsibilityGraphExpansionError) as raised:
+        validate_terminal_selection_protocol(
+            candidates=candidates,
+            response={"terminal_binding_ids": [pdf["binding_id"]]},
+        )
+    assert raised.value.code == "missing_required_terminal_binding"
+    assert raised.value.details["missing_required_final_output_fields"] == [
+        "docx_path"
+    ]
 
 
 def test_binding_protocol_rejects_unknown_candidate_and_edge_fields():
@@ -218,3 +241,30 @@ async def test_invalid_candidate_retries_only_current_obligation():
     assert len(input_calls) == 2
     assert input_calls[1]["validation_issue"]["affected_obligation_id"] == "O0001"
     assert len(edges) == 2
+
+
+@pytest.mark.asyncio
+async def test_invalid_terminal_selection_retries_once_with_same_domain():
+    items = [item("scripts/a.py", [], ["z"])]
+    calls = []
+
+    async def model(messages, _model):
+        payload = json.loads(messages[-1]["content"])
+        calls.append(payload)
+        if len(calls) == 1:
+            return json.dumps({"terminal_binding_ids": ["outside"]})
+        return json.dumps({
+            "terminal_binding_ids": [payload["terminal_candidates"][0]["binding_id"]]
+        })
+
+    edges = await expand_responsibility_graph(
+        function_items=items,
+        platform_contract=contract(["text"]),
+        planner_model="p",
+        model_call=model,
+        goal_context={},
+    )
+    assert len(calls) == 2
+    assert calls[0]["terminal_candidates"] == calls[1]["terminal_candidates"]
+    assert calls[1]["protocol_error"]["code"] == "invalid_terminal_selection_protocol"
+    assert len(edges) == 1

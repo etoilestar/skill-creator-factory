@@ -84,6 +84,9 @@ def build_terminal_binding_candidates(
 ) -> list[dict]:
     """Build the declared FunctionItem-output × platform-terminal product."""
     items = normalize_structured_function_items(function_items, source="graph_expansion")
+    boundary = _boundary(platform_contract)
+    required_targets = boundary.get("required_final_output_fields")
+    has_explicit_required_targets = isinstance(required_targets, list)
     targets = _final_output_fields(platform_contract)
     candidates: list[dict] = []
     for item in items:
@@ -99,6 +102,7 @@ def build_terminal_binding_candidates(
                     "binding_id": f"T{len(candidates) + 1:04d}",
                     "source": {"node_id": item["target_file"], "port_id": output_name},
                     "target": {"node_id": PLATFORM_OUTPUT_NODE, "port_id": target_name},
+                    "target_required": has_explicit_required_targets,
                     "edge": _edge(str(item["target_file"]), output_name, PLATFORM_OUTPUT_NODE, target_name),
                     "source_context": {
                         "node_purpose": item.get("purpose", ""),
@@ -140,6 +144,18 @@ def validate_terminal_selection_protocol(*, candidates: list[dict], response: An
     target_slots = [registry[value]["target"]["port_id"] for value in ids]
     if len(target_slots) != len(set(target_slots)):
         raise ResponsibilityGraphExpansionError("a platform output slot may have only one source", code="invalid_terminal_selection_protocol")
+    required_slots = {
+        candidate["target"]["port_id"]
+        for candidate in candidates
+        if candidate.get("target_required")
+    }
+    missing_required_slots = sorted(required_slots - set(target_slots))
+    if missing_required_slots:
+        raise ResponsibilityGraphExpansionError(
+            "terminal selection does not cover every required platform output",
+            code="missing_required_terminal_binding",
+            details={"missing_required_final_output_fields": missing_required_slots},
+        )
     return ids
 
 
@@ -159,11 +175,32 @@ async def select_terminal_bindings(
         "The backend owns every legal endpoint and binding. Return strict JSON containing only "
         "terminal_binding_ids. Do not return nodes, ports, edges, explanations, or IDs outside the candidates."
     )
-    text = await model_call([
-        {"role": "system", "content": prompt},
-        {"role": "user", "content": json.dumps({"goal_context": goal_context, "terminal_candidates": public_candidates}, ensure_ascii=False)},
-    ], planner_model)
-    return validate_terminal_selection_protocol(candidates=candidates, response=_parse_json_object(text, code="invalid_terminal_selection_protocol"))
+    payload: dict[str, Any] = {
+        "goal_context": goal_context,
+        "terminal_candidates": public_candidates,
+    }
+    for attempt in range(2):
+        text = await model_call([
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ], planner_model)
+        try:
+            return validate_terminal_selection_protocol(
+                candidates=candidates,
+                response=_parse_json_object(text, code="invalid_terminal_selection_protocol"),
+            )
+        except ValueError as exc:
+            if attempt:
+                raise ResponsibilityGraphExpansionError(
+                    "terminal selection failed after one retry",
+                    code="terminal_selection_failed",
+                    details={"validation_error": str(exc)},
+                ) from exc
+            payload["protocol_error"] = {
+                "code": getattr(exc, "code", "invalid_terminal_selection_protocol"),
+                "details": getattr(exc, "details", {}),
+            }
+    raise AssertionError("unreachable terminal selection loop")
 
 
 def enqueue_required_inputs_for_node(
@@ -396,10 +433,25 @@ async def expand_responsibility_graph(
     logger.info("[Creator][graph_expansion] terminal_candidate_count=%d", len(terminal_candidates))
     model_call_count = 0
     selection_retry_count = 0
+
+    async def counted_model_call(messages: list[dict[str, str]], model: str) -> str:
+        nonlocal model_call_count
+        model_call_count += 1
+        return await model_call(messages, model)
+
     try:
-        if terminal_candidates:
-            model_call_count += 1
-        terminal_ids = await select_terminal_bindings(candidates=terminal_candidates, goal_context=context, planner_model=planner_model, model_call=model_call)
+        calls_before_terminal_selection = model_call_count
+        try:
+            terminal_ids = await select_terminal_bindings(
+                candidates=terminal_candidates,
+                goal_context=context,
+                planner_model=planner_model,
+                model_call=counted_model_call,
+            )
+        finally:
+            selection_retry_count += max(
+                0, model_call_count - calls_before_terminal_selection - 1
+            )
         logger.info("[Creator][graph_expansion] selected_terminal_binding_ids=%s", terminal_ids)
         state = initialize_state_from_terminals(terminal_ids=terminal_ids, candidates=terminal_candidates, function_items=normalized)
         logger.info("[Creator][graph_expansion] active_node_count=%d", len(state.active_nodes))
@@ -419,11 +471,10 @@ async def expand_responsibility_graph(
             candidate_id = ""
             for attempt in range(2):
                 try:
-                    model_call_count += 1
                     candidate_id = await _select_binding_candidate(
                         obligation=obligation, candidates=candidates, goal_context=context,
                         committed_edges=state.committed_edges, planner_model=planner_model,
-                        model_call=model_call, validation_issue=issue,
+                        model_call=counted_model_call, validation_issue=issue,
                     )
                     candidate = next(value for value in candidates if value["candidate_id"] == candidate_id)
                     _validate_transaction(state.committed_edges + [candidate["edge"]], normalized)
@@ -453,6 +504,12 @@ async def expand_responsibility_graph(
         edges = _finalize_graph(state=state, function_items=normalized, platform_contract=platform_contract, terminal_candidates=terminal_candidates)
         diagnostic = {"issue_type": "inactive_frozen_function_items", "targets": state.inactive_function_items, "reason": "Frozen FunctionItems were not selected on any path to a required terminal."}
         logger.info("[Creator][graph_expansion] inactive_function_items=%s", json.dumps(diagnostic, ensure_ascii=False))
+        if state.inactive_function_items:
+            raise ResponsibilityGraphExpansionError(
+                json.dumps(diagnostic, ensure_ascii=False),
+                code="inactive_frozen_function_items",
+                details=diagnostic,
+            )
         logger.info("[Creator][graph_expansion] model_call_count=%d", model_call_count)
         logger.info("[Creator][graph_expansion] selection_retry_count=%d", selection_retry_count)
         logger.info("[Creator][graph_expansion] graph_valid=true")

@@ -1,270 +1,150 @@
 import json
-
 import pytest
 
-from backend.services.platform_io_contract import build_platform_io_contract
 from backend.services.creator.responsibility_graph_expansion import (
-    GraphExpansionState,
-    ResponsibilityGraphExpansionError,
-    build_binding_candidates_for_obligation,
-    build_terminal_binding_candidates,
-    enqueue_required_inputs_for_node,
-    expand_responsibility_graph,
-    initialize_state_from_terminals,
-    validate_binding_selection_protocol,
-    validate_terminal_selection_protocol,
+    GraphExpansionState, ResponsibilityGraphExpansionError,
+    build_endpoint_registry, expand_responsibility_graph,
+    validate_and_materialize_input_binding,
+    validate_and_materialize_terminal_bindings,
+    validate_input_source_reference_protocol,
+    validate_terminal_reference_protocol,
 )
+from backend.services.platform_io_contract import build_platform_io_contract
 
 
 def item(node, inputs, outputs, defaults=None):
-    return {
-        "target_file": node,
-        "role": "script",
-        "purpose": f"purpose-{node}",
-        "inputs": inputs,
-        "outputs": outputs,
-        "required_capabilities": [],
-        "constraints": [],
-        "default_values": defaults or {},
-    }
+    return {"target_file": node, "role": "script", "purpose": f"purpose-{node}", "inputs": inputs, "outputs": outputs, "required_capabilities": [], "constraints": [], "default_values": defaults or {}}
 
 
-def contract(outputs=None):
-    boundary = {
-        "input_envelope_fields": ["input", "payload"],
-        "final_output_fields": outputs or ["text", "pdf_path", "image_path", "docx_path"],
-    }
+def contract(required=None):
+    boundary = {"input_envelope_fields": ["fields", "options"], "final_output_fields": ["text", "pdf_path", "image_path", "docx_path"]}
+    if required is not None:
+        boundary["required_final_output_fields"] = required
     return {"platform_skill_boundary": boundary}
 
 
-def scripted_model(terminal_node, terminal_output, terminal_field, bindings, calls=None, terminal_fields=None):
-    """Choose by supplied semantic contexts, never by backend edge data."""
-    remaining = list(bindings)
-
-    async def model(messages, _model):
-        payload = json.loads(messages[-1]["content"])
-        if calls is not None:
-            calls.append(payload)
-        if "terminal_candidates" in payload:
-            wanted = terminal_fields or [terminal_field]
-            ids = []
-            for field in wanted:
-                candidate = next(value for value in payload["terminal_candidates"] if
-                    value["source_context"]["node_purpose"] == f"purpose-{terminal_node}"
-                    and value["source_context"]["output_name"] == terminal_output
-                    and value["target_context"]["platform_output_field"] == field)
-                ids.append(candidate["binding_id"])
-            return json.dumps({"terminal_binding_ids": ids})
-        source_node, source_port = remaining.pop(0)
-        if source_node == "platform_input_node":
-            candidate = next(value for value in payload["binding_candidates"] if value["source_context"].get("platform_input_field") == source_port)
-        else:
-            candidate = next(value for value in payload["binding_candidates"] if
-                value["source_context"].get("node_purpose") == f"purpose-{source_node}"
-                and value["source_context"].get("output_name") == source_port)
-        return json.dumps({"selection": {"obligation_id": payload["obligation"]["obligation_id"], "candidate_id": candidate["candidate_id"]}})
-
-    return model
+def obligation(node="scripts/b.py", port="x"):
+    return {"obligation_id": "O0001", "target": {"node_id": node, "port_id": port}, "target_context": {"input_contract": {}}}
 
 
-def test_real_platform_contract_exposes_all_terminal_fields_without_text_default():
-    items = [item("scripts/a.py", [], ["q1"])]
-    candidates = build_terminal_binding_candidates(
-        function_items=items, platform_contract=build_platform_io_contract()
-    )
-    fields = {value["target"]["port_id"] for value in candidates}
-    assert {"text", "pdf_path", "image_path", "docx_path"} <= fields
-    for field in ("pdf_path", "image_path", "docx_path"):
-        assert any(value["target"]["port_id"] == field for value in candidates)
-
-
-@pytest.mark.asyncio
-async def test_goal_driven_serial_activation_order_and_determinism():
-    items = [
-        item("scripts/a.py", ["a_in"], ["a_out"]),
-        item("scripts/b.py", ["b_in"], ["b_out"]),
-        item("scripts/c.py", ["c_in"], ["c_out"]),
-    ]
-    calls = []
-    choices = [("scripts/b.py", "b_out"), ("scripts/a.py", "a_out"), ("platform_input_node", "input")]
-    model = scripted_model("scripts/c.py", "c_out", "pdf_path", choices, calls)
-    first = await expand_responsibility_graph(function_items=items, platform_contract=contract(), planner_model="p", model_call=model, goal_context={"user_request": "g"})
-    second = await expand_responsibility_graph(function_items=items, platform_contract=contract(), planner_model="p", model_call=scripted_model("scripts/c.py", "c_out", "pdf_path", choices), goal_context={})
+def test_registry_has_independent_stable_endpoints_without_cartesian_product():
+    items = [item(f"scripts/n{i}.py", [], [f"o{i}"]) for i in range(10)]
+    platform = {"platform_skill_boundary": {"input_envelope_fields": [f"i{i}" for i in range(3)], "final_output_fields": [f"p{i}" for i in range(10)]}}
+    first = build_endpoint_registry(function_items=items, platform_contract=platform)
+    second = build_endpoint_registry(function_items=items, platform_contract=platform)
     assert first == second
-    assert [(edge["from_node"], edge["to_node"]) for edge in first] == [
-        ("scripts/c.py", "platform_output_node"),
-        ("scripts/b.py", "scripts/c.py"),
-        ("scripts/a.py", "scripts/b.py"),
-        ("platform_input_node", "scripts/a.py"),
-    ]
-    input_calls = [value for value in calls if "obligation" in value]
-    assert [value["obligation"]["target"]["node_id"] for value in input_calls] == ["scripts/c.py", "scripts/b.py", "scripts/a.py"]
+    assert len(first["nodes"]) == len(first["script_outputs"]) == len(first["platform_outputs"]) == 10
+    assert first["nodes"][0]["node_id"] == "N0001"
+    assert first["script_outputs"][-1]["output_id"] == "OUT0010"
+    assert first["platform_outputs"][-1]["slot_id"] == "POUT0010"
+    assert all("edge" not in value for group in first.values() for value in group)
 
 
-@pytest.mark.asyncio
-async def test_branch_merge_activates_only_goal_ancestors(caplog):
-    caplog.set_level("INFO")
-    items = [
-        item("scripts/a.py", ["a_in"], ["a_out"]),
-        item("scripts/b.py", ["b_in"], ["b_out"]),
-        item("scripts/c.py", ["left", "right"], ["c_out"]),
-        item("scripts/d.py", ["unused"], ["d_out"]),
-    ]
-    with pytest.raises(ResponsibilityGraphExpansionError) as raised:
-        await expand_responsibility_graph(
-            function_items=items, platform_contract=contract(), planner_model="p",
-            model_call=scripted_model("scripts/c.py", "c_out", "image_path", [
-                ("scripts/a.py", "a_out"), ("scripts/b.py", "b_out"),
-                ("platform_input_node", "input"), ("platform_input_node", "payload"),
-            ]), goal_context={},
-        )
-    assert raised.value.code == "inactive_frozen_function_items"
-    assert raised.value.details["targets"] == ["scripts/d.py"]
-    assert "scripts/d.py" in caplog.text
+def test_one_hundred_outputs_register_no_edge_candidates():
+    items = [item(f"scripts/n{i}.py", [], [f"o{i}"]) for i in range(100)]
+    registry = build_endpoint_registry(function_items=items, platform_contract=contract())
+    assert len(registry["script_outputs"]) == 100
+    assert not any("candidate_id" in value or "edge" in value for value in registry["script_outputs"])
 
 
-def test_frontier_skips_defaults_duplicates_and_inactive_nodes():
-    items = [item("scripts/a.py", ["x", "y"], ["z"], {"y": 4})]
-    inactive = GraphExpansionState()
-    enqueue_required_inputs_for_node(node_id="scripts/a.py", function_items=items, state=inactive)
-    assert not inactive.frontier
-    state = GraphExpansionState(active_nodes={"scripts/a.py"})
-    enqueue_required_inputs_for_node(node_id="scripts/a.py", function_items=items, state=state)
-    enqueue_required_inputs_for_node(node_id="scripts/a.py", function_items=items, state=state)
-    assert [(value["target"]["port_id"]) for value in state.frontier] == ["x"]
-
-
-def test_terminal_protocol_rejects_unknown_duplicate_slots_and_edge_fields():
-    items = [item("scripts/a.py", [], ["z"]), item("scripts/b.py", [], ["q"])]
-    candidates = build_terminal_binding_candidates(function_items=items, platform_contract=contract(["text"]))
-    cases = [
-        {"terminal_binding_ids": []},
-        {"terminal_binding_ids": ["outside"]},
-        {"terminal_binding_ids": [candidates[0]["binding_id"], candidates[0]["binding_id"]]},
-        {"terminal_binding_ids": [candidates[0]["binding_id"], candidates[1]["binding_id"]]},
-        {"terminal_binding_ids": [candidates[0]["binding_id"]], "edge": {}},
-    ]
-    for response in cases:
-        with pytest.raises(ResponsibilityGraphExpansionError):
-            validate_terminal_selection_protocol(candidates=candidates, response=response)
-
-
-def test_terminal_protocol_requires_every_explicit_required_output():
+def test_terminal_direct_references_materialize_only_selected_pair_and_required_coverage():
     items = [item("scripts/a.py", [], ["z"])]
-    required_contract = contract(["pdf_path", "docx_path"])
-    required_contract["platform_skill_boundary"]["required_final_output_fields"] = [
-        "pdf_path", "docx_path"
-    ]
-    candidates = build_terminal_binding_candidates(
-        function_items=items, platform_contract=required_contract
-    )
-    pdf = next(
-        value for value in candidates if value["target"]["port_id"] == "pdf_path"
-    )
-    with pytest.raises(ResponsibilityGraphExpansionError) as raised:
-        validate_terminal_selection_protocol(
-            candidates=candidates,
-            response={"terminal_binding_ids": [pdf["binding_id"]]},
-        )
-    assert raised.value.code == "missing_required_terminal_binding"
-    assert raised.value.details["missing_required_final_output_fields"] == [
-        "docx_path"
-    ]
-
-
-def test_binding_protocol_rejects_unknown_candidate_and_edge_fields():
-    items = [item("scripts/a.py", ["x"], ["z"])]
-    terminals = build_terminal_binding_candidates(function_items=items, platform_contract=contract(["text"]))
-    state = initialize_state_from_terminals(terminal_ids=[terminals[0]["binding_id"]], candidates=terminals, function_items=items)
-    obligation = state.frontier[0]
-    candidates = build_binding_candidates_for_obligation(obligation=obligation, function_items=items, platform_contract=contract(), state=state)
-    for response in (
-        {"selection": {"obligation_id": obligation["obligation_id"], "candidate_id": "outside"}},
-        {"selection": {"obligation_id": obligation["obligation_id"], "candidate_id": candidates[0]["candidate_id"], "from_node": "x"}},
-    ):
-        with pytest.raises(ResponsibilityGraphExpansionError):
-            validate_binding_selection_protocol(obligation=obligation, candidates=candidates, response=response)
-
-
-@pytest.mark.asyncio
-async def test_multiple_terminals_are_allowed_on_distinct_slots():
-    items = [item("scripts/a.py", [], ["z"])]
-    edges = await expand_responsibility_graph(
-        function_items=items, platform_contract=contract(), planner_model="p",
-        model_call=scripted_model("scripts/a.py", "z", "text", [], terminal_fields=["pdf_path", "docx_path"]), goal_context={},
-    )
+    platform = contract(["pdf_path", "docx_path"])
+    registry = build_endpoint_registry(function_items=items, platform_contract=platform)
+    output_id = registry["script_outputs"][0]["output_id"]
+    slots = {value["field"]: value["slot_id"] for value in registry["platform_outputs"]}
+    with pytest.raises(ResponsibilityGraphExpansionError, match="cover every required"):
+        validate_and_materialize_terminal_bindings(selections=[{"source_output_id": output_id, "platform_output_slot_id": slots["pdf_path"]}], registry=registry, function_items=items, platform_contract=platform)
+    edges = validate_and_materialize_terminal_bindings(selections=[
+        {"source_output_id": output_id, "platform_output_slot_id": slots["pdf_path"]},
+        {"source_output_id": output_id, "platform_output_slot_id": slots["docx_path"]},
+    ], registry=registry, function_items=items, platform_contract=platform)
     assert [edge["to_input"] for edge in edges] == ["pdf_path", "docx_path"]
 
 
-def test_cycle_source_is_not_a_candidate_and_unknown_types_remain():
-    items = [item("scripts/a.py", ["x"], ["a"]), item("scripts/b.py", ["y"], ["b"])]
-    state = GraphExpansionState(
-        active_nodes={"scripts/a.py", "scripts/b.py"},
-        committed_edges=[{"from_node": "scripts/a.py", "from_output": "a", "to_node": "scripts/b.py", "to_input": "y", "purpose": "p", "constraints": []}],
-    )
-    obligation = {"obligation_id": "O0001", "target": {"node_id": "scripts/a.py", "port_id": "x"}, "target_context": {"input_contract": {"type": "unknown"}}}
-    candidates = build_binding_candidates_for_obligation(obligation=obligation, function_items=items, platform_contract=contract(), state=state)
-    assert "scripts/b.py" not in {value["edge"]["from_node"] for value in candidates}
-    assert "platform_input_node" in {value["edge"]["from_node"] for value in candidates}
+def test_script_output_reference_materializes_one_edge_and_rejects_cycle():
+    items = [item("scripts/a.py", ["a_in"], ["a"]), item("scripts/b.py", ["x"], ["b"])]
+    registry = build_endpoint_registry(function_items=items, platform_contract=contract())
+    state = GraphExpansionState(active_nodes={"scripts/b.py"})
+    selected = {"obligation_id": "O0001", "source_kind": "script_output", "source_output_id": registry["script_outputs"][0]["output_id"]}
+    edge = validate_and_materialize_input_binding(obligation=obligation(), selection=selected, registry=registry, state=state, function_items=items)
+    assert (edge["from_node"], edge["to_node"]) == ("scripts/a.py", "scripts/b.py")
+    state.committed_edges = [edge]
+    state.active_nodes.add("scripts/a.py")
+    reverse = {**selected, "source_output_id": registry["script_outputs"][1]["output_id"]}
+    with pytest.raises(ResponsibilityGraphExpansionError) as raised:
+        validate_and_materialize_input_binding(obligation=obligation("scripts/a.py", "a_in"), selection=reverse, registry=registry, state=state, function_items=items)
+    assert raised.value.code == "responsibility_graph_cycle"
 
 
-@pytest.mark.asyncio
-async def test_random_rename_preserves_topology():
-    async def topology(node, input_name, output_name):
-        edges = await expand_responsibility_graph(
-            function_items=[item(node, [input_name], [output_name])], platform_contract=contract(), planner_model="p",
-            model_call=scripted_model(node, output_name, "docx_path", [("platform_input_node", "payload")]), goal_context={},
-        )
-        return [(edge["from_node"] == "platform_input_node", edge["to_node"] == "platform_output_node") for edge in edges]
-    assert await topology("scripts/q7.py", "q8", "q9") == await topology("scripts/v2.py", "v3", "v4")
+@pytest.mark.parametrize("slot_field,path", [
+    ("fields", ["page_count"]),
+    ("options", ["future_8f31", "setting_91ab"]),
+    ("options", []),
+])
+def test_platform_open_paths_need_no_parameter_vocabulary(slot_field, path):
+    items = [item("scripts/b.py", ["x"], ["z"])]
+    registry = build_endpoint_registry(function_items=items, platform_contract=contract())
+    slot = next(value for value in registry["platform_inputs"] if value["field"] == slot_field)
+    state = GraphExpansionState(active_nodes={"scripts/b.py"})
+    edge = validate_and_materialize_input_binding(obligation=obligation(), selection={"obligation_id": "O0001", "source_kind": "platform_input", "platform_input_slot_id": slot["slot_id"], "path": path}, registry=registry, state=state, function_items=items)
+    assert edge["from_output"] == slot_field
+    assert (edge["constraints"][0]["source_path"] if path else []) == path
 
 
-@pytest.mark.asyncio
-async def test_invalid_candidate_retries_only_current_obligation():
-    items = [item("scripts/a.py", ["x"], ["z"])]
-    calls = []
+@pytest.mark.parametrize("path", [[""], ["__proto__"], ["constructor"], "not-list"])
+def test_invalid_platform_paths_are_rejected(path):
+    with pytest.raises(ResponsibilityGraphExpansionError):
+        validate_input_source_reference_protocol(obligation=obligation(), response={"selection": {"obligation_id": "O0001", "source_kind": "platform_input", "platform_input_slot_id": "PIN0001", "path": path}})
 
+
+def test_unknown_endpoint_ids_and_extra_edge_fields_are_rejected():
+    with pytest.raises(ResponsibilityGraphExpansionError):
+        validate_terminal_reference_protocol(response={"terminal_bindings": [{"source_output_id": "OUT9999", "platform_output_slot_id": "POUT9999", "edge": {}}]})
+    items = [item("scripts/b.py", ["x"], ["z"])]
+    registry = build_endpoint_registry(function_items=items, platform_contract=contract())
+    with pytest.raises(ResponsibilityGraphExpansionError):
+        validate_and_materialize_input_binding(obligation=obligation(), selection={"obligation_id": "O0001", "source_kind": "script_output", "source_output_id": "OUT9999"}, registry=registry, state=GraphExpansionState(active_nodes={"scripts/b.py"}), function_items=items)
+
+
+def scripted_model(terminal_node, terminal_port, terminal_field, input_sources, calls=None):
+    remaining = list(input_sources)
     async def model(messages, _model):
         payload = json.loads(messages[-1]["content"])
-        calls.append(payload)
-        if "terminal_candidates" in payload:
-            return json.dumps({"terminal_binding_ids": [payload["terminal_candidates"][0]["binding_id"]]})
-        if len([value for value in calls if "obligation" in value]) == 1:
-            return json.dumps({"selection": {"obligation_id": payload["obligation"]["obligation_id"], "candidate_id": "outside"}})
-        return json.dumps({"selection": {"obligation_id": payload["obligation"]["obligation_id"], "candidate_id": payload["binding_candidates"][0]["candidate_id"]}})
-
-    edges = await expand_responsibility_graph(
-        function_items=items, platform_contract=contract(["text"]),
-        planner_model="p", model_call=model, goal_context={},
-    )
-    input_calls = [value for value in calls if "obligation" in value]
-    assert len(input_calls) == 2
-    assert input_calls[1]["validation_issue"]["affected_obligation_id"] == "O0001"
-    assert len(edges) == 2
+        if calls is not None: calls.append(payload)
+        if "platform_outputs" in payload and "obligation" not in payload:
+            output = next(value for value in payload["script_outputs"] if value["node_purpose"] == f"purpose-{terminal_node}" and value["port_id"] == terminal_port)
+            slot = next(value for value in payload["platform_outputs"] if value["field"] == terminal_field)
+            return json.dumps({"terminal_bindings": [{"source_output_id": output["output_id"], "platform_output_slot_id": slot["slot_id"]}]})
+        kind, marker, path = remaining.pop(0)
+        if kind == "script_output":
+            output = next(value for value in payload["script_outputs"] if value["node_purpose"] == f"purpose-{marker[0]}" and value["port_id"] == marker[1])
+            selection = {"obligation_id": payload["obligation"]["obligation_id"], "source_kind": kind, "source_output_id": output["output_id"]}
+        else:
+            slot = next(value for value in payload["platform_inputs"] if value["field"] == marker)
+            selection = {"obligation_id": payload["obligation"]["obligation_id"], "source_kind": kind, "platform_input_slot_id": slot["slot_id"], "path": path}
+        return json.dumps({"selection": selection})
+    return model
 
 
 @pytest.mark.asyncio
-async def test_invalid_terminal_selection_retries_once_with_same_domain():
+async def test_two_script_goal_driven_expansion_uses_endpoint_references():
+    items = [item("scripts/a.py", ["a_in"], ["a_out"]), item("scripts/b.py", ["b_in"], ["b_out"])]
+    calls = []
+    edges = await expand_responsibility_graph(function_items=items, platform_contract=build_platform_io_contract(), planner_model="p", goal_context={"user_request": "random"}, model_call=scripted_model("scripts/b.py", "b_out", "text", [("script_output", ("scripts/a.py", "a_out"), []), ("platform_input", "fields", ["future_91ab"])], calls))
+    assert [(edge["from_node"], edge["to_node"]) for edge in edges] == [("scripts/b.py", "platform_output_node"), ("scripts/a.py", "scripts/b.py"), ("platform_input_node", "scripts/a.py")]
+    assert all("terminal_candidates" not in call and "binding_candidates" not in call for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_terminal_protocol_retries_with_same_independent_registry():
     items = [item("scripts/a.py", [], ["z"])]
     calls = []
-
     async def model(messages, _model):
-        payload = json.loads(messages[-1]["content"])
-        calls.append(payload)
-        if len(calls) == 1:
-            return json.dumps({"terminal_binding_ids": ["outside"]})
-        return json.dumps({
-            "terminal_binding_ids": [payload["terminal_candidates"][0]["binding_id"]]
-        })
-
-    edges = await expand_responsibility_graph(
-        function_items=items,
-        platform_contract=contract(["text"]),
-        planner_model="p",
-        model_call=model,
-        goal_context={},
-    )
-    assert len(calls) == 2
-    assert calls[0]["terminal_candidates"] == calls[1]["terminal_candidates"]
-    assert calls[1]["protocol_error"]["code"] == "invalid_terminal_selection_protocol"
-    assert len(edges) == 1
+        payload = json.loads(messages[-1]["content"]); calls.append(payload)
+        if len(calls) == 1: return json.dumps({"terminal_binding_ids": ["legacy"]})
+        return json.dumps({"terminal_bindings": [{"source_output_id": payload["script_outputs"][0]["output_id"], "platform_output_slot_id": payload["platform_outputs"][0]["slot_id"]}]})
+    await expand_responsibility_graph(function_items=items, platform_contract=contract(), planner_model="p", model_call=model, goal_context={})
+    assert calls[0]["script_outputs"] == calls[1]["script_outputs"]
+    assert calls[0]["platform_outputs"] == calls[1]["platform_outputs"]
+    assert calls[1]["validation_issue"]["code"] == "invalid_terminal_reference_protocol"

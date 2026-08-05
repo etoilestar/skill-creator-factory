@@ -237,6 +237,59 @@ async def test_missing_platform_output_reports_required_fields_without_terminal_
     assert raised.value.details["missing_required_final_output_fields"] == ["pdf_path", "text"]
 
 
+
+@pytest.mark.asyncio
+async def test_repeated_member_interfaces_bind_distinct_unbound_inputs():
+    items = [
+        item("scripts/a.py", ["runtime_input"], ["first", "second", "third"]),
+        item("scripts/b.py", ["first", "second", "third"], ["result"]),
+    ]
+
+    interface_plan = plan(
+        p2m("I0001", "scripts/a.py"),
+        m2m("I0002", "scripts/a.py", "scripts/b.py"),
+        m2m("I0003", "scripts/a.py", "scripts/b.py"),
+        m2m("I0004", "scripts/a.py", "scripts/b.py"),
+        m2p("I0005", "scripts/b.py"),
+    )
+    seen_target_lists = []
+
+    async def model(messages, _model):
+        payload = json.loads(messages[-1]["content"])
+        obligation = payload["obligation"]
+        if obligation["kind"] == "platform_to_script":
+            return json.dumps({
+                "source_id": payload["platform_inputs"][0]["slot_id"],
+                "target_id": payload["target_member_inputs"][0]["input_id"],
+                "source_path": [],
+            })
+        if obligation["kind"] == "script_to_script":
+            seen_target_lists.append([value["port_id"] for value in payload["target_member_inputs"]])
+            return json.dumps({
+                "source_id": payload["source_member_outputs"][len(seen_target_lists) - 1]["output_id"],
+                "target_id": payload["target_member_inputs"][0]["input_id"],
+            })
+        return json.dumps({
+            "source_id": payload["source_member_outputs"][0]["output_id"],
+            "target_id": payload["platform_outputs"][0]["slot_id"],
+        })
+
+    edges = await expand_responsibility_graph(
+        function_items=items,
+        platform_contract=contract(required=["text"]),
+        planner_model="p",
+        goal_context={},
+        model_call=model,
+        interface_plan=interface_plan,
+    )
+
+    assert seen_target_lists == [["first", "second", "third"], ["second", "third"], ["third"]]
+    assert {(edge["to_node"], edge["to_input"]) for edge in edges} >= {
+        ("scripts/b.py", "first"),
+        ("scripts/b.py", "second"),
+        ("scripts/b.py", "third"),
+    }
+
 @pytest.mark.asyncio
 async def test_platform_endpoint_retry_corrects_string_source_path_to_array():
     items = [

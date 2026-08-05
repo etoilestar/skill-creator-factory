@@ -197,11 +197,68 @@ Your only task is to declare the necessary interaction directions:
 2. one FunctionItem to another FunctionItem;
 3. a FunctionItem to platform output.
 
-Each interaction must appear exactly once as one interface object.
+Each interface object represents exactly one logical data-transfer obligation.
 
-Do not repeat FunctionItem purposes, inputs, outputs, dependencies, capabilities, execution commands, paths, argv contracts, placeholders, or port declarations.
-Do not select endpoint IDs. Do not generate ResponsibilityEdges. Do not infer from filenames, suffixes, roles, or business keyword tables.
-Use the Blueprint goal, FunctionItem purposes, declared inputs/outputs, requirement allocations, and platform contract as semantic evidence.
+A later graph-binding step will materialize each interface object as exactly
+one source endpoint connected to exactly one target endpoint.
+
+Therefore, do not combine multiple independently required target inputs into
+one broad interface.
+
+When one FunctionItem requires multiple independent inputs from the same
+source FunctionItem, declare multiple member_to_member interfaces between the
+same source_member and target_member. Each interface must have a distinct goal
+describing one logical data transfer.
+
+Interfaces between the same members are not duplicates when their goals
+represent different required data transfers.
+
+An interface is a duplicate only when it repeats the same direction and the
+same logical data-transfer responsibility.
+
+For every required FunctionItem input that has no default value, the complete
+interface plan must contain one incoming interface intent capable of supplying
+that input.
+
+For every required platform final output, the complete interface plan must
+contain one member_to_platform interface intent capable of supplying that
+output.
+
+Do not output endpoint IDs, port IDs, input IDs, output IDs, or ResponsibilityEdges.
+
+Do not copy full port declarations into interface objects. However, the goal
+must describe the specific data responsibility clearly enough to distinguish
+independent transfers.
+
+Infer semantic transfers only from:
+- the complete system goal;
+- FunctionItem purposes;
+- declared FunctionItem inputs and outputs;
+- executable requirement allocations;
+- the platform contract.
+
+Do not infer relationships from filenames, suffixes, roles, naming conventions,
+business keyword tables, or fixed workflow templates.
+
+Example:
+
+FunctionItem A produces three independent data values required by FunctionItem B.
+
+Incorrect:
+Declare one broad A-to-B interface whose goal groups all three values.
+
+Correct:
+Declare three A-to-B interfaces. Each interface represents one independent
+logical transfer and has a distinct transfer goal.
+
+Do not include endpoint IDs or port IDs in the returned interface objects.
+
+Do not copy complete FunctionItem definitions, complete port declarations,
+dependencies, capabilities, commands, paths, or argv contracts into the
+interface objects.
+
+The interface goal may describe the specific data responsibility in natural
+language when necessary to distinguish one logical transfer from another.
 
 Return only strict JSON matching this schema. No markdown unless the transport wraps the single JSON object in one json fence.
 Schema:
@@ -219,6 +276,7 @@ async def _reformat_interface_plan_response(*, raw_response: str, validation_err
 
 async def plan_function_item_interfaces(*, original_user_goal: str, frozen_function_items: list[dict[str, Any]], requirement_allocations: list[dict[str, Any]] | None = None, requirement_channels: dict[str, str] | None = None, platform_contract: dict[str, Any] | None = None, planner_model: str, model_call: ModelCall) -> dict[str, Any]:
     """Ask the model for interaction intents between frozen FunctionItems."""
+
     payload = {
         "system_goal": original_user_goal,
         "function_items": _compact_function_items(frozen_function_items),
@@ -253,12 +311,64 @@ async def plan_function_item_interfaces(*, original_user_goal: str, frozen_funct
 async def repair_interface_intents(*, original_user_goal: str, frozen_function_items: list[dict[str, Any]], current_interface_plan: dict[str, Any], validation_errors: list[dict[str, Any]], affected_members: list[str] | None = None, missing_platform_output_fields: list[str] | None = None, requirement_allocations: list[dict[str, Any]] | None = None, requirement_channels: dict[str, str] | None = None, platform_contract: dict[str, Any] | None = None, planner_model: str, model_call: ModelCall) -> dict[str, Any]:
     """Run one local semantic repair of interface intents."""
     logger.info("[Creator][interface_semantic_repair] affected_members=%s missing_platform_output_fields=%s", affected_members or [], missing_platform_output_fields or [])
-    prompt = "Preserve every existing interface that is unrelated to affected_members or missing_platform_output_fields. Only add, delete, or modify interfaces required to resolve the supplied validation errors. Do not change FunctionItems. Do not redesign the complete interface plan. Return only JSON matching the interface schema."
+
+    uncovered_inputs: list[dict[str, str]] = []
+    for error in validation_errors:
+        details = error.get("details") if isinstance(error, dict) else None
+        if not isinstance(details, dict):
+            continue
+        raw_uncovered = details.get("uncovered_inputs")
+        if not isinstance(raw_uncovered, list):
+            continue
+        for item in raw_uncovered:
+            if not isinstance(item, dict):
+                continue
+            target = str(item.get("target") or "").strip()
+            input_id = str(item.get("input_id") or "").strip()
+            if target and input_id:
+                uncovered_inputs.append({"target": target, "input_id": input_id})
+    prompt = """You are repairing only the current Interface Intent Plan.
+
+Preserve every existing interface unrelated to the supplied validation errors.
+
+The validation errors are authoritative. In particular,
+uncovered_inputs identifies required FunctionItem inputs that still have no
+incoming graph edge.
+
+An existing interface between two members does not prove that every required
+target input is covered, because each interface will materialize exactly one
+source endpoint to one target endpoint.
+
+For every uncovered input, add or adjust one interface intent representing the
+missing logical data transfer.
+
+Multiple interfaces between the same source_member and target_member are
+allowed and required when they represent different missing data transfers.
+
+Do not merge several uncovered inputs into one broad interface.
+
+Do not return the plan unchanged when uncovered_inputs is non-empty.
+
+Use FunctionItem purposes, declared inputs and outputs, requirement allocations,
+the current interface plan, and the validation errors to determine the semantic
+source of each missing transfer.
+
+Do not infer sources from filenames, suffixes, role names, naming tables, or
+hard-coded business rules.
+
+Do not add endpoint IDs, input IDs, output IDs, port IDs, or ResponsibilityEdges
+to the returned interface objects.
+
+Do not modify FunctionItems.
+Do not redesign unrelated parts of the plan.
+Return only strict JSON matching the supplied interface schema.
+"""
     payload = {
         "system_goal": original_user_goal,
         "function_items": _compact_function_items(frozen_function_items),
         "current_interface_plan": current_interface_plan,
         "validation_errors": validation_errors,
+        "uncovered_inputs": uncovered_inputs,
         "affected_members": affected_members or [],
         "missing_platform_output_fields": missing_platform_output_fields or [],
         "executable_requirement_allocations": [

@@ -50,7 +50,8 @@ from .basic_format import check_patch_candidate_basic_format
 from .command_normalizer import _effective_command_lines
 from .command_normalizer import parse_skill_md_bash_command_blocks
 from . import contracts as creator_contracts
-from .responsibility_graph_expansion import expand_responsibility_graph
+from .responsibility_graph_expansion import ResponsibilityGraphExpansionError, expand_responsibility_graph
+from .subsystem_interface_plan import plan_subsystem_interfaces, repair_subsystem_interfaces
 
 
 def _tool_binding_digest(binding: dict[str, Any]) -> str:
@@ -7088,6 +7089,8 @@ async def _bind_executable_responsibility_plan(
     current_planner_result: dict[str, Any],
     planner_model: str,
     allowed_function_item_targets: list[str],
+    requirement_allocations: list[dict[str, Any]] | None = None,
+    requirement_channels: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Expand edges incrementally over Backend-materialized frozen FunctionItems."""
     frozen_blueprint_text = str(
@@ -7102,17 +7105,59 @@ async def _bind_executable_responsibility_plan(
             messages, "planner", fallback_model=model,
         )
 
-    responsibility_edges = await expand_responsibility_graph(
-        function_items=frozen_function_items,
-        platform_contract=build_platform_io_contract(),
+    platform_contract = build_platform_io_contract()
+    subsystem_plan = await plan_subsystem_interfaces(
+        original_user_goal=request.user_request,
+        frozen_blueprint=frozen_blueprint_text,
+        frozen_function_items=frozen_function_items,
+        requirement_allocations=requirement_allocations or [],
+        requirement_channels=requirement_channels or {},
+        platform_contract=platform_contract,
         planner_model=planner_model,
         model_call=select_sources,
-        goal_context={
-            "user_request": request.user_request,
-            "confirmed_blueprint": frozen_blueprint_text,
-            "skill_name": current_planner_result.get("skill_name", ""),
-        },
     )
+    graph_context = {
+        "user_request": request.user_request,
+        "confirmed_blueprint": frozen_blueprint_text,
+        "skill_name": current_planner_result.get("skill_name", ""),
+        "subsystem_plan": subsystem_plan,
+    }
+    try:
+        responsibility_edges = await expand_responsibility_graph(
+            function_items=frozen_function_items,
+            platform_contract=platform_contract,
+            planner_model=planner_model,
+            model_call=select_sources,
+            goal_context=graph_context,
+            subsystem_plan=subsystem_plan,
+        )
+    except ResponsibilityGraphExpansionError as exc:
+        if exc.code != "subsystem_plan_incomplete":
+            raise
+        subsystem_plan = await repair_subsystem_interfaces(
+            original_user_goal=request.user_request,
+            frozen_blueprint=frozen_blueprint_text,
+            frozen_function_items=frozen_function_items,
+            requirement_allocations=requirement_allocations or [],
+            requirement_channels=requirement_channels or {},
+            platform_contract=platform_contract,
+            validation_errors=[{
+                "code": exc.code,
+                "details": getattr(exc, "details", {}),
+                "instruction": "Repair only subsystem/interface declarations for uncovered required input intents. Do not modify Blueprint or FunctionItems.",
+            }],
+            planner_model=planner_model,
+            model_call=select_sources,
+        )
+        graph_context["subsystem_plan"] = subsystem_plan
+        responsibility_edges = await expand_responsibility_graph(
+            function_items=frozen_function_items,
+            platform_contract=platform_contract,
+            planner_model=planner_model,
+            model_call=select_sources,
+            goal_context=graph_context,
+            subsystem_plan=subsystem_plan,
+        )
     return {
         "function_items": frozen_function_items,
         "responsibility_edges": responsibility_edges,
@@ -8889,6 +8934,8 @@ Blueprint Planner 只规划业务责任。
                 current_planner_result=first_planner_result,
                 planner_model=route.model,
                 allowed_function_item_targets=allowed_function_item_targets,
+                requirement_allocations=requirement_allocations,
+                requirement_channels=requirement_channels,
             )
             if allowed_function_item_targets
             else {"function_items": [], "responsibility_edges": []}

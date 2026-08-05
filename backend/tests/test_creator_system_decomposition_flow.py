@@ -149,12 +149,16 @@ async def test_prepare_main_path_reconciles_decomposition_then_interface_binds_g
                     {"interface_id": "I0003", "kind": "member_to_platform", "goal": "final output", "source_member": "scripts/b.py"},
                 ]
             })
-        if "Select endpoint IDs only for this declared interface intent" in system:
+        if "source_path" in system or "Return exactly one strict JSON object" in system:
             calls.append("endpoint_planner")
             endpoint_payloads.append(payload)
             obligation = payload["obligation"]
             if obligation["kind"] == "platform_to_script":
-                return json.dumps({"source_id": payload["platform_inputs"][0]["slot_id"], "target_id": payload["target_member_inputs"][0]["input_id"], "path": []})
+                assert "source_path" in system
+                assert "never a script path" in system
+                assert "Use []" in system
+            if obligation["kind"] == "platform_to_script":
+                return json.dumps({"source_id": payload["platform_inputs"][0]["slot_id"], "target_id": payload["target_member_inputs"][0]["input_id"], "source_path": []})
             if obligation["kind"] == "script_to_script":
                 return json.dumps({"source_id": payload["source_member_outputs"][0]["output_id"], "target_id": payload["target_member_inputs"][0]["input_id"]})
             slot = next(value for value in payload["platform_outputs"] if value["field"] == "text")

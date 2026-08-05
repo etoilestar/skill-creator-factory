@@ -6,6 +6,7 @@ from backend.services.creator.responsibility_graph_expansion import (
     ResponsibilityGraphExpansionError,
     build_endpoint_registry,
     expand_responsibility_graph,
+    _validate_interface_selection_protocol,
 )
 from backend.services.platform_io_contract import build_platform_io_contract
 
@@ -35,6 +36,52 @@ def m2m(interface_id, source, target):
 
 def m2p(interface_id, source):
     return {"interface_id": interface_id, "kind": "member_to_platform", "goal": "platform output", "source_member": source}
+
+
+def test_platform_selection_rejects_string_source_path():
+    obligation = {
+        "kind": "platform_to_script",
+    }
+
+    with pytest.raises(ResponsibilityGraphExpansionError) as raised:
+        _validate_interface_selection_protocol(
+            obligation=obligation,
+            response={
+                "source_id": "PIN0001",
+                "target_id": "IN0001",
+                "source_path": "scripts/a.py",
+            },
+        )
+
+    assert raised.value.code == "invalid_interface_endpoint_protocol"
+    assert raised.value.details["path"] == "$.source_path"
+    assert raised.value.details["expected_type"] == "array<string>"
+
+
+def test_platform_selection_accepts_empty_source_path():
+    result = _validate_interface_selection_protocol(
+        obligation={"kind": "platform_to_script"},
+        response={
+            "source_id": "PIN0001",
+            "target_id": "IN0001",
+            "source_path": [],
+        },
+    )
+
+    assert result["source_path"] == []
+
+
+def test_platform_selection_accepts_nested_source_path():
+    result = _validate_interface_selection_protocol(
+        obligation={"kind": "platform_to_script"},
+        response={
+            "source_id": "PIN0001",
+            "target_id": "IN0001",
+            "source_path": ["article", "text"],
+        },
+    )
+
+    assert result["source_path"] == ["article", "text"]
 
 
 def test_registry_has_independent_stable_endpoints_without_cartesian_product():
@@ -68,7 +115,7 @@ async def test_two_script_interface_expansion_uses_endpoint_references_without_g
         obligation = payload["obligation"]
         if obligation["kind"] == "platform_to_script":
             slot = next(value for value in payload["platform_inputs"] if value["field"] == "fields")
-            return json.dumps({"source_id": slot["slot_id"], "target_id": payload["target_member_inputs"][0]["input_id"], "path": ["future_91ab"]})
+            return json.dumps({"source_id": slot["slot_id"], "target_id": payload["target_member_inputs"][0]["input_id"], "source_path": ["future_91ab"]})
         if obligation["kind"] == "script_to_platform":
             slot = next(value for value in payload["platform_outputs"] if value["field"] == "text")
             return json.dumps({"source_id": payload["source_member_outputs"][0]["output_id"], "target_id": slot["slot_id"]})
@@ -97,8 +144,8 @@ async def test_endpoint_selection_retries_only_current_interface():
         calls.append(payload)
         if payload["obligation"]["kind"] == "platform_to_script":
             if len(calls) == 1:
-                return json.dumps({"source_id": "PIN9999", "target_id": payload["target_member_inputs"][0]["input_id"], "path": []})
-            return json.dumps({"source_id": payload["platform_inputs"][0]["slot_id"], "target_id": payload["target_member_inputs"][0]["input_id"], "path": []})
+                return json.dumps({"source_id": "PIN9999", "target_id": payload["target_member_inputs"][0]["input_id"], "source_path": []})
+            return json.dumps({"source_id": payload["platform_inputs"][0]["slot_id"], "target_id": payload["target_member_inputs"][0]["input_id"], "source_path": []})
         slot = next(value for value in payload["platform_outputs"] if value["field"] == "text")
         return json.dumps({"source_id": payload["source_member_outputs"][0]["output_id"], "target_id": slot["slot_id"]})
 
@@ -113,7 +160,7 @@ async def test_structured_port_defaults_and_unresolved_inputs_use_port_ids():
     async def model(messages, _model):
         payload = json.loads(messages[-1]["content"])
         if payload["obligation"]["kind"] == "platform_to_script":
-            return json.dumps({"source_id": payload["platform_inputs"][0]["slot_id"], "target_id": payload["target_member_inputs"][0]["input_id"], "path": []})
+            return json.dumps({"source_id": payload["platform_inputs"][0]["slot_id"], "target_id": payload["target_member_inputs"][0]["input_id"], "source_path": []})
         slot = next(value for value in payload["platform_outputs"] if value["field"] == "text")
         return json.dumps({"source_id": payload["source_member_outputs"][0]["output_id"], "target_id": slot["slot_id"]})
 
@@ -163,7 +210,7 @@ async def test_endpoint_payload_keeps_structured_port_metadata_and_type_conflict
         captured.append(payload)
         obligation = payload["obligation"]
         if obligation["kind"] == "platform_to_script":
-            return json.dumps({"source_id": payload["platform_inputs"][0]["slot_id"], "target_id": payload["target_member_inputs"][0]["input_id"], "path": []})
+            return json.dumps({"source_id": payload["platform_inputs"][0]["slot_id"], "target_id": payload["target_member_inputs"][0]["input_id"], "source_path": []})
         if obligation["kind"] == "script_to_script":
             return json.dumps({"source_id": payload["source_member_outputs"][0]["output_id"], "target_id": payload["target_member_inputs"][0]["input_id"]})
         slot = next(value for value in payload["platform_outputs"] if value["field"] == "text")
@@ -188,3 +235,74 @@ async def test_missing_platform_output_reports_required_fields_without_terminal_
         await expand_responsibility_graph(function_items=items, platform_contract=platform, planner_model="p", model_call=lambda *_: "{}", goal_context={}, interface_plan=plan())
     assert raised.value.code == "interface_plan_incomplete"
     assert raised.value.details["missing_required_final_output_fields"] == ["pdf_path", "text"]
+
+
+@pytest.mark.asyncio
+async def test_platform_endpoint_retry_corrects_string_source_path_to_array():
+    items = [
+        item(
+            "scripts/a.py",
+            ["user_request"],
+            ["result"],
+        )
+    ]
+
+    calls = []
+
+    async def model(messages, _model):
+        payload = json.loads(messages[-1]["content"])
+        calls.append(payload)
+
+        obligation = payload["obligation"]
+
+        if obligation["kind"] == "platform_to_script":
+            if len(calls) == 1:
+                return json.dumps({
+                    "source_id": payload["platform_inputs"][0]["slot_id"],
+                    "target_id": payload["target_member_inputs"][0]["input_id"],
+                    "source_path": "scripts/a.py",
+                })
+
+            assert payload["validation_error"]["details"]["path"] == "$.source_path"
+            assert (
+                payload["validation_error"]["details"]["expected_type"]
+                == "array<string>"
+            )
+            assert (
+                payload["previous_selection"]["source_path"]
+                == "scripts/a.py"
+            )
+
+            return json.dumps({
+                "source_id": payload["platform_inputs"][0]["slot_id"],
+                "target_id": payload["target_member_inputs"][0]["input_id"],
+                "source_path": [],
+            })
+
+        text_slot = next(
+            value
+            for value in payload["platform_outputs"]
+            if value["field"] == "text"
+        )
+
+        return json.dumps({
+            "source_id": payload["source_member_outputs"][0]["output_id"],
+            "target_id": text_slot["slot_id"],
+        })
+
+    edges = await expand_responsibility_graph(
+        function_items=items,
+        platform_contract=build_platform_io_contract(),
+        planner_model="p",
+        goal_context={"system_goal": "opaque goal"},
+        model_call=model,
+        interface_plan=plan(
+            p2m("I0001", "scripts/a.py"),
+            m2p("I0002", "scripts/a.py"),
+        ),
+    )
+
+    assert len(calls) == 3
+    assert edges[0]["from_node"] == "platform_input_node"
+    assert edges[0]["to_node"] == "scripts/a.py"
+    assert edges[0]["constraints"] == []

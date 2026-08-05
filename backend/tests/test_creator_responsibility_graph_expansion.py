@@ -290,6 +290,150 @@ async def test_repeated_member_interfaces_bind_distinct_unbound_inputs():
         ("scripts/b.py", "third"),
     }
 
+
+@pytest.mark.asyncio
+async def test_source_output_may_fan_out_to_multiple_targets():
+    items = [
+        item("scripts/source.py", ["runtime_input"], ["shared_result"]),
+        item("scripts/consumer_a.py", ["input_a"], ["result_a"]),
+        item("scripts/consumer_b.py", ["input_b"], ["result_b"]),
+    ]
+    interface_plan = plan(
+        p2m("I0001", "scripts/source.py"),
+        m2m("I0002", "scripts/source.py", "scripts/consumer_a.py"),
+        m2m("I0003", "scripts/source.py", "scripts/consumer_b.py"),
+        m2p("I0004", "scripts/consumer_a.py"),
+        m2p("I0005", "scripts/consumer_b.py"),
+    )
+    selected_source_ids = []
+
+    async def model(messages, _model):
+        payload = json.loads(messages[-1]["content"])
+        obligation = payload["obligation"]
+        if obligation["kind"] == "platform_to_script":
+            return json.dumps({
+                "source_id": payload["platform_inputs"][0]["slot_id"],
+                "target_id": payload["target_member_inputs"][0]["input_id"],
+                "source_path": [],
+            })
+        if obligation["kind"] == "script_to_script":
+            source_id = payload["source_member_outputs"][0]["output_id"]
+            selected_source_ids.append(source_id)
+            return json.dumps({
+                "source_id": source_id,
+                "target_id": payload["target_member_inputs"][0]["input_id"],
+            })
+        return json.dumps({
+            "source_id": payload["source_member_outputs"][0]["output_id"],
+            "target_id": payload["platform_outputs"][0]["slot_id"],
+        })
+
+    await expand_responsibility_graph(
+        function_items=items,
+        platform_contract=contract(required=["text", "pdf_path"]),
+        planner_model="p",
+        goal_context={},
+        model_call=model,
+        interface_plan=interface_plan,
+    )
+
+    assert len(selected_source_ids) == 2
+    assert selected_source_ids[0] == selected_source_ids[1]
+
+
+@pytest.mark.asyncio
+async def test_target_input_is_removed_after_first_binding():
+    items = [
+        item("scripts/source.py", ["runtime_input"], ["shared_result"]),
+        item("scripts/target.py", ["first", "second"], ["result"]),
+    ]
+    seen_target_lists = []
+    seen_source_lists = []
+
+    async def model(messages, _model):
+        payload = json.loads(messages[-1]["content"])
+        obligation = payload["obligation"]
+        if obligation["kind"] == "platform_to_script":
+            return json.dumps({
+                "source_id": payload["platform_inputs"][0]["slot_id"],
+                "target_id": payload["target_member_inputs"][0]["input_id"],
+                "source_path": [],
+            })
+        if obligation["kind"] == "script_to_script":
+            seen_target_lists.append([value["port_id"] for value in payload["target_member_inputs"]])
+            seen_source_lists.append([value["port_id"] for value in payload["source_member_outputs"]])
+            return json.dumps({
+                "source_id": payload["source_member_outputs"][0]["output_id"],
+                "target_id": payload["target_member_inputs"][0]["input_id"],
+            })
+        return json.dumps({
+            "source_id": payload["source_member_outputs"][0]["output_id"],
+            "target_id": payload["platform_outputs"][0]["slot_id"],
+        })
+
+    await expand_responsibility_graph(
+        function_items=items,
+        platform_contract=contract(required=["text"]),
+        planner_model="p",
+        goal_context={},
+        model_call=model,
+        interface_plan=plan(
+            p2m("I0001", "scripts/source.py"),
+            m2m("I0002", "scripts/source.py", "scripts/target.py"),
+            m2m("I0003", "scripts/source.py", "scripts/target.py"),
+            m2p("I0004", "scripts/target.py"),
+        ),
+    )
+
+    assert seen_target_lists == [["first", "second"], ["second"]]
+    assert seen_source_lists == [["shared_result"], ["shared_result"]]
+
+
+@pytest.mark.asyncio
+async def test_overcomplete_only_when_no_remaining_target_endpoint():
+    items = [
+        item("scripts/source.py", ["runtime_input"], ["shared_result"]),
+        item("scripts/target.py", ["only"], ["result"]),
+    ]
+
+    async def model(messages, _model):
+        payload = json.loads(messages[-1]["content"])
+        obligation = payload["obligation"]
+        if obligation["kind"] == "platform_to_script":
+            return json.dumps({
+                "source_id": payload["platform_inputs"][0]["slot_id"],
+                "target_id": payload["target_member_inputs"][0]["input_id"],
+                "source_path": [],
+            })
+        if obligation["kind"] == "script_to_script":
+            return json.dumps({
+                "source_id": payload["source_member_outputs"][0]["output_id"],
+                "target_id": payload["target_member_inputs"][0]["input_id"],
+            })
+        return json.dumps({
+            "source_id": payload["source_member_outputs"][0]["output_id"],
+            "target_id": payload["platform_outputs"][0]["slot_id"],
+        })
+
+    with pytest.raises(ResponsibilityGraphExpansionError) as raised:
+        await expand_responsibility_graph(
+            function_items=items,
+            platform_contract=contract(required=["text"]),
+            planner_model="p",
+            goal_context={},
+            model_call=model,
+            interface_plan=plan(
+                p2m("I0001", "scripts/source.py"),
+                m2m("I0002", "scripts/source.py", "scripts/target.py"),
+                m2m("I0003", "scripts/source.py", "scripts/target.py"),
+                m2p("I0004", "scripts/target.py"),
+            ),
+        )
+
+    assert raised.value.code == "interface_plan_overcomplete"
+    assert raised.value.details["reason"] == "no_remaining_target_endpoint"
+    assert "source" not in raised.value.details["reason"]
+
 @pytest.mark.asyncio
 async def test_platform_endpoint_retry_corrects_string_source_path_to_array():
     items = [

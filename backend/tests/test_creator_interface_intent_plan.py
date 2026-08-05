@@ -223,6 +223,8 @@ def test_interface_planner_payload_is_compact_and_uses_existing_function_items_o
     asyncio.run(plan_function_item_interfaces(original_user_goal="goal", frozen_function_items=items, requirement_allocations=[allocation("R1", ["scripts/a.py"]), allocation("R2", [])], requirement_channels={"R1": "executable", "R2": "direct"}, planner_model="p", model_call=model))
     assert set(captured) == {"system_goal", "function_items", "executable_requirement_allocations", "platform_contract"}
     assert captured["function_items"][0]["target_file"] == "scripts/a.py"
+    assert captured["function_items"][0]["required_inputs"] == ["input_1"]
+    assert captured["function_items"][0]["defaulted_inputs"] == []
     assert [value["requirement_id"] for value in captured["executable_requirement_allocations"]] == ["R1"]
 
 
@@ -281,6 +283,11 @@ def test_interface_and_repair_prompts_define_one_interface_per_transfer():
     assert "each interface object as exactly one source endpoint connected to exactly one target endpoint" in prompt
     assert "do not combine multiple independently required target inputs" in prompt
     assert "multiple member_to_member interfaces between the same source_member and target_member" in prompt
+    assert "source outputs are reusable" in prompt
+    assert "do not determine the number of interfaces from the number of source outputs" in prompt
+    assert "a structured value transferred into one target input remains one logical transfer regardless of how many internal fields" in prompt
+    assert "required_inputs require incoming transfer coverage" in prompt
+    assert "defaulted_inputs do not require an interface" in prompt
 
     captured = {}
     items = [
@@ -330,6 +337,9 @@ def test_interface_and_repair_prompts_define_one_interface_per_transfer():
     assert "uncovered_inputs" in captured["system"]
     assert "does not prove that every required target input is covered" in captured["system"]
     assert "do not return the plan unchanged" in captured["system"]
+    assert "source endpoints are reusable" in captured["system"]
+    assert "interface_plan_overcomplete means only" in captured["system"]
+    assert "do not create interfaces solely because a source member exposes additional outputs" in captured["system"]
     assert captured["payload"]["uncovered_inputs"] == [
         {"target": "scripts/b.py", "input_id": "second"},
         {"target": "scripts/b.py", "input_id": "third"},

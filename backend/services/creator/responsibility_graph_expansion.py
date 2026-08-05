@@ -329,6 +329,19 @@ async def _select_interface_endpoint_reference(*, obligation: dict, registry: di
     if kind == "platform_to_script":
         payload["platform_inputs"] = [dict(value) for value in registry["platform_inputs"]]
         payload["target_member_inputs"] = _unbound_script_inputs(registry=registry, member=obligation["target_member"], committed_edges=committed_edges)
+        if not payload["target_member_inputs"]:
+            raise ResponsibilityGraphExpansionError(
+                "interface has no remaining unbound target input",
+                code="interface_plan_overcomplete",
+                details={
+                    "interface_id": obligation.get("interface_id", ""),
+                    "obligation_id": obligation.get("obligation_id", ""),
+                    "kind": kind,
+                    "source_member": obligation.get("source_member", ""),
+                    "target_member": obligation.get("target_member", ""),
+                    "reason": "no_remaining_target_endpoint",
+                },
+            )
         prompt = """You are selecting endpoint IDs for exactly one already-declared
 platform-to-FunctionItem interface.
 
@@ -400,8 +413,10 @@ Invalid examples:
   "source_path": []
 }
 
-target_member_inputs contains only target inputs that do not yet have an
-incoming committed edge.
+target_member_inputs contains only currently unbound target inputs.
+
+Platform input slots may be reused for multiple target inputs when the system
+semantics require it; do not treat platform inputs as consumed.
 
 Select exactly one target_id from that supplied list.
 
@@ -420,6 +435,18 @@ Do not return:
     elif kind == "script_to_platform":
         payload["source_member_outputs"] = _public_script_outputs(registry, obligation["source_member"])
         payload["platform_outputs"] = _unbound_platform_outputs(registry=registry, committed_edges=committed_edges)
+        if not payload["platform_outputs"]:
+            raise ResponsibilityGraphExpansionError(
+                "interface has no remaining unbound platform output",
+                code="interface_plan_overcomplete",
+                details={
+                    "interface_id": obligation.get("interface_id", ""),
+                    "obligation_id": obligation.get("obligation_id", ""),
+                    "kind": kind,
+                    "source_member": obligation.get("source_member", ""),
+                    "reason": "no_remaining_platform_target",
+                },
+            )
         prompt = """Return exactly one strict JSON object:
 
 {
@@ -429,6 +456,9 @@ Do not return:
 
 source_id must be copied from source_member_outputs.output_id.
 target_id must be copied from platform_outputs.slot_id.
+
+source_member_outputs may be reused across different platform output
+obligations when semantically appropriate.
 
 platform_outputs contains only platform output slots that do not yet have a
 committed source.
@@ -440,17 +470,41 @@ an edge, a wrapper, or an explanation."""
     else:
         payload["source_member_outputs"] = _public_script_outputs(registry, obligation["source_member"])
         payload["target_member_inputs"] = _unbound_script_inputs(registry=registry, member=obligation["target_member"], committed_edges=committed_edges)
+        if not payload["target_member_inputs"]:
+            raise ResponsibilityGraphExpansionError(
+                "interface has no remaining unbound target input",
+                code="interface_plan_overcomplete",
+                details={
+                    "interface_id": obligation.get("interface_id", ""),
+                    "obligation_id": obligation.get("obligation_id", ""),
+                    "kind": kind,
+                    "source_member": obligation.get("source_member", ""),
+                    "target_member": obligation.get("target_member", ""),
+                    "reason": "no_remaining_target_endpoint",
+                },
+            )
         prompt = """You are binding exactly one logical data-transfer interface.
 
 Select exactly one source_id from source_member_outputs and exactly one
 target_id from target_member_inputs.
 
-target_member_inputs contains only currently unbound inputs.
+source_member_outputs may contain outputs already used by earlier interfaces.
+That is valid.
+
+Select the source endpoint that semantically satisfies the current interface
+goal.
+
+target_member_inputs contains only target inputs that do not yet have an
+incoming edge.
 
 Use the current interface goal, source output descriptions and contracts, and
 target input descriptions and contracts as semantic evidence.
 
+Do not reject or avoid a source output merely because another committed edge
+already uses it.
+
 Do not select an already-bound target input.
+Do not select or reconstruct a target input absent from target_member_inputs.
 Do not infer a mapping from filenames, fixed port-name tables, suffixes, or
 business keywords.
 

@@ -105,18 +105,38 @@ def _raise(message: str, code: str, *, path: str, **details: Any) -> None:
     raise InterfaceIntentPlanError(message, code=code, details=payload)
 
 
+def _compact_port_id(value: Any) -> str:
+    if isinstance(value, dict):
+        return str(
+            value.get("port_id")
+            or value.get("id")
+            or value.get("name")
+            or value.get("field")
+            or ""
+        ).strip()
+    return str(value or "").strip()
+
+
 def _compact_function_items(function_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     normalized = normalize_structured_function_items(function_items, source="interface_intent_plan")
-    return [
-        {
-            "target_file": item["target_file"],
-            "purpose": item.get("purpose", ""),
-            "inputs": item.get("inputs") or [],
-            "outputs": item.get("outputs") or [],
-            "dependencies": item.get("dependencies") or [],
-        }
-        for item in normalized
-    ]
+    compact_items: list[dict[str, Any]] = []
+    for item in normalized:
+        default_values = item.get("default_values") if isinstance(item.get("default_values"), dict) else {}
+        input_ids = [_compact_port_id(raw_input) for raw_input in item.get("inputs") or []]
+        required_inputs = [port_id for port_id in input_ids if port_id and port_id not in default_values]
+        defaulted_inputs = [port_id for port_id in input_ids if port_id and port_id in default_values]
+        compact_items.append(
+            {
+                "target_file": item["target_file"],
+                "purpose": item.get("purpose", ""),
+                "inputs": item.get("inputs") or [],
+                "outputs": item.get("outputs") or [],
+                "required_inputs": required_inputs,
+                "defaulted_inputs": defaulted_inputs,
+                "dependencies": item.get("dependencies") or [],
+            }
+        )
+    return compact_items
 
 
 def validate_interface_intent_plan(*, plan: dict[str, Any], function_items: list[dict[str, Any]]) -> dict[str, Any]:
@@ -201,6 +221,46 @@ Each interface object represents exactly one logical data-transfer obligation.
 
 A later graph-binding step will materialize each interface object as exactly
 one source endpoint connected to exactly one target endpoint.
+
+Each interface represents one independent logical transfer to one target
+endpoint.
+
+Each Interface ultimately materializes as one source endpoint, one target
+endpoint, and one ResponsibilityEdge.
+
+Source endpoints are reusable.
+
+Source outputs are reusable. A source output may supply multiple different
+target inputs or platform output slots when the system semantics require it.
+
+Do not treat a source output as consumed after one interface uses it.
+
+Do not determine the number of interfaces from the number of source outputs.
+
+Do not determine the number of interfaces from whether the same source_member
+and target_member already have another interface.
+
+Declare an additional interface only when there is another independent target
+input or platform output obligation that still requires a source.
+
+A structured value transferred into one target input remains one logical
+transfer regardless of how many internal fields the value contains.
+
+The complete interface plan must cover every required target input and every
+required platform output, while avoiding multiple interfaces that compete for
+the same target endpoint.
+
+Use one interface per independent target transfer obligation.
+
+Do not classify interfaces as duplicates merely because source_member,
+target_member, or the eventual source output is the same. Interfaces are
+duplicates only when they point to the same logical target obligation and carry
+the same transfer responsibility.
+
+required_inputs require incoming transfer coverage.
+
+defaulted_inputs do not require an interface unless the system semantics
+explicitly require an override.
 
 Therefore, do not combine multiple independently required target inputs into
 one broad interface.
@@ -348,6 +408,26 @@ allowed and required when they represent different missing data transfers.
 Do not merge several uncovered inputs into one broad interface.
 
 Do not return the plan unchanged when uncovered_inputs is non-empty.
+
+Source endpoints are reusable.
+
+Do not remove an interface merely because its source member or eventual source
+endpoint is also used by another interface.
+
+interface_plan_overcomplete means only that the identified interface has no
+remaining unbound target endpoint.
+
+When repairing an overcomplete interface:
+- remove it if it repeats an already satisfied target obligation;
+- redirect it only when validation evidence identifies another unsatisfied
+  target obligation;
+- preserve valid source fan-out and unrelated interfaces.
+
+When repairing uncovered_inputs:
+- add or adjust only the transfers required for those uncovered target inputs;
+- do not merge independent target obligations into one broad interface;
+- do not create interfaces solely because a source member exposes additional
+  outputs.
 
 Use FunctionItem purposes, declared inputs and outputs, requirement allocations,
 the current interface plan, and the validation errors to determine the semantic

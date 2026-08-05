@@ -186,19 +186,105 @@ def _public_script_outputs(registry: dict, member: str) -> list[dict]:
 
 def _validate_interface_selection_protocol(*, obligation: dict, response: Any) -> dict:
     if not isinstance(response, dict):
-        raise ResponsibilityGraphExpansionError("endpoint selection must be a JSON object", code="invalid_interface_endpoint_protocol")
-    kind = obligation.get("kind")
-    expected = {"source_id", "target_id", "path"} if kind == "platform_to_script" else {"source_id", "target_id"}
-    if set(response) != expected:
-        raise ResponsibilityGraphExpansionError("endpoint selection contains invalid fields", code="invalid_interface_endpoint_protocol")
-    if not isinstance(response.get("source_id"), str) or not response["source_id"] or not isinstance(response.get("target_id"), str) or not response["target_id"]:
-        raise ResponsibilityGraphExpansionError("endpoint IDs must be non-empty strings", code="invalid_interface_endpoint_protocol")
-    if kind == "platform_to_script":
-        path = response.get("path")
-        if not isinstance(path, list) or any(not isinstance(value, str) or not value or value.lower() in _DANGEROUS_PATH_PARTS for value in path):
-            raise ResponsibilityGraphExpansionError("platform path is invalid", code="invalid_interface_endpoint_protocol")
-    return dict(response)
+        raise ResponsibilityGraphExpansionError(
+            "endpoint selection must be a JSON object",
+            code="invalid_interface_endpoint_protocol",
+            details={
+                "path": "$",
+                "expected_type": "object",
+                "observed_type": type(response).__name__,
+                "observed_value": response,
+                "observed_response": response,
+            },
+        )
 
+    kind = obligation.get("kind")
+    expected = {"source_id", "target_id", "source_path"} if kind == "platform_to_script" else {"source_id", "target_id"}
+
+    if set(response) != expected:
+        raise ResponsibilityGraphExpansionError(
+            "endpoint selection fields do not match the current interface kind",
+            code="invalid_interface_endpoint_protocol",
+            details={
+                "path": "$",
+                "expected_fields": sorted(expected),
+                "observed_fields": sorted(response),
+                "observed_value": response,
+                "observed_response": response,
+            },
+        )
+
+    source_id = response.get("source_id")
+    target_id = response.get("target_id")
+
+    if not isinstance(source_id, str) or not source_id:
+        raise ResponsibilityGraphExpansionError(
+            "source_id must be a non-empty string",
+            code="invalid_interface_endpoint_protocol",
+            details={
+                "path": "$.source_id",
+                "expected_type": "non-empty string",
+                "observed_type": type(source_id).__name__,
+                "observed_value": source_id,
+                "observed_response": response,
+            },
+        )
+
+    if not isinstance(target_id, str) or not target_id:
+        raise ResponsibilityGraphExpansionError(
+            "target_id must be a non-empty string",
+            code="invalid_interface_endpoint_protocol",
+            details={
+                "path": "$.target_id",
+                "expected_type": "non-empty string",
+                "observed_type": type(target_id).__name__,
+                "observed_value": target_id,
+                "observed_response": response,
+            },
+        )
+
+    if kind == "platform_to_script":
+        source_path = response.get("source_path")
+
+        if not isinstance(source_path, list):
+            raise ResponsibilityGraphExpansionError(
+                "source_path must be a JSON array of zero or more non-empty strings",
+                code="invalid_interface_endpoint_protocol",
+                details={
+                    "path": "$.source_path",
+                    "expected_type": "array<string>",
+                    "observed_type": type(source_path).__name__,
+                    "observed_value": source_path,
+                    "observed_response": response,
+                    "direct_binding_example": [],
+                },
+            )
+
+        invalid_parts = [
+            part
+            for part in source_path
+            if (
+                not isinstance(part, str)
+                or not part
+                or part.lower() in _DANGEROUS_PATH_PARTS
+            )
+        ]
+
+        if invalid_parts:
+            raise ResponsibilityGraphExpansionError(
+                "source_path contains an invalid path component",
+                code="invalid_interface_endpoint_protocol",
+                details={
+                    "path": "$.source_path",
+                    "expected_type": "array of safe non-empty strings",
+                    "observed_type": "array",
+                    "observed_value": source_path,
+                    "invalid_parts": invalid_parts,
+                    "observed_response": response,
+                },
+            )
+
+    return dict(response)
 
 async def _select_interface_endpoint_reference(*, obligation: dict, registry: dict, goal_context: dict, committed_edges: list[dict], planner_model: str, model_call: ModelCall, validation_issue: dict | None = None) -> dict:
     kind = obligation["kind"]
@@ -206,20 +292,139 @@ async def _select_interface_endpoint_reference(*, obligation: dict, registry: di
     if kind == "platform_to_script":
         payload["platform_inputs"] = [dict(value) for value in registry["platform_inputs"]]
         payload["target_member_inputs"] = _public_script_inputs(registry, obligation["target_member"])
-        prompt = "Select endpoint IDs only for this declared interface intent. Return strict JSON with exactly source_id, target_id, and path. Choose source_id from platform_inputs and target_id from target_member_inputs. Do not return an edge, wrapper, obligation_id, or explanation."
+        prompt = """You are selecting endpoint IDs for exactly one already-declared
+platform-to-FunctionItem interface.
+
+Return exactly one strict JSON object with exactly these three fields:
+
+{
+  "source_id": "<one platform_inputs.slot_id>",
+  "target_id": "<one target_member_inputs.input_id>",
+  "source_path": ["<optional nested key>", "..."]
+}
+
+Field definitions:
+
+1. source_id
+   - Must be copied exactly from one object in platform_inputs.
+   - Use that object's slot_id value.
+   - Do not use its field value.
+   - Do not invent an endpoint ID.
+
+2. target_id
+   - Must be copied exactly from one object in target_member_inputs.
+   - Use that object's input_id value.
+   - Do not use port_id, node_id, target_member, or a file path.
+   - Do not invent an endpoint ID.
+
+3. source_path
+   - Must always be a JSON array.
+   - Every element must be a non-empty string.
+   - It describes nested keys inside the platform input slot selected by source_id.
+   - It does not describe the target script.
+   - It is never a script path, filename, FunctionItem target, module path,
+     endpoint ID, output path, or filesystem path.
+   - Use [] when the entire selected platform input slot should be passed directly.
+   - Do not repeat the selected platform field itself inside source_path.
+
+Direct binding example:
+
+{
+  "source_id": "PIN0001",
+  "target_id": "IN0001",
+  "source_path": []
+}
+
+Nested source example:
+
+{
+  "source_id": "PIN0005",
+  "target_id": "IN0001",
+  "source_path": ["article", "text"]
+}
+
+Invalid examples:
+
+{
+  "source_id": "PIN0001",
+  "target_id": "IN0001",
+  "source_path": "scripts/extractor.py"
+}
+
+{
+  "source_id": "PIN0001",
+  "target_id": "IN0001",
+  "source_path": "user_request"
+}
+
+{
+  "source_id": "user_request",
+  "target_id": "input_text",
+  "source_path": []
+}
+
+Do not return:
+- an edge;
+- a wrapper object;
+- obligation_id;
+- interface_id;
+- target_member;
+- explanations;
+- markdown;
+- comments;
+- additional fields."""
     elif kind == "script_to_platform":
         payload["source_member_outputs"] = _public_script_outputs(registry, obligation["source_member"])
         payload["platform_outputs"] = [dict(value) for value in registry["platform_outputs"]]
-        prompt = "Select endpoint IDs only for this declared interface intent. Return strict JSON with exactly source_id and target_id. Choose source_id from source_member_outputs and target_id from platform_outputs. Do not return an edge, wrapper, obligation_id, or explanation."
+        prompt = """Return exactly one strict JSON object:
+
+{
+  "source_id": "<one source_member_outputs.output_id>",
+  "target_id": "<one platform_outputs.slot_id>"
+}
+
+source_id must be copied from source_member_outputs.output_id.
+target_id must be copied from platform_outputs.slot_id.
+
+Do not return source_path, path, member names, field names, file paths,
+an edge, a wrapper, or an explanation."""
     else:
         payload["source_member_outputs"] = _public_script_outputs(registry, obligation["source_member"])
         payload["target_member_inputs"] = _public_script_inputs(registry, obligation["target_member"])
-        prompt = "Select endpoint IDs only for this declared interface intent. Return strict JSON with exactly source_id and target_id. Choose source_id from source_member_outputs and target_id from target_member_inputs. Do not return an edge, wrapper, obligation_id, or explanation."
+        prompt = """Return exactly one strict JSON object:
+
+{
+  "source_id": "<one source_member_outputs.output_id>",
+  "target_id": "<one target_member_inputs.input_id>"
+}
+
+source_id must be copied from source_member_outputs.output_id.
+target_id must be copied from target_member_inputs.input_id.
+
+Do not return source_path, path, member names, port names, file paths,
+an edge, a wrapper, or an explanation."""
     if validation_issue:
         payload.update(validation_issue)
+        prompt += """
+
+This is the only retry for the current interface.
+
+The previous response failed protocol validation.
+Read validation_error and previous_selection carefully.
+
+Change only the invalid fields.
+Do not redesign the interface.
+Do not choose endpoints outside the supplied endpoint lists.
+Do not repeat the previous invalid value.
+
+For platform_to_script:
+- source_path must be an array;
+- [] means direct binding;
+- source_path is never a script or file path.
+
+Return only the corrected strict JSON object."""
     text = await model_call([{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}], planner_model)
     return _validate_interface_selection_protocol(obligation=obligation, response=_parse_object(text, "invalid_interface_endpoint_protocol"))
-
 
 def _materialize_interface_obligation(*, obligation: dict, selection: dict, registry: dict, state: GraphExpansionState) -> dict:
     selection = _validate_interface_selection_protocol(obligation=obligation, response=selection)
@@ -231,7 +436,10 @@ def _materialize_interface_obligation(*, obligation: dict, selection: dict, regi
             raise ResponsibilityGraphExpansionError("selected endpoint is outside declared interface obligation scope", code="invalid_interface_endpoint_reference")
         if _types_conflict(source.get("contract") or {}, target.get("contract") or {}):
             raise ResponsibilityGraphExpansionError("selected endpoints have conflicting types", code="interface_endpoint_type_conflict")
-        constraints = [{"type": "platform_parameter_binding", "source_key": ".".join(selection["path"]), "source_path": list(selection["path"]), "required": True}] if selection["path"] else []
+        source_path = list(selection["source_path"])
+        constraints = []
+        if source_path:
+            constraints.append({"type": "platform_parameter_binding", "source_key": ".".join(source_path), "source_path": source_path, "required": True})
         return _edge(PLATFORM_INPUT_NODE, source["field"], target["target_file"], target["port_id"], constraints=constraints)
     if kind == "script_to_platform":
         source = next((value for value in registry["script_outputs"] if value["output_id"] == selection["source_id"] and value["target_file"] == obligation["source_member"]), None)
@@ -291,12 +499,54 @@ async def _expand_from_interface_plan(*, normalized: list[dict], platform_contra
                 edge = _materialize_interface_obligation(obligation=obligation, selection=selection, registry=registry, state=state)
                 _validate_transaction(state.committed_edges + [edge], normalized)
             except ValueError as exc:
+                details = getattr(exc, "details", {}) or {}
+                logger.info(
+                    "[Creator][graph_endpoint_failure] "
+                    "obligation_id=%s interface_id=%s kind=%s attempt=%d "
+                    "code=%s error_path=%s expected_type=%s observed_type=%s",
+                    obligation.get("obligation_id", ""),
+                    obligation.get("interface_id", ""),
+                    obligation.get("kind", ""),
+                    attempt + 1,
+                    getattr(exc, "code", type(exc).__name__),
+                    details.get("path", ""),
+                    details.get("expected_type", ""),
+                    details.get("observed_type", ""),
+                )
                 if attempt:
+                    logger.info(
+                        "[Creator][graph_endpoint_failure] "
+                        "obligation_id=%s interface_id=%s kind=%s attempt=2 "
+                        "retry_exhausted=true graph_valid=false",
+                        obligation.get("obligation_id", ""),
+                        obligation.get("interface_id", ""),
+                        obligation.get("kind", ""),
+                    )
                     if isinstance(exc, ResponsibilityGraphExpansionError):
                         raise exc
                     raise ResponsibilityGraphExpansionError("current interface obligation failed after one retry", code="graph_expansion_selection_failed", details={"obligation_id": obligation["obligation_id"], "validation_error": str(exc)}) from exc
                 retries += 1
-                issue = {"current_goal": obligation.get("goal", ""), "previous_selection": locals().get("selection", {}), "validation_error": {"code": getattr(exc, "code", "invalid_interface_endpoint_reference"), "details": getattr(exc, "details", {})}, "instruction": "Replace only the endpoint selection for the current interface."}
+                error_details = dict(details)
+                issue = {
+                    "retry_mode": "repair_current_endpoint_selection_only",
+                    "previous_selection": error_details.get("observed_response", {}),
+                    "validation_error": {
+                        "code": getattr(exc, "code", "invalid_interface_endpoint_reference"),
+                        "details": error_details,
+                    },
+                    "repair_instruction": (
+                        "Repair only the current endpoint selection. "
+                        "Do not change the interface intent or any other obligation. "
+                        "Preserve source_id and target_id when they already reference valid "
+                        "listed endpoints. "
+                        "For platform_to_script, source_path must be a JSON array of "
+                        "zero or more non-empty strings. "
+                        "Use source_path=[] when directly passing the entire selected "
+                        "platform input slot. "
+                        "Never place a script path, filename, member target, module path, "
+                        "or endpoint ID inside source_path."
+                    ),
+                }
                 continue
             state.committed_edges.append(edge)
             break

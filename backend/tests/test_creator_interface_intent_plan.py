@@ -67,7 +67,7 @@ async def scripted_endpoint_model(messages, _model):
     payload = json.loads(messages[-1]["content"])
     obligation = payload["obligation"]
     if obligation["kind"] == "platform_to_script":
-        return json.dumps({"source_id": payload["platform_inputs"][0]["slot_id"], "target_id": payload["target_member_inputs"][0]["input_id"], "path": []})
+        return json.dumps({"source_id": payload["platform_inputs"][0]["slot_id"], "target_id": payload["target_member_inputs"][0]["input_id"], "source_path": []})
     if obligation["kind"] == "script_to_platform":
         slot = next(slot for slot in payload["platform_outputs"] if slot["field"] == "text")
         return json.dumps({"source_id": payload["source_member_outputs"][0]["output_id"], "target_id": slot["slot_id"]})
@@ -107,7 +107,7 @@ async def test_branch_converge_multi_input_and_multi_platform_output_shapes():
         payload = json.loads(messages[-1]["content"])
         obligation = payload["obligation"]
         if obligation["kind"] == "platform_to_script":
-            return json.dumps({"source_id": payload["platform_inputs"][0]["slot_id"], "target_id": payload["target_member_inputs"][0]["input_id"], "path": []})
+            return json.dumps({"source_id": payload["platform_inputs"][0]["slot_id"], "target_id": payload["target_member_inputs"][0]["input_id"], "source_path": []})
         if obligation["kind"] == "script_to_platform":
             field = next(terminal_fields)
             slot = next(slot for slot in payload["platform_outputs"] if slot["field"] == field)
@@ -128,7 +128,7 @@ async def test_same_output_can_feed_member_and_platform_when_interfaces_declare_
         payload = json.loads(messages[-1]["content"])
         obligation = payload["obligation"]
         if obligation["kind"] == "platform_to_script":
-            return json.dumps({"source_id": payload["platform_inputs"][0]["slot_id"], "target_id": payload["target_member_inputs"][0]["input_id"], "path": []})
+            return json.dumps({"source_id": payload["platform_inputs"][0]["slot_id"], "target_id": payload["target_member_inputs"][0]["input_id"], "source_path": []})
         if obligation["kind"] == "script_to_platform":
             field = next(terminal_fields)
             slot = next(slot for slot in payload["platform_outputs"] if slot["field"] == field)
@@ -154,7 +154,7 @@ async def test_plan_and_endpoint_selection_accept_single_json_fence_and_protocol
     async def endpoint_model(messages, _model):
         payload = json.loads(messages[-1]["content"])
         if payload["obligation"]["kind"] == "platform_to_script":
-            return fenced_json({"source_id": payload["platform_inputs"][0]["slot_id"], "target_id": payload["target_member_inputs"][0]["input_id"], "path": []})
+            return fenced_json({"source_id": payload["platform_inputs"][0]["slot_id"], "target_id": payload["target_member_inputs"][0]["input_id"], "source_path": []})
         slot = next(slot for slot in payload["platform_outputs"] if slot["field"] == "text")
         return fenced_json({"source_id": payload["source_member_outputs"][0]["output_id"], "target_id": slot["slot_id"]})
 

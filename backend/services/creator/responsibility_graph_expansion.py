@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -98,9 +98,19 @@ def build_endpoint_registry(*, function_items: list[dict], platform_contract: di
     return {"nodes": nodes, "script_inputs": inputs, "script_outputs": outputs, "platform_inputs": platform_inputs, "platform_outputs": platform_outputs}
 
 
+def _strip_single_json_fence(text: str) -> str:
+    stripped = str(text or "").strip()
+    if not stripped.startswith("```") or not stripped.endswith("```"):
+        return stripped
+    lines = stripped.splitlines()
+    if len(lines) < 3 or lines[0].strip().lower() not in {"```", "```json"} or lines[-1].strip() != "```":
+        return stripped
+    return "\n".join(lines[1:-1]).strip()
+
+
 def _parse_object(text: str, code: str) -> dict:
     try:
-        value = json.loads(text)
+        value = json.loads(_strip_single_json_fence(text))
     except (TypeError, json.JSONDecodeError) as exc:
         raise ResponsibilityGraphExpansionError("model response must be strict JSON", code=code) from exc
     if not isinstance(value, dict):
@@ -395,14 +405,51 @@ def _materialize_subsystem_obligation(*, obligation: dict, selection: dict, regi
     return _edge(source["target_file"], source["port_id"], target["target_file"], target["port_id"])
 
 
+def _validate_platform_terminal_edges(*, terminal_edges: list[dict], platform_contract: dict) -> None:
+    if not terminal_edges:
+        raise ResponsibilityGraphExpansionError("at least one terminal binding is required", code="missing_required_terminal_binding")
+    selected_fields: set[str] = set()
+    for edge in terminal_edges:
+        field = str(edge.get("to_input") or "")
+        if field in selected_fields:
+            raise ResponsibilityGraphExpansionError("a platform output slot may have only one source", code="duplicate_terminal_provenance", details={"platform_output_field": field})
+        selected_fields.add(field)
+    required = _boundary(platform_contract).get("required_final_output_fields")
+    if isinstance(required, list):
+        required_fields = {_port(value)[0] for value in required if _port(value)[0]}
+        missing = sorted(required_fields - selected_fields)
+        if missing:
+            raise ResponsibilityGraphExpansionError("terminal selection does not cover every required platform output", code="missing_required_terminal_binding", details={"missing_required_final_output_fields": missing})
+
+
+def _validate_required_input_interface_coverage(*, obligations: list[dict], registry: dict, normalized: list[dict]) -> None:
+    declared_input_intents = Counter(
+        ob["target_member"]
+        for ob in obligations
+        if ob.get("kind") in {"platform_to_script", "script_to_script"}
+    )
+    missing: list[dict[str, Any]] = []
+    for item in normalized:
+        target = item["target_file"]
+        required_inputs = [
+            str(name)
+            for name in item.get("inputs") or []
+            if str(name) not in (item.get("default_values") or {})
+        ]
+        if declared_input_intents[target] < len(required_inputs):
+            missing.append({
+                "target": target,
+                "required_input_count": len(required_inputs),
+                "declared_input_interface_count": declared_input_intents[target],
+            })
+    if missing:
+        raise ResponsibilityGraphExpansionError("subsystem plan does not declare enough input interface intents for required FunctionItem inputs", code="subsystem_plan_incomplete", details={"uncovered_inputs": missing})
+
+
 async def _expand_from_subsystem_plan(*, normalized: list[dict], platform_contract: dict, registry: dict, subsystem_plan: dict, planner_model: str, goal_context: dict, model_call: ModelCall) -> list[dict]:
     obligations = build_graph_obligations_from_subsystems(subsystem_plan=subsystem_plan)
     item_by_target = {item["target_file"]: item for item in normalized}
-    covered_inputs = {(ob["target_member"], inp["port_id"]) for ob in obligations if ob["kind"] in {"platform_to_script", "script_to_script"} for inp in registry["script_inputs"] if inp["target_file"] == ob["target_member"]}
-    required_inputs = {(item["target_file"], str(name)) for item in normalized for name in item.get("inputs") or [] if str(name) not in (item.get("default_values") or {})}
-    missing = sorted(required_inputs - covered_inputs)
-    if missing:
-        raise ResponsibilityGraphExpansionError("subsystem plan does not cover every required FunctionItem input", code="subsystem_plan_incomplete", details={"uncovered_inputs": missing})
+    _validate_required_input_interface_coverage(obligations=obligations, registry=registry, normalized=normalized)
     state = GraphExpansionState(active_nodes=set(item_by_target), activation_order=list(item_by_target))
     retries = model_calls = 0
     async def counted(messages: list[dict[str, str]], model: str) -> str:
@@ -425,6 +472,7 @@ async def _expand_from_subsystem_plan(*, normalized: list[dict], platform_contra
             state.committed_edges.append(edge)
             break
     terminals = [edge for edge in state.committed_edges if edge["to_node"] == PLATFORM_OUTPUT_NODE]
+    _validate_platform_terminal_edges(terminal_edges=terminals, platform_contract=platform_contract)
     edges = _finalize_graph(state=state, function_items=normalized, terminal_edges=terminals)
     logger.info("[Creator][graph_expansion] inactive_function_items=[] model_call_count=%d selection_retry_count=%d graph_valid=true", model_calls, retries)
     return edges

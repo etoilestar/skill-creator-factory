@@ -23,9 +23,19 @@ class SubsystemInterfacePlanError(GraphValidationError):
     """Machine-readable Subsystem Interface Plan protocol failure."""
 
 
+def _strip_single_json_fence(text: str) -> str:
+    stripped = str(text or "").strip()
+    if not stripped.startswith("```") or not stripped.endswith("```"):
+        return stripped
+    lines = stripped.splitlines()
+    if len(lines) < 3 or not lines[0].strip().lower() in {"```", "```json"} or lines[-1].strip() != "```":
+        return stripped
+    return "\n".join(lines[1:-1]).strip()
+
+
 def _parse_object(text: str) -> dict[str, Any]:
     try:
-        value = json.loads(text)
+        value = json.loads(_strip_single_json_fence(text))
     except (TypeError, json.JSONDecodeError) as exc:
         raise SubsystemInterfacePlanError("subsystem plan must be strict JSON", code="invalid_subsystem_plan_json") from exc
     if not isinstance(value, dict):
@@ -197,7 +207,7 @@ def build_graph_obligations_from_subsystems(*, subsystem_plan: dict[str, Any]) -
     return obligations
 
 
-async def plan_subsystem_interfaces(*, original_user_goal: str, frozen_blueprint: str, frozen_function_items: list[dict[str, Any]], requirement_allocations: list[dict[str, Any]] | None = None, requirement_channels: dict[str, str] | None = None, platform_contract: dict[str, Any] | None = None, planner_model: str, model_call: ModelCall) -> dict[str, Any]:
+async def plan_subsystem_interfaces(*, original_user_goal: str, frozen_blueprint: str, frozen_function_items: list[dict[str, Any]], requirement_allocations: list[dict[str, Any]] | None = None, requirement_channels: dict[str, str] | None = None, platform_contract: dict[str, Any] | None = None, validation_errors: list[dict[str, Any]] | None = None, planner_model: str, model_call: ModelCall) -> dict[str, Any]:
     """Ask the model for a Subsystem Interface Plan and validate it."""
     prompt = """
 You are decomposing one frozen Skill Blueprint into semantic execution subsystems before concrete endpoint binding.
@@ -210,11 +220,12 @@ Do not mechanically create one subsystem per FunctionItem. Do not force Function
 """.strip()
     payload: dict[str, Any] = {"original_user_goal": original_user_goal, "frozen_blueprint": frozen_blueprint, "frozen_function_items": frozen_function_items, "requirement_allocations": requirement_allocations or [], "requirement_channels": requirement_channels or {}, "platform_contract": platform_contract or {}}
     issue = None
+    initial_validation_errors = list(validation_errors or [])
     for attempt in range(2):
         request_payload = dict(payload)
-        if issue:
-            request_payload["validation_errors"] = [issue]
-            logger.info("[Creator][subsystem_plan_repair] attempt=%d error_codes=%s", attempt, [issue.get("code")])
+        if initial_validation_errors or issue:
+            request_payload["validation_errors"] = initial_validation_errors + ([issue] if issue else [])
+            logger.info("[Creator][subsystem_plan_repair] attempt=%d error_codes=%s", attempt, [value.get("code") for value in request_payload["validation_errors"]])
         text = await model_call([{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(request_payload, ensure_ascii=False, default=str)}], planner_model)
         try:
             return validate_subsystem_interface_plan(plan=_parse_object(text), function_items=frozen_function_items)

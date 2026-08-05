@@ -79,3 +79,100 @@ async def test_subsystem_expansion_limits_endpoint_selection_to_declared_members
     assert [value["port_id"] for value in script_to_script_call["source_member_outputs"]] == ["mid"]
     assert [value["port_id"] for value in script_to_script_call["target_member_inputs"]] == ["mid"]
     assert "script_outputs" not in script_to_script_call
+
+
+def fenced_json(value):
+    return "```json\n" + json.dumps(value) + "\n```"
+
+
+@pytest.mark.asyncio
+async def test_subsystem_plan_accepts_single_json_fence():
+    from backend.services.creator.subsystem_interface_plan import plan_subsystem_interfaces
+
+    items = [item("scripts/a.py", ["raw"], ["done"])]
+    plan = {
+        "subsystems": [{"subsystem_id": "S0001", "goal": "single", "members": ["scripts/a.py"], "internal_interfaces": [], "external_inputs": [{"interface_id": "IF0001", "goal": "runtime input", "consumer_member": "scripts/a.py", "source_scope": "platform"}], "external_outputs": [{"interface_id": "IF0002", "goal": "final output", "producer_member": "scripts/a.py", "target_scope": "platform"}]}],
+        "subsystem_links": [],
+    }
+
+    async def model(_messages, _model):
+        return fenced_json(plan)
+
+    assert await plan_subsystem_interfaces(original_user_goal="g", frozen_blueprint="b", frozen_function_items=items, planner_model="p", model_call=model) == plan
+
+
+@pytest.mark.asyncio
+async def test_subsystem_endpoint_selection_accepts_single_json_fence():
+    items = [item("scripts/a.py", ["raw"], ["done"])]
+    plan = {
+        "subsystems": [{"subsystem_id": "S0001", "goal": "single", "members": ["scripts/a.py"], "internal_interfaces": [], "external_inputs": [{"interface_id": "IF0001", "goal": "runtime input", "consumer_member": "scripts/a.py", "source_scope": "platform"}], "external_outputs": [{"interface_id": "IF0002", "goal": "final output", "producer_member": "scripts/a.py", "target_scope": "platform"}]}],
+        "subsystem_links": [],
+    }
+
+    async def model(messages, _model):
+        payload = json.loads(messages[-1]["content"])
+        if payload["obligation"]["kind"] == "platform_to_script":
+            return fenced_json({"source_id": payload["platform_inputs"][0]["slot_id"], "target_id": payload["target_member_inputs"][0]["input_id"], "path": []})
+        text_slot = next(slot for slot in payload["platform_outputs"] if slot["field"] == "text")
+        return fenced_json({"source_id": payload["source_member_outputs"][0]["output_id"], "target_id": text_slot["slot_id"]})
+
+    edges = await expand_responsibility_graph(function_items=items, platform_contract=build_platform_io_contract(), planner_model="p", goal_context={}, model_call=model, subsystem_plan=plan)
+    assert edges[-1]["to_node"] == "platform_output_node"
+
+
+@pytest.mark.asyncio
+async def test_subsystem_expansion_requires_one_interface_intent_per_required_input():
+    from backend.services.creator.responsibility_graph_expansion import ResponsibilityGraphExpansionError
+
+    items = [item("scripts/a.py", ["first", "second"], ["done"])]
+    plan = {
+        "subsystems": [{"subsystem_id": "S0001", "goal": "single", "members": ["scripts/a.py"], "internal_interfaces": [], "external_inputs": [{"interface_id": "IF0001", "goal": "only one runtime input", "consumer_member": "scripts/a.py", "source_scope": "platform"}], "external_outputs": [{"interface_id": "IF0002", "goal": "final output", "producer_member": "scripts/a.py", "target_scope": "platform"}]}],
+        "subsystem_links": [],
+    }
+
+    async def model(_messages, _model):
+        raise AssertionError("endpoint selection must not run for incomplete subsystem plans")
+
+    with pytest.raises(ResponsibilityGraphExpansionError) as raised:
+        await expand_responsibility_graph(function_items=items, platform_contract=build_platform_io_contract(), planner_model="p", goal_context={}, model_call=model, subsystem_plan=plan)
+    assert raised.value.code == "subsystem_plan_incomplete"
+    assert raised.value.details["uncovered_inputs"][0]["required_input_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_subsystem_expansion_enforces_required_platform_outputs_and_unique_terminal_slots():
+    from backend.services.creator.responsibility_graph_expansion import ResponsibilityGraphExpansionError
+
+    platform = {"platform_skill_boundary": {"input_envelope_fields": ["fields"], "final_output_fields": ["text", "pdf_path"], "required_final_output_fields": ["text", "pdf_path"]}}
+    single_items = [item("scripts/a.py", [], ["done"])]
+    single_plan = {
+        "subsystems": [{"subsystem_id": "S0001", "goal": "one", "members": ["scripts/a.py"], "internal_interfaces": [], "external_inputs": [], "external_outputs": [{"interface_id": "IF0001", "goal": "first terminal", "producer_member": "scripts/a.py", "target_scope": "platform"}]}],
+        "subsystem_links": [],
+    }
+
+    async def missing_required_model(messages, _model):
+        payload = json.loads(messages[-1]["content"])
+        text_slot = next(slot for slot in payload["platform_outputs"] if slot["field"] == "text")
+        return json.dumps({"source_id": payload["source_member_outputs"][0]["output_id"], "target_id": text_slot["slot_id"]})
+
+    with pytest.raises(ResponsibilityGraphExpansionError) as raised:
+        await expand_responsibility_graph(function_items=single_items, platform_contract=platform, planner_model="p", goal_context={}, model_call=missing_required_model, subsystem_plan=single_plan)
+    assert raised.value.code == "missing_required_terminal_binding"
+
+    duplicate_items = [item("scripts/a.py", [], ["done"]), item("scripts/b.py", [], ["other"])]
+    duplicate_plan = {
+        "subsystems": [
+            {"subsystem_id": "S0001", "goal": "one", "members": ["scripts/a.py"], "internal_interfaces": [], "external_inputs": [], "external_outputs": [{"interface_id": "IF0001", "goal": "first terminal", "producer_member": "scripts/a.py", "target_scope": "platform"}]},
+            {"subsystem_id": "S0002", "goal": "two", "members": ["scripts/b.py"], "internal_interfaces": [], "external_inputs": [], "external_outputs": [{"interface_id": "IF0002", "goal": "second terminal", "producer_member": "scripts/b.py", "target_scope": "platform"}]},
+        ],
+        "subsystem_links": [],
+    }
+
+    async def duplicate_terminal_model(messages, _model):
+        payload = json.loads(messages[-1]["content"])
+        slot = next(slot for slot in payload["platform_outputs"] if slot["field"] == "text")
+        return json.dumps({"source_id": payload["source_member_outputs"][0]["output_id"], "target_id": slot["slot_id"]})
+
+    with pytest.raises(ResponsibilityGraphExpansionError) as raised:
+        await expand_responsibility_graph(function_items=duplicate_items, platform_contract=platform, planner_model="p", goal_context={}, model_call=duplicate_terminal_model, subsystem_plan=duplicate_plan)
+    assert raised.value.code == "duplicate_terminal_provenance"

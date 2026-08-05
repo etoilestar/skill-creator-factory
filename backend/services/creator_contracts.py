@@ -149,9 +149,9 @@ def project_required_resources(entry: SkillPlanEntry) -> list[str]:
     """Project only this frozen entry's explicitly declared static resources."""
     projected: list[str] = []
     for value in [
-        *(entry.dependencies or []),
-        *(entry.reference_files or []),
-        *(entry.skill_local_references or []),
+        *(getattr(entry, "dependencies", []) or []),
+        *(getattr(entry, "reference_files", []) or []),
+        *(getattr(entry, "skill_local_references", []) or []),
     ]:
         path = str(getattr(value, "path", value) or "").strip().replace("\\", "/")
         if path.startswith(("references/", "assets/")) and path not in projected:

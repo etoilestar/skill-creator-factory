@@ -303,6 +303,38 @@ def collect_interface_plan_validation_issues(
     return issues
 
 
+def merge_interface_validation_issues(
+    *issue_groups: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Stably combine diagnostics without interpreting or rewriting them."""
+    merged: list[dict[str, Any]] = []
+    seen: set[tuple[Any, Any, Any, Any]] = set()
+    for group in issue_groups:
+        for issue in group:
+            key = (
+                issue.get("code"), issue.get("category"),
+                issue.get("interface_id"), issue.get("path"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(issue)
+    return merged
+
+
+def _resolve_system_requirements_context(
+    *, requirement_allocations: list[dict[str, Any]] | None,
+    explicit_system_requirements: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Resolve system context once while preserving an explicit empty list."""
+    if explicit_system_requirements is not None:
+        return list(explicit_system_requirements)
+    return [
+        allocation for allocation in (requirement_allocations or [])
+        if not (allocation.get("owners") or [])
+    ]
+
+
 def build_interface_repair_scope(
     validation_issues: list[dict[str, Any]],
     current_interface_plan: dict[str, Any] | None = None,
@@ -559,6 +591,60 @@ async def _reformat_interface_plan_response(*, raw_response: str, validation_err
     return _parse_object(text)
 
 
+def _validate_interface_review_response(
+    *, value: dict[str, Any], interface_plan: dict[str, Any],
+    frozen_function_items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if set(value) != {"passed", "issues"} or not isinstance(value.get("passed"), bool) or not isinstance(value.get("issues"), list):
+        _raise("semantic review response has invalid shape", "invalid_interface_semantic_review_protocol", path="$")
+    known_ids = {interface["interface_id"] for interface in interface_plan.get("interfaces") or []}
+    issues: list[dict[str, Any]] = []
+    for index, raw in enumerate(value["issues"]):
+        path = f"$.issues[{index}]"
+        if not isinstance(raw, dict) or set(raw) != {"code", "category", "interface_id", "message", "evidence"}:
+            _raise("semantic review issue has invalid shape", "invalid_interface_semantic_review_protocol", path=path)
+        interface_id = str(raw.get("interface_id") or "").strip()
+        if (raw.get("code") != "interface_semantic_inconsistency"
+                or raw.get("category") != "semantic_alignment_error"
+                or interface_id not in known_ids
+                or not isinstance(raw.get("message"), str) or not raw["message"].strip()
+                or not isinstance(raw.get("evidence"), dict) or not raw["evidence"]):
+            _raise("semantic review issue is not auditable", "invalid_interface_semantic_review_protocol", path=path)
+        issues.append({
+            "code": raw["code"], "category": raw["category"],
+            "stage": "interface_semantic_review", "path": f"$.interfaces[{interface_id}]",
+            "interface_id": interface_id, "message": raw["message"],
+            "observed_value": None, "expected_constraint": {"type": "semantic_alignment"},
+            "allowed_scope": [item["target_file"] for item in _compact_function_items(frozen_function_items)],
+            "details": {"evidence": raw["evidence"]},
+        })
+    if value["passed"] != (not issues):
+        _raise("semantic review passed flag contradicts issues", "invalid_interface_semantic_review_protocol", path="$.passed")
+    return issues
+
+
+async def _reformat_interface_review_response(
+    *, raw_response: str, validation_error: InterfaceIntentPlanError,
+    reviewer_model: str, model_call: ModelCall,
+) -> dict[str, Any]:
+    prompt = """Return only a corrected JSON object matching the supplied review schema.
+Preserve the review's existing semantic conclusions and issue evidence. Do not
+add or remove issues, change interface IDs, or propose repairs. Only correct
+protocol shape and make passed consistent with whether issues is empty.
+Schema: {"passed": boolean, "issues": [{"code": string, "category": string,
+"interface_id": string, "message": string, "evidence": object}]}"""
+    payload = {"raw_response": raw_response, "validation_error": {
+        "code": validation_error.code, "message": str(validation_error), "details": validation_error.details,
+    }}
+    logger.info("[Creator][interface_semantic_review_protocol_repair] attempt=1")
+    text = await model_call(
+        [{"role": "system", "content": prompt},
+         {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
+        reviewer_model,
+    )
+    return _parse_object(text)
+
+
 async def review_interface_plan_semantically(
     *, original_user_goal: str, frozen_function_items: list[dict[str, Any]],
     interface_plan: dict[str, Any], requirement_allocations: list[dict[str, Any]] | None,
@@ -577,7 +663,14 @@ Do not infer from filenames, roles, keywords, naming conventions, string
 similarity, or a fixed workflow. Every issue must contain code
 "interface_semantic_inconsistency", category "semantic_alignment_error",
 interface_id, message, and a non-empty evidence object grounded in the supplied
-goal, requirement IDs, purposes, or platform contract."""
+goal, requirement IDs, purposes, or platform contract.
+
+Some interfaces may already contain deterministic reference or scope errors;
+the backend reports those separately. Do not duplicate deterministic reference
+diagnostics. Review only additional semantic alignment concerns supported by
+the system goal, FunctionItem purposes, requirements, interface kind, and goal.
+If an invalid or ambiguous reference prevents a supported conclusion, do not
+invent an issue."""
     payload = {
         "system_goal": original_user_goal,
         "function_items": _compact_function_items(frozen_function_items),
@@ -587,51 +680,54 @@ goal, requirement IDs, purposes, or platform contract."""
         "unowned_system_requirements": system_requirements or [],
         "platform_contract": platform_contract or {},
     }
-    try:
-        value = _parse_object(await model_call(
+    raw_response = await model_call(
             [{"role": "system", "content": prompt},
              {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
             reviewer_model,
-        ))
-        if set(value) != {"passed", "issues"} or not isinstance(value["passed"], bool) or not isinstance(value["issues"], list):
-            _raise("semantic review response has invalid shape", "invalid_interface_semantic_review_protocol", path="$")
-        known_ids = {value["interface_id"] for value in interface_plan.get("interfaces") or []}
-        issues: list[dict[str, Any]] = []
-        for index, raw in enumerate(value["issues"]):
-            path = f"$.issues[{index}]"
-            if not isinstance(raw, dict) or set(raw) != {"code", "category", "interface_id", "message", "evidence"}:
-                _raise("semantic review issue has invalid shape", "invalid_interface_semantic_review_protocol", path=path)
-            interface_id = str(raw.get("interface_id") or "").strip()
-            if (raw.get("code") != "interface_semantic_inconsistency"
-                    or raw.get("category") != "semantic_alignment_error"
-                    or interface_id not in known_ids
-                    or not isinstance(raw.get("message"), str) or not raw["message"].strip()
-                    or not isinstance(raw.get("evidence"), dict) or not raw["evidence"]):
-                _raise("semantic review issue is not auditable", "invalid_interface_semantic_review_protocol", path=path)
-            issues.append({
-                "code": raw["code"], "category": raw["category"],
-                "stage": "interface_semantic_review", "path": f"$.interfaces[{interface_id}]",
-                "interface_id": interface_id, "message": raw["message"],
-                "observed_value": None,
-                "expected_constraint": {"type": "semantic_alignment"},
-                "allowed_scope": [item["target_file"] for item in _compact_function_items(frozen_function_items)],
-                "details": {"evidence": raw["evidence"]},
-            })
-        if value["passed"] != (not issues):
-            _raise("semantic review passed flag contradicts issues", "invalid_interface_semantic_review_protocol", path="$.passed")
-    except InterfaceIntentPlanError as exc:
-        logger.info("[Creator][interface_semantic_review] result=failed error_code=%s", exc.code)
-        raise InterfaceIntentPlanError(
-            "interface semantic review failed", code="interface_semantic_review_failed",
-            details={"review_attempts": 1, "review_error": {"code": exc.code, "message": str(exc), "details": exc.details}},
-        ) from exc
+        )
+    try:
+        issues = _validate_interface_review_response(
+            value=_parse_object(raw_response), interface_plan=interface_plan,
+            frozen_function_items=frozen_function_items,
+        )
+    except InterfaceIntentPlanError as original_exc:
+        try:
+            reformatted = await _reformat_interface_review_response(
+                raw_response=raw_response, validation_error=original_exc,
+                reviewer_model=reviewer_model, model_call=model_call,
+            )
+            issues = _validate_interface_review_response(
+                value=reformatted, interface_plan=interface_plan,
+                frozen_function_items=frozen_function_items,
+            )
+        except InterfaceIntentPlanError as repair_exc:
+            logger.info("[Creator][interface_semantic_review] result=failed error_code=%s", repair_exc.code)
+            raise InterfaceIntentPlanError(
+                "interface semantic review failed", code="interface_semantic_review_failed",
+                details={
+                    "review_attempts": 1, "protocol_repair_attempts": 1,
+                    "original_error": {"code": original_exc.code, "message": str(original_exc), "details": original_exc.details},
+                    "repair_error": {"code": repair_exc.code, "message": str(repair_exc), "details": repair_exc.details},
+                },
+            ) from repair_exc
+        logger.info("[Creator][interface_semantic_review_protocol_repair] attempt=1 result=success")
+    except Exception:
+        # Model transport failures remain transport failures, not protocol repair.
+        raise
     logger.info("[Creator][interface_semantic_review] result=%s issue_count=%d", "passed" if not issues else "issues_found", len(issues))
     return issues
 
 
-async def plan_function_item_interfaces(*, original_user_goal: str, frozen_function_items: list[dict[str, Any]], requirement_allocations: list[dict[str, Any]] | None = None, requirement_channels: dict[str, str] | None = None, interaction_requirements: list[dict[str, Any]] | None = None, platform_contract: dict[str, Any] | None = None, skill_name: str = "", planner_model: str, model_call: ModelCall, reviewer_model: str | None = None) -> dict[str, Any]:
+async def plan_function_item_interfaces(*, original_user_goal: str, frozen_function_items: list[dict[str, Any]], requirement_allocations: list[dict[str, Any]] | None = None, requirement_channels: dict[str, str] | None = None, system_requirements: list[dict[str, Any]] | None = None, interaction_requirements: list[dict[str, Any]] | None = None, platform_contract: dict[str, Any] | None = None, skill_name: str = "", planner_model: str, model_call: ModelCall, reviewer_model: str | None = None) -> dict[str, Any]:
     """Ask the model for interaction intents between frozen FunctionItems."""
 
+    system_requirements_context = _resolve_system_requirements_context(
+        requirement_allocations=requirement_allocations,
+        explicit_system_requirements=(
+            system_requirements if system_requirements is not None
+            else interaction_requirements
+        ),
+    )
     payload = {
         "system_goal": original_user_goal,
         "skill_name": skill_name,
@@ -642,10 +738,7 @@ async def plan_function_item_interfaces(*, original_user_goal: str, frozen_funct
             if requirement_channels and requirement_channels.get(str(allocation.get("requirement_id") or "")) == "executable"
         ],
         "requirement_channels": requirement_channels or {},
-        "unowned_system_requirements": interaction_requirements or [
-            allocation for allocation in (requirement_allocations or [])
-            if not (allocation.get("owners") or [])
-        ],
+        "unowned_system_requirements": system_requirements_context,
         "platform_contract": platform_contract or {},
     }
     raw_response = await model_call([{"role": "system", "content": _interface_plan_prompt()}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}], planner_model)
@@ -671,28 +764,10 @@ async def plan_function_item_interfaces(*, original_user_goal: str, frozen_funct
                 ) from repair_exc
         else:
             raise
-    issues = collect_interface_plan_validation_issues(
+    deterministic_issues = collect_interface_plan_validation_issues(
         plan=parsed, function_items=frozen_function_items, platform_contract=platform_contract,
     )
-    logger.info(
-        "[Creator][interface_validation] stage=initial issue_count=%d issue_categories=%s repairable=%s",
-        len(issues), sorted({issue["category"] for issue in issues}), bool(issues),
-    )
-    if issues:
-        return await repair_interface_plan_semantically(
-            original_user_goal=original_user_goal,
-            frozen_function_items=frozen_function_items,
-            current_interface_plan=parsed,
-            validation_issues=issues,
-            repair_scope=build_interface_repair_scope(issues, parsed),
-            requirement_allocations=requirement_allocations,
-            requirement_channels=requirement_channels,
-            interaction_requirements=interaction_requirements,
-            platform_contract=platform_contract,
-            skill_name=skill_name,
-            planner_model=planner_model,
-            model_call=model_call,
-        )
+    review_issues: list[dict[str, Any]] = []
     if reviewer_model:
         review_issues = await review_interface_plan_semantically(
             original_user_goal=original_user_goal,
@@ -700,26 +775,31 @@ async def plan_function_item_interfaces(*, original_user_goal: str, frozen_funct
             interface_plan=parsed,
             requirement_allocations=requirement_allocations,
             requirement_channels=requirement_channels,
-            system_requirements=payload["unowned_system_requirements"],
+            system_requirements=system_requirements_context,
             platform_contract=platform_contract,
             reviewer_model=reviewer_model,
             model_call=model_call,
         )
-        if review_issues:
-            return await repair_interface_plan_semantically(
-                original_user_goal=original_user_goal,
-                frozen_function_items=frozen_function_items,
-                current_interface_plan=parsed,
-                validation_issues=review_issues,
-                repair_scope=build_interface_repair_scope(review_issues, parsed),
-                requirement_allocations=requirement_allocations,
-                requirement_channels=requirement_channels,
-                interaction_requirements=payload["unowned_system_requirements"],
-                platform_contract=platform_contract,
-                skill_name=skill_name,
-                planner_model=planner_model,
-                model_call=model_call,
-            )
+    combined_issues = merge_interface_validation_issues(deterministic_issues, review_issues)
+    logger.info(
+        "[Creator][interface_validation] stage=initial deterministic_issue_count=%d review_issue_count=%d combined_issue_count=%d repairable=%s",
+        len(deterministic_issues), len(review_issues), len(combined_issues), bool(combined_issues),
+    )
+    if combined_issues:
+        return await repair_interface_plan_semantically(
+            original_user_goal=original_user_goal,
+            frozen_function_items=frozen_function_items,
+            current_interface_plan=parsed,
+            validation_issues=combined_issues,
+            repair_scope=build_interface_repair_scope(combined_issues, parsed),
+            requirement_allocations=requirement_allocations,
+            requirement_channels=requirement_channels,
+            system_requirements=system_requirements_context,
+            platform_contract=platform_contract,
+            skill_name=skill_name,
+            planner_model=planner_model,
+            model_call=model_call,
+        )
     return validate_interface_intent_plan(plan=parsed, function_items=frozen_function_items)
 
 
@@ -728,12 +808,20 @@ async def repair_interface_plan_semantically(
     current_interface_plan: dict[str, Any], validation_issues: list[dict[str, Any]],
     repair_scope: dict[str, Any], requirement_allocations: list[dict[str, Any]] | None = None,
     requirement_channels: dict[str, str] | None = None,
+    system_requirements: list[dict[str, Any]] | None = None,
     interaction_requirements: list[dict[str, Any]] | None = None,
     platform_contract: dict[str, Any] | None = None, skill_name: str = "",
     repair_stage: str = "initial_interface_validation",
     planner_model: str, model_call: ModelCall,
 ) -> dict[str, Any]:
     """Perform one bounded, model-driven semantic repair of the full plan."""
+    system_requirements_context = (
+        list(system_requirements) if system_requirements is not None
+        else _resolve_system_requirements_context(
+            requirement_allocations=requirement_allocations,
+            explicit_system_requirements=interaction_requirements,
+        )
+    )
     logger.info(
         "[Creator][interface_semantic_repair] stage=%s attempt=1 issue_count=%d affected_interface_count=%d allow_add=%s allow_remove=%s",
         repair_stage, len(validation_issues), len(repair_scope.get("affected_interface_ids") or []),
@@ -857,7 +945,7 @@ Return only strict JSON matching the supplied interface schema.
         "affected_members": repair_scope.get("affected_members") or [],
         "requirement_allocations": requirement_allocations or [],
         "requirement_channels": requirement_channels or {},
-        "unowned_system_requirements": interaction_requirements or [],
+        "unowned_system_requirements": system_requirements_context,
         "platform_contract": platform_contract or {},
         "repair_scope": repair_scope,
         "interface_schema": INTERFACE_SCHEMA,
@@ -897,6 +985,7 @@ async def repair_interface_intents(
     missing_platform_output_fields: list[str] | None = None,
     requirement_allocations: list[dict[str, Any]] | None = None,
     requirement_channels: dict[str, str] | None = None,
+    system_requirements: list[dict[str, Any]] | None = None,
     interaction_requirements: list[dict[str, Any]] | None = None,
     platform_contract: dict[str, Any] | None = None, skill_name: str = "",
     repair_stage: str = "graph_expansion_feedback",
@@ -934,6 +1023,7 @@ async def repair_interface_intents(
         current_interface_plan=current_interface_plan, validation_issues=issues,
         repair_scope=scope, requirement_allocations=requirement_allocations,
         requirement_channels=requirement_channels,
+        system_requirements=system_requirements,
         interaction_requirements=interaction_requirements, platform_contract=platform_contract,
         skill_name=skill_name, repair_stage=repair_stage,
         planner_model=planner_model, model_call=model_call,

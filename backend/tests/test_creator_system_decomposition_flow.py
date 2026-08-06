@@ -213,6 +213,7 @@ async def test_bind_plan_repairs_overcomplete_interface_once(monkeypatch):
     ]
     expansion_plans = []
     repair_calls = []
+    planning_calls = []
 
     monkeypatch.setattr(
         api,
@@ -221,6 +222,7 @@ async def test_bind_plan_repairs_overcomplete_interface_once(monkeypatch):
     )
 
     async def plan_interfaces(**_kwargs):
+        planning_calls.append(_kwargs)
         return initial_plan
 
     async def expand_graph(**kwargs):
@@ -248,6 +250,7 @@ async def test_bind_plan_repairs_overcomplete_interface_once(monkeypatch):
         assert "Remove or adjust only the interface identified by interface_id" in error["instruction"]
         assert kwargs["affected_members"] == ["scripts/source.py", "scripts/target.py"]
         assert kwargs["missing_platform_output_fields"] == []
+        assert kwargs["system_requirements"] == planning_calls[0]["system_requirements"]
         return repaired_plan
 
     async def creator_model(*_args, **_kwargs):
@@ -263,11 +266,14 @@ async def test_bind_plan_repairs_overcomplete_interface_once(monkeypatch):
         current_planner_result={"internal_blueprint_text": _blueprint()},
         planner_model="p",
         allowed_function_item_targets=["scripts/source.py", "scripts/target.py"],
+        requirement_allocations=[_allocation("R-system", [])],
+        requirement_channels={"R-system": "direct"},
     )
 
     assert len(repair_calls) == 1
     assert expansion_plans == [initial_plan, repaired_plan]
     assert result["responsibility_edges"] == final_edges
+    assert planning_calls[0]["system_requirements"] == [_allocation("R-system", [])]
 
 
 @pytest.mark.asyncio

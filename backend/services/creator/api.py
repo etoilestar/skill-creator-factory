@@ -7200,11 +7200,16 @@ async def _bind_executable_responsibility_plan(
         )
 
     platform_contract = build_platform_io_contract()
+    system_requirements_context = [
+        allocation for allocation in (requirement_allocations or [])
+        if not (allocation.get("owners") or [])
+    ]
     interface_plan = await plan_function_item_interfaces(
         original_user_goal=request.user_request,
         frozen_function_items=frozen_function_items,
         requirement_allocations=requirement_allocations or [],
         requirement_channels=requirement_channels or {},
+        system_requirements=system_requirements_context,
         platform_contract=platform_contract,
         skill_name=str(current_planner_result.get("skill_name") or ""),
         planner_model=planner_model,
@@ -7257,6 +7262,7 @@ async def _bind_executable_responsibility_plan(
             frozen_function_items=frozen_function_items,
             requirement_allocations=requirement_allocations or [],
             requirement_channels=requirement_channels or {},
+            system_requirements=system_requirements_context,
             platform_contract=platform_contract,
             skill_name=str(current_planner_result.get("skill_name") or ""),
             current_interface_plan=interface_plan,

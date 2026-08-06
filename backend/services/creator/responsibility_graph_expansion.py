@@ -611,6 +611,7 @@ async def _expand_from_interface_plan(*, normalized: list[dict], platform_contra
                 _validate_transaction(state.committed_edges + [edge], normalized)
             except ValueError as exc:
                 details = getattr(exc, "details", {}) or {}
+                error_code = getattr(exc, "code", type(exc).__name__)
                 logger.info(
                     "[Creator][graph_endpoint_failure] "
                     "obligation_id=%s interface_id=%s kind=%s attempt=%d "
@@ -619,11 +620,16 @@ async def _expand_from_interface_plan(*, normalized: list[dict], platform_contra
                     obligation.get("interface_id", ""),
                     obligation.get("kind", ""),
                     attempt + 1,
-                    getattr(exc, "code", type(exc).__name__),
+                    error_code,
                     details.get("path", ""),
                     details.get("expected_type", ""),
                     details.get("observed_type", ""),
                 )
+                if (
+                    isinstance(exc, ResponsibilityGraphExpansionError)
+                    and error_code == "interface_plan_overcomplete"
+                ):
+                    raise
                 if attempt:
                     logger.info(
                         "[Creator][graph_endpoint_failure] "

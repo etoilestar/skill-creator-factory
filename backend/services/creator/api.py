@@ -7208,6 +7208,10 @@ async def _bind_executable_responsibility_plan(
         "system_goal": request.user_request,
         "skill_name": current_planner_result.get("skill_name", ""),
     }
+    repairable_interface_codes = {
+        "interface_plan_incomplete",
+        "interface_plan_overcomplete",
+    }
     try:
         responsibility_edges = await expand_responsibility_graph(
             function_items=frozen_function_items,
@@ -7218,8 +7222,32 @@ async def _bind_executable_responsibility_plan(
             interface_plan=interface_plan,
         )
     except ResponsibilityGraphExpansionError as exc:
-        if exc.code != "interface_plan_incomplete":
+        if exc.code not in repairable_interface_codes:
             raise
+        error_details = dict(getattr(exc, "details", {}) or {})
+        affected_members: list[str] = []
+        if exc.code == "interface_plan_incomplete":
+            for value in error_details.get("uncovered_inputs") or []:
+                member = str(value.get("target") or "").strip() if isinstance(value, dict) else ""
+                if member and member not in affected_members:
+                    affected_members.append(member)
+            repair_instruction = (
+                "Add or adjust only the interface intents required to cover "
+                "the reported uncovered target inputs or missing platform outputs. "
+                "Preserve unrelated interfaces and valid source fan-out."
+            )
+        else:
+            for key in ("source_member", "target_member"):
+                member = str(error_details.get(key) or "").strip()
+                if member and member not in affected_members:
+                    affected_members.append(member)
+            repair_instruction = (
+                "Remove or adjust only the interface identified by interface_id "
+                "because it has no remaining unbound target endpoint. "
+                "Preserve unrelated interfaces and valid source fan-out. "
+                "Do not remove an interface merely because its source endpoint "
+                "is reused by another interface."
+            )
         interface_plan = await repair_interface_intents(
             original_user_goal=request.user_request,
             frozen_function_items=frozen_function_items,
@@ -7227,12 +7255,17 @@ async def _bind_executable_responsibility_plan(
             requirement_channels=requirement_channels or {},
             platform_contract=platform_contract,
             current_interface_plan=interface_plan,
-            affected_members=sorted({value.get("target", "") for value in (getattr(exc, "details", {}).get("uncovered_inputs") or []) if value.get("target")}),
-            missing_platform_output_fields=getattr(exc, "details", {}).get("missing_required_final_output_fields") or [],
+            affected_members=affected_members,
+            missing_platform_output_fields=(
+                error_details.get("missing_required_final_output_fields") or []
+                if exc.code == "interface_plan_incomplete"
+                else []
+            ),
             validation_errors=[{
                 "code": exc.code,
-                "details": getattr(exc, "details", {}),
-                "instruction": "Repair only interface declarations for uncovered required input intents. Do not modify Blueprint or FunctionItems.",
+                "message": str(exc),
+                "details": error_details,
+                "instruction": repair_instruction,
             }],
             planner_model=planner_model,
             model_call=select_sources,

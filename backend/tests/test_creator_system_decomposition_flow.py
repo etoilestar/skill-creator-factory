@@ -192,3 +192,75 @@ async def test_prepare_main_path_reconciles_decomposition_then_interface_binds_g
     ]
     assert calls[5] == "interface_intent_planner"
     assert calls.count("endpoint_planner") == 3
+
+
+@pytest.mark.asyncio
+async def test_bind_plan_repairs_overcomplete_interface_once(monkeypatch):
+    initial_plan = {"interfaces": [{"interface_id": "I0003"}]}
+    repaired_plan = {"interfaces": [{"interface_id": "I0002"}]}
+    frozen_items = [
+        {"target_file": "scripts/source.py"},
+        {"target_file": "scripts/target.py"},
+    ]
+    final_edges = [
+        {"from_node": "platform_input_node", "to_node": "scripts/source.py"},
+        {"from_node": "scripts/source.py", "to_node": "scripts/target.py"},
+        {"from_node": "scripts/target.py", "to_node": "platform_output_node"},
+    ]
+    expansion_plans = []
+    repair_calls = []
+
+    monkeypatch.setattr(
+        api,
+        "_frozen_function_items_from_blueprint",
+        lambda **_kwargs: frozen_items,
+    )
+
+    async def plan_interfaces(**_kwargs):
+        return initial_plan
+
+    async def expand_graph(**kwargs):
+        expansion_plans.append(kwargs["interface_plan"])
+        if len(expansion_plans) == 1:
+            raise api.ResponsibilityGraphExpansionError(
+                "interface has no remaining unbound target input",
+                code="interface_plan_overcomplete",
+                details={
+                    "interface_id": "I0003",
+                    "obligation_id": "O0003",
+                    "kind": "script_to_script",
+                    "source_member": "scripts/source.py",
+                    "target_member": "scripts/target.py",
+                    "reason": "no_remaining_target_endpoint",
+                },
+            )
+        return final_edges
+
+    async def repair_interfaces(**kwargs):
+        repair_calls.append(kwargs)
+        error = kwargs["validation_errors"][0]
+        assert error["code"] == "interface_plan_overcomplete"
+        assert error["details"]["interface_id"] == "I0003"
+        assert "Remove or adjust only the interface identified by interface_id" in error["instruction"]
+        assert kwargs["affected_members"] == ["scripts/source.py", "scripts/target.py"]
+        assert kwargs["missing_platform_output_fields"] == []
+        return repaired_plan
+
+    async def creator_model(*_args, **_kwargs):
+        raise AssertionError("endpoint model should be handled by the expansion mock")
+
+    monkeypatch.setattr(api, "plan_function_item_interfaces", plan_interfaces)
+    monkeypatch.setattr(api, "expand_responsibility_graph", expand_graph)
+    monkeypatch.setattr(api, "repair_interface_intents", repair_interfaces)
+    monkeypatch.setattr(api, "complete_creator_role_once", creator_model)
+
+    result = await api._bind_executable_responsibility_plan(
+        request=_request(),
+        current_planner_result={"internal_blueprint_text": _blueprint()},
+        planner_model="p",
+        allowed_function_item_targets=["scripts/source.py", "scripts/target.py"],
+    )
+
+    assert len(repair_calls) == 1
+    assert expansion_plans == [initial_plan, repaired_plan]
+    assert result["responsibility_edges"] == final_edges

@@ -396,7 +396,10 @@ async def test_overcomplete_only_when_no_remaining_target_endpoint():
         item("scripts/target.py", ["only"], ["result"]),
     ]
 
+    script_to_script_calls = 0
+
     async def model(messages, _model):
+        nonlocal script_to_script_calls
         payload = json.loads(messages[-1]["content"])
         obligation = payload["obligation"]
         if obligation["kind"] == "platform_to_script":
@@ -406,6 +409,7 @@ async def test_overcomplete_only_when_no_remaining_target_endpoint():
                 "source_path": [],
             })
         if obligation["kind"] == "script_to_script":
+            script_to_script_calls += 1
             return json.dumps({
                 "source_id": payload["source_member_outputs"][0]["output_id"],
                 "target_id": payload["target_member_inputs"][0]["input_id"],
@@ -431,8 +435,10 @@ async def test_overcomplete_only_when_no_remaining_target_endpoint():
         )
 
     assert raised.value.code == "interface_plan_overcomplete"
+    assert raised.value.details["interface_id"] == "I0003"
     assert raised.value.details["reason"] == "no_remaining_target_endpoint"
     assert "source" not in raised.value.details["reason"]
+    assert script_to_script_calls == 1
 
 @pytest.mark.asyncio
 async def test_platform_endpoint_retry_corrects_string_source_path_to_array():

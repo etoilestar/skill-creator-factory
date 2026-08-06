@@ -326,6 +326,14 @@ def test_interface_and_repair_prompts_define_one_interface_per_transfer():
                         {"target": "scripts/b.py", "input_id": "third"},
                     ]
                 },
+            }, {
+                "code": "interface_plan_overcomplete",
+                "details": {
+                    "interface_id": "I0006",
+                    "obligation_id": "O0006",
+                    "kind": "script_to_script",
+                    "reason": "no_remaining_target_endpoint",
+                },
             }],
             affected_members=["scripts/b.py"],
             missing_platform_output_fields=[],
@@ -344,6 +352,12 @@ def test_interface_and_repair_prompts_define_one_interface_per_transfer():
         {"target": "scripts/b.py", "input_id": "second"},
         {"target": "scripts/b.py", "input_id": "third"},
     ]
+    assert captured["payload"]["overcomplete_interfaces"] == [{
+        "interface_id": "I0006",
+        "obligation_id": "O0006",
+        "kind": "script_to_script",
+        "reason": "no_remaining_target_endpoint",
+    }]
     repeated = [
         iface for iface in result["interfaces"]
         if iface["kind"] == "member_to_member"

@@ -373,10 +373,20 @@ async def repair_interface_intents(*, original_user_goal: str, frozen_function_i
     logger.info("[Creator][interface_semantic_repair] affected_members=%s missing_platform_output_fields=%s", affected_members or [], missing_platform_output_fields or [])
 
     uncovered_inputs: list[dict[str, str]] = []
+    overcomplete_interfaces: list[dict[str, str]] = []
     for error in validation_errors:
         details = error.get("details") if isinstance(error, dict) else None
         if not isinstance(details, dict):
             continue
+        if error.get("code") == "interface_plan_overcomplete":
+            interface_id = str(details.get("interface_id") or "").strip()
+            if interface_id:
+                overcomplete_interfaces.append({
+                    "interface_id": interface_id,
+                    "obligation_id": str(details.get("obligation_id") or "").strip(),
+                    "kind": str(details.get("kind") or "").strip(),
+                    "reason": str(details.get("reason") or "").strip(),
+                })
         raw_uncovered = details.get("uncovered_inputs")
         if not isinstance(raw_uncovered, list):
             continue
@@ -414,14 +424,23 @@ Source endpoints are reusable.
 Do not remove an interface merely because its source member or eventual source
 endpoint is also used by another interface.
 
-interface_plan_overcomplete means only that the identified interface has no
-remaining unbound target endpoint.
+interface_plan_overcomplete means only that the interface identified by
+interface_id has no remaining unbound target endpoint.
 
-When repairing an overcomplete interface:
-- remove it if it repeats an already satisfied target obligation;
-- redirect it only when validation evidence identifies another unsatisfied
+It does not mean that:
+- the source endpoint has already been used;
+- the source member has too many outputs;
+- the same source and target members already have another interface;
+- source fan-out is invalid.
+
+For interface_plan_overcomplete:
+- inspect the reported interface_id;
+- remove that interface if it repeats an already satisfied target obligation;
+- adjust it only when validation evidence identifies another unsatisfied
   target obligation;
-- preserve valid source fan-out and unrelated interfaces.
+- preserve valid source reuse, valid source fan-out, and unrelated interfaces.
+
+Do not return the plan unchanged when interface_plan_overcomplete is present.
 
 When repairing uncovered_inputs:
 - add or adjust only the transfers required for those uncovered target inputs;
@@ -449,6 +468,7 @@ Return only strict JSON matching the supplied interface schema.
         "current_interface_plan": current_interface_plan,
         "validation_errors": validation_errors,
         "uncovered_inputs": uncovered_inputs,
+        "overcomplete_interfaces": overcomplete_interfaces,
         "affected_members": affected_members or [],
         "missing_platform_output_fields": missing_platform_output_fields or [],
         "executable_requirement_allocations": [
@@ -461,4 +481,3 @@ Return only strict JSON matching the supplied interface schema.
     }
     text = await model_call([{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}], planner_model)
     return validate_interface_intent_plan(plan=_parse_object(text), function_items=frozen_function_items)
-

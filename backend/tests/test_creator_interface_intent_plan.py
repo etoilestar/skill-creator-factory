@@ -540,6 +540,88 @@ async def test_semantic_reviewer_drives_one_repair_for_valid_but_reversed_member
     assert result == corrected_plan
 
 
+@pytest.mark.asyncio
+async def test_valid_three_stage_intent_passes_review_without_semantic_repair():
+    items = [
+        {**item("scripts/unit_a.py", ["request"], ["structured_result"]), "purpose": "produce a structured result"},
+        {**item("scripts/unit_b.py", ["structured_result"], ["final_text"]), "purpose": "produce final text from a structured result"},
+    ]
+    valid_plan = plan(
+        p2m("I1", "scripts/unit_a.py", "Provide the runtime request to the producer."),
+        m2m("I2", "scripts/unit_a.py", "scripts/unit_b.py", "Transfer the structured result to the consumer."),
+        m2p("I3", "scripts/unit_b.py", "Return the consumer result to the platform."),
+    )
+    responses = iter([json.dumps(valid_plan), json.dumps({"passed": True, "issues": []})])
+    calls = []
+
+    async def model(messages, _model):
+        calls.append(messages)
+        return next(responses)
+
+    result = await plan_function_item_interfaces(
+        original_user_goal="transform a request into final text",
+        frozen_function_items=items, platform_contract={
+            "platform_skill_boundary": {
+                "input_envelope_fields": ["fields", "options"],
+                "final_output_fields": ["text", "artifact"],
+            }
+        }, planner_model="p", reviewer_model="r", model_call=model,
+    )
+    assert result == valid_plan
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_reviewer_prompt_confines_issues_to_interface_intent_fields():
+    captured = {}
+
+    async def model(messages, _model):
+        captured["prompt"] = messages[0]["content"]
+        return json.dumps({"passed": True, "issues": []})
+
+    await review_interface_plan_semantically(
+        original_user_goal="g", frozen_function_items=[item("scripts/unit_a.py", [], ["result"])],
+        interface_plan=plan(m2p("I1", "scripts/unit_a.py")),
+        requirement_allocations=[], requirement_channels={}, system_requirements=[],
+        platform_contract={}, reviewer_model="r", model_call=model,
+    )
+    prompt_text = captured["prompt"]
+    for phrase in ("source_field", "target_field", "source_id", "target_id", "source_path", "Endpoint Binding", "must not be reported"):
+        assert phrase in prompt_text
+    assert "Every reported issue must be solvable by modifying only one or more of:" in prompt_text
+    for field in ("kind", "goal", "source_member"):
+        assert f"- {field};" in prompt_text
+    assert "- target_member." in prompt_text
+
+
+@pytest.mark.asyncio
+async def test_semantic_repair_prompt_forbids_protocol_expansion_for_later_stage_issue():
+    current = plan(p2m("I1", "scripts/unit_a.py", "Provide the runtime request."))
+    captured = {}
+    issue = {
+        "code": "interface_semantic_inconsistency", "category": "semantic_alignment_error",
+        "interface_id": "I1", "message": "The interface does not explicitly specify the source platform field.",
+        "details": {"evidence": {"platform_contract": "multiple fields"}},
+    }
+
+    async def model(messages, _model):
+        captured["prompt"] = messages[0]["content"]
+        return json.dumps(current)
+
+    result = await repair_interface_plan_semantically(
+        original_user_goal="g", frozen_function_items=[item("scripts/unit_a.py", ["request"], ["result"])],
+        current_interface_plan=current, validation_issues=[issue],
+        repair_scope=build_interface_repair_scope([issue], current),
+        planner_model="p", model_call=model,
+    )
+    assert validate_interface_intent_plan(plan=result, function_items=[item("scripts/unit_a.py", ["request"], ["result"])]) == current
+    assert set(result["interfaces"][0]) == {"interface_id", "kind", "goal", "target_member"}
+    prompt_text = captured["prompt"]
+    assert "Never add fields outside the supplied Interface Intent schema." in prompt_text
+    for field in ("source_field", "target_field", "source_id", "target_id", "source_path", "platform_slot"):
+        assert field in prompt_text
+
+
 def test_issue_merge_is_stable_deterministic_first_and_deduplicated():
     deterministic = [{"code": "c1", "category": "reference_error", "interface_id": "I1", "path": "$.a"}]
     duplicate = dict(deterministic[0])

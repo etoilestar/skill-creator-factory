@@ -14,6 +14,7 @@ from backend.services.creator.function_item_interface_plan import (
     build_interface_repair_scope,
     collect_interface_plan_validation_issues,
     repair_interface_plan_semantically,
+    review_interface_plan_semantically,
     validate_interface_repair_scope,
     validate_interface_intent_plan,
     _interface_plan_prompt,
@@ -225,12 +226,12 @@ def test_interface_planner_payload_is_compact_and_uses_existing_function_items_o
 
     import asyncio
     asyncio.run(plan_function_item_interfaces(original_user_goal="goal", frozen_function_items=items, requirement_allocations=[allocation("R1", ["scripts/a.py"]), allocation("R2", [])], requirement_channels={"R1": "executable", "R2": "direct"}, planner_model="p", model_call=model))
-    assert set(captured) == {"system_goal", "skill_name", "function_items", "executable_requirement_allocations", "requirement_channels", "interaction_requirements", "platform_contract"}
+    assert set(captured) == {"system_goal", "skill_name", "function_items", "executable_requirement_allocations", "requirement_channels", "unowned_system_requirements", "platform_contract"}
     assert captured["function_items"][0]["target_file"] == "scripts/a.py"
     assert captured["function_items"][0]["required_inputs"] == ["input_1"]
     assert captured["function_items"][0]["defaulted_inputs"] == []
     assert [value["requirement_id"] for value in captured["executable_requirement_allocations"]] == ["R1"]
-    assert [value["requirement_id"] for value in captured["interaction_requirements"]] == ["R2"]
+    assert [value["requirement_id"] for value in captured["unowned_system_requirements"]] == ["R2"]
 
 
 def test_semantic_validator_collects_all_reference_levels_and_self_connections():
@@ -427,3 +428,112 @@ def test_interface_and_repair_prompts_define_one_interface_per_transfer():
     assert len(repeated) == 3
     assert len({iface["interface_id"] for iface in repeated}) == 3
     assert len({iface["goal"] for iface in repeated}) == 3
+
+
+def test_affected_members_expand_scope_only_to_directly_related_interfaces():
+    current = plan(
+        m2m("I1", "scripts/unit_1.py", "scripts/unit_2.py"),
+        m2m("I2", "scripts/unit_3.py", "scripts/unit_4.py"),
+    )
+    issues = [{
+        "code": "interface_plan_incomplete", "category": "coverage_error",
+        "interface_id": "", "details": {
+            "uncovered_inputs": [{"target": "scripts/unit_2.py", "input_id": "value_b"}]
+        },
+    }]
+    scope = build_interface_repair_scope(issues, current)
+    assert scope["affected_interface_ids"] == ["I1"]
+    validate_interface_repair_scope(
+        before=current,
+        after=plan(m2m("I1", "scripts/unit_1.py", "scripts/unit_2.py", "adjusted"), current["interfaces"][1]),
+        repair_scope=scope,
+    )
+    with pytest.raises(InterfaceIntentPlanError):
+        validate_interface_repair_scope(
+            before=current,
+            after=plan(current["interfaces"][0], m2m("I2", "scripts/unit_4.py", "scripts/unit_3.py")),
+            repair_scope=scope,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response,underlying", [
+    ("{bad", "invalid_interface_plan_json"),
+    (json.dumps({"interfaces": [{**p2m("I1", "scripts/unit_1.py"), "extra": True}]}), "invalid_interface_protocol"),
+    (json.dumps({"interfaces": [{"interface_id": "I1", "kind": "wrong", "goal": "g"}]}), "invalid_interface_kind"),
+    (json.dumps(plan(p2m("I1", "scripts/unit_1.py"), m2p("I1", "scripts/unit_1.py"))), "duplicate_interface_id"),
+])
+async def test_all_semantic_repair_protocol_failures_are_wrapped(response, underlying):
+    items = [item("scripts/unit_1.py", ["value_a"], ["value_b"])]
+    calls = 0
+
+    async def model(_messages, _model):
+        nonlocal calls
+        calls += 1
+        return response
+
+    issue = {"code": "interface_self_connection", "category": "direction_error", "interface_id": "I1", "details": {}}
+    with pytest.raises(InterfaceIntentPlanError) as raised:
+        await repair_interface_plan_semantically(
+            original_user_goal="g", frozen_function_items=items,
+            current_interface_plan=plan(p2m("I1", "scripts/unit_1.py")),
+            validation_issues=[issue], repair_scope=build_interface_repair_scope([issue]),
+            planner_model="p", model_call=model,
+        )
+    assert calls == 1
+    assert raised.value.code == "interface_semantic_repair_failed"
+    assert raised.value.details["repair_error"]["code"] == underlying
+
+
+@pytest.mark.asyncio
+async def test_duplicate_interface_id_gets_one_protocol_repair_only():
+    items = [item("scripts/unit_1.py", ["value_a"], ["value_b"])]
+    responses = iter([
+        json.dumps(plan(p2m("I1", "scripts/unit_1.py"), m2p("I1", "scripts/unit_1.py"))),
+        json.dumps(plan(p2m("I1", "scripts/unit_1.py"), m2p("I2", "scripts/unit_1.py"))),
+    ])
+    calls = 0
+
+    async def model(_messages, _model):
+        nonlocal calls
+        calls += 1
+        return next(responses)
+
+    result = await plan_function_item_interfaces(
+        original_user_goal="g", frozen_function_items=items,
+        planner_model="p", model_call=model,
+    )
+    assert calls == 2
+    assert [value["interface_id"] for value in result["interfaces"]] == ["I1", "I2"]
+
+
+@pytest.mark.asyncio
+async def test_semantic_reviewer_drives_one_repair_for_valid_but_reversed_members():
+    items = [
+        {**item("scripts/unit_1.py", ["request"], ["intermediate"]), "purpose": "produce an intermediate value"},
+        {**item("scripts/unit_2.py", ["intermediate"], ["result"]), "purpose": "consume the intermediate value"},
+    ]
+    reversed_plan = plan(m2m("I1", "scripts/unit_2.py", "scripts/unit_1.py", "transfer intermediate"))
+    corrected_plan = plan(m2m("I1", "scripts/unit_1.py", "scripts/unit_2.py", "transfer intermediate"))
+    responses = iter([
+        json.dumps(reversed_plan),
+        json.dumps({"passed": False, "issues": [{
+            "code": "interface_semantic_inconsistency", "category": "semantic_alignment_error",
+            "interface_id": "I1", "message": "Direction conflicts with the declared responsibilities.",
+            "evidence": {"source_purpose": "consume", "target_purpose": "produce"},
+        }]}),
+        json.dumps(corrected_plan),
+    ])
+    calls = 0
+
+    async def model(_messages, _model):
+        nonlocal calls
+        calls += 1
+        return next(responses)
+
+    result = await plan_function_item_interfaces(
+        original_user_goal="produce then consume", frozen_function_items=items,
+        planner_model="p", reviewer_model="r", model_call=model,
+    )
+    assert calls == 3
+    assert result == corrected_plan

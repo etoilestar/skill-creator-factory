@@ -149,6 +149,9 @@ async def test_prepare_main_path_reconciles_decomposition_then_interface_binds_g
                     {"interface_id": "I0003", "kind": "member_to_platform", "goal": "final output", "source_member": "scripts/b.py"},
                 ]
             })
+        if "Review an Interface Intent Plan" in system:
+            calls.append("interface_semantic_review")
+            return json.dumps({"passed": True, "issues": []})
         if "source_path" in system or "Return exactly one strict JSON object" in system:
             calls.append("endpoint_planner")
             endpoint_payloads.append(payload)
@@ -191,6 +194,7 @@ async def test_prepare_main_path_reconciles_decomposition_then_interface_binds_g
         "semantic_review",
     ]
     assert calls[5] == "interface_intent_planner"
+    assert calls[6] == "interface_semantic_review"
     assert calls.count("endpoint_planner") == 3
 
 
@@ -264,3 +268,62 @@ async def test_bind_plan_repairs_overcomplete_interface_once(monkeypatch):
     assert len(repair_calls) == 1
     assert expansion_plans == [initial_plan, repaired_plan]
     assert result["responsibility_edges"] == final_edges
+
+
+@pytest.mark.asyncio
+async def test_graph_revalidation_failure_is_wrapped_without_third_attempt(monkeypatch):
+    plan_value = {"interfaces": []}
+    monkeypatch.setattr(api, "_frozen_function_items_from_blueprint", lambda **_kwargs: [])
+    monkeypatch.setattr(api, "plan_function_item_interfaces", lambda **_kwargs: _async_value(plan_value))
+    attempts = 0
+
+    async def expand_graph(**_kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise api.ResponsibilityGraphExpansionError(
+            "still incomplete", code="interface_plan_incomplete",
+            details={"uncovered_inputs": []},
+        )
+
+    async def repair(**_kwargs):
+        return plan_value
+
+    monkeypatch.setattr(api, "expand_responsibility_graph", expand_graph)
+    monkeypatch.setattr(api, "repair_interface_intents", repair)
+    with pytest.raises(api.InterfaceIntentPlanError) as raised:
+        await api._bind_executable_responsibility_plan(
+            request=_request(), current_planner_result={"internal_blueprint_text": _blueprint()},
+            planner_model="p", allowed_function_item_targets=[],
+        )
+    assert attempts == 2
+    assert raised.value.code == "interface_semantic_repair_failed"
+    assert raised.value.details["original_graph_error"]["code"] == "interface_plan_incomplete"
+    assert raised.value.details["remaining_graph_error"]["code"] == "interface_plan_incomplete"
+
+
+@pytest.mark.asyncio
+async def test_unknown_graph_error_bypasses_semantic_repair(monkeypatch):
+    monkeypatch.setattr(api, "_frozen_function_items_from_blueprint", lambda **_kwargs: [])
+    monkeypatch.setattr(api, "plan_function_item_interfaces", lambda **_kwargs: _async_value({"interfaces": []}))
+    repair_called = False
+
+    async def expand_graph(**_kwargs):
+        raise api.ResponsibilityGraphExpansionError("cycle", code="cycle_error", details={})
+
+    async def repair(**_kwargs):
+        nonlocal repair_called
+        repair_called = True
+
+    monkeypatch.setattr(api, "expand_responsibility_graph", expand_graph)
+    monkeypatch.setattr(api, "repair_interface_intents", repair)
+    with pytest.raises(api.ResponsibilityGraphExpansionError) as raised:
+        await api._bind_executable_responsibility_plan(
+            request=_request(), current_planner_result={"internal_blueprint_text": _blueprint()},
+            planner_model="p", allowed_function_item_targets=[],
+        )
+    assert raised.value.code == "cycle_error"
+    assert repair_called is False
+
+
+async def _async_value(value):
+    return value

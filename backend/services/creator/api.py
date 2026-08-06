@@ -51,7 +51,12 @@ from .command_normalizer import _effective_command_lines
 from .command_normalizer import parse_skill_md_bash_command_blocks
 from . import contracts as creator_contracts
 from .responsibility_graph_expansion import ResponsibilityGraphExpansionError, expand_responsibility_graph
-from .function_item_interface_plan import plan_function_item_interfaces, repair_interface_intents
+from .function_item_interface_plan import (
+    GRAPH_INTERFACE_ISSUE_CATEGORIES,
+    InterfaceIntentPlanError,
+    plan_function_item_interfaces,
+    repair_interface_intents,
+)
 
 
 def _tool_binding_digest(binding: dict[str, Any]) -> str:
@@ -7204,15 +7209,13 @@ async def _bind_executable_responsibility_plan(
         skill_name=str(current_planner_result.get("skill_name") or ""),
         planner_model=planner_model,
         model_call=select_sources,
+        reviewer_model=planner_model,
     )
     graph_context = {
         "system_goal": request.user_request,
         "skill_name": current_planner_result.get("skill_name", ""),
     }
-    repairable_interface_codes = {
-        "interface_plan_incomplete",
-        "interface_plan_overcomplete",
-    }
+    repairable_interface_codes = set(GRAPH_INTERFACE_ISSUE_CATEGORIES)
     try:
         responsibility_edges = await expand_responsibility_graph(
             function_items=frozen_function_items,
@@ -7272,14 +7275,30 @@ async def _bind_executable_responsibility_plan(
             planner_model=planner_model,
             model_call=select_sources,
         )
-        responsibility_edges = await expand_responsibility_graph(
-            function_items=frozen_function_items,
-            platform_contract=platform_contract,
-            planner_model=planner_model,
-            model_call=select_sources,
-            goal_context=graph_context,
-            interface_plan=interface_plan,
-        )
+        try:
+            responsibility_edges = await expand_responsibility_graph(
+                function_items=frozen_function_items,
+                platform_contract=platform_contract,
+                planner_model=planner_model,
+                model_call=select_sources,
+                goal_context=graph_context,
+                interface_plan=interface_plan,
+            )
+        except ResponsibilityGraphExpansionError as repair_exc:
+            logger.info(
+                "[Creator][interface_graph_revalidation] attempt=1 result=failed error_code=%s",
+                repair_exc.code,
+            )
+            raise InterfaceIntentPlanError(
+                "interface semantic repair did not produce a valid responsibility graph",
+                code="interface_semantic_repair_failed",
+                details={
+                    "stage": "graph_expansion_feedback", "repair_attempts": 1,
+                    "original_graph_error": {"code": exc.code, "details": exc.details},
+                    "remaining_graph_error": {"code": repair_exc.code, "details": repair_exc.details},
+                },
+            ) from repair_exc
+        logger.info("[Creator][interface_graph_revalidation] attempt=1 result=success")
     return {
         "function_items": frozen_function_items,
         "responsibility_edges": responsibility_edges,

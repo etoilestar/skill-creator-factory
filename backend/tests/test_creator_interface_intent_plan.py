@@ -11,6 +11,10 @@ from backend.services.creator.function_item_interface_plan import (
     build_graph_obligations_from_interfaces,
     plan_function_item_interfaces,
     repair_interface_intents,
+    build_interface_repair_scope,
+    collect_interface_plan_validation_issues,
+    repair_interface_plan_semantically,
+    validate_interface_repair_scope,
     validate_interface_intent_plan,
     _interface_plan_prompt,
 )
@@ -221,11 +225,67 @@ def test_interface_planner_payload_is_compact_and_uses_existing_function_items_o
 
     import asyncio
     asyncio.run(plan_function_item_interfaces(original_user_goal="goal", frozen_function_items=items, requirement_allocations=[allocation("R1", ["scripts/a.py"]), allocation("R2", [])], requirement_channels={"R1": "executable", "R2": "direct"}, planner_model="p", model_call=model))
-    assert set(captured) == {"system_goal", "function_items", "executable_requirement_allocations", "platform_contract"}
+    assert set(captured) == {"system_goal", "skill_name", "function_items", "executable_requirement_allocations", "requirement_channels", "interaction_requirements", "platform_contract"}
     assert captured["function_items"][0]["target_file"] == "scripts/a.py"
     assert captured["function_items"][0]["required_inputs"] == ["input_1"]
     assert captured["function_items"][0]["defaulted_inputs"] == []
     assert [value["requirement_id"] for value in captured["executable_requirement_allocations"]] == ["R1"]
+    assert [value["requirement_id"] for value in captured["interaction_requirements"]] == ["R2"]
+
+
+def test_semantic_validator_collects_all_reference_levels_and_self_connections():
+    items = [item("scripts/unit_1.py", ["value_a"], ["value_b"]), item("scripts/unit_2.py", ["value_b"], ["value_a"])]
+    candidate = plan(
+        m2m("I1", "missing_1", "value_b"),
+        m2m("I2", "missing_2", "scripts/unit_2.py"),
+        m2m("I3", "scripts/unit_1.py", "scripts/unit_1.py"),
+    )
+    issues = collect_interface_plan_validation_issues(plan=candidate, function_items=items)
+    assert [issue["code"] for issue in issues] == [
+        "unknown_interface_member", "unknown_interface_member",
+        "unknown_interface_member", "interface_self_connection",
+    ]
+    assert issues[1]["category"] == "reference_scope_error"
+    assert all(issue["allowed_scope"] == ["scripts/unit_1.py", "scripts/unit_2.py"] for issue in issues)
+    assert not any("correct_source_member" in issue for issue in issues)
+
+
+@pytest.mark.asyncio
+async def test_initial_semantic_errors_are_repaired_once_without_backend_inference():
+    items = [item("scripts/unit_1.py", ["value_a"], ["value_b"]), item("scripts/unit_2.py", ["value_b"], ["value_a"])]
+    responses = iter([
+        json.dumps(plan(m2m("I1", "unknown", "scripts/unit_2.py"), m2m("I2", "scripts/unit_1.py", "scripts/unit_1.py"))),
+        json.dumps(plan(m2m("I1", "scripts/unit_1.py", "scripts/unit_2.py"), m2m("I2", "scripts/unit_2.py", "scripts/unit_1.py"))),
+    ])
+    calls = []
+
+    async def model(messages, _model):
+        calls.append(messages)
+        return next(responses)
+
+    repaired = await plan_function_item_interfaces(
+        original_user_goal="abstract collaboration", frozen_function_items=items,
+        planner_model="p", model_call=model,
+    )
+    assert len(calls) == 2
+    repair_payload = json.loads(calls[1][-1]["content"])
+    assert len(repair_payload["validation_issues"]) == 2
+    assert repaired["interfaces"][0]["source_member"] == "scripts/unit_1.py"
+
+
+def test_repair_scope_rejects_unrelated_changes_reordering_and_hidden_endpoint_fields():
+    before = plan(p2m("I1", "unit_1"), m2p("I2", "unit_2"))
+    scope = build_interface_repair_scope([{
+        "code": "unknown_interface_member", "category": "reference_error",
+        "interface_id": "I1", "details": {},
+    }])
+    with pytest.raises(InterfaceIntentPlanError) as raised:
+        validate_interface_repair_scope(
+            before=before,
+            after=plan({**m2p("I2", "unit_2"), "endpoint_id": "E1"}, p2m("I1", "unit_1")),
+            repair_scope=scope,
+        )
+    assert raised.value.code == "interface_repair_scope_error"
 
 
 def test_old_subsystem_module_and_test_are_removed():

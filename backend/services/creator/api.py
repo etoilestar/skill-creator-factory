@@ -8,7 +8,7 @@ import math
 import re
 import shutil
 import traceback
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 
 import httpx
 from fastapi.encoders import jsonable_encoder
@@ -230,6 +230,18 @@ class RequirementOwnershipError(PreparePlanProtocolError):
         super().__init__(message)
         self.code = code
         self.details = details
+
+
+@dataclass
+class RequirementOwnershipRepairBudget:
+    """Request-local budget shared by every ownership validation pass."""
+
+    max_attempts: int = 1
+    attempts_used: int = 0
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.max_attempts - self.attempts_used)
 
 
 
@@ -7572,9 +7584,10 @@ A. Keep the executable channel and assign one or more frozen FunctionItem
 B. Change the requirement to the appropriate non-executable channel when no
    frozen FunctionItem truthfully owns its runtime fulfillment.
 
-Only the affected requirement's channel, owners, and evidence may change. An
-allocation for an affected requirement may be added or removed only when needed.
-Do not modify unaffected requirements. Do not create new requirement IDs,
+Every existing requirement allocation must remain present exactly once and in
+its current array position. Do not add or remove requirement allocations. For
+an affected existing allocation, only its channel, owners, and evidence may
+change. Do not modify unaffected requirements. Do not create new requirement IDs,
 rewrite requirement descriptions, create FunctionItems, invent owner identifiers,
 assign arbitrary owners merely to pass validation, or return executable with an
 empty owners list.
@@ -7595,15 +7608,20 @@ objects, not a partial patch. Return strict JSON only with exactly those keys.""
          {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
         model,
     )
-    data = _parse_prepare_plan_json(text)
-    if set(data) != {"requirement_allocations", "requirement_channels"}:
+    try:
+        data = _parse_prepare_plan_json(text)
+        if set(data) != {"requirement_allocations", "requirement_channels"}:
+            raise PreparePlanProtocolError(
+                "Requirement ownership repair must return exactly requirement_allocations and requirement_channels"
+            )
+        allocations = _validate_requirement_allocations_for_ownership(data["requirement_allocations"])
+        channels = _validate_requirement_channels_for_ownership(data["requirement_channels"])
+    except (PreparePlanProtocolError, ValueError, TypeError, KeyError) as exc:
         raise RequirementOwnershipError(
-            "Requirement ownership repair returned an invalid protocol shape",
-            code="requirement_ownership_repair_scope_violation",
+            "Requirement ownership repair returned an invalid protocol",
+            code="requirement_ownership_repair_protocol_error",
             details={"affected_requirement_ids": sorted(affected_ids)},
-        )
-    allocations = _validate_requirement_allocations_for_ownership(data["requirement_allocations"])
-    channels = _validate_requirement_channels_for_ownership(data["requirement_channels"])
+        ) from exc
     _validate_requirement_ownership_repair_scope(
         before_allocations=current_requirement_allocations,
         before_channels=current_requirement_channels,
@@ -7616,7 +7634,7 @@ objects, not a partial patch. Return strict JSON only with exactly those keys.""
 async def _validate_and_repair_requirement_ownership(
     *, request: PreparePlanRequest, blueprint_text: str,
     function_items: list[dict[str, Any]], projection: dict[str, Any],
-    planner_model: str,
+    planner_model: str, repair_budget: RequirementOwnershipRepairBudget,
 ) -> dict[str, Any]:
     allocations = projection["requirement_allocations"]
     channels = projection["requirement_channels"]
@@ -7626,8 +7644,9 @@ async def _validate_and_repair_requirement_ownership(
     )
     affected_ids = sorted({issue["requirement_id"] for issue in initial_issues if issue.get("requirement_id")})
     logger.info(
-        "[Creator][requirement_ownership_validation] stage=initial executable_requirement_count=%d issue_count=%d affected_requirement_ids=%s",
+        "[Creator][requirement_ownership_validation] stage=initial executable_requirement_count=%d issue_count=%d affected_requirement_ids=%s repair_attempts_used=%d repair_attempts_remaining=%d",
         sum(value == "executable" for value in channels.values()), len(initial_issues), affected_ids,
+        repair_budget.attempts_used, repair_budget.remaining,
     )
     if not initial_issues:
         _validate_requirement_channels(channels, allocations)
@@ -7637,9 +7656,45 @@ async def _validate_and_repair_requirement_ownership(
         )
         logger.info("[Creator][requirement_ownership_validation] stage=initial issue_count=0 ownership_valid=true")
         return projection
+    issue_codes = [issue["code"] for issue in initial_issues]
+    if {"missing_executable_requirement_allocation", "unknown_requirement_allocation"} & set(issue_codes):
+        logger.info(
+            "[Creator][requirement_ownership_repair] result=skipped reason=projection_identity_mismatch issue_codes=%s",
+            issue_codes,
+        )
+        raise RequirementOwnershipError(
+            "Requirement ownership projection has an unrecoverable identity mismatch",
+            code="requirement_ownership_repair_failed",
+            details={"stage": "requirement_ownership", "attempts": repair_budget.attempts_used,
+                     "max_attempts": repair_budget.max_attempts,
+                     "initial_issues": initial_issues, "remaining_issues": initial_issues,
+                     "affected_requirement_ids": affected_ids,
+                     "repair_error": {
+                         "code": "requirement_ownership_projection_identity_mismatch",
+                         "message": "Requirement channels and allocations do not contain the same requirement identities.",
+                     }},
+        )
+    if repair_budget.remaining <= 0:
+        logger.info(
+            "[Creator][requirement_ownership_repair] result=skipped reason=budget_exhausted attempts_used=%d remaining_issue_codes=%s",
+            repair_budget.attempts_used, issue_codes,
+        )
+        raise RequirementOwnershipError(
+            "Requirement ownership is invalid and the request repair budget is exhausted",
+            code="requirement_ownership_repair_failed",
+            details={"stage": "requirement_ownership", "attempts": repair_budget.attempts_used,
+                     "max_attempts": repair_budget.max_attempts,
+                     "initial_issues": initial_issues, "remaining_issues": initial_issues,
+                     "affected_requirement_ids": affected_ids,
+                     "repair_error": {
+                         "code": "requirement_ownership_repair_budget_exhausted",
+                         "message": "The request-level ownership repair budget has already been used.",
+                     }},
+        )
+    repair_budget.attempts_used += 1
     logger.info(
-        "[Creator][requirement_ownership_repair] attempt=1 issue_codes=%s affected_requirement_ids=%s",
-        [issue["code"] for issue in initial_issues], affected_ids,
+        "[Creator][requirement_ownership_repair] attempt=%d max_attempts=%d issue_codes=%s affected_requirement_ids=%s",
+        repair_budget.attempts_used, repair_budget.max_attempts, issue_codes, affected_ids,
     )
 
     async def call_model(messages: list[dict[str, str]], model: str) -> str:
@@ -7670,7 +7725,8 @@ async def _validate_and_repair_requirement_ownership(
             raise RequirementOwnershipError(
                 "Requirement ownership remained invalid after one repair",
                 code="requirement_ownership_repair_failed",
-                details={"stage": "requirement_ownership", "attempts": 1,
+                details={"stage": "requirement_ownership", "attempts": repair_budget.attempts_used,
+                         "max_attempts": repair_budget.max_attempts,
                          "initial_issues": initial_issues, "remaining_issues": remaining,
                          "affected_requirement_ids": affected_ids},
             )
@@ -7688,7 +7744,8 @@ async def _validate_and_repair_requirement_ownership(
         raise RequirementOwnershipError(
             "Requirement ownership repair failed",
             code="requirement_ownership_repair_failed",
-            details={"stage": "requirement_ownership", "attempts": 1,
+            details={"stage": "requirement_ownership", "attempts": repair_budget.attempts_used,
+                     "max_attempts": repair_budget.max_attempts,
                      "initial_issues": initial_issues, "remaining_issues": [],
                      "affected_requirement_ids": affected_ids,
                      "repair_error": {"code": exc.code, "message": str(exc)}},
@@ -7698,7 +7755,8 @@ async def _validate_and_repair_requirement_ownership(
         raise RequirementOwnershipError(
             "Requirement ownership repair failed",
             code="requirement_ownership_repair_failed",
-            details={"stage": "requirement_ownership", "attempts": 1,
+            details={"stage": "requirement_ownership", "attempts": repair_budget.attempts_used,
+                     "max_attempts": repair_budget.max_attempts,
                      "initial_issues": initial_issues, "remaining_issues": [],
                      "affected_requirement_ids": affected_ids,
                      "repair_error": {"code": getattr(exc, "code", type(exc).__name__), "message": str(exc)}},
@@ -8375,6 +8433,8 @@ async def _generate_internal_blueprint_or_questions(
 
     Tool discovery and ToolPool mutation are forbidden here.
     """
+
+    ownership_repair_budget = RequirementOwnershipRepairBudget(max_attempts=1)
 
     existing_context = (
         _read_prepare_existing_skill_context(
@@ -9243,7 +9303,7 @@ Blueprint Planner 只规划业务责任。
         requirement_projection = await _validate_and_repair_requirement_ownership(
             request=request, blueprint_text=frozen_blueprint_text,
             function_items=semantic_function_items, projection=requirement_projection,
-            planner_model=route.model,
+            planner_model=route.model, repair_budget=ownership_repair_budget,
         )
         requirement_allocations = requirement_projection["requirement_allocations"]
         requirement_channels = requirement_projection["requirement_channels"]
@@ -9296,6 +9356,7 @@ Blueprint Planner 只规划业务责任。
                 request=request, blueprint_text=frozen_blueprint_text,
                 function_items=semantic_function_items,
                 projection=requirement_projection, planner_model=route.model,
+                repair_budget=ownership_repair_budget,
             )
             requirement_allocations = requirement_projection["requirement_allocations"]
             requirement_channels = requirement_projection["requirement_channels"]
@@ -9375,6 +9436,7 @@ Blueprint Planner 只规划业务责任。
                     request=request, blueprint_text=frozen_blueprint_text,
                     function_items=semantic_function_items,
                     projection=requirement_projection, planner_model=route.model,
+                    repair_budget=ownership_repair_budget,
                 )
                 requirement_allocations = requirement_projection["requirement_allocations"]
                 requirement_channels = requirement_projection["requirement_channels"]

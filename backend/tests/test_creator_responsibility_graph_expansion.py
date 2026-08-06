@@ -11,6 +11,33 @@ from backend.services.creator.responsibility_graph_expansion import (
 from backend.services.platform_io_contract import build_platform_io_contract
 
 
+@pytest.mark.asyncio
+async def test_empty_endpoint_candidate_domain_fails_without_model_call():
+    calls = 0
+
+    async def model(*_args):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("empty endpoint domains must not call the model")
+
+    function_items = [{
+        "target_file": "scripts/a.py", "role": "script", "purpose": "produce output",
+        "inputs": [], "outputs": [], "required_capabilities": [], "constraints": [],
+        "default_values": {},
+    }]
+    with pytest.raises(ResponsibilityGraphExpansionError) as raised:
+        await expand_responsibility_graph(
+            function_items=function_items,
+            platform_contract={"platform_skill_boundary": {"input_envelope_fields": ["fields"], "final_output_fields": ["text"]}},
+            planner_model="p", model_call=model, interface_plan={"interfaces": [{
+                "interface_id": "i1", "kind": "member_to_platform",
+                "goal": "output_x to platform text", "source_member": "scripts/a.py",
+            }]},
+        )
+    assert raised.value.code == "empty_interface_endpoint_domain"
+    assert calls == 0
+
+
 def item(node, inputs, outputs, defaults=None):
     return {"target_file": node, "role": "script", "purpose": f"purpose-{node}", "inputs": inputs, "outputs": outputs, "required_capabilities": [], "constraints": [], "default_values": defaults or {}}
 

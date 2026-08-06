@@ -14,6 +14,7 @@ from backend.services.creator.function_item_interface_plan import (
     build_interface_repair_scope,
     collect_interface_plan_validation_issues,
     merge_interface_validation_issues,
+    normalize_interface_review_issue,
     repair_interface_plan_semantically,
     review_interface_plan_semantically,
     validate_interface_repair_scope,
@@ -45,6 +46,37 @@ def m2p(interface_id, source, goal="platform output"):
 
 def fenced_json(value):
     return "```json\n" + json.dumps(value) + "\n```"
+
+
+def review_issue(code="model_defined_issue", category="alignment", *, interfaces=None, members=None, inputs=None, message="blocking issue"):
+    return {
+        "code": code,
+        "category": category,
+        "message": message,
+        "affected_interfaces": list(interfaces or []),
+        "affected_members": list(members or []),
+        "affected_inputs": list(inputs or []),
+        "evidence": {"observed": "failed plan", "expected": "valid plan"},
+    }
+
+
+def test_unified_review_issue_accepts_new_codes_and_validates_all_references():
+    items = [item("scripts/a.py", ["input_x"], ["output_x"]), item("scripts/b.py", ["input_y"], ["output_y"])]
+    current = plan(m2m("i1", "scripts/a.py", "scripts/b.py"))
+    raw = review_issue(
+        "previously_unseen_code", "coverage", interfaces=["i1"],
+        members=["scripts/b.py"],
+        inputs=[{"target_member": "scripts/b.py", "target_input": "input_y"}],
+    )
+    assert normalize_interface_review_issue(raw, items, current)["code"] == "previously_unseen_code"
+    for invalid in (
+        {**raw, "affected_interfaces": ["missing"]},
+        {**raw, "affected_members": ["scripts/missing.py"]},
+        {**raw, "affected_inputs": [{"target_member": "scripts/b.py", "target_input": "input_x"}]},
+    ):
+        with pytest.raises(InterfaceIntentPlanError) as raised:
+            normalize_interface_review_issue(invalid, items, current)
+        assert raised.value.code == "invalid_interface_semantic_review_reference"
 
 
 def test_interface_plan_rejects_unknown_member_self_connection_and_extra_fields():
@@ -190,8 +222,7 @@ async def test_repair_interface_intents_returns_validated_repaired_plan():
     async def model(messages, _model):
         payload = json.loads(messages[-1]["content"])
         assert payload["current_interface_plan"] == {"interfaces": []}
-        assert payload["affected_members"] == ["scripts/a.py"]
-        assert payload["validation_errors"][0]["code"] == "interface_plan_incomplete"
+        assert payload["validation_issues"][0]["affected_members"] == ["scripts/a.py"]
         return json.dumps(repaired)
 
     assert await repair_interface_intents(original_user_goal="g", frozen_function_items=items, current_interface_plan={"interfaces": []}, validation_errors=[{"code": "interface_plan_incomplete"}], affected_members=["scripts/a.py"], missing_platform_output_fields=[], planner_model="p", model_call=model) == repaired
@@ -416,22 +447,17 @@ def test_interface_prompt_uses_five_sections_and_forbids_instruction_leakage():
         )
     )
 
-    assert "uncovered_inputs" in captured["system"]
-    assert "does not prove that every required target input is covered" in captured["system"]
-    assert "do not return the plan unchanged" in captured["system"]
-    assert "source endpoints are reusable" in captured["system"]
-    assert "interface_plan_overcomplete means only" in captured["system"]
-    assert "do not create interfaces solely because a source member exposes additional outputs" in captured["system"]
-    assert captured["payload"]["uncovered_inputs"] == [
-        {"target": "scripts/b.py", "input_id": "second"},
-        {"target": "scripts/b.py", "input_id": "third"},
+    assert "unified blocking issue envelopes" in captured["system"]
+    assert "returning an unchanged plan is invalid" in captured["system"]
+    assert "repeated member pairs are allowed" in captured["system"]
+    assert captured["payload"]["validation_issues"][0]["affected_inputs"] == [
+        {"target_member": "scripts/b.py", "target_input": "second"},
+        {"target_member": "scripts/b.py", "target_input": "third"},
     ]
-    assert captured["payload"]["overcomplete_interfaces"] == [{
-        "interface_id": "I0006",
-        "obligation_id": "O0006",
-        "kind": "script_to_script",
-        "reason": "no_remaining_target_endpoint",
-    }]
+    assert set(captured["payload"]["validation_issues"][1]) >= {
+        "code", "category", "message", "affected_interfaces", "affected_members",
+        "affected_inputs", "evidence",
+    }
     repeated = [
         iface for iface in result["interfaces"]
         if iface["kind"] == "member_to_member"
@@ -530,12 +556,9 @@ async def test_semantic_reviewer_drives_one_repair_for_valid_but_reversed_member
     corrected_plan = plan(m2m("I1", "scripts/unit_1.py", "scripts/unit_2.py", "transfer intermediate"))
     responses = iter([
         json.dumps(reversed_plan),
-        json.dumps({"passed": False, "issues": [{
-            "code": "interface_semantic_inconsistency", "category": "semantic_alignment_error",
-            "interface_id": "I1", "message": "Direction conflicts with the declared responsibilities.",
-            "evidence": {"source_purpose": "consume", "target_purpose": "produce"},
-        }]}),
+        json.dumps({"passed": False, "issues": [review_issue("direction_conflict", interfaces=["I1"], message="Direction conflicts with the declared responsibilities.")]}),
         json.dumps(corrected_plan),
+        json.dumps({"passed": True, "issues": []}),
     ])
     calls = 0
 
@@ -548,7 +571,7 @@ async def test_semantic_reviewer_drives_one_repair_for_valid_but_reversed_member
         original_user_goal="produce then consume", frozen_function_items=items,
         planner_model="p", reviewer_model="r", model_call=model,
     )
-    assert calls == 3
+    assert calls == 4
     assert result == corrected_plan
 
 
@@ -610,28 +633,53 @@ async def test_reviewer_prompt_confines_issues_to_interface_intent_fields():
 async def test_semantic_repair_prompt_forbids_protocol_expansion_for_later_stage_issue():
     current = plan(p2m("I1", "scripts/unit_a.py", "Provide the runtime request."))
     captured = {}
-    issue = {
-        "code": "interface_semantic_inconsistency", "category": "semantic_alignment_error",
-        "interface_id": "I1", "message": "The interface does not explicitly specify the source platform field.",
-        "details": {"evidence": {"platform_contract": "multiple fields"}},
-    }
+    issue = {**review_issue("platform_field_concern", interfaces=["I1"]),
+        "stage": "interface_semantic_review", "path": "$.issues[0]", "interface_id": "I1",
+        "details": review_issue("platform_field_concern", interfaces=["I1"])}
 
     async def model(messages, _model):
         captured["prompt"] = messages[0]["content"]
         return json.dumps(current)
 
-    result = await repair_interface_plan_semantically(
-        original_user_goal="g", frozen_function_items=[item("scripts/unit_a.py", ["request"], ["result"])],
-        current_interface_plan=current, validation_issues=[issue],
-        repair_scope=build_interface_repair_scope([issue], current),
-        planner_model="p", model_call=model,
-    )
-    assert validate_interface_intent_plan(plan=result, function_items=[item("scripts/unit_a.py", ["request"], ["result"])]) == current
-    assert set(result["interfaces"][0]) == {"interface_id", "kind", "goal", "target_member"}
+    with pytest.raises(InterfaceIntentPlanError) as raised:
+        await repair_interface_plan_semantically(
+            original_user_goal="g", frozen_function_items=[item("scripts/unit_a.py", ["request"], ["result"])],
+            current_interface_plan=current, validation_issues=[issue],
+            repair_scope=build_interface_repair_scope([issue], current),
+            planner_model="p", model_call=model,
+        )
+    assert raised.value.code == "repair_no_progress"
     prompt_text = captured["prompt"]
-    assert "Never add fields outside the supplied Interface Intent schema." in prompt_text
-    for field in ("source_field", "target_field", "source_id", "target_id", "source_path", "platform_slot"):
-        assert field in prompt_text
+    assert "Do not modify FunctionItems or add fields outside" in prompt_text
+    assert "Do not add endpoint IDs" in prompt_text
+
+
+@pytest.mark.asyncio
+async def test_wording_only_interface_repair_with_same_fingerprint_is_no_progress():
+    items = [item("scripts/a.py", ["input_x"], ["output_x"])]
+    current = plan(p2m("i1", "scripts/a.py", "old wording"))
+    changed = plan(p2m("i1", "scripts/a.py", "new wording"))
+    envelope = review_issue(
+        "coverage_gap", "coverage", interfaces=["i1"], members=["scripts/a.py"],
+        inputs=[{"target_member": "scripts/a.py", "target_input": "input_x"}],
+    )
+    issue = {**envelope, "details": envelope, "interface_id": "i1"}
+    responses = iter([
+        json.dumps(changed),
+        json.dumps({"passed": False, "issues": [envelope]}),
+    ])
+
+    async def model(*_args):
+        return next(responses)
+
+    with pytest.raises(InterfaceIntentPlanError) as raised:
+        await repair_interface_plan_semantically(
+            original_user_goal="g", frozen_function_items=items,
+            current_interface_plan=current, validation_issues=[issue],
+            repair_scope=build_interface_repair_scope([issue], current),
+            planner_model="p", reviewer_model="r", model_call=model,
+        )
+    assert raised.value.code == "repair_no_progress"
 
 
 def test_issue_merge_is_stable_deterministic_first_and_deduplicated():
@@ -664,12 +712,9 @@ async def test_deterministic_and_review_issues_share_context_and_one_repair():
     )
     responses = iter([
         json.dumps(initial),
-        json.dumps({"passed": False, "issues": [{
-            "code": "interface_semantic_inconsistency", "category": "semantic_alignment_error",
-            "interface_id": "I2", "message": "Direction conflicts with responsibilities.",
-            "evidence": {"source_purpose": "consumer", "target_purpose": "producer"},
-        }]}),
+        json.dumps({"passed": False, "issues": [review_issue("direction_conflict", interfaces=["I2"], message="Direction conflicts with responsibilities.")]}),
         json.dumps(repaired),
+        json.dumps({"passed": True, "issues": []}),
     ])
     payloads = []
 
@@ -683,7 +728,7 @@ async def test_deterministic_and_review_issues_share_context_and_one_repair():
         planner_model="p", reviewer_model="r", model_call=model,
     )
     assert result == repaired
-    assert len(payloads) == 3
+    assert len(payloads) == 4
     assert all(payload["unowned_system_requirements"] == allocations for payload in payloads)
     assert [issue["interface_id"] for issue in payloads[2]["validation_issues"]] == ["I1", "I2"]
 
@@ -711,12 +756,9 @@ async def test_reviewer_protocol_repair_runs_once_then_semantic_repair():
     responses = iter([
         json.dumps(initial),
         json.dumps({"review": {"passed": False}}),
-        json.dumps({"passed": False, "issues": [{
-            "code": "interface_semantic_inconsistency", "category": "semantic_alignment_error",
-            "interface_id": "I1", "message": "Boundary conflicts with the goal.",
-            "evidence": {"platform_contract": "input"},
-        }]}),
+        json.dumps({"passed": False, "issues": [review_issue("boundary_conflict", interfaces=["I1"], message="Boundary conflicts with the goal.")]}),
         json.dumps(m2p_plan := plan(m2p("I1", "scripts/unit_1.py"))),
+        json.dumps({"passed": True, "issues": []}),
     ])
     calls = 0
 
@@ -729,7 +771,7 @@ async def test_reviewer_protocol_repair_runs_once_then_semantic_repair():
         original_user_goal="g", frozen_function_items=items,
         planner_model="p", reviewer_model="r", model_call=model,
     ) == m2p_plan
-    assert calls == 4
+    assert calls == 5
 
 
 @pytest.mark.asyncio

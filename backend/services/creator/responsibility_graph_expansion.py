@@ -342,96 +342,11 @@ async def _select_interface_endpoint_reference(*, obligation: dict, registry: di
                     "reason": "no_remaining_target_endpoint",
                 },
             )
-        prompt = """You are selecting endpoint IDs for exactly one already-declared
-platform-to-FunctionItem interface.
-
-Return exactly one strict JSON object with exactly these three fields:
-
-{
-  "source_id": "<one platform_inputs.slot_id>",
-  "target_id": "<one target_member_inputs.input_id>",
-  "source_path": ["<optional nested key>", "..."]
-}
-
-Field definitions:
-
-1. source_id
-   - Must be copied exactly from one object in platform_inputs.
-   - Use that object's slot_id value.
-   - Do not use its field value.
-   - Do not invent an endpoint ID.
-
-2. target_id
-   - Must be copied exactly from one object in target_member_inputs.
-   - Use that object's input_id value.
-   - Do not use port_id, node_id, target_member, or a file path.
-   - Do not invent an endpoint ID.
-
-3. source_path
-   - Must always be a JSON array.
-   - Every element must be a non-empty string.
-   - It describes nested keys inside the platform input slot selected by source_id.
-   - It does not describe the target script.
-   - It is never a script path, filename, FunctionItem target, module path,
-     endpoint ID, output path, or filesystem path.
-   - Use [] when the entire selected platform input slot should be passed directly.
-   - Do not repeat the selected platform field itself inside source_path.
-
-Direct binding example:
-
-{
-  "source_id": "PIN0001",
-  "target_id": "IN0001",
-  "source_path": []
-}
-
-Nested source example:
-
-{
-  "source_id": "PIN0005",
-  "target_id": "IN0001",
-  "source_path": ["article", "text"]
-}
-
-Invalid examples:
-
-{
-  "source_id": "PIN0001",
-  "target_id": "IN0001",
-  "source_path": "scripts/extractor.py"
-}
-
-{
-  "source_id": "PIN0001",
-  "target_id": "IN0001",
-  "source_path": "user_request"
-}
-
-{
-  "source_id": "user_request",
-  "target_id": "input_text",
-  "source_path": []
-}
-
-target_member_inputs contains only currently unbound target inputs.
-
-Platform input slots may be reused for multiple target inputs when the system
-semantics require it; do not treat platform inputs as consumed.
-
-Select exactly one target_id from that supplied list.
-
-Do not select or reconstruct an input that is absent from the list.
-
-Do not return:
-- an edge;
-- a wrapper object;
-- obligation_id;
-- interface_id;
-- target_member;
-- explanations;
-- markdown;
-- comments;
-- additional fields."""
+        prompt = """For this platform_to_script obligation, return exactly:
+{"source_id":"<allowed platform input ID>","target_id":"<allowed target input ID>","source_path":[]}
+source_path is an array of nested keys within the selected platform input; use
+[] for direct binding. Use [] when no nested key is needed. source_path is
+never a script path, member path, filename, or endpoint ID."""
     elif kind == "script_to_platform":
         payload["source_member_outputs"] = _public_script_outputs(registry, obligation["source_member"])
         payload["platform_outputs"] = _unbound_platform_outputs(registry=registry, committed_edges=committed_edges)
@@ -447,26 +362,9 @@ Do not return:
                     "reason": "no_remaining_platform_target",
                 },
             )
-        prompt = """Return exactly one strict JSON object:
-
-{
-  "source_id": "<one source_member_outputs.output_id>",
-  "target_id": "<one platform_outputs.slot_id>"
-}
-
-source_id must be copied from source_member_outputs.output_id.
-target_id must be copied from platform_outputs.slot_id.
-
-source_member_outputs may be reused across different platform output
-obligations when semantically appropriate.
-
-platform_outputs contains only platform output slots that do not yet have a
-committed source.
-
-Select exactly one target_id from that supplied list.
-
-Do not return source_path, path, member names, field names, file paths,
-an edge, a wrapper, or an explanation."""
+        prompt = """For this script_to_platform obligation, return exactly:
+{"source_id":"<allowed source output ID>","target_id":"<allowed platform output ID>"}
+Do not return source_path or any additional field."""
     else:
         payload["source_member_outputs"] = _public_script_outputs(registry, obligation["source_member"])
         payload["target_member_inputs"] = _unbound_script_inputs(registry=registry, member=obligation["target_member"], committed_edges=committed_edges)
@@ -483,37 +381,11 @@ an edge, a wrapper, or an explanation."""
                     "reason": "no_remaining_target_endpoint",
                 },
             )
-        prompt = """You are binding exactly one logical data-transfer interface.
-
-Select exactly one source_id from source_member_outputs and exactly one
-target_id from target_member_inputs.
-
-source_member_outputs may contain outputs already used by earlier interfaces.
-That is valid.
-
-Select the source endpoint that semantically satisfies the current interface
-goal.
-
-target_member_inputs contains only target inputs that do not yet have an
-incoming edge.
-
-Use the current interface goal, source output descriptions and contracts, and
-target input descriptions and contracts as semantic evidence.
-
-Do not reject or avoid a source output merely because another committed edge
-already uses it.
-
-Do not select an already-bound target input.
-Do not select or reconstruct a target input absent from target_member_inputs.
-Do not infer a mapping from filenames, fixed port-name tables, suffixes, or
-business keywords.
-
-Return exactly one strict JSON object.
-Return only:
-{
-  "source_id": "...",
-  "target_id": "..."
-}"""
+        prompt = """For this script_to_script obligation, return exactly:
+{"source_id":"<allowed source output ID>","target_id":"<allowed target input ID>"}
+Use the Interface goal and declared contracts as semantic evidence. Reused
+source outputs are legal. Do not infer a mapping from filenames or matching
+field names alone. Do not return additional fields."""
     payload["allowed_source_endpoints"] = [
         {"id": value.get("slot_id") or value.get("output_id"), "member": value.get("target_file") or "platform", "field": value.get("field") or value.get("port_id"), "type": (value.get("contract") or {}).get("type")}
         for value in (payload.get("platform_inputs") or payload.get("source_member_outputs") or [])
@@ -522,6 +394,17 @@ Return only:
         {"id": value.get("slot_id") or value.get("input_id"), "member": value.get("target_file") or "platform", "field": value.get("field") or value.get("port_id"), "type": (value.get("contract") or {}).get("type")}
         for value in (payload.get("target_member_inputs") or payload.get("platform_outputs") or [])
     ]
+    if not payload["allowed_source_endpoints"] or not payload["allowed_target_endpoints"]:
+        raise ResponsibilityGraphExpansionError(
+            "current interface obligation has an empty legal endpoint domain",
+            code="empty_interface_endpoint_domain",
+            details={
+                "obligation_id": obligation.get("obligation_id", ""),
+                "interface_id": obligation.get("interface_id", ""),
+                "source_candidate_count": len(payload["allowed_source_endpoints"]),
+                "target_candidate_count": len(payload["allowed_target_endpoints"]),
+            },
+        )
     prompt = """1. AUTHORITATIVE FACTS
 The payload's current obligation, allowed_source_endpoints, and
 allowed_target_endpoints are the only endpoint authority.
@@ -664,7 +547,9 @@ async def _expand_from_interface_plan(*, normalized: list[dict], platform_contra
                 )
                 if (
                     isinstance(exc, ResponsibilityGraphExpansionError)
-                    and error_code == "interface_plan_overcomplete"
+                    and (error_code == "interface_plan_overcomplete"
+                         or "source_candidate_count" in details
+                         or "target_candidate_count" in details)
                 ):
                     raise
                 if attempt:

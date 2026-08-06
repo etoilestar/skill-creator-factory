@@ -398,6 +398,35 @@ async def test_requirement_prompts_define_ownership_closure(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_requirement_planner_receives_compact_clarification_context(monkeypatch):
+    captured = {}
+
+    async def model(messages, _role, fallback_model=None):
+        captured.update(json.loads(messages[-1]["content"])["confirmed_user_context"])
+        return json.dumps({
+            "requirement_allocations": [_allocation("R1", [])],
+            "requirement_channels": {"R1": "resource"},
+        })
+
+    monkeypatch.setattr(api, "complete_creator_role_once", model)
+    request = _request(
+        conversation_history=[
+            {"role": "assistant", "content": "Choose constraint?"},
+            {"role": "user", "content": "Use constraint x."},
+        ],
+        human_feedback="Keep the confirmed choice.",
+    )
+    await api._plan_requirement_allocations(
+        request=request, blueprint_text=_blueprint(), function_items=[], planner_model="p",
+    )
+    assert captured["clarification_answers"] == [
+        {"question": "Choose constraint?", "answer": "Use constraint x."}
+    ]
+    assert "Use constraint x." in captured["current_confirmed_goal"]
+    assert captured["human_feedback"] == "Keep the confirmed choice."
+
+
+@pytest.mark.asyncio
 async def test_prepare_main_path_reconciles_decomposition_then_interface_binds_graph(monkeypatch):
     blueprint = _blueprint()
     calls: list[str] = []
@@ -560,7 +589,7 @@ async def test_bind_plan_repairs_overcomplete_interface_once(monkeypatch):
         error = kwargs["validation_errors"][0]
         assert error["code"] == "interface_plan_overcomplete"
         assert error["details"]["interface_id"] == "I0003"
-        assert "Remove or adjust only the interface identified by interface_id" in error["instruction"]
+        assert "instruction" not in error
         assert kwargs["affected_members"] == ["scripts/source.py", "scripts/target.py"]
         assert kwargs["missing_platform_output_fields"] == []
         assert kwargs["system_requirements"] == planning_calls[0]["system_requirements"]
@@ -609,15 +638,13 @@ async def test_graph_revalidation_failure_is_wrapped_without_third_attempt(monke
 
     monkeypatch.setattr(api, "expand_responsibility_graph", expand_graph)
     monkeypatch.setattr(api, "repair_interface_intents", repair)
-    with pytest.raises(api.InterfaceIntentPlanError) as raised:
+    with pytest.raises(api.ResponsibilityGraphExpansionError) as raised:
         await api._bind_executable_responsibility_plan(
             request=_request(), current_planner_result={"internal_blueprint_text": _blueprint()},
             planner_model="p", allowed_function_item_targets=[],
         )
-    assert attempts == 2
-    assert raised.value.code == "interface_semantic_repair_failed"
-    assert raised.value.details["original_graph_error"]["code"] == "interface_plan_incomplete"
-    assert raised.value.details["remaining_graph_error"]["code"] == "interface_plan_incomplete"
+    assert attempts == 1
+    assert raised.value.code == "interface_plan_incomplete"
 
 
 @pytest.mark.asyncio

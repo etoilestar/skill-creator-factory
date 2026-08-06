@@ -52,7 +52,6 @@ from .command_normalizer import parse_skill_md_bash_command_blocks
 from . import contracts as creator_contracts
 from .responsibility_graph_expansion import ResponsibilityGraphExpansionError, expand_responsibility_graph
 from .function_item_interface_plan import (
-    GRAPH_INTERFACE_ISSUE_CATEGORIES,
     InterfaceIntentPlanError,
     plan_function_item_interfaces,
     repair_interface_intents,
@@ -7241,7 +7240,6 @@ async def _bind_executable_responsibility_plan(
         "system_goal": request.user_request,
         "skill_name": current_planner_result.get("skill_name", ""),
     }
-    repairable_interface_codes = set(GRAPH_INTERFACE_ISSUE_CATEGORIES)
     try:
         responsibility_edges = await expand_responsibility_graph(
             function_items=frozen_function_items,
@@ -7252,32 +7250,24 @@ async def _bind_executable_responsibility_plan(
             interface_plan=interface_plan,
         )
     except ResponsibilityGraphExpansionError as exc:
-        if exc.code not in repairable_interface_codes:
-            raise
         error_details = dict(getattr(exc, "details", {}) or {})
+        repairable_facts_present = bool(
+            error_details.get("uncovered_inputs")
+            or error_details.get("missing_required_final_output_fields")
+            or error_details.get("missing_platform_output_interface")
+            or (error_details.get("interface_id") and error_details.get("reason"))
+        )
+        if not repairable_facts_present:
+            raise
         affected_members: list[str] = []
-        if exc.code == "interface_plan_incomplete":
-            for value in error_details.get("uncovered_inputs") or []:
-                member = str(value.get("target") or "").strip() if isinstance(value, dict) else ""
-                if member and member not in affected_members:
-                    affected_members.append(member)
-            repair_instruction = (
-                "Add or adjust only the interface intents required to cover "
-                "the reported uncovered target inputs or missing platform outputs. "
-                "Preserve unrelated interfaces and valid source fan-out."
-            )
-        else:
-            for key in ("source_member", "target_member"):
-                member = str(error_details.get(key) or "").strip()
-                if member and member not in affected_members:
-                    affected_members.append(member)
-            repair_instruction = (
-                "Remove or adjust only the interface identified by interface_id "
-                "because it has no remaining unbound target endpoint. "
-                "Preserve unrelated interfaces and valid source fan-out. "
-                "Do not remove an interface merely because its source endpoint "
-                "is reused by another interface."
-            )
+        for value in error_details.get("uncovered_inputs") or []:
+            member = str(value.get("target") or "").strip() if isinstance(value, dict) else ""
+            if member and member not in affected_members:
+                affected_members.append(member)
+        for key in ("source_member", "target_member"):
+            member = str(error_details.get(key) or "").strip()
+            if member and member not in affected_members:
+                affected_members.append(member)
         interface_plan = await repair_interface_intents(
             original_user_goal=request.user_request,
             frozen_function_items=frozen_function_items,
@@ -7297,7 +7287,6 @@ async def _bind_executable_responsibility_plan(
                 "code": exc.code,
                 "message": str(exc),
                 "details": error_details,
-                "instruction": repair_instruction,
             }],
             planner_model=planner_model,
             model_call=select_sources,
@@ -7339,18 +7328,19 @@ async def _plan_requirement_allocations(
     """Ask the Planner for the semantic requirement-to-owner projection."""
     prompt = """
 1. AUTHORITATIVE FACTS
-The payload contains the frozen user requirement text, compact frozen
-FunctionItems, LEGAL CHANNEL VALUES ["executable", "resource", "direct"], and
-LEGAL OWNER TARGET FILES. First enumerate the complete immutable
-FROZEN REQUIREMENT IDS in stable request order (R1, R2, ...); that complete list
-is authoritative for the remainder of this one requirement coverage projection.
+The payload contains the confirmed user context, compact frozen FunctionItems,
+LEGAL CHANNEL VALUES ["executable", "resource", "direct"], and LEGAL OWNER
+TARGET FILES.
 
 2. TASK
-Produce a complete projection for every frozen requirement. Every frozen
-requirement_id must appear exactly once in requirement_allocations and exactly
-once in requirement_channels. Do not return partial requirement_channels. Do
-not omit structural, prohibitive, global, platform-level, or non-executable
-requirements: each still needs a channel and allocation, possibly with owners=[].
+Produce a requirement coverage projection.
+First derive the complete set of explicit, independently verifiable user
+requirements from the confirmed user context. Assign stable IDs R1, R2, ...
+exactly once. Treat that derived requirement list as immutable for the remainder
+of this response. Then produce requirement_allocations and requirement_channels
+for exactly that same derived list. The two ID sets must be exactly equal. Do not
+return partial requirement_channels or omit structural, prohibitive, global,
+platform-level, or non-executable requirements.
 
 Channel rules:
 - executable: a frozen FunctionItem performs a runtime action directly fulfilling
@@ -7374,17 +7364,39 @@ Do not include planning notes, explanations, Markdown fences, comments, or hidde
 
 4. FINAL SELF-CHECK
 Before returning, silently verify allocation IDs and channel keys exactly equal
-the frozen requirement IDs; each occurs once; none is omitted; every executable
+the derived requirement IDs; each occurs once; none is omitted; every executable
 requirement has a legal owner; non-executable requirements have none; and no
 structural/prohibitive requirement was made executable merely to avoid empty owners.
 
 5. OUTPUT CONTRACT
-Return only the requested strict JSON object. Use this complete dynamic skeleton,
-repeating both entries for every ID identified above without filling values by default:
-{"requirement_allocations":[{"requirement_id":"R1","requirement":"<copy frozen R1 text exactly>","owners":[],"evidence":{"responsibility":"","outputs":[],"capabilities":[]}}],"requirement_channels":{"R1":""}}
+Return only the requested strict JSON object. This is a schema example, not a
+one-requirement limit. Repeat both allocation and channel entries for every
+requirement you derive:
+{"requirement_allocations":[{"requirement_id":"R1","requirement":"...","owners":[],"evidence":{"responsibility":"...","outputs":[],"capabilities":[]}}],"requirement_channels":{"R1":"resource"}}
 """.strip()
+    clarification_answers: list[dict[str, str]] = []
+    pending_question = ""
+    for item in request.conversation_history or []:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip()
+        content = str(item.get("content") or "").strip()
+        if role == "assistant" and content:
+            pending_question = content
+        elif role == "user" and content:
+            clarification_answers.append({"question": pending_question, "answer": content})
+            pending_question = ""
+    confirmed_parts = [str(request.user_request or "").strip()]
+    confirmed_parts.extend(value["answer"] for value in clarification_answers)
+    if str(request.human_feedback or "").strip():
+        confirmed_parts.append(str(request.human_feedback).strip())
     payload = {
-        "requirements": {"frozen_source_text": request.user_request},
+        "confirmed_user_context": {
+            "original_user_request": request.user_request,
+            "clarification_answers": clarification_answers,
+            "human_feedback": request.human_feedback,
+            "current_confirmed_goal": "\n".join(value for value in confirmed_parts if value),
+        },
         "function_items": [
             {
                 "target_file": str(item.get("target_file") or "").strip(),
@@ -8665,6 +8677,13 @@ Do not decide which files can become graph nodes beyond declaring the FilePlan i
 FunctionItems and ResponsibilityEdges will be bound in a second protocol binding pass by the same Blueprint Planner after the backend freezes the exact executable target domain from this FilePlan.
 
 The Blueprint must decompose the complete user goal exactly once into the minimum coherent set of executable FunctionItems. Each FunctionItem represents one atomic executable sub-goal. For every FunctionItem: purpose must state the concrete sub-goal completed by this FunctionItem; inputs must declare only data required from the platform or another FunctionItem; outputs must declare only data produced for the platform or another FunctionItem; the FunctionItem must have a distinct execution responsibility; do not create duplicate FunctionItems with equivalent responsibilities. Collectively, the FunctionItems must cover all executable parts of the complete user goal. Do not generate ResponsibilityEdges in the Blueprint. Do not create a second subsystem or grouping layer.
+
+For every FunctionItem input, explicitly state whether it is required at
+runtime. When the input may be omitted, mark required=false. When the
+implementation has a valid fallback, declare that a default is present and put
+its value in default_values. Do not mark an input optional merely because it
+sounds like a preference; judge only from the confirmed user goal and proposed
+runtime contract. Do not infer optionality from the input field name.
 
 In this pass, FilePlan owns file topology and file-local metadata.
 Declare script file responsibilities inside SkillPlan entries only.

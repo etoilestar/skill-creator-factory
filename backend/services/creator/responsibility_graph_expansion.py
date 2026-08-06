@@ -184,6 +184,43 @@ def _public_script_outputs(registry: dict, member: str) -> list[dict]:
     return [{key: value[key] for key in ("output_id", "node_id", "node_purpose", "port_id", "description", "contract")} for value in registry["script_outputs"] if value["target_file"] == member]
 
 
+def _unbound_script_inputs(
+    *,
+    registry: dict,
+    member: str,
+    committed_edges: list[dict],
+) -> list[dict]:
+    bound_inputs = {
+        (str(edge.get("to_node") or ""), str(edge.get("to_input") or ""))
+        for edge in committed_edges
+        if edge.get("to_node") != PLATFORM_OUTPUT_NODE
+    }
+
+    return [
+        endpoint
+        for endpoint in _public_script_inputs(registry, member)
+        if (member, str(endpoint.get("port_id") or "")) not in bound_inputs
+    ]
+
+
+def _unbound_platform_outputs(
+    *,
+    registry: dict,
+    committed_edges: list[dict],
+) -> list[dict]:
+    bound_fields = {
+        str(edge.get("to_input") or "")
+        for edge in committed_edges
+        if edge.get("to_node") == PLATFORM_OUTPUT_NODE
+    }
+
+    return [
+        endpoint
+        for endpoint in registry["platform_outputs"]
+        if str(endpoint.get("field") or "") not in bound_fields
+    ]
+
+
 def _validate_interface_selection_protocol(*, obligation: dict, response: Any) -> dict:
     if not isinstance(response, dict):
         raise ResponsibilityGraphExpansionError(
@@ -291,7 +328,20 @@ async def _select_interface_endpoint_reference(*, obligation: dict, registry: di
     payload: dict[str, Any] = {"goal_context": goal_context, "current_partial_graph": {"committed_edges": committed_edges}, "obligation": obligation}
     if kind == "platform_to_script":
         payload["platform_inputs"] = [dict(value) for value in registry["platform_inputs"]]
-        payload["target_member_inputs"] = _public_script_inputs(registry, obligation["target_member"])
+        payload["target_member_inputs"] = _unbound_script_inputs(registry=registry, member=obligation["target_member"], committed_edges=committed_edges)
+        if not payload["target_member_inputs"]:
+            raise ResponsibilityGraphExpansionError(
+                "interface has no remaining unbound target input",
+                code="interface_plan_overcomplete",
+                details={
+                    "interface_id": obligation.get("interface_id", ""),
+                    "obligation_id": obligation.get("obligation_id", ""),
+                    "kind": kind,
+                    "source_member": obligation.get("source_member", ""),
+                    "target_member": obligation.get("target_member", ""),
+                    "reason": "no_remaining_target_endpoint",
+                },
+            )
         prompt = """You are selecting endpoint IDs for exactly one already-declared
 platform-to-FunctionItem interface.
 
@@ -363,6 +413,15 @@ Invalid examples:
   "source_path": []
 }
 
+target_member_inputs contains only currently unbound target inputs.
+
+Platform input slots may be reused for multiple target inputs when the system
+semantics require it; do not treat platform inputs as consumed.
+
+Select exactly one target_id from that supplied list.
+
+Do not select or reconstruct an input that is absent from the list.
+
 Do not return:
 - an edge;
 - a wrapper object;
@@ -375,7 +434,19 @@ Do not return:
 - additional fields."""
     elif kind == "script_to_platform":
         payload["source_member_outputs"] = _public_script_outputs(registry, obligation["source_member"])
-        payload["platform_outputs"] = [dict(value) for value in registry["platform_outputs"]]
+        payload["platform_outputs"] = _unbound_platform_outputs(registry=registry, committed_edges=committed_edges)
+        if not payload["platform_outputs"]:
+            raise ResponsibilityGraphExpansionError(
+                "interface has no remaining unbound platform output",
+                code="interface_plan_overcomplete",
+                details={
+                    "interface_id": obligation.get("interface_id", ""),
+                    "obligation_id": obligation.get("obligation_id", ""),
+                    "kind": kind,
+                    "source_member": obligation.get("source_member", ""),
+                    "reason": "no_remaining_platform_target",
+                },
+            )
         prompt = """Return exactly one strict JSON object:
 
 {
@@ -386,23 +457,63 @@ Do not return:
 source_id must be copied from source_member_outputs.output_id.
 target_id must be copied from platform_outputs.slot_id.
 
+source_member_outputs may be reused across different platform output
+obligations when semantically appropriate.
+
+platform_outputs contains only platform output slots that do not yet have a
+committed source.
+
+Select exactly one target_id from that supplied list.
+
 Do not return source_path, path, member names, field names, file paths,
 an edge, a wrapper, or an explanation."""
     else:
         payload["source_member_outputs"] = _public_script_outputs(registry, obligation["source_member"])
-        payload["target_member_inputs"] = _public_script_inputs(registry, obligation["target_member"])
-        prompt = """Return exactly one strict JSON object:
+        payload["target_member_inputs"] = _unbound_script_inputs(registry=registry, member=obligation["target_member"], committed_edges=committed_edges)
+        if not payload["target_member_inputs"]:
+            raise ResponsibilityGraphExpansionError(
+                "interface has no remaining unbound target input",
+                code="interface_plan_overcomplete",
+                details={
+                    "interface_id": obligation.get("interface_id", ""),
+                    "obligation_id": obligation.get("obligation_id", ""),
+                    "kind": kind,
+                    "source_member": obligation.get("source_member", ""),
+                    "target_member": obligation.get("target_member", ""),
+                    "reason": "no_remaining_target_endpoint",
+                },
+            )
+        prompt = """You are binding exactly one logical data-transfer interface.
 
+Select exactly one source_id from source_member_outputs and exactly one
+target_id from target_member_inputs.
+
+source_member_outputs may contain outputs already used by earlier interfaces.
+That is valid.
+
+Select the source endpoint that semantically satisfies the current interface
+goal.
+
+target_member_inputs contains only target inputs that do not yet have an
+incoming edge.
+
+Use the current interface goal, source output descriptions and contracts, and
+target input descriptions and contracts as semantic evidence.
+
+Do not reject or avoid a source output merely because another committed edge
+already uses it.
+
+Do not select an already-bound target input.
+Do not select or reconstruct a target input absent from target_member_inputs.
+Do not infer a mapping from filenames, fixed port-name tables, suffixes, or
+business keywords.
+
+Return exactly one strict JSON object.
+Return only:
 {
-  "source_id": "<one source_member_outputs.output_id>",
-  "target_id": "<one target_member_inputs.input_id>"
-}
-
-source_id must be copied from source_member_outputs.output_id.
-target_id must be copied from target_member_inputs.input_id.
-
-Do not return source_path, path, member names, port names, file paths,
-an edge, a wrapper, or an explanation."""
+  "source_id": "...",
+  "target_id": "..."
+}"""
     if validation_issue:
         payload.update(validation_issue)
         prompt += """
@@ -500,6 +611,7 @@ async def _expand_from_interface_plan(*, normalized: list[dict], platform_contra
                 _validate_transaction(state.committed_edges + [edge], normalized)
             except ValueError as exc:
                 details = getattr(exc, "details", {}) or {}
+                error_code = getattr(exc, "code", type(exc).__name__)
                 logger.info(
                     "[Creator][graph_endpoint_failure] "
                     "obligation_id=%s interface_id=%s kind=%s attempt=%d "
@@ -508,11 +620,16 @@ async def _expand_from_interface_plan(*, normalized: list[dict], platform_contra
                     obligation.get("interface_id", ""),
                     obligation.get("kind", ""),
                     attempt + 1,
-                    getattr(exc, "code", type(exc).__name__),
+                    error_code,
                     details.get("path", ""),
                     details.get("expected_type", ""),
                     details.get("observed_type", ""),
                 )
+                if (
+                    isinstance(exc, ResponsibilityGraphExpansionError)
+                    and error_code == "interface_plan_overcomplete"
+                ):
+                    raise
                 if attempt:
                     logger.info(
                         "[Creator][graph_endpoint_failure] "

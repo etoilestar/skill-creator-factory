@@ -12,6 +12,7 @@ from backend.services.creator.function_item_interface_plan import (
     plan_function_item_interfaces,
     repair_interface_intents,
     validate_interface_intent_plan,
+    _interface_plan_prompt,
 )
 from backend.services.platform_io_contract import build_platform_io_contract
 
@@ -112,8 +113,7 @@ async def test_branch_converge_multi_input_and_multi_platform_output_shapes():
             field = next(terminal_fields)
             slot = next(slot for slot in payload["platform_outputs"] if slot["field"] == field)
             return json.dumps({"source_id": payload["source_member_outputs"][0]["output_id"], "target_id": slot["slot_id"]})
-        index = 0 if obligation["interface_id"] == "I0003" else 1
-        return json.dumps({"source_id": payload["source_member_outputs"][0]["output_id"], "target_id": payload["target_member_inputs"][index]["input_id"]})
+        return json.dumps({"source_id": payload["source_member_outputs"][0]["output_id"], "target_id": payload["target_member_inputs"][0]["input_id"]})
 
     edges = await expand_responsibility_graph(function_items=items, platform_contract=platform, planner_model="p", goal_context={}, model_call=model, interface_plan=plan(p2m("I0001", "scripts/a.py"), p2m("I0002", "scripts/b.py"), m2m("I0003", "scripts/a.py", "scripts/c.py"), m2m("I0004", "scripts/b.py", "scripts/c.py"), m2p("I0005", "scripts/c.py"), m2p("I0006", "scripts/c.py")))
     assert len([edge for edge in edges if edge["to_node"] == "platform_output_node"]) == 2
@@ -223,6 +223,8 @@ def test_interface_planner_payload_is_compact_and_uses_existing_function_items_o
     asyncio.run(plan_function_item_interfaces(original_user_goal="goal", frozen_function_items=items, requirement_allocations=[allocation("R1", ["scripts/a.py"]), allocation("R2", [])], requirement_channels={"R1": "executable", "R2": "direct"}, planner_model="p", model_call=model))
     assert set(captured) == {"system_goal", "function_items", "executable_requirement_allocations", "platform_contract"}
     assert captured["function_items"][0]["target_file"] == "scripts/a.py"
+    assert captured["function_items"][0]["required_inputs"] == ["input_1"]
+    assert captured["function_items"][0]["defaulted_inputs"] == []
     assert [value["requirement_id"] for value in captured["executable_requirement_allocations"]] == ["R1"]
 
 
@@ -274,3 +276,94 @@ async def test_interface_protocol_repair_wraps_second_invalid_json():
         await plan_function_item_interfaces(original_user_goal="goal", frozen_function_items=items, planner_model="p", model_call=model)
     assert raised.value.code == "interface_plan_protocol_repair_failed"
     assert raised.value.details["repair_error"]["code"] == "invalid_interface_plan_json"
+
+
+def test_interface_and_repair_prompts_define_one_interface_per_transfer():
+    prompt = " ".join(_interface_plan_prompt().lower().split())
+    assert "each interface object as exactly one source endpoint connected to exactly one target endpoint" in prompt
+    assert "do not combine multiple independently required target inputs" in prompt
+    assert "multiple member_to_member interfaces between the same source_member and target_member" in prompt
+    assert "source outputs are reusable" in prompt
+    assert "do not determine the number of interfaces from the number of source outputs" in prompt
+    assert "a structured value transferred into one target input remains one logical transfer regardless of how many internal fields" in prompt
+    assert "required_inputs require incoming transfer coverage" in prompt
+    assert "defaulted_inputs do not require an interface" in prompt
+
+    captured = {}
+    items = [
+        item("scripts/a.py", ["runtime_input"], ["first", "second", "third"]),
+        item("scripts/b.py", ["first", "second", "third"], ["result"]),
+    ]
+    repaired = plan(
+        p2m("I0001", "scripts/a.py"),
+        m2m("I0002", "scripts/a.py", "scripts/b.py", goal="transfer one"),
+        m2m("I0003", "scripts/a.py", "scripts/b.py", goal="transfer two"),
+        m2m("I0004", "scripts/a.py", "scripts/b.py", goal="transfer three"),
+        m2p("I0005", "scripts/b.py"),
+    )
+
+    async def model(messages, _model):
+        captured["system"] = " ".join(messages[0]["content"].lower().split())
+        captured["payload"] = json.loads(messages[-1]["content"])
+        return json.dumps(repaired)
+
+    import asyncio
+
+    result = asyncio.run(
+        repair_interface_intents(
+            original_user_goal="g",
+            frozen_function_items=items,
+            current_interface_plan=plan(
+                p2m("I0001", "scripts/a.py"),
+                m2m("I0002", "scripts/a.py", "scripts/b.py", goal="transfer one"),
+                m2p("I0005", "scripts/b.py"),
+            ),
+            validation_errors=[{
+                "code": "interface_plan_incomplete",
+                "details": {
+                    "uncovered_inputs": [
+                        {"target": "scripts/b.py", "input_id": "second"},
+                        {"target": "scripts/b.py", "input_id": "third"},
+                    ]
+                },
+            }, {
+                "code": "interface_plan_overcomplete",
+                "details": {
+                    "interface_id": "I0006",
+                    "obligation_id": "O0006",
+                    "kind": "script_to_script",
+                    "reason": "no_remaining_target_endpoint",
+                },
+            }],
+            affected_members=["scripts/b.py"],
+            missing_platform_output_fields=[],
+            planner_model="p",
+            model_call=model,
+        )
+    )
+
+    assert "uncovered_inputs" in captured["system"]
+    assert "does not prove that every required target input is covered" in captured["system"]
+    assert "do not return the plan unchanged" in captured["system"]
+    assert "source endpoints are reusable" in captured["system"]
+    assert "interface_plan_overcomplete means only" in captured["system"]
+    assert "do not create interfaces solely because a source member exposes additional outputs" in captured["system"]
+    assert captured["payload"]["uncovered_inputs"] == [
+        {"target": "scripts/b.py", "input_id": "second"},
+        {"target": "scripts/b.py", "input_id": "third"},
+    ]
+    assert captured["payload"]["overcomplete_interfaces"] == [{
+        "interface_id": "I0006",
+        "obligation_id": "O0006",
+        "kind": "script_to_script",
+        "reason": "no_remaining_target_endpoint",
+    }]
+    repeated = [
+        iface for iface in result["interfaces"]
+        if iface["kind"] == "member_to_member"
+        and iface["source_member"] == "scripts/a.py"
+        and iface["target_member"] == "scripts/b.py"
+    ]
+    assert len(repeated) == 3
+    assert len({iface["interface_id"] for iface in repeated}) == 3
+    assert len({iface["goal"] for iface in repeated}) == 3

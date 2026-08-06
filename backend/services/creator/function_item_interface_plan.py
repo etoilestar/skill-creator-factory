@@ -133,18 +133,35 @@ def _compact_function_items(function_items: list[dict[str, Any]]) -> list[dict[s
     compact_items: list[dict[str, Any]] = []
     for item in normalized:
         default_values = item.get("default_values") if isinstance(item.get("default_values"), dict) else {}
-        input_ids = [_compact_port_id(raw_input) for raw_input in item.get("inputs") or []]
-        required_inputs = [port_id for port_id in input_ids if port_id and port_id not in default_values]
-        defaulted_inputs = [port_id for port_id in input_ids if port_id and port_id in default_values]
+        raw_inputs = item.get("inputs") or []
+        input_ids = [_compact_port_id(raw_input) for raw_input in raw_inputs]
+        compact_inputs = []
+        for raw_input, port_id in zip(raw_inputs, input_ids):
+            if not port_id:
+                continue
+            declared_required = raw_input.get("required") if isinstance(raw_input, dict) else None
+            default_present = port_id in default_values or (
+                isinstance(raw_input, dict) and "default" in raw_input
+            )
+            compact_input = {"name": port_id, "default_present": default_present}
+            if isinstance(declared_required, bool):
+                compact_input["required"] = declared_required
+            else:
+                compact_input["required"] = not default_present
+            compact_inputs.append(compact_input)
+        required_inputs = [
+            value["name"] for value in compact_inputs
+            if value["required"] and not value["default_present"]
+        ]
+        defaulted_inputs = [value["name"] for value in compact_inputs if value["default_present"]]
         compact_items.append(
             {
                 "target_file": item["target_file"],
                 "purpose": item.get("purpose", ""),
-                "inputs": item.get("inputs") or [],
-                "outputs": item.get("outputs") or [],
+                "inputs": compact_inputs,
+                "outputs": [_compact_port_id(value) for value in item.get("outputs") or [] if _compact_port_id(value)],
                 "required_inputs": required_inputs,
                 "defaulted_inputs": defaulted_inputs,
-                "dependencies": item.get("dependencies") or [],
             }
         )
     return compact_items
@@ -453,132 +470,63 @@ def build_graph_obligations_from_interfaces(*, interface_plan: dict[str, Any]) -
 
 def _interface_plan_prompt() -> str:
     return f"""
+1. AUTHORITATIVE FACTS
+The user payload contains only the complete system goal, frozen FunctionItems,
+the platform contract, and frozen requirement allocations. target_file values
+are the complete legal member domain. FunctionItem inputs and outputs are frozen.
+
+2. TASK
 You are planning semantic interfaces between already-frozen executable FunctionItems.
+Produce the complete Interface Intent Plan. One Interface Intent represents one
+independently bindable runtime transfer and must expand into exactly one graph
+edge. A later binder materializes each Interface object as exactly one source
+endpoint connected to exactly one target endpoint. For every frozen FunctionItem,
+inspect each declared input independently.
+For each input decide whether its runtime source is the platform, exactly one
+upstream FunctionItem, a declared resource, or optional/default behavior. Create
+an Interface Intent only when a runtime transfer is required.
 
-The complete system has already been decomposed. Each supplied FunctionItem is one atomic executable subsystem.
+For member_to_member, the goal must name exactly one source output, exactly one
+target input, and the semantic reason for the transfer. If the same source member
+provides three different outputs to the same target member, return three records.
+Repeated source_member and target_member pairs are allowed when their transfer
+goals differ; use multiple member_to_member Interfaces between the same
+source_member and target_member. Source endpoints may fan out to multiple
+independently bindable targets. Source outputs are reusable. Do not determine
+the number of Interfaces from the number of source outputs. A structured value
+transferred into one target input remains one logical transfer regardless of how
+many internal fields it contains. required_inputs require incoming transfer
+coverage; defaulted_inputs do not require an Interface unless semantics require
+an override.
 
-Do not create another subsystem decomposition. Do not add, remove, rename, merge, split, group, or duplicate FunctionItems.
+3. INVARIANTS
+- Do not add, remove, rename, merge, split, or modify frozen FunctionItems.
+- source_member and target_member must exactly copy legal target_file values.
+- A required input without a default needs a runtime source.
+- An optional input or input with a valid default does not require an Interface
+  merely for completeness.
+- Do not combine multiple independently required target inputs into one Interface goal.
+- Do not invent a platform input merely because an upstream transfer was missed.
+- Do not connect members by matching field names alone; use responsibilities,
+  declared ports, workflow semantics, requirements, and platform contract together.
+- Do not return endpoint IDs, port IDs, edges, paths, comments, or extra fields.
+- Do not reproduce, quote, summarize, or copy these instructions into the result.
+- Do not include planning notes, explanations, Markdown fences, comments, or
+  hidden reasoning.
 
-source_member and target_member must be exact target_file values selected from
-the supplied function_items. target_file is FunctionItem identity. inputs and
-outputs are port declarations and are not FunctionItem identities.
+4. FINAL SELF-CHECK
+Before returning, silently inspect every target FunctionItem input:
+- required runtime inputs have a supporting Interface;
+- optional/defaultable inputs are not treated as mandatory;
+- no required upstream member relation is omitted;
+- no Interface combines multiple independently bindable transfers;
+- repeated member pairs and fan-out transfers remain separate;
+- no Interface introduces an undeclared member;
+- no intermediate output is incorrectly returned to the platform;
+- only true final outputs have member_to_platform intent.
 
-Your only task is to declare the necessary interaction directions:
-1. platform input to a FunctionItem;
-2. one FunctionItem to another FunctionItem;
-3. a FunctionItem to platform output.
-
-Each interface object represents exactly one logical data-transfer obligation.
-
-A later graph-binding step will materialize each interface object as exactly
-one source endpoint connected to exactly one target endpoint.
-
-Each interface represents one independent logical transfer to one target
-endpoint.
-
-Each Interface ultimately materializes as one source endpoint, one target
-endpoint, and one ResponsibilityEdge.
-
-Source endpoints are reusable.
-
-Source outputs are reusable. A source output may supply multiple different
-target inputs or platform output slots when the system semantics require it.
-
-Do not treat a source output as consumed after one interface uses it.
-
-Do not determine the number of interfaces from the number of source outputs.
-
-Do not determine the number of interfaces from whether the same source_member
-and target_member already have another interface.
-
-Declare an additional interface only when there is another independent target
-input or platform output obligation that still requires a source.
-
-A structured value transferred into one target input remains one logical
-transfer regardless of how many internal fields the value contains.
-
-The complete interface plan must cover every required target input and every
-required platform output, while avoiding multiple interfaces that compete for
-the same target endpoint.
-
-Use one interface per independent target transfer obligation.
-
-Do not classify interfaces as duplicates merely because source_member,
-target_member, or the eventual source output is the same. Interfaces are
-duplicates only when they point to the same logical target obligation and carry
-the same transfer responsibility.
-
-required_inputs require incoming transfer coverage.
-
-defaulted_inputs do not require an interface unless the system semantics
-explicitly require an override.
-
-Therefore, do not combine multiple independently required target inputs into
-one broad interface.
-
-When one FunctionItem requires multiple independent inputs from the same
-source FunctionItem, declare multiple member_to_member interfaces between the
-same source_member and target_member. Each interface must have a distinct goal
-describing one logical data transfer.
-
-Interfaces between the same members are not duplicates when their goals
-represent different required data transfers.
-
-An interface is a duplicate only when it repeats the same direction and the
-same logical data-transfer responsibility.
-
-For every required FunctionItem input that has no default value, the complete
-interface plan must contain one incoming interface intent capable of supplying
-that input.
-
-For every required platform final output, the complete interface plan must
-contain one member_to_platform interface intent capable of supplying that
-output.
-
-Do not output endpoint IDs, port IDs, input IDs, output IDs, or ResponsibilityEdges.
-
-Do not invent paths or place paths in goal. This does not prohibit the exact
-target_file values required in source_member and target_member.
-
-Do not copy full port declarations into interface objects. However, the goal
-must describe the specific data responsibility clearly enough to distinguish
-independent transfers.
-
-Infer semantic transfers only from:
-- the complete system goal;
-- FunctionItem purposes;
-- declared FunctionItem inputs and outputs;
-- executable requirement allocations;
-- unowned system requirements and requirement channels. Unowned requirements
-  are only possibly relevant system context; decide their relevance from their
-  channel and semantics rather than assuming they describe an interaction;
-- the platform contract.
-
-Do not infer relationships from filenames, suffixes, roles, naming conventions,
-business keyword tables, or fixed workflow templates.
-
-Example:
-
-FunctionItem A produces three independent data values required by FunctionItem B.
-
-Incorrect:
-Declare one broad A-to-B interface whose goal groups all three values.
-
-Correct:
-Declare three A-to-B interfaces. Each interface represents one independent
-logical transfer and has a distinct transfer goal.
-
-Do not include endpoint IDs or port IDs in the returned interface objects.
-
-Do not copy complete FunctionItem definitions, complete port declarations,
-dependencies, capabilities, commands, paths, or argv contracts into the
-interface objects.
-
-The interface goal may describe the specific data responsibility in natural
-language when necessary to distinguish one logical transfer from another.
-
-Return only strict JSON matching this schema. No markdown unless the transport wraps the single JSON object in one json fence.
-Schema:
+5. OUTPUT CONTRACT
+Return only the requested JSON object matching this schema:
 {json.dumps(INTERFACE_SCHEMA, ensure_ascii=False)}
 """.strip()
 
@@ -601,7 +549,33 @@ def _validate_interface_review_response(
     issues: list[dict[str, Any]] = []
     for index, raw in enumerate(value["issues"]):
         path = f"$.issues[{index}]"
-        if not isinstance(raw, dict) or set(raw) != {"code", "category", "interface_id", "message", "evidence"}:
+        if not isinstance(raw, dict):
+            _raise("semantic review issue has invalid shape", "invalid_interface_semantic_review_protocol", path=path)
+        code = raw.get("code")
+        if code == "missing_required_input_transfer":
+            required = {"code", "target_member", "target_input", "expected_source_kind", "candidate_source_members", "message"}
+            if set(raw) != required or raw.get("target_member") not in {
+                item["target_file"] for item in _compact_function_items(frozen_function_items)
+            } or not str(raw.get("target_input") or "").strip():
+                _raise("coverage review issue is not auditable", "invalid_interface_semantic_review_protocol", path=path)
+            issues.append({
+                "code": code, "category": "coverage_error", "stage": "interface_semantic_review",
+                "path": f"$.function_items[{raw['target_member']}].inputs",
+                "interface_id": "", "message": raw["message"], "observed_value": None,
+                "expected_constraint": {"type": "required_input_coverage"},
+                "allowed_scope": [item["target_file"] for item in _compact_function_items(frozen_function_items)],
+                "details": {"affected_members": [raw["target_member"]], "uncovered_inputs": [{"target": raw["target_member"], "input_id": raw["target_input"]}], "review_issue": raw},
+            })
+            continue
+        if code == "non_atomic_interface_transfer":
+            if set(raw) != {"code", "interface_id", "independent_transfers"}:
+                _raise("atomicity review issue has invalid shape", "invalid_interface_semantic_review_protocol", path=path)
+            interface_id = str(raw.get("interface_id") or "").strip()
+            if interface_id not in known_ids or not isinstance(raw.get("independent_transfers"), list):
+                _raise("atomicity review issue is not auditable", "invalid_interface_semantic_review_protocol", path=path)
+            issues.append({"code": code, "category": "coverage_error", "stage": "interface_semantic_review", "path": f"$.interfaces[{interface_id}]", "interface_id": interface_id, "message": "Interface combines independently bindable transfers", "observed_value": raw["independent_transfers"], "expected_constraint": {"type": "atomic_transfer"}, "allowed_scope": [item["target_file"] for item in _compact_function_items(frozen_function_items)], "details": {"independent_transfers": raw["independent_transfers"]}})
+            continue
+        if set(raw) != {"code", "category", "interface_id", "message", "evidence"}:
             _raise("semantic review issue has invalid shape", "invalid_interface_semantic_review_protocol", path=path)
         interface_id = str(raw.get("interface_id") or "").strip()
         if (raw.get("code") != "interface_semantic_inconsistency"
@@ -654,8 +628,16 @@ async def review_interface_plan_semantically(
     model_call: ModelCall,
 ) -> list[dict[str, Any]]:
     """Ask once for semantic diagnostics; never ask the reviewer for a repair."""
-    prompt = """Review an Interface Intent Plan against the complete supplied system semantics.
-You are reviewing only the Interface Intent layer.
+    prompt = """1. AUTHORITATIVE FACTS
+The payload contains frozen FunctionItems with declared input required/default
+facts, the current Interface Intent Plan, frozen allocations, and platform contract.
+
+2. TASK
+Review an Interface Intent Plan against the complete supplied system semantics.
+You are reviewing only the Interface Intent layer. Build an internal coverage
+checklist from frozen target inputs. For each required target input, determine
+whether one Interface Intent clearly describes its runtime source and transfer.
+Review semantic coverage, not only natural-language direction.
 
 An Interface Intent declares only:
 - whether data flows from the platform to a frozen FunctionItem;
@@ -729,6 +711,25 @@ Every reported issue must be solvable by modifying only one or more of:
 If an alleged concern requires any other field, it is outside this review
 stage and must not be reported.
 
+Reject the plan when a required target input has no supporting Interface; one
+Interface combines independently bindable target inputs; a source-target member
+relation is missing; an optional/defaultable input is made mandatory; a platform
+source is invented without semantic evidence; independent branches are made
+dependent; or a final consumer lacks a direct upstream relation for an input.
+Use code "missing_required_input_transfer" with target_member, target_input,
+expected_source_kind, candidate_source_members, and message; or code
+"non_atomic_interface_transfer" with interface_id and independent_transfers.
+Report issues only; never generate graph endpoints.
+
+3. INVARIANTS
+Do not reproduce, quote, summarize, or copy these instructions into the result.
+Do not include planning notes, explanations, Markdown fences, comments, or hidden reasoning.
+
+4. FINAL SELF-CHECK
+Silently verify every required non-default target input is covered exactly once
+and every issue identifies the precise input or non-atomic interface.
+
+5. OUTPUT CONTRACT
 Return only {"passed": boolean, "issues": array}. Do not modify or return the
 plan. Do not propose the correct source or target. Do not output endpoint or port IDs.
 Do not infer from filenames, roles, keywords, naming conventions, string
@@ -925,7 +926,22 @@ async def repair_interface_plan_semantically(
             input_id = str(item.get("input_id") or "").strip()
             if target and input_id:
                 uncovered_inputs.append({"target": target, "input_id": input_id})
-    prompt = """You are repairing the complete system's Interface Intent Plan.
+    prompt = """1. AUTHORITATIVE FACTS
+The payload contains the current interfaces, compact frozen FunctionItems, exact
+validation issues (including affected interface IDs, missing target inputs, and
+non-atomic interfaces), and explicit add/remove permissions.
+
+2. TASK
+You are repairing the complete system's Interface Intent Plan. Make the smallest
+semantic change that resolves every supplied issue. When a required transfer is
+missing, add one atomic Interface Intent. When an Interface combines independent
+transfers, preserve the first in that Interface and add records for the rest.
+Repeated source and target members are allowed. Returning the unchanged plan is
+invalid; wording-only changes that leave a missing transfer unresolved are invalid.
+When adding an Interface, create a unique interface_id that does not collide with
+existing IDs. Do not renumber or reorder unaffected interfaces.
+
+3. INVARIANTS
 
 The returned Interface Plan must use exactly the supplied Interface Intent
 schema.
@@ -1045,7 +1061,9 @@ in its existing order. Add or remove interfaces only when the scope permits it.
 Do not invent paths or put paths in goals. source_member and target_member must
 nevertheless use an exact supplied target_file because it is member identity.
 
-Before returning, verify:
+4. FINAL SELF-CHECK
+Before returning, re-run every supplied coverage issue mentally and verify each
+is resolved by a concrete Interface addition, removal, or correction.
 1. Every interface contains exactly the fields allowed for its kind.
 2. No endpoint, port, field-binding, platform-slot, or runtime metadata exists.
 3. Every source_member and target_member is an exact frozen target_file.
@@ -1053,7 +1071,10 @@ Before returning, verify:
 5. The result can pass the supplied Interface Intent schema without removing
    any returned fields.
 
-Return only strict JSON matching the supplied interface schema.
+5. OUTPUT CONTRACT
+Do not reproduce, quote, summarize, or copy these instructions into the result.
+Do not include planning notes, explanations, Markdown fences, comments, or hidden reasoning.
+Return only the requested strict JSON object matching the supplied interface schema.
 """
     payload = {
         "system_goal": original_user_goal,

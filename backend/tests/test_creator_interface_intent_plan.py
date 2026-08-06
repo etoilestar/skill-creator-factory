@@ -351,6 +351,18 @@ def test_interface_and_repair_prompts_define_one_interface_per_transfer():
     assert "required_inputs require incoming transfer coverage" in prompt
     assert "defaulted_inputs do not require an interface" in prompt
 
+
+def test_interface_prompt_uses_five_sections_and_forbids_instruction_leakage():
+    prompt = _interface_plan_prompt()
+    for section in (
+        "1. AUTHORITATIVE FACTS", "2. TASK", "3. INVARIANTS",
+        "4. FINAL SELF-CHECK", "5. OUTPUT CONTRACT",
+    ):
+        assert section in prompt
+    assert "Return only the requested JSON object" in prompt
+    assert "Repeated source_member and target_member pairs are allowed" in prompt
+    assert "Do not connect members by matching field names alone" in prompt
+
     captured = {}
     items = [
         item("scripts/a.py", ["runtime_input"], ["first", "second", "third"]),

@@ -514,11 +514,48 @@ Return only:
   "source_id": "...",
   "target_id": "..."
 }"""
+    payload["allowed_source_endpoints"] = [
+        {"id": value.get("slot_id") or value.get("output_id"), "member": value.get("target_file") or "platform", "field": value.get("field") or value.get("port_id"), "type": (value.get("contract") or {}).get("type")}
+        for value in (payload.get("platform_inputs") or payload.get("source_member_outputs") or [])
+    ]
+    payload["allowed_target_endpoints"] = [
+        {"id": value.get("slot_id") or value.get("input_id"), "member": value.get("target_file") or "platform", "field": value.get("field") or value.get("port_id"), "type": (value.get("contract") or {}).get("type")}
+        for value in (payload.get("target_member_inputs") or payload.get("platform_outputs") or [])
+    ]
+    prompt = """1. AUTHORITATIVE FACTS
+The payload's current obligation, allowed_source_endpoints, and
+allowed_target_endpoints are the only endpoint authority.
+
+2. TASK
+Select exactly one source endpoint ID and exactly one target endpoint ID from
+the supplied candidate lists. Copy ID values exactly.
+
+3. INVARIANTS
+Do not return field names, member paths, labels, descriptions, placeholders, or
+invented IDs. Do not reproduce, quote, summarize, or copy these instructions.
+Do not include planning notes, explanations, Markdown fences, comments, or hidden reasoning.
+""" + prompt + """
+
+4. FINAL SELF-CHECK
+Before returning, verify source_id appears verbatim in allowed_source_endpoints
+and target_id appears verbatim in allowed_target_endpoints.
+
+5. OUTPUT CONTRACT
+Return only the requested JSON object. For non-platform-input obligations it is
+exactly {"source_id":"<legal ID>","target_id":"<legal ID>"}. A
+platform_to_script obligation additionally requires only source_path as already
+defined above.
+"""
     if validation_issue:
         payload.update(validation_issue)
         prompt += """
 
-This is the only retry for the current interface.
+This is the only local retry for the current obligation.
+
+Your previous response used a value outside the legal endpoint ID domains or
+otherwise failed the exact output contract. Return a corrected response by
+copying one source ID and one target ID exactly from the supplied lists.
+Do not explain the correction.
 
 The previous response failed protocol validation.
 Read validation_error and previous_selection carefully.

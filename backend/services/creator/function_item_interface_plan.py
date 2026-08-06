@@ -655,10 +655,82 @@ async def review_interface_plan_semantically(
 ) -> list[dict[str, Any]]:
     """Ask once for semantic diagnostics; never ask the reviewer for a repair."""
     prompt = """Review an Interface Intent Plan against the complete supplied system semantics.
-Return only {"passed": boolean, "issues": array}. Check responsibility direction,
-platform boundaries, independent transfer obligations, and alignment between each
-goal and the frozen FunctionItem purposes. Do not modify or return the plan. Do
-not propose a correct source or target. Do not output endpoint or port IDs.
+You are reviewing only the Interface Intent layer.
+
+An Interface Intent declares only:
+- whether data flows from the platform to a frozen FunctionItem;
+- from one frozen FunctionItem to another;
+- or from a frozen FunctionItem to the platform;
+- and the independent semantic responsibility of that transfer.
+
+This stage intentionally does not bind concrete input fields, output fields,
+ports, endpoint IDs, stdout keys, platform slots, source paths, argv fields,
+or placeholder expressions.
+
+Those details are assigned later by Endpoint Binding and Graph Expansion.
+Their absence from an Interface Intent is correct and must not be reported
+as a semantic issue.
+
+Review only the following Interface Intent concerns:
+
+1. kind alignment:
+   Whether platform_to_member, member_to_member, or member_to_platform
+   matches the high-level system workflow.
+2. member direction alignment:
+   Whether the declared source_member and target_member responsibilities
+   are directionally consistent with the frozen FunctionItem purposes.
+3. goal alignment:
+   Whether the interface goal describes a transfer responsibility that is
+   consistent with the declared source and target members.
+4. independent transfer alignment:
+   Whether independently required logical transfers have been incorrectly
+   merged into one broad intent.
+5. duplicate semantic responsibility:
+   Whether multiple intents repeat the same direction and the same logical
+   target responsibility.
+
+Do not report an issue merely because an Interface Intent does not specify:
+- source_field;
+- target_field;
+- source_id;
+- target_id;
+- input_id;
+- output_id;
+- port_id;
+- stdout field names;
+- argv keys;
+- placeholder expressions;
+- source_path;
+- platform input envelope fields;
+- platform final output fields;
+- serialization details;
+- runtime transport details.
+
+Do not require member_to_member transfers to pass through a platform output slot.
+A member_to_member Interface Intent represents direct logical data flow between
+two FunctionItems. The later graph-binding stage selects the concrete source
+output and target input.
+A platform_to_member Interface Intent does not need to name a specific platform
+input envelope field.
+A member_to_platform Interface Intent does not need to name a specific platform
+final output field.
+The absence of those bindings is not ambiguity and is not a semantic
+misalignment at this stage.
+
+If the kind, member direction, and goal are semantically consistent, return
+passed=true even when concrete endpoint or field bindings are not yet present.
+Do not invent issues that can only be resolved by adding fields outside the
+supplied Interface Intent schema.
+Every reported issue must be solvable by modifying only one or more of:
+- kind;
+- goal;
+- source_member;
+- target_member.
+If an alleged concern requires any other field, it is outside this review
+stage and must not be reported.
+
+Return only {"passed": boolean, "issues": array}. Do not modify or return the
+plan. Do not propose the correct source or target. Do not output endpoint or port IDs.
 Do not infer from filenames, roles, keywords, naming conventions, string
 similarity, or a fixed workflow. Every issue must contain code
 "interface_semantic_inconsistency", category "semantic_alignment_error",
@@ -855,6 +927,48 @@ async def repair_interface_plan_semantically(
                 uncovered_inputs.append({"target": target, "input_id": input_id})
     prompt = """You are repairing the complete system's Interface Intent Plan.
 
+The returned Interface Plan must use exactly the supplied Interface Intent
+schema.
+
+Never add fields outside the supplied Interface Intent schema.
+
+In particular, never add:
+- source_field;
+- target_field;
+- source_id;
+- target_id;
+- input_id;
+- output_id;
+- port_id;
+- stdout_field;
+- platform_slot;
+- source_path;
+- argv;
+- placeholder;
+- runtime binding metadata.
+
+Concrete port, endpoint, platform-slot, stdout-field, and source-path selection
+belongs to the later Endpoint Binding and Graph Expansion stages.
+Do not attempt to solve those later-stage responsibilities inside the
+Interface Intent Plan.
+
+A semantic repair may modify only the Interface Intent fields permitted by the
+supplied schema:
+- interface_id, only when protocol uniqueness requires it;
+- kind;
+- goal;
+- source_member;
+- target_member.
+Do not expand the protocol.
+
+Some validation issues may describe concerns that belong to later endpoint,
+port, platform-slot, serialization, or runtime-binding stages.
+When an issue cannot be resolved using only the allowed Interface Intent
+fields, do not add new fields and do not redesign the plan.
+Treat that issue as outside the current repair layer and preserve the affected
+Interface Intent unless another supplied issue provides a valid Interface
+Intent-level reason to modify it.
+
 Validation issues are deterministic diagnostics. They identify violated
 constraints but do not supply the business-semantic answer. Use the original
 system goal, frozen FunctionItem purposes, inputs and outputs, requirement
@@ -930,6 +1044,15 @@ Obey repair_scope. Preserve every unaffected valid interface byte-for-byte and
 in its existing order. Add or remove interfaces only when the scope permits it.
 Do not invent paths or put paths in goals. source_member and target_member must
 nevertheless use an exact supplied target_file because it is member identity.
+
+Before returning, verify:
+1. Every interface contains exactly the fields allowed for its kind.
+2. No endpoint, port, field-binding, platform-slot, or runtime metadata exists.
+3. Every source_member and target_member is an exact frozen target_file.
+4. Unaffected interfaces remain unchanged.
+5. The result can pass the supplied Interface Intent schema without removing
+   any returned fields.
+
 Return only strict JSON matching the supplied interface schema.
 """
     payload = {

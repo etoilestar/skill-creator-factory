@@ -74,6 +74,189 @@ def _allocation(requirement_id: str, owners: list[str]) -> dict:
     }
 
 
+def test_requirement_ownership_validator_checks_only_reference_closure():
+    items = [{"target_file": "scripts/unit_a.py"}]
+    issues = api.collect_requirement_ownership_issues(
+        requirement_channels={"R1": "executable", "R2": "direct", "R3": "resource"},
+        requirement_allocations=[
+            _allocation("R1", []),
+            _allocation("R2", ["scripts/not_exists.py", "scripts/not_exists.py"]),
+        ],
+        frozen_function_items=items,
+    )
+    assert [(issue["code"], issue["requirement_id"]) for issue in issues] == [
+        ("unowned_executable_requirement", "R1"),
+        ("non_executable_requirement_owner", "R2"),
+        ("unknown_requirement_owner", "R2"),
+        ("duplicate_requirement_owner", "R2"),
+        ("unknown_requirement_owner", "R2"),
+        ("unknown_requirement_allocation", "R3"),
+    ]
+    assert api.collect_requirement_ownership_issues(
+        requirement_channels={"R1": "executable", "R2": "direct"},
+        requirement_allocations=[
+            _allocation("R1", ["scripts/unit_a.py"]), _allocation("R2", []),
+        ], frozen_function_items=items,
+    ) == []
+
+
+@pytest.mark.asyncio
+async def test_requirement_ownership_repair_accepts_non_executable_without_owner():
+    current = [_allocation("R1", [])]
+    captured = {}
+
+    async def model(messages, _model):
+        captured["prompt"] = messages[0]["content"]
+        return json.dumps({
+            "requirement_allocations": current,
+            "requirement_channels": {"R1": "direct"},
+        })
+
+    repaired = await api.repair_requirement_ownership(
+        original_user_goal="g", frozen_blueprint=_blueprint(),
+        frozen_function_items=[{"target_file": "scripts/unit_a.py"}],
+        current_requirement_channels={"R1": "executable"},
+        current_requirement_allocations=current,
+        ownership_issues=[{"code": "unowned_executable_requirement", "requirement_id": "R1"}],
+        model="p", model_call=model,
+    )
+    assert repaired["requirement_channels"] == {"R1": "direct"}
+    assert repaired["requirement_allocations"][0]["owners"] == []
+    assert "assign arbitrary owners merely to pass validation" in " ".join(captured["prompt"].split())
+
+
+@pytest.mark.asyncio
+async def test_requirement_ownership_repair_rejects_unaffected_requirement_change():
+    before = [_allocation("R1", ["scripts/unit_a.py"]), _allocation("R2", [])]
+
+    async def model(_messages, _model):
+        return json.dumps({
+            "requirement_allocations": [
+                {**before[0], "evidence": {**before[0]["evidence"], "responsibility": "changed"}},
+                _allocation("R2", ["scripts/unit_a.py"]),
+            ],
+            "requirement_channels": {"R1": "executable", "R2": "executable"},
+        })
+
+    with pytest.raises(api.RequirementOwnershipError) as raised:
+        await api.repair_requirement_ownership(
+            original_user_goal="g", frozen_blueprint=_blueprint(),
+            frozen_function_items=[{"target_file": "scripts/unit_a.py"}],
+            current_requirement_channels={"R1": "executable", "R2": "executable"},
+            current_requirement_allocations=before,
+            ownership_issues=[{"code": "unowned_executable_requirement", "requirement_id": "R2"}],
+            model="p", model_call=model,
+        )
+    assert raised.value.code == "requirement_ownership_repair_scope_violation"
+
+
+@pytest.mark.asyncio
+async def test_requirement_ownership_repair_rejects_function_item_output():
+    current = [_allocation("R1", [])]
+
+    async def model(_messages, _model):
+        return json.dumps({
+            "requirement_allocations": [_allocation("R1", ["scripts/unit_a.py"])],
+            "requirement_channels": {"R1": "executable"},
+            "frozen_function_items": [{"target_file": "scripts/renamed.py"}],
+        })
+
+    with pytest.raises(api.RequirementOwnershipError) as raised:
+        await api.repair_requirement_ownership(
+            original_user_goal="g", frozen_blueprint=_blueprint(),
+            frozen_function_items=[{"target_file": "scripts/unit_a.py"}],
+            current_requirement_channels={"R1": "executable"},
+            current_requirement_allocations=current,
+            ownership_issues=[{"code": "unowned_executable_requirement", "requirement_id": "R1"}],
+            model="p", model_call=model,
+        )
+    assert raised.value.code == "requirement_ownership_repair_scope_violation"
+
+
+@pytest.mark.asyncio
+async def test_unknown_requirement_owner_is_repaired_once(monkeypatch):
+    projection = {
+        "requirement_allocations": [_allocation("R1", ["scripts/not_exists.py"])],
+        "requirement_channels": {"R1": "executable"},
+    }
+    calls = 0
+
+    async def model(_messages, _role, fallback_model=None):
+        nonlocal calls
+        calls += 1
+        return json.dumps({
+            "requirement_allocations": [_allocation("R1", ["scripts/unit_a.py"])],
+            "requirement_channels": {"R1": "executable"},
+        })
+
+    monkeypatch.setattr(api, "complete_creator_role_once", model)
+    repaired = await api._validate_and_repair_requirement_ownership(
+        request=_request(), blueprint_text=_blueprint(),
+        function_items=[{"target_file": "scripts/unit_a.py"}],
+        projection=projection, planner_model="p",
+    )
+    assert calls == 1
+    assert repaired["requirement_allocations"][0]["owners"] == ["scripts/unit_a.py"]
+
+
+@pytest.mark.asyncio
+async def test_requirement_ownership_repair_fails_after_exactly_one_attempt(monkeypatch, caplog):
+    projection = {
+        "requirement_allocations": [_allocation("R1", [])],
+        "requirement_channels": {"R1": "executable"},
+    }
+    calls = 0
+
+    async def model(_messages, _role, fallback_model=None):
+        nonlocal calls
+        calls += 1
+        return json.dumps(projection)
+
+    monkeypatch.setattr(api, "complete_creator_role_once", model)
+    with caplog.at_level("INFO"), pytest.raises(api.RequirementOwnershipError) as raised:
+        await api._validate_and_repair_requirement_ownership(
+            request=_request(), blueprint_text=_blueprint(),
+            function_items=[{"target_file": "scripts/unit_a.py"}],
+            projection=projection, planner_model="p",
+        )
+    assert calls == 1
+    assert raised.value.code == "requirement_ownership_repair_failed"
+    assert raised.value.details["remaining_issues"][0]["code"] == "unowned_executable_requirement"
+    assert "stage=initial" in caplog.text
+    assert "stage=post_repair" in caplog.text
+    assert "result=failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_requirement_prompts_define_ownership_closure(monkeypatch):
+    prompts = []
+
+    async def model(messages, _role, fallback_model=None):
+        prompts.append(messages[0]["content"])
+        if "requirement coverage projection" in messages[0]["content"]:
+            return json.dumps({
+                "requirement_allocations": [_allocation("R1", ["scripts/unit_a.py"])],
+                "requirement_channels": {"R1": "executable"},
+            })
+        return json.dumps({"passed": True, "issues": [], "deferred_checks": []})
+
+    monkeypatch.setattr(api, "complete_creator_role_once", model)
+    await api._plan_requirement_allocations(
+        request=_request(), blueprint_text=_blueprint(),
+        function_items=[{"target_file": "scripts/unit_a.py"}], planner_model="p",
+    )
+    await api._review_blueprint_semantic_closure(
+        request=_request(), blueprint_text=_blueprint(),
+        function_items=[{"target_file": "scripts/unit_a.py"}],
+        requirement_allocations=[_allocation("R1", ["scripts/unit_a.py"])],
+        requirement_channels={"R1": "executable"}, planner_model="p",
+    )
+    assert "channel = executable\nowners = []" in prompts[0]
+    assert "Every executable requirement must have at least one owner" in " ".join(prompts[0].split())
+    assert "must not pass if an executable requirement has no owner" in prompts[1]
+    assert "exact frozen FunctionItem target_file" in prompts[1]
+
+
 @pytest.mark.asyncio
 async def test_prepare_main_path_reconciles_decomposition_then_interface_binds_graph(monkeypatch):
     blueprint = _blueprint()
@@ -81,22 +264,6 @@ async def test_prepare_main_path_reconciles_decomposition_then_interface_binds_g
     interface_payloads: list[dict] = []
     endpoint_payloads: list[dict] = []
     review_responses = iter([
-        {
-            "passed": False,
-            "issues": [{
-                "issue_type": "requirement_uncovered",
-                "requirement_id": "R2",
-                "blocking_now": True,
-                "evidence_stage": "blueprint",
-                "repair_scope": "allocation",
-                "affected_targets": ["scripts/b.py"],
-                "evidence": [{"source": "requirement_allocations", "target": "R2", "field": "owners", "observed": []}],
-                "expected_fact": "R2 should be owned by an existing FunctionItem after reconciliation",
-                "reason": "owner missing before reconciliation",
-                "repair_guidance": "assign an existing owner",
-            }],
-            "deferred_checks": [],
-        },
         {"passed": True, "issues": [], "deferred_checks": []},
     ])
 
@@ -133,6 +300,13 @@ async def test_prepare_main_path_reconciles_decomposition_then_interface_binds_g
         if "semantic coverage Reviewer" in system:
             calls.append("semantic_review")
             return json.dumps(next(review_responses))
+        if "Repair only the listed requirement channel and ownership issues" in system:
+            calls.append("requirement_ownership_repair")
+            assert payload["affected_requirement_ids"] == ["R2"]
+            return json.dumps({
+                "requirement_allocations": [_allocation("R1", ["scripts/a.py"]), _allocation("R2", ["scripts/b.py"])],
+                "requirement_channels": {"R1": "executable", "R2": "executable"},
+            })
         if "reconciling a requirement allocation exactly once" in system:
             calls.append("allocation_reconciliation")
             return json.dumps({
@@ -189,12 +363,11 @@ async def test_prepare_main_path_reconciles_decomposition_then_interface_binds_g
     assert calls[:5] == [
         "blueprint_planner",
         "requirement_allocation",
+        "requirement_ownership_repair",
         "semantic_review",
-        "allocation_reconciliation",
-        "semantic_review",
+        "interface_intent_planner",
     ]
-    assert calls[5] == "interface_intent_planner"
-    assert calls[6] == "interface_semantic_review"
+    assert calls[5] == "interface_semantic_review"
     assert calls.count("endpoint_planner") == 3
 
 

@@ -223,6 +223,15 @@ class PreparePlanProtocolError(ValueError):
     """Planner prepare-plan structured transport failed validation."""
 
 
+class RequirementOwnershipError(PreparePlanProtocolError):
+    """Bounded requirement-ownership repair failed with structured details."""
+
+    def __init__(self, message: str, *, code: str, details: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = details
+
+
 
 _NOT_SUPPORTED_MARKERS = (
     "not supported in current implementation",
@@ -7347,12 +7356,12 @@ Allocate a requirement only to FunctionItems that genuinely own or co-own that
 responsibility. One requirement may be jointly covered by one or more existing
 FunctionItems. Collaboration, data transfer, or separation of responsibilities
 across FunctionItems must not produce owners=[] merely because the requirement
-is workflow-level. If no current FunctionItem legitimately owns a core requirement,
-keep that requirement in requirement_allocations, return owners=[], do not omit
-the requirement, do not force an unrelated owner merely to avoid an empty owner
-list, and do not invent a new FunctionItem during requirement allocation.
-owners=[] means only that the current Blueprint has no legitimate owner; it does
-not mean that the requirement is unimportant, ignorable, or already complete.
+is workflow-level. If no current FunctionItem legitimately owns a core
+requirement, keep that requirement in requirement_allocations, select its
+truthful non-executable channel, and return owners=[]. Do not omit the
+requirement, force an unrelated owner, or invent a new FunctionItem. For a
+non-executable channel, owners=[] does not mean that the requirement is
+unimportant, ignorable, or already complete.
 
 authoritative_scripts is the complete owner identity domain. Every owners value
 MUST be copied verbatim from authoritative_scripts. Do not output a role,
@@ -7375,6 +7384,35 @@ Classify each requirement independently as executable, resource, or direct using
 only the original request and supplied structured planning facts. Only executable
 requirements require script owners. Resource and direct requirements use
 owners=[] and remain in their respective semantic-review channels.
+
+An executable requirement represents runtime responsibility that is fulfilled
+by one or more frozen FunctionItems. Every executable requirement must have at
+least one owner. Every owner must exactly equal the target_file of an existing
+frozen FunctionItem.
+
+Never return:
+channel = executable
+owners = []
+Do not classify a requirement as executable unless at least one frozen
+FunctionItem truthfully owns its runtime fulfillment.
+
+A requirement may be system-wide, platform-owned, cross-cutting,
+resource-related, prohibitive, or otherwise not truthfully owned by one
+FunctionItem. In that case, choose the appropriate non-executable channel rather
+than returning an executable requirement with no owners.
+
+Do not assign arbitrary owners merely to satisfy the non-empty owners
+constraint. Do not assign every FunctionItem by default. Each selected owner
+must be semantically responsible for fulfilling the requirement, and the
+evidence must explain that responsibility.
+
+Before returning, verify:
+1. Every executable requirement has at least one owner.
+2. Every owner exactly matches a frozen FunctionItem target_file.
+3. No owner identifier was invented.
+4. The ownership evidence explains runtime responsibility.
+5. Requirements without truthful FunctionItem ownership are not labeled
+   executable.
 
 Return strict JSON only: {"requirement_allocations":[{"requirement_id":"R1",
 "requirement":"...","owners":["..."],"evidence":{"responsibility":"...",
@@ -7402,20 +7440,269 @@ plan. Do not add files, FunctionItems, or requirements merely for closure.
     data = _parse_prepare_plan_json(text)
     if set(data) != {"requirement_allocations", "requirement_channels"}:
         raise PreparePlanProtocolError("Planner requirement allocation returned an invalid protocol shape")
-    allocations = validate_requirement_allocations(
-        data["requirement_allocations"],
-        allowed_owner_targets=[
-            str(item.get("target_file") or "").strip()
-            for item in function_items
-        ],
+    allocations = _validate_requirement_allocations_for_ownership(
+        data["requirement_allocations"]
     )
-    channels = _validate_requirement_channels(
-        data["requirement_channels"], allocations
+    channels = _validate_requirement_channels_for_ownership(
+        data["requirement_channels"]
     )
     return {
         "requirement_allocations": allocations,
         "requirement_channels": channels,
     }
+
+
+def _validate_requirement_allocations_for_ownership(
+    allocations: Any,
+) -> list[dict[str, Any]]:
+    """Validate allocation shape while leaving owner closure to its validator."""
+    owner_domain = {
+        str(owner).strip()
+        for allocation in allocations if isinstance(allocation, dict)
+        for owner in (allocation.get("owners") or [])
+        if str(owner).strip()
+    } if isinstance(allocations, list) else set()
+    return validate_requirement_allocations(
+        allocations, allowed_owner_targets=owner_domain,
+    )
+
+
+def _validate_requirement_channels_for_ownership(channels: Any) -> dict[str, str]:
+    """Validate channel wire values without inferring allocation correspondence."""
+    if not isinstance(channels, dict):
+        raise PreparePlanProtocolError("requirement_channels must be an object")
+    normalized = {str(key).strip(): str(value).strip() for key, value in channels.items()}
+    invalid = {key: value for key, value in normalized.items()
+               if not key or value not in {"executable", "resource", "direct"}}
+    if invalid:
+        raise PreparePlanProtocolError(
+            f"requirement_channels contains invalid channel values: {invalid}"
+        )
+    return normalized
+
+
+def collect_requirement_ownership_issues(
+    *, requirement_channels: dict[str, str],
+    requirement_allocations: list[dict[str, Any]],
+    frozen_function_items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Collect only empty, duplicate, and closed-reference ownership issues."""
+    valid_owners = {
+        str(item.get("target_file") or "").strip()
+        for item in frozen_function_items
+        if str(item.get("target_file") or "").strip()
+    }
+    allocation_ids = {
+        str(item.get("requirement_id") or "").strip()
+        for item in requirement_allocations
+    }
+    issues: list[dict[str, Any]] = []
+    for allocation in requirement_allocations:
+        requirement_id = str(allocation.get("requirement_id") or "").strip()
+        owners = list(allocation.get("owners") or [])
+        if requirement_id not in requirement_channels:
+            issues.append({"code": "unknown_requirement_allocation", "requirement_id": requirement_id})
+        if requirement_channels.get(requirement_id) == "executable" and not owners:
+            issues.append({"code": "unowned_executable_requirement", "requirement_id": requirement_id})
+        if requirement_channels.get(requirement_id) in {"resource", "direct"} and owners:
+            issues.append({"code": "non_executable_requirement_owner", "requirement_id": requirement_id})
+        seen: set[str] = set()
+        for owner in owners:
+            if owner in seen:
+                issues.append({"code": "duplicate_requirement_owner", "requirement_id": requirement_id, "owner": owner})
+            seen.add(owner)
+            if owner not in valid_owners:
+                issues.append({"code": "unknown_requirement_owner", "requirement_id": requirement_id, "owner": owner})
+    for requirement_id, channel in requirement_channels.items():
+        if requirement_id not in allocation_ids:
+            issues.append({
+                "code": ("missing_executable_requirement_allocation"
+                         if channel == "executable" else "unknown_requirement_allocation"),
+                "requirement_id": requirement_id,
+            })
+    return issues
+
+
+def _validate_requirement_ownership_repair_scope(
+    *, before_allocations: list[dict[str, Any]], before_channels: dict[str, str],
+    after_allocations: list[dict[str, Any]], after_channels: dict[str, str],
+    affected_requirement_ids: set[str],
+) -> None:
+    before_identity = [(item["requirement_id"], item["requirement"]) for item in before_allocations]
+    after_identity = [(item["requirement_id"], item["requirement"]) for item in after_allocations]
+    before_by_id = {item["requirement_id"]: item for item in before_allocations}
+    after_by_id = {item["requirement_id"]: item for item in after_allocations}
+    violation = before_identity != after_identity
+    for requirement_id in set(before_by_id) | set(after_by_id) | set(before_channels) | set(after_channels):
+        if requirement_id in affected_requirement_ids:
+            continue
+        if (before_by_id.get(requirement_id) != after_by_id.get(requirement_id)
+                or before_channels.get(requirement_id) != after_channels.get(requirement_id)):
+            violation = True
+            break
+    if violation:
+        raise RequirementOwnershipError(
+            "Requirement ownership repair exceeded its affected requirement scope",
+            code="requirement_ownership_repair_scope_violation",
+            details={"affected_requirement_ids": sorted(affected_requirement_ids)},
+        )
+
+
+async def repair_requirement_ownership(
+    *, original_user_goal: str, frozen_blueprint: str,
+    frozen_function_items: list[dict[str, Any]],
+    current_requirement_channels: dict[str, str],
+    current_requirement_allocations: list[dict[str, Any]],
+    ownership_issues: list[dict[str, Any]], model: str,
+    model_call: Callable[[list[dict[str, str]], str], Awaitable[str]],
+) -> dict[str, Any]:
+    """Ask once for a repair and enforce a requirement-ID-bounded diff."""
+    affected_ids = {
+        str(issue.get("requirement_id") or "").strip()
+        for issue in ownership_issues if str(issue.get("requirement_id") or "").strip()
+    }
+    prompt = """Repair only the listed requirement channel and ownership issues.
+The Blueprint and all FunctionItems are frozen. Do not create, delete, merge,
+split, rename, or rewrite FunctionItems. Do not modify target_file values. Do
+not modify requirement IDs or requirement text.
+
+For each affected requirement choose only one semantic repair:
+A. Keep the executable channel and assign one or more frozen FunctionItem
+   target_file values that truthfully own the runtime responsibility.
+B. Change the requirement to the appropriate non-executable channel when no
+   frozen FunctionItem truthfully owns its runtime fulfillment.
+
+Only the affected requirement's channel, owners, and evidence may change. An
+allocation for an affected requirement may be added or removed only when needed.
+Do not modify unaffected requirements. Do not create new requirement IDs,
+rewrite requirement descriptions, create FunctionItems, invent owner identifiers,
+assign arbitrary owners merely to pass validation, or return executable with an
+empty owners list.
+
+Return the complete repaired requirement_channels and requirement_allocations
+objects, not a partial patch. Return strict JSON only with exactly those keys."""
+    payload = {
+        "original_user_goal": original_user_goal,
+        "frozen_blueprint": frozen_blueprint,
+        "frozen_function_items": frozen_function_items,
+        "current_requirement_channels": current_requirement_channels,
+        "current_requirement_allocations": current_requirement_allocations,
+        "ownership_issues": ownership_issues,
+        "affected_requirement_ids": sorted(affected_ids),
+    }
+    text = await model_call(
+        [{"role": "system", "content": prompt},
+         {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
+        model,
+    )
+    data = _parse_prepare_plan_json(text)
+    if set(data) != {"requirement_allocations", "requirement_channels"}:
+        raise RequirementOwnershipError(
+            "Requirement ownership repair returned an invalid protocol shape",
+            code="requirement_ownership_repair_scope_violation",
+            details={"affected_requirement_ids": sorted(affected_ids)},
+        )
+    allocations = _validate_requirement_allocations_for_ownership(data["requirement_allocations"])
+    channels = _validate_requirement_channels_for_ownership(data["requirement_channels"])
+    _validate_requirement_ownership_repair_scope(
+        before_allocations=current_requirement_allocations,
+        before_channels=current_requirement_channels,
+        after_allocations=allocations, after_channels=channels,
+        affected_requirement_ids=affected_ids,
+    )
+    return {"requirement_allocations": allocations, "requirement_channels": channels}
+
+
+async def _validate_and_repair_requirement_ownership(
+    *, request: PreparePlanRequest, blueprint_text: str,
+    function_items: list[dict[str, Any]], projection: dict[str, Any],
+    planner_model: str,
+) -> dict[str, Any]:
+    allocations = projection["requirement_allocations"]
+    channels = projection["requirement_channels"]
+    initial_issues = collect_requirement_ownership_issues(
+        requirement_channels=channels, requirement_allocations=allocations,
+        frozen_function_items=function_items,
+    )
+    affected_ids = sorted({issue["requirement_id"] for issue in initial_issues if issue.get("requirement_id")})
+    logger.info(
+        "[Creator][requirement_ownership_validation] stage=initial executable_requirement_count=%d issue_count=%d affected_requirement_ids=%s",
+        sum(value == "executable" for value in channels.values()), len(initial_issues), affected_ids,
+    )
+    if not initial_issues:
+        _validate_requirement_channels(channels, allocations)
+        validate_requirement_allocations(
+            allocations,
+            allowed_owner_targets=[item.get("target_file") for item in function_items],
+        )
+        logger.info("[Creator][requirement_ownership_validation] stage=initial issue_count=0 ownership_valid=true")
+        return projection
+    logger.info(
+        "[Creator][requirement_ownership_repair] attempt=1 issue_codes=%s affected_requirement_ids=%s",
+        [issue["code"] for issue in initial_issues], affected_ids,
+    )
+
+    async def call_model(messages: list[dict[str, str]], model: str) -> str:
+        return await complete_creator_role_once(messages, "planner", fallback_model=model)
+
+    try:
+        candidate = await repair_requirement_ownership(
+            original_user_goal=request.user_request, frozen_blueprint=blueprint_text,
+            frozen_function_items=function_items,
+            current_requirement_channels=channels,
+            current_requirement_allocations=allocations,
+            ownership_issues=initial_issues, model=planner_model, model_call=call_model,
+        )
+        remaining = collect_requirement_ownership_issues(
+            requirement_channels=candidate["requirement_channels"],
+            requirement_allocations=candidate["requirement_allocations"],
+            frozen_function_items=function_items,
+        )
+        logger.info(
+            "[Creator][requirement_ownership_validation] stage=post_repair issue_count=%d ownership_valid=%s",
+            len(remaining), str(not remaining).lower(),
+        )
+        if remaining:
+            logger.info(
+                "[Creator][requirement_ownership_repair] attempt=1 result=failed remaining_issue_codes=%s",
+                [issue["code"] for issue in remaining],
+            )
+            raise RequirementOwnershipError(
+                "Requirement ownership remained invalid after one repair",
+                code="requirement_ownership_repair_failed",
+                details={"stage": "requirement_ownership", "attempts": 1,
+                         "initial_issues": initial_issues, "remaining_issues": remaining,
+                         "affected_requirement_ids": affected_ids},
+            )
+        _validate_requirement_channels(candidate["requirement_channels"], candidate["requirement_allocations"])
+        validate_requirement_allocations(
+            candidate["requirement_allocations"],
+            allowed_owner_targets=[item.get("target_file") for item in function_items],
+        )
+        logger.info("[Creator][requirement_ownership_repair] attempt=1 result=candidate_valid")
+        return candidate
+    except RequirementOwnershipError as exc:
+        if exc.code == "requirement_ownership_repair_failed":
+            raise
+        logger.info("[Creator][requirement_ownership_repair] attempt=1 result=failed remaining_issue_codes=[]")
+        raise RequirementOwnershipError(
+            "Requirement ownership repair failed",
+            code="requirement_ownership_repair_failed",
+            details={"stage": "requirement_ownership", "attempts": 1,
+                     "initial_issues": initial_issues, "remaining_issues": [],
+                     "affected_requirement_ids": affected_ids,
+                     "repair_error": {"code": exc.code, "message": str(exc)}},
+        ) from exc
+    except Exception as exc:
+        logger.info("[Creator][requirement_ownership_repair] attempt=1 result=failed remaining_issue_codes=[]")
+        raise RequirementOwnershipError(
+            "Requirement ownership repair failed",
+            code="requirement_ownership_repair_failed",
+            details={"stage": "requirement_ownership", "attempts": 1,
+                     "initial_issues": initial_issues, "remaining_issues": [],
+                     "affected_requirement_ids": affected_ids,
+                     "repair_error": {"code": getattr(exc, "code", type(exc).__name__), "message": str(exc)}},
+        ) from exc
 
 
 def _validate_requirement_channels(
@@ -7632,14 +7919,24 @@ async def _review_blueprint_semantic_closure(
     prompt = """
 You are the pre-graph Blueprint semantic coverage Reviewer.
 
+The review must not pass if an executable requirement has no owner.
+For every executable requirement, verify that:
+1. at least one owner exists;
+2. every owner is an exact frozen FunctionItem target_file;
+3. the selected owners are semantically responsible for fulfilling the requirement;
+4. the evidence supports that ownership;
+5. the executable channel was not selected when the requirement is actually
+   system-wide, platform-owned, prohibitive, resource-related, or otherwise not
+   truthfully owned by a FunctionItem.
+
 Review only facts observable in the supplied pre-graph payload: the original
 user requirement, current Blueprint/FilePlan, frozen FunctionItems, requirement
 allocations, requirement channels, and authoritative FunctionItem target domain.
 Do not require every requirement to have a FunctionItem owner. FunctionItem
-ownership applies only where the supplied allocation legitimately assigns
-runtime FunctionItems. Only requirements whose current allocation uses
-FunctionItem ownership require FunctionItem owners. Do not convert other
-responsibilities into synthetic owners.
+ownership applies to executable requirements; every executable requirement
+must have at least one owner. Non-executable requirements do not require a
+FunctionItem owner. Do not convert those other responsibilities into synthetic
+owners.
 
 You must not make a blocking conclusion whose proof requires facts that do not
 yet exist: ResponsibilityGraph edges, runtime execution order, upstream data
@@ -8943,6 +9240,11 @@ Blueprint Planner 只规划业务责任。
             request=request, blueprint_text=frozen_blueprint_text,
             function_items=semantic_function_items, planner_model=route.model,
         )
+        requirement_projection = await _validate_and_repair_requirement_ownership(
+            request=request, blueprint_text=frozen_blueprint_text,
+            function_items=semantic_function_items, projection=requirement_projection,
+            planner_model=route.model,
+        )
         requirement_allocations = requirement_projection["requirement_allocations"]
         requirement_channels = requirement_projection["requirement_channels"]
         channel_counts = _requirement_channel_summary(requirement_channels)
@@ -8987,6 +9289,13 @@ Blueprint Planner 只规划业务责任。
                 requirement_channels=requirement_channels,
                 semantic_review={**semantic_review, "issues": allocation_issues},
                 planner_model=route.model,
+            )
+            requirement_allocations = requirement_projection["requirement_allocations"]
+            requirement_channels = requirement_projection["requirement_channels"]
+            requirement_projection = await _validate_and_repair_requirement_ownership(
+                request=request, blueprint_text=frozen_blueprint_text,
+                function_items=semantic_function_items,
+                projection=requirement_projection, planner_model=route.model,
             )
             requirement_allocations = requirement_projection["requirement_allocations"]
             requirement_channels = requirement_projection["requirement_channels"]
@@ -9061,6 +9370,11 @@ Blueprint Planner 只规划业务责任。
                 requirement_projection = await _plan_executable_requirement_allocations(
                     request=request, blueprint_text=frozen_blueprint_text,
                     function_items=semantic_function_items, planner_model=route.model,
+                )
+                requirement_projection = await _validate_and_repair_requirement_ownership(
+                    request=request, blueprint_text=frozen_blueprint_text,
+                    function_items=semantic_function_items,
+                    projection=requirement_projection, planner_model=route.model,
                 )
                 requirement_allocations = requirement_projection["requirement_allocations"]
                 requirement_channels = requirement_projection["requirement_channels"]

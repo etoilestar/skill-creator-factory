@@ -487,6 +487,15 @@ the platform contract, and frozen requirement allocations. target_file values
 are the complete legal member domain. FunctionItem inputs and outputs are frozen.
 
 2. TASK
+Plan the minimum complete set of atomic runtime transfers required to satisfy
+every required target input and every required platform output.
+
+ATOMIC INTERFACE DEFINITION
+One Interface Intent represents exactly one independently bindable runtime
+transfer: one source value -> one target input. It is not a general relationship,
+an entire member-to-member channel, a bundle of fields, all data exchanged
+between members, or a workflow step containing multiple transfers.
+
 You are planning semantic interfaces between already-frozen executable FunctionItems.
 Produce the complete Interface Intent Plan. One Interface Intent represents one
 independently bindable runtime transfer and must expand into exactly one graph
@@ -508,7 +517,19 @@ the number of Interfaces from the number of source outputs. A structured value
 transferred into one target input remains one logical transfer regardless of how
 many internal fields it contains. required_inputs require incoming transfer
 coverage; defaulted_inputs do not require an Interface unless semantics require
-an override.
+an override. Every goal must name or unambiguously describe exactly one source
+value, exactly one target input, and why that value is required by that target.
+Split independently bindable values into separate intents. Repeated member pairs
+are expected and valid; never merge transfers merely because the pair is equal.
+
+PLANNING PROCEDURE
+Silently enumerate every frozen input. Ignore only required=false or
+default_present=true inputs. For each remaining input, semantically choose one
+upstream FunctionItem output or one platform runtime input and emit exactly one
+intent. Independently enumerate required final platform outputs and emit exactly
+one member_to_platform intent for each. Verify every required target input has
+exactly one intended transfer unless multiple producers are explicitly required,
+and verify no goal bundles multiple target inputs.
 
 3. INVARIANTS
 - Do not add, remove, rename, merge, split, or modify frozen FunctionItems.
@@ -520,6 +541,11 @@ an override.
 - Do not invent a platform input merely because an upstream transfer was missed.
 - Do not connect members by matching field names alone; use responsibilities,
   declared ports, workflow semantics, requirements, and platform contract together.
+- A required input with no semantic upstream producer must be considered for a
+  platform_to_member intent, including the first workflow member. Do not invent
+  a platform input when a valid upstream producer exists.
+- A final output is not implied by the final FunctionItem's existence; explicitly
+  emit every required member_to_platform transfer.
 - Do not return endpoint IDs, port IDs, edges, paths, comments, or extra fields.
 - Do not reproduce, quote, summarize, or copy these instructions into the result.
 - Do not include planning notes, explanations, Markdown fences, comments, or
@@ -703,6 +729,14 @@ checklist from frozen target inputs. For each required target input, determine
 whether one Interface Intent clearly describes its runtime source and transfer.
 Review semantic coverage, not only natural-language direction.
 
+Do not pass merely because every member participates in an Interface. Member-level
+connectivity is not sufficient. Review target-input coverage. Silently construct
+a table of target_member, target_input, required, default_present, and
+covering_interface_ids. Every required input without a default normally needs
+exactly one semantically valid covering Interface. Zero is missing coverage; an
+Interface bundling independently bindable inputs is non-atomic; the correct member
+pair is insufficient unless its goal describes the specific required transfer.
+
 An Interface Intent declares only:
 - whether data flows from the platform to a frozen FunctionItem;
 - from one frozen FunctionItem to another;
@@ -780,6 +814,20 @@ combines independently bindable transfers, a member relation is missing, an
 optional/default input is made mandatory without evidence, or a platform source
 is invented without semantic evidence. Report violated facts only; never choose
 a source member, output, endpoint, or repair.
+
+For missing coverage use code missing_required_input_transfer, category coverage,
+message "A required target input has no atomic Interface Intent.", the target in
+affected_members and affected_inputs, affected_interfaces=[], and evidence with
+observed "No Interface goal represents this target input." and expected "One
+atomic source-value-to-target-input Interface Intent." For a bundled transfer use
+code non_atomic_interface_transfer, category atomicity, list the Interface and
+each affected input, and explain that one intent represents multiple independently
+bindable transfers.
+
+Check every required root input for a platform_to_member or valid upstream
+transfer, every required final result for member_to_platform, every downstream
+required input for coverage, and every Interface for atomicity. Any failure means
+passed=false.
 
 3. INVARIANTS
 Every issue uses the same envelope regardless of code. code is a stable,
@@ -951,7 +999,7 @@ async def repair_interface_plan_semantically(
     repair_stage: str = "initial_interface_validation",
     planner_model: str, model_call: ModelCall, reviewer_model: str | None = None,
 ) -> dict[str, Any]:
-    """Perform one bounded, model-driven semantic repair of the full plan."""
+    """Perform one bounded Critic + Generator semantic repair cycle."""
     system_requirements_context = (
         list(system_requirements) if system_requirements is not None
         else _resolve_system_requirements_context(
@@ -965,16 +1013,30 @@ async def repair_interface_plan_semantically(
         bool(repair_scope.get("allow_add_interfaces")), bool(repair_scope.get("allow_remove_interfaces")),
     )
 
+    critic_prompt = """Diagnose the supplied Interface Plan against the explicit
+blocking facts. For every uncovered required input, identify one repair action.
+For every non-atomic Interface, identify whether it must be split or modified.
+Preserve every unaffected Interface. Do not produce the final Interface Plan.
+Do not choose endpoint IDs. Do not infer relationships from names alone. Do not
+omit an issue merely because the correct source requires semantic reasoning.
+Return only {"diagnosis": string, "repair_actions": [actions]}. Allowed actions
+are add_atomic_interface, split_interface, modify_interface, preserve_interface,
+and remove_interface."""
+
     prompt = """1. AUTHORITATIVE FACTS
 The payload contains compact frozen FunctionItems, the failed complete Interface
 Plan, unified blocking issue envelopes, requirement allocations, the platform
 contract, repair_scope, the legal member domain, and the legal Interface schema.
 
 2. TASK
-Repair the Interface Intent Plan so that the supplied blocking issues are
-resolved. Use the complete system semantics to decide the correct change. The
-validation issues describe violated facts; they do not prescribe the
-business-semantic answer. Make the smallest concrete semantic change.
+Apply the supplied repair actions and return one complete repaired Interface
+Plan. For each add_atomic_interface action, use full system semantics to choose
+the correct source member or platform, create exactly one independently bindable
+transfer describing one source value and one target input, and assign a new
+unique interface_id. For split_interface, replace the bundled Interface with
+separate atomic intents, preserve its semantic transfers, and never merge them
+again. Preserve all unaffected Interfaces exactly. Do not change FunctionItems
+or return the unchanged failed plan.
 
 3. INVARIANTS
 - Do not modify FunctionItems or add fields outside the Interface schema.
@@ -1014,6 +1076,34 @@ include explanations, Markdown, comments, or hidden reasoning.
         "repair_scope": repair_scope,
         "interface_schema": INTERFACE_SCHEMA,
     }
+    critic_text = await model_call(
+        [{"role": "system", "content": critic_prompt},
+         {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
+        planner_model,
+    )
+    critic = _parse_object(critic_text)
+    if set(critic) != {"diagnosis", "repair_actions"} or not isinstance(critic.get("diagnosis"), str) or not isinstance(critic.get("repair_actions"), list):
+        _raise("repair critic response has invalid shape", "invalid_interface_repair_critic_protocol", path="$")
+    allowed_actions = {"add_atomic_interface", "split_interface", "modify_interface", "preserve_interface", "remove_interface"}
+    legal_interfaces = {str(value.get("interface_id") or "") for value in current_interface_plan.get("interfaces") or []}
+    compact = _compact_function_items(frozen_function_items)
+    legal_inputs = {item["target_file"]: {value["name"] for value in item["inputs"]} for item in compact}
+    for index, action in enumerate(critic["repair_actions"]):
+        if not isinstance(action, dict) or action.get("action") not in allowed_actions:
+            _raise("repair critic action is invalid", "invalid_interface_repair_critic_protocol", path=f"$.repair_actions[{index}]")
+        if "interface_id" in action and action["interface_id"] not in legal_interfaces:
+            _raise("repair action references an unknown interface", "invalid_interface_repair_critic_reference", path=f"$.repair_actions[{index}].interface_id")
+        if "target_member" in action:
+            member, target_input = action.get("target_member"), action.get("target_input")
+            if member not in legal_inputs or target_input not in legal_inputs[member]:
+                _raise("repair action references an unknown input", "invalid_interface_repair_critic_reference", path=f"$.repair_actions[{index}]")
+    logger.info(
+        "[Creator][interface_repair_critic] action_count=%d action_types=%s affected_interfaces=%s affected_inputs=%s",
+        len(critic["repair_actions"]), [a.get("action") for a in critic["repair_actions"]],
+        [a.get("interface_id") for a in critic["repair_actions"] if a.get("interface_id")],
+        [{"target_member": a.get("target_member"), "target_input": a.get("target_input")} for a in critic["repair_actions"] if a.get("target_member")],
+    )
+    payload["repair_critic"] = critic
     text = await model_call([{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}], planner_model)
     try:
         candidate = validate_interface_plan_protocol(_parse_object(text))
@@ -1053,6 +1143,13 @@ include explanations, Markdown, comments, or hidden reasoning.
                              "remaining_issues": after_issues},
                 )
         result = validate_interface_intent_plan(plan=candidate, function_items=frozen_function_items)
+        logger.info(
+            "[Creator][interface_repair_result] plan_changed=%s before_issue_fingerprints=%s after_issue_fingerprints=%s remaining_uncovered_inputs=%s",
+            candidate != current_interface_plan,
+            [interface_issue_fingerprint(issue) for issue in validation_issues],
+            [interface_issue_fingerprint(issue) for issue in (after_issues if reviewer_model else remaining)],
+            [value for issue in (after_issues if reviewer_model else remaining) for value in ((issue.get("details") or {}).get("affected_inputs") or [])],
+        )
     except InterfaceIntentPlanError as exc:
         logger.info(
             "[Creator][interface_semantic_repair] stage=%s attempt=1 result=failed error_code=%s",
@@ -1092,6 +1189,9 @@ async def repair_interface_intents(
         str(item.get("interface_id") or "")
         for item in current_interface_plan.get("interfaces") or []
     }
+    uncovered_required_inputs: list[dict[str, Any]] = []
+    missing_platform_inputs: list[dict[str, str]] = []
+    non_atomic_interfaces: list[dict[str, Any]] = []
     for error in validation_errors:
         details = dict(error.get("details") or {})
         affected_inputs = []
@@ -1102,6 +1202,10 @@ async def repair_interface_intents(
             target_input = str(value.get("input_id") or value.get("target_input") or "").strip()
             if member and target_input:
                 affected_inputs.append({"target_member": member, "target_input": target_input})
+                uncovered_required_inputs.append({
+                    "target_member": member, "target_input": target_input,
+                    "required": True, "default_present": False,
+                })
         members = [
             value for value in dict.fromkeys([
                 *(affected_members or []),
@@ -1122,11 +1226,43 @@ async def repair_interface_intents(
             "affected_inputs": affected_inputs,
             "evidence": {"graph_error": str(error.get("code") or "graph_binding_issue"), "details": details},
         }
+        if details.get("reason") and interfaces:
+            non_atomic_interfaces.append({
+                "interface_id": interfaces[0], "reason": str(details["reason"]),
+                "affected_inputs": affected_inputs,
+            })
         issues.append({**envelope, "stage": "graph_validation", "path": "$.interfaces",
                        "interface_id": interfaces[0] if interfaces else "", "details": envelope})
     scope = build_interface_repair_scope(issues, current_interface_plan)
     if missing_platform_output_fields:
         scope["allow_add_interfaces"] = True
+    graph_feedback = {
+        "stage": "graph_expansion_feedback",
+        "current_interface_plan": current_interface_plan,
+        "frozen_function_items": _compact_function_items(frozen_function_items),
+        "blocking_issues": [
+            {key: value for key, value in issue.items() if key != "details"}
+            for issue in issues
+        ],
+        "uncovered_required_inputs": uncovered_required_inputs,
+        "missing_platform_inputs": missing_platform_inputs,
+        "missing_platform_outputs": [
+            {"source_member": "", "source_output": str(value)}
+            for value in (missing_platform_output_fields or [])
+        ],
+        "non_atomic_interfaces": non_atomic_interfaces,
+        "repair_scope": {"allow_add": bool(scope["allow_add_interfaces"]),
+                         "allow_remove": bool(scope["allow_remove_interfaces"]),
+                         "allow_modify": bool(scope["allow_modify_interfaces"])},
+    }
+    for issue in issues:
+        issue.setdefault("details", {})["graph_feedback"] = graph_feedback
+    logger.info(
+        "[Creator][interface_coverage] required_input_count=%d covered_input_count=%d uncovered_inputs=%s non_atomic_interface_ids=%s missing_platform_inputs=%s missing_platform_outputs=%s",
+        len(uncovered_required_inputs), 0, uncovered_required_inputs,
+        [value["interface_id"] for value in non_atomic_interfaces], missing_platform_inputs,
+        graph_feedback["missing_platform_outputs"],
+    )
     return await repair_interface_plan_semantically(
         original_user_goal=original_user_goal, frozen_function_items=frozen_function_items,
         current_interface_plan=current_interface_plan, validation_issues=issues,

@@ -236,7 +236,7 @@ def _validate_interface_selection_protocol(*, obligation: dict, response: Any) -
         )
 
     kind = obligation.get("kind")
-    expected = {"source_id", "target_id", "source_path"} if kind == "platform_to_script" else {"source_id", "target_id"}
+    expected = {"source_id", "target_id"}
 
     if set(response) != expected:
         raise ResponsibilityGraphExpansionError(
@@ -280,47 +280,6 @@ def _validate_interface_selection_protocol(*, obligation: dict, response: Any) -
             },
         )
 
-    if kind == "platform_to_script":
-        source_path = response.get("source_path")
-
-        if not isinstance(source_path, list):
-            raise ResponsibilityGraphExpansionError(
-                "source_path must be a JSON array of zero or more non-empty strings",
-                code="invalid_interface_endpoint_protocol",
-                details={
-                    "path": "$.source_path",
-                    "expected_type": "array<string>",
-                    "observed_type": type(source_path).__name__,
-                    "observed_value": source_path,
-                    "observed_response": response,
-                    "direct_binding_example": [],
-                },
-            )
-
-        invalid_parts = [
-            part
-            for part in source_path
-            if (
-                not isinstance(part, str)
-                or not part
-                or part.lower() in _DANGEROUS_PATH_PARTS
-            )
-        ]
-
-        if invalid_parts:
-            raise ResponsibilityGraphExpansionError(
-                "source_path contains an invalid path component",
-                code="invalid_interface_endpoint_protocol",
-                details={
-                    "path": "$.source_path",
-                    "expected_type": "array of safe non-empty strings",
-                    "observed_type": "array",
-                    "observed_value": source_path,
-                    "invalid_parts": invalid_parts,
-                    "observed_response": response,
-                },
-            )
-
     return dict(response)
 
 async def _select_interface_endpoint_reference(*, obligation: dict, registry: dict, goal_context: dict, committed_edges: list[dict], planner_model: str, model_call: ModelCall, validation_issue: dict | None = None) -> dict:
@@ -343,10 +302,8 @@ async def _select_interface_endpoint_reference(*, obligation: dict, registry: di
                 },
             )
         prompt = """For this platform_to_script obligation, return exactly:
-{"source_id":"<allowed platform input ID>","target_id":"<allowed target input ID>","source_path":[]}
-source_path is an array of nested keys within the selected platform input; use
-[] for direct binding. Use [] when no nested key is needed. source_path is
-never a script path, member path, filename, or endpoint ID."""
+{"source_id":"<allowed platform input ID>","target_id":"<allowed target input ID>"}
+Do not return source_path or any additional field."""
     elif kind == "script_to_platform":
         payload["source_member_outputs"] = _public_script_outputs(registry, obligation["source_member"])
         payload["platform_outputs"] = _unbound_platform_outputs(registry=registry, committed_edges=committed_edges)
@@ -448,11 +405,6 @@ Do not redesign the interface.
 Do not choose endpoints outside the supplied endpoint lists.
 Do not repeat the previous invalid value.
 
-For platform_to_script:
-- source_path must be an array;
-- [] means direct binding;
-- source_path is never a script or file path.
-
 Return only the corrected strict JSON object."""
     text = await model_call([{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}], planner_model)
     return _validate_interface_selection_protocol(obligation=obligation, response=_parse_object(text, "invalid_interface_endpoint_protocol"))
@@ -467,11 +419,7 @@ def _materialize_interface_obligation(*, obligation: dict, selection: dict, regi
             raise ResponsibilityGraphExpansionError("selected endpoint is outside declared interface obligation scope", code="invalid_interface_endpoint_reference")
         if _types_conflict(source.get("contract") or {}, target.get("contract") or {}):
             raise ResponsibilityGraphExpansionError("selected endpoints have conflicting types", code="interface_endpoint_type_conflict")
-        source_path = list(selection["source_path"])
-        constraints = []
-        if source_path:
-            constraints.append({"type": "platform_parameter_binding", "source_key": ".".join(source_path), "source_path": source_path, "required": True})
-        return _edge(PLATFORM_INPUT_NODE, source["field"], target["target_file"], target["port_id"], constraints=constraints)
+        return _edge(PLATFORM_INPUT_NODE, source["field"], target["target_file"], target["port_id"])
     if kind == "script_to_platform":
         source = next((value for value in registry["script_outputs"] if value["output_id"] == selection["source_id"] and value["target_file"] == obligation["source_member"]), None)
         target = next((value for value in registry["platform_outputs"] if value["slot_id"] == selection["target_id"]), None)
@@ -578,12 +526,7 @@ async def _expand_from_interface_plan(*, normalized: list[dict], platform_contra
                         "Do not change the interface intent or any other obligation. "
                         "Preserve source_id and target_id when they already reference valid "
                         "listed endpoints. "
-                        "For platform_to_script, source_path must be a JSON array of "
-                        "zero or more non-empty strings. "
-                        "Use source_path=[] when directly passing the entire selected "
-                        "platform input slot. "
-                        "Never place a script path, filename, member target, module path, "
-                        "or endpoint ID inside source_path."
+                        "Return exactly source_id and target_id, with no extra fields."
                     ),
                 }
                 continue

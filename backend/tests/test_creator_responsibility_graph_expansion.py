@@ -8,6 +8,18 @@ from backend.services.creator.responsibility_graph_expansion import (
     expand_responsibility_graph,
     _validate_interface_selection_protocol,
 )
+
+
+def test_endpoint_protocol_rejects_every_extra_field():
+    from backend.services.creator.responsibility_graph_expansion import _validate_interface_selection_protocol
+
+    with pytest.raises(ResponsibilityGraphExpansionError) as raised:
+        _validate_interface_selection_protocol(
+            obligation={"kind": "platform_to_script"},
+            response={"source_id": "S", "target_id": "T", "source_path": []},
+        )
+    assert raised.value.code == "invalid_interface_endpoint_protocol"
+
 from backend.services.platform_io_contract import build_platform_io_contract
 
 

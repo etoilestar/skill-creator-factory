@@ -21,6 +21,17 @@ from backend.services.creator.function_item_interface_plan import (
     validate_interface_intent_plan,
     _interface_plan_prompt,
 )
+
+
+def test_interface_prompts_require_atomic_target_input_coverage():
+    from backend.services.creator.function_item_interface_plan import _interface_plan_prompt
+
+    prompt = _interface_plan_prompt()
+    assert "minimum complete set of atomic runtime transfers" in prompt
+    assert "one source value -> one target input" in prompt
+    assert "Repeated source_member and target_member pairs are allowed" in prompt
+    assert "default_present=true" in prompt
+
 from backend.services.platform_io_contract import build_platform_io_contract
 
 

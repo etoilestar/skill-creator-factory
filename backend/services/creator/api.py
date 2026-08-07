@@ -7285,11 +7285,19 @@ async def _bind_executable_responsibility_plan(
             ),
             validation_errors=[{
                 "code": exc.code,
+                "category": (
+                    "coverage"
+                    if error_details.get("uncovered_inputs")
+                    or error_details.get("missing_required_final_output_fields")
+                    or error_details.get("missing_platform_output_interface")
+                    else "other"
+                ),
                 "message": str(exc),
                 "details": error_details,
             }],
             planner_model=planner_model,
             model_call=select_sources,
+            reviewer_model=planner_model,
         )
         try:
             responsibility_edges = await expand_responsibility_graph(
@@ -7360,6 +7368,24 @@ than a frozen FunctionItem. owners must be empty.
 A requirement is not executable merely because it is important, enforceable, or
 must eventually be validated. Validation stage and execution ownership are
 different concepts.
+
+CHANNEL SELF-CHECK
+
+For every requirement, ask:
+
+1. Is the requirement fulfilled by a runtime action performed by one or more
+   frozen FunctionItems? If yes, executable may be appropriate.
+2. Does the requirement instead constrain structure, topology, protocol,
+   permissions, prohibited behavior, file production, capability boundaries, or
+   how runtime actions must behave? If yes, resource is normally appropriate.
+3. Is the host platform or assistant directly responsible for the final action?
+   If yes, direct may be appropriate.
+
+Do not classify a requirement as executable merely because every FunctionItem
+must comply with it, violating it would cause runtime failure, it is important,
+it must be validated later, it affects output behavior, it defines an execution
+protocol, or it restricts capabilities. Do not assign every FunctionItem as
+owner merely because every FunctionItem is governed by the same rule.
 
 3. INVARIANTS
 Never assign all FunctionItems merely to satisfy the non-empty owner rule. For
@@ -8141,26 +8167,26 @@ Requirement Projection stage for this review pass. Review each requirement
 using its supplied channel. Do not silently reinterpret a resource or direct
 requirement as executable.
 
-When the supplied requirement channel appears inconsistent with the confirmed
-user requirement or frozen Blueprint, report the concern using:
+CHANNEL AUTHORITY
 
-issue_type = "responsibility_mismatch"
-
-Do not invent a new issue_type such as:
-- channel_alignment_issue
-- channel_mismatch
-- invalid_channel
-- ownership_channel_conflict
-
-The issue reason and evidence must explicitly state the actual supplied channel,
-the current observed Blueprint or FunctionItem fact, and why the observed fact
-may conflict with that supplied channel.
+requirement_channels is frozen and authoritative for this review pass.
+Do not reclassify, replace, challenge, reinterpret, or recommend changing any
+requirement channel. Do not report that a resource or direct requirement should
+be executable. Do not create an issue whose repair_guidance asks to change a
+requirement channel. Review only whether the current Blueprint and allocations
+are valid under the supplied channel.
 
 2. CHANNEL-AWARE REVIEW RULES
 Ownership rules are channel-aware:
-- executable requirements require at least one existing frozen FunctionItem owner;
-- resource requirements validly use owners=[];
-- direct requirements validly use owners=[].
+- For executable requirements, at least one owner must exist; every owner must
+  be an existing frozen FunctionItem, perform a runtime action contributing
+  directly to fulfillment, and have evidence citing current FunctionItem facts.
+- For resource requirements, owners=[] is valid and required. Verify only that
+  the structural, protocol, prohibition, topology, capability, or resource
+  constraint is represented in the Blueprint or platform contract. Do not assign
+  affected FunctionItems as owners, including when a rule applies globally.
+- For direct requirements, owners=[] is valid and required. Verify only that the
+  platform or assistant responsibility is represented; never synthesize an owner.
 
 Every executable requirement must have at least one frozen FunctionItem owner.
 Every resource or direct requirement must remain represented in the projection,
@@ -8182,6 +8208,12 @@ verification. Later verification does not create executable ownership. Graph,
 generation, runtime, file validation, and sandbox validation are possible later
 evidence stages. Do not change resource/direct to executable merely because its
 compliance will be checked later.
+
+A FunctionItem being constrained by a requirement does not make that
+FunctionItem an owner of the requirement. A requirement that applies to all
+FunctionItems is not automatically a distributed executable requirement. Owner
+means the FunctionItem performs the runtime action that fulfills the requirement.
+Affected or governed FunctionItems are not necessarily owners.
 
 3. CURRENT-STAGE BLOCKING RULES
 A blocking Blueprint-stage issue requires concrete evidence that the current
@@ -8224,8 +8256,11 @@ a separate current Blueprint defect is already evidenced.
 6. FINAL SELF-CHECK
 Before returning, silently verify:
 - every requirement statement uses the actual supplied channel;
-- no resource/direct requirement is described as executable unless the issue
-  explicitly challenges its current channel;
+- no issue proposes changing a requirement channel;
+- no resource/direct requirement is made blocking merely because owners=[];
+- no issue assigns all FunctionItems only because a constraint applies globally;
+- no issue confuses governed FunctionItems with owners;
+- every blocking issue can be repaired without changing requirement_channels;
 - only executable requirements are required to have owners;
 - no issue proposes an owner outside authoritative_function_item_targets;
 - no issue proposes a new FunctionItem or file;
@@ -8275,25 +8310,6 @@ object being cited. field identifies the exact field within that source.
 observed contains the concrete supplied value. Do not put an explanation,
 multiple sources, or a natural-language sentence in source or field.
 
-Channel-concern protocol example:
-{
-  "issue_type": "responsibility_mismatch",
-  "requirement_id": "R1",
-  "blocking_now": true,
-  "evidence_stage": "blueprint",
-  "repair_scope": "allocation",
-  "affected_targets": ["scripts/a.py"],
-  "evidence": [
-    {"source": "requirement_channels", "target": "R1", "field": "R1", "observed": "resource"},
-    {"source": "function_items", "target": "scripts/a.py", "field": "purpose", "observed": "Performs the runtime action required by R1."}
-  ],
-  "expected_fact": "The requirement channel must align with the supplied current-stage runtime responsibility.",
-  "reason": "R1 is currently classified as resource, while the frozen FunctionItem purpose provides concrete evidence of direct runtime ownership.",
-  "repair_guidance": "Reconsider only the supplied channel and ownership allocation for R1."
-}
-This example demonstrates protocol shape only and does not prescribe that a
-resource channel is normally incorrect.
-
 A blocking entry requires non-empty evidence and expected_fact. A deferred entry
 uses evidence=[], expected_fact="", affected_targets=[], repair_scope="none", and
 empty repair_guidance. Return no explanation outside the JSON object.
@@ -8339,8 +8355,7 @@ only invalid JSON/envelope/field types, reference-domain violations, lifecycle
 routing fields, passed consistency, and required evidence protocol fields.
 
 When repairing evidence protocol:
-- preserve the original issue_type, except map an unknown channel concern type
-  such as channel_alignment_issue to responsibility_mismatch as specified above;
+- preserve the original issue_type;
 - preserve requirement_id;
 - preserve blocking_now;
 - preserve the semantic reason;

@@ -791,24 +791,14 @@ async def test_ownerless_non_executable_channel_remains_passed(monkeypatch, chan
 
 
 @pytest.mark.asyncio
-async def test_channel_concern_uses_responsibility_mismatch(monkeypatch):
-    issue = _review_issue(
-        issue_type="responsibility_mismatch", repair_scope="allocation",
-        evidence=[
-            {"source": "requirement_channels", "target": "R1", "field": "R1", "observed": "resource"},
-            {"source": "function_items", "target": "scripts/a.py", "field": "purpose", "observed": "runtime action"},
-        ],
-        reason="R1 actual supplied channel is resource, but the frozen purpose states a runtime action.",
-    )
-
+async def test_resource_channel_is_frozen_and_not_challenged(monkeypatch):
     async def complete(messages, *_args, **_kwargs):
         prompt = messages[0]["content"]
-        assert 'issue_type = "responsibility_mismatch"' in prompt
-        assert "Do not invent a new issue_type" in prompt
+        assert "requirement_channels is frozen and authoritative" in prompt
+        assert "Do not reclassify, replace, challenge" in prompt
+        assert 'issue_type = "responsibility_mismatch"' not in prompt
         assert "source must be exactly one of" in prompt
-        assert "resource requirements validly use owners=[]" in prompt
-        assert "direct requirements validly use owners=[]" in prompt
-        return json.dumps({"passed": False, "issues": [issue], "deferred_checks": []})
+        return json.dumps({"passed": True, "issues": [], "deferred_checks": []})
 
     monkeypatch.setattr(api, "complete_creator_role_once", complete)
     review = await api._review_blueprint_semantic_closure(
@@ -818,34 +808,31 @@ async def test_channel_concern_uses_responsibility_mismatch(monkeypatch):
         requirement_allocations=[_allocation("R1", [])],
         requirement_channels={"R1": "resource"}, planner_model="test",
     )
-    assert review["issues"][0]["issue_type"] == "responsibility_mismatch"
+    assert review == {"passed": True, "issues": [], "deferred_checks": []}
 
 
 @pytest.mark.asyncio
-async def test_unknown_channel_issue_type_is_protocol_repaired_once(monkeypatch):
+async def test_unknown_channel_issue_type_is_not_semantically_remapped(monkeypatch):
     calls = []
     reason = "The actual supplied resource channel conflicts with a frozen runtime fact."
     unknown = _review_issue(issue_type="channel_alignment_issue", reason=reason)
-    repaired = _review_issue(issue_type="responsibility_mismatch", reason=reason)
 
     async def complete(messages, *_args, **_kwargs):
         calls.append(messages)
         if len(calls) == 1:
             return json.dumps({"passed": False, "issues": [unknown], "deferred_checks": []})
-        assert "map an unknown channel concern type" in messages[0]["content"]
-        return json.dumps({"passed": False, "issues": [repaired], "deferred_checks": []})
+        assert "map an unknown channel concern type" not in messages[0]["content"]
+        return json.dumps({"passed": False, "issues": [unknown], "deferred_checks": []})
 
     monkeypatch.setattr(api, "complete_creator_role_once", complete)
-    review = await api._review_blueprint_semantic_closure(
-        request=api.PreparePlanRequest(user_request="abstract requirement"),
-        blueprint_text="blueprint", function_items=[{"target_file": "scripts/a.py"}],
-        requirement_allocations=[_allocation("R1", ["scripts/a.py"])],
-        requirement_channels={"R1": "executable"}, planner_model="test",
-    )
+    with pytest.raises(api.PreparePlanProtocolError):
+        await api._review_blueprint_semantic_closure(
+            request=api.PreparePlanRequest(user_request="abstract requirement"),
+            blueprint_text="blueprint", function_items=[{"target_file": "scripts/a.py"}],
+            requirement_allocations=[_allocation("R1", ["scripts/a.py"])],
+            requirement_channels={"R1": "executable"}, planner_model="test",
+        )
     assert len(calls) == 2
-    assert review["issues"][0]["issue_type"] == "responsibility_mismatch"
-    assert review["issues"][0]["requirement_id"] == "R1"
-    assert review["issues"][0]["reason"] == reason
 
 
 @pytest.mark.asyncio

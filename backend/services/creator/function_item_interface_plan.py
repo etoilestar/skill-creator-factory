@@ -25,10 +25,6 @@ PROTOCOL_REPAIRABLE_CODES = {
     "invalid_interface_kind",
     "duplicate_interface_id",
 }
-GRAPH_INTERFACE_ISSUE_CATEGORIES = {
-    "interface_plan_incomplete": "coverage_error",
-    "interface_plan_overcomplete": "cardinality_error",
-}
 INTERFACE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -133,18 +129,35 @@ def _compact_function_items(function_items: list[dict[str, Any]]) -> list[dict[s
     compact_items: list[dict[str, Any]] = []
     for item in normalized:
         default_values = item.get("default_values") if isinstance(item.get("default_values"), dict) else {}
-        input_ids = [_compact_port_id(raw_input) for raw_input in item.get("inputs") or []]
-        required_inputs = [port_id for port_id in input_ids if port_id and port_id not in default_values]
-        defaulted_inputs = [port_id for port_id in input_ids if port_id and port_id in default_values]
+        raw_inputs = item.get("inputs") or []
+        input_ids = [_compact_port_id(raw_input) for raw_input in raw_inputs]
+        compact_inputs = []
+        for raw_input, port_id in zip(raw_inputs, input_ids):
+            if not port_id:
+                continue
+            declared_required = raw_input.get("required") if isinstance(raw_input, dict) else None
+            default_present = port_id in default_values or (
+                isinstance(raw_input, dict) and "default" in raw_input
+            )
+            compact_input = {"name": port_id, "default_present": default_present}
+            if isinstance(declared_required, bool):
+                compact_input["required"] = declared_required
+            else:
+                compact_input["required"] = not default_present
+            compact_inputs.append(compact_input)
+        required_inputs = [
+            value["name"] for value in compact_inputs
+            if value["required"] and not value["default_present"]
+        ]
+        defaulted_inputs = [value["name"] for value in compact_inputs if value["default_present"]]
         compact_items.append(
             {
                 "target_file": item["target_file"],
                 "purpose": item.get("purpose", ""),
-                "inputs": item.get("inputs") or [],
-                "outputs": item.get("outputs") or [],
+                "inputs": compact_inputs,
+                "outputs": [_compact_port_id(value) for value in item.get("outputs") or [] if _compact_port_id(value)],
                 "required_inputs": required_inputs,
                 "defaulted_inputs": defaulted_inputs,
-                "dependencies": item.get("dependencies") or [],
             }
         )
     return compact_items
@@ -346,25 +359,40 @@ def build_interface_repair_scope(
     allow_add = False
     allow_remove = False
     for issue in validation_issues:
-        interface_id = str(issue.get("interface_id") or "").strip()
-        if interface_id and interface_id not in affected_ids:
-            affected_ids.append(interface_id)
         details = issue.get("details") if isinstance(issue.get("details"), dict) else {}
+        interface_ids = details.get("affected_interfaces") or (
+            [issue.get("interface_id")] if issue.get("interface_id") else []
+        )
+        for interface_id in interface_ids:
+            interface_id = str(interface_id or "").strip()
+            if interface_id and interface_id not in affected_ids:
+                affected_ids.append(interface_id)
         for member in details.get("affected_members") or []:
             member = str(member or "").strip()
+            if member and member not in affected_members:
+                affected_members.append(member)
+        for raw in details.get("affected_inputs") or []:
+            member = str(raw.get("target_member") or "").strip() if isinstance(raw, dict) else ""
             if member and member not in affected_members:
                 affected_members.append(member)
         for raw in details.get("uncovered_inputs") or []:
             member = str(raw.get("target") or "").strip() if isinstance(raw, dict) else ""
             if member and member not in affected_members:
                 affected_members.append(member)
-        code = issue.get("code")
-        if code == "interface_plan_incomplete" or issue.get("category") == "coverage_error":
+        category = str(issue.get("category") or details.get("category") or "other")
+        category = {
+            "coverage_error": "coverage", "cardinality_error": "atomicity",
+            "semantic_alignment_error": "alignment", "reference_error": "reference",
+            "reference_scope_error": "reference", "direction_error": "alignment",
+        }.get(category, category)
+        if category == "coverage":
             allow_add = True
-        if code == "interface_plan_overcomplete" or issue.get("category") == "cardinality_error":
+        if category == "atomicity":
+            allow_add = True
             allow_remove = True
-            if interface_id and interface_id not in removable_ids:
-                removable_ids.append(interface_id)
+            for interface_id in interface_ids:
+                if interface_id and interface_id not in removable_ids:
+                    removable_ids.append(interface_id)
     for interface in (current_interface_plan or {}).get("interfaces") or []:
         if not isinstance(interface, dict):
             continue
@@ -453,132 +481,63 @@ def build_graph_obligations_from_interfaces(*, interface_plan: dict[str, Any]) -
 
 def _interface_plan_prompt() -> str:
     return f"""
+1. AUTHORITATIVE FACTS
+The user payload contains only the complete system goal, frozen FunctionItems,
+the platform contract, and frozen requirement allocations. target_file values
+are the complete legal member domain. FunctionItem inputs and outputs are frozen.
+
+2. TASK
 You are planning semantic interfaces between already-frozen executable FunctionItems.
+Produce the complete Interface Intent Plan. One Interface Intent represents one
+independently bindable runtime transfer and must expand into exactly one graph
+edge. A later binder materializes each Interface object as exactly one source
+endpoint connected to exactly one target endpoint. For every frozen FunctionItem,
+inspect each declared input independently.
+For each input decide whether its runtime source is the platform, exactly one
+upstream FunctionItem, a declared resource, or optional/default behavior. Create
+an Interface Intent only when a runtime transfer is required.
 
-The complete system has already been decomposed. Each supplied FunctionItem is one atomic executable subsystem.
+For member_to_member, the goal must name exactly one source output, exactly one
+target input, and the semantic reason for the transfer. If the same source member
+provides three different outputs to the same target member, return three records.
+Repeated source_member and target_member pairs are allowed when their transfer
+goals differ; use multiple member_to_member Interfaces between the same
+source_member and target_member. Source endpoints may fan out to multiple
+independently bindable targets. Source outputs are reusable. Do not determine
+the number of Interfaces from the number of source outputs. A structured value
+transferred into one target input remains one logical transfer regardless of how
+many internal fields it contains. required_inputs require incoming transfer
+coverage; defaulted_inputs do not require an Interface unless semantics require
+an override.
 
-Do not create another subsystem decomposition. Do not add, remove, rename, merge, split, group, or duplicate FunctionItems.
+3. INVARIANTS
+- Do not add, remove, rename, merge, split, or modify frozen FunctionItems.
+- source_member and target_member must exactly copy legal target_file values.
+- A required input without a default needs a runtime source.
+- An optional input or input with a valid default does not require an Interface
+  merely for completeness.
+- Do not combine multiple independently required target inputs into one Interface goal.
+- Do not invent a platform input merely because an upstream transfer was missed.
+- Do not connect members by matching field names alone; use responsibilities,
+  declared ports, workflow semantics, requirements, and platform contract together.
+- Do not return endpoint IDs, port IDs, edges, paths, comments, or extra fields.
+- Do not reproduce, quote, summarize, or copy these instructions into the result.
+- Do not include planning notes, explanations, Markdown fences, comments, or
+  hidden reasoning.
 
-source_member and target_member must be exact target_file values selected from
-the supplied function_items. target_file is FunctionItem identity. inputs and
-outputs are port declarations and are not FunctionItem identities.
+4. FINAL SELF-CHECK
+Before returning, silently inspect every target FunctionItem input:
+- required runtime inputs have a supporting Interface;
+- optional/defaultable inputs are not treated as mandatory;
+- no required upstream member relation is omitted;
+- no Interface combines multiple independently bindable transfers;
+- repeated member pairs and fan-out transfers remain separate;
+- no Interface introduces an undeclared member;
+- no intermediate output is incorrectly returned to the platform;
+- only true final outputs have member_to_platform intent.
 
-Your only task is to declare the necessary interaction directions:
-1. platform input to a FunctionItem;
-2. one FunctionItem to another FunctionItem;
-3. a FunctionItem to platform output.
-
-Each interface object represents exactly one logical data-transfer obligation.
-
-A later graph-binding step will materialize each interface object as exactly
-one source endpoint connected to exactly one target endpoint.
-
-Each interface represents one independent logical transfer to one target
-endpoint.
-
-Each Interface ultimately materializes as one source endpoint, one target
-endpoint, and one ResponsibilityEdge.
-
-Source endpoints are reusable.
-
-Source outputs are reusable. A source output may supply multiple different
-target inputs or platform output slots when the system semantics require it.
-
-Do not treat a source output as consumed after one interface uses it.
-
-Do not determine the number of interfaces from the number of source outputs.
-
-Do not determine the number of interfaces from whether the same source_member
-and target_member already have another interface.
-
-Declare an additional interface only when there is another independent target
-input or platform output obligation that still requires a source.
-
-A structured value transferred into one target input remains one logical
-transfer regardless of how many internal fields the value contains.
-
-The complete interface plan must cover every required target input and every
-required platform output, while avoiding multiple interfaces that compete for
-the same target endpoint.
-
-Use one interface per independent target transfer obligation.
-
-Do not classify interfaces as duplicates merely because source_member,
-target_member, or the eventual source output is the same. Interfaces are
-duplicates only when they point to the same logical target obligation and carry
-the same transfer responsibility.
-
-required_inputs require incoming transfer coverage.
-
-defaulted_inputs do not require an interface unless the system semantics
-explicitly require an override.
-
-Therefore, do not combine multiple independently required target inputs into
-one broad interface.
-
-When one FunctionItem requires multiple independent inputs from the same
-source FunctionItem, declare multiple member_to_member interfaces between the
-same source_member and target_member. Each interface must have a distinct goal
-describing one logical data transfer.
-
-Interfaces between the same members are not duplicates when their goals
-represent different required data transfers.
-
-An interface is a duplicate only when it repeats the same direction and the
-same logical data-transfer responsibility.
-
-For every required FunctionItem input that has no default value, the complete
-interface plan must contain one incoming interface intent capable of supplying
-that input.
-
-For every required platform final output, the complete interface plan must
-contain one member_to_platform interface intent capable of supplying that
-output.
-
-Do not output endpoint IDs, port IDs, input IDs, output IDs, or ResponsibilityEdges.
-
-Do not invent paths or place paths in goal. This does not prohibit the exact
-target_file values required in source_member and target_member.
-
-Do not copy full port declarations into interface objects. However, the goal
-must describe the specific data responsibility clearly enough to distinguish
-independent transfers.
-
-Infer semantic transfers only from:
-- the complete system goal;
-- FunctionItem purposes;
-- declared FunctionItem inputs and outputs;
-- executable requirement allocations;
-- unowned system requirements and requirement channels. Unowned requirements
-  are only possibly relevant system context; decide their relevance from their
-  channel and semantics rather than assuming they describe an interaction;
-- the platform contract.
-
-Do not infer relationships from filenames, suffixes, roles, naming conventions,
-business keyword tables, or fixed workflow templates.
-
-Example:
-
-FunctionItem A produces three independent data values required by FunctionItem B.
-
-Incorrect:
-Declare one broad A-to-B interface whose goal groups all three values.
-
-Correct:
-Declare three A-to-B interfaces. Each interface represents one independent
-logical transfer and has a distinct transfer goal.
-
-Do not include endpoint IDs or port IDs in the returned interface objects.
-
-Do not copy complete FunctionItem definitions, complete port declarations,
-dependencies, capabilities, commands, paths, or argv contracts into the
-interface objects.
-
-The interface goal may describe the specific data responsibility in natural
-language when necessary to distinguish one logical transfer from another.
-
-Return only strict JSON matching this schema. No markdown unless the transport wraps the single JSON object in one json fence.
-Schema:
+5. OUTPUT CONTRACT
+Return only the requested JSON object matching this schema:
 {json.dumps(INTERFACE_SCHEMA, ensure_ascii=False)}
 """.strip()
 
@@ -591,33 +550,107 @@ async def _reformat_interface_plan_response(*, raw_response: str, validation_err
     return _parse_object(text)
 
 
+INTERFACE_REVIEW_CATEGORIES = {"coverage", "atomicity", "alignment", "reference", "other"}
+INTERFACE_REVIEW_ISSUE_FIELDS = {
+    "code", "category", "message", "affected_interfaces", "affected_members",
+    "affected_inputs", "evidence",
+}
+INTERFACE_REVIEW_SCHEMA = {
+    "passed": "boolean",
+    "issues": [{
+        "code": "string", "category": "coverage|atomicity|alignment|reference|other",
+        "message": "string", "affected_interfaces": ["string"],
+        "affected_members": ["string"],
+        "affected_inputs": [{"target_member": "string", "target_input": "string"}],
+        "evidence": "object",
+    }],
+}
+
+
+def normalize_interface_review_issue(
+    raw_issue: dict[str, Any], frozen_function_items: list[dict[str, Any]],
+    current_interface_plan: dict[str, Any], *, path: str = "$.issues[]",
+) -> dict[str, Any]:
+    """Validate one open issue envelope using reference existence only."""
+    if not isinstance(raw_issue, dict) or set(raw_issue) != INTERFACE_REVIEW_ISSUE_FIELDS:
+        _raise("semantic review issue has invalid shape", "invalid_interface_semantic_review_protocol", path=path)
+    code = str(raw_issue.get("code") or "").strip()
+    category = str(raw_issue.get("category") or "").strip()
+    message = str(raw_issue.get("message") or "").strip()
+    affected_interfaces = raw_issue.get("affected_interfaces")
+    affected_members = raw_issue.get("affected_members")
+    affected_inputs = raw_issue.get("affected_inputs")
+    evidence = raw_issue.get("evidence")
+    if (not code or category not in INTERFACE_REVIEW_CATEGORIES or not message
+            or not isinstance(affected_interfaces, list)
+            or not all(isinstance(value, str) and value.strip() for value in affected_interfaces)
+            or not isinstance(affected_members, list)
+            or not all(isinstance(value, str) and value.strip() for value in affected_members)
+            or not isinstance(affected_inputs, list)
+            or not isinstance(evidence, dict) or not evidence):
+        _raise("semantic review issue is not auditable", "invalid_interface_semantic_review_protocol", path=path)
+
+    known_interfaces = {
+        str(interface.get("interface_id") or "")
+        for interface in current_interface_plan.get("interfaces") or []
+    }
+    compact_items = _compact_function_items(frozen_function_items)
+    inputs_by_member = {
+        item["target_file"]: {value["name"] for value in item.get("inputs") or []}
+        for item in compact_items
+    }
+    if any(value not in known_interfaces for value in affected_interfaces):
+        _raise("review issue references an unknown interface", "invalid_interface_semantic_review_reference", path=f"{path}.affected_interfaces")
+    if any(value not in inputs_by_member for value in affected_members):
+        _raise("review issue references an unknown member", "invalid_interface_semantic_review_reference", path=f"{path}.affected_members")
+    normalized_inputs: list[dict[str, str]] = []
+    for input_index, value in enumerate(affected_inputs):
+        input_path = f"{path}.affected_inputs[{input_index}]"
+        if not isinstance(value, dict) or set(value) != {"target_member", "target_input"}:
+            _raise("affected input has invalid shape", "invalid_interface_semantic_review_protocol", path=input_path)
+        member = str(value.get("target_member") or "").strip()
+        target_input = str(value.get("target_input") or "").strip()
+        if member not in inputs_by_member or target_input not in inputs_by_member[member]:
+            _raise("review issue references an unknown declared input", "invalid_interface_semantic_review_reference", path=input_path)
+        normalized_inputs.append({"target_member": member, "target_input": target_input})
+
+    envelope = {
+        "code": code, "category": category, "message": message,
+        "affected_interfaces": list(affected_interfaces),
+        "affected_members": list(affected_members),
+        "affected_inputs": normalized_inputs, "evidence": dict(evidence),
+    }
+    return {
+        **envelope, "stage": "interface_semantic_review", "path": path,
+        "interface_id": affected_interfaces[0] if affected_interfaces else "",
+        "details": envelope,
+    }
+
+
+def interface_issue_fingerprint(issue: dict[str, Any]) -> tuple[Any, ...]:
+    details = issue.get("details") if isinstance(issue.get("details"), dict) else issue
+    return (
+        details.get("category") or issue.get("category"),
+        tuple(sorted(details.get("affected_interfaces") or [])),
+        tuple(sorted(details.get("affected_members") or [])),
+        tuple(sorted(
+            (str(value.get("target_member") or ""), str(value.get("target_input") or ""))
+            for value in (details.get("affected_inputs") or []) if isinstance(value, dict)
+        )),
+    )
+
+
 def _validate_interface_review_response(
     *, value: dict[str, Any], interface_plan: dict[str, Any],
     frozen_function_items: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    if set(value) != {"passed", "issues"} or not isinstance(value.get("passed"), bool) or not isinstance(value.get("issues"), list):
+    if (set(value) != {"passed", "issues"} or not isinstance(value.get("passed"), bool)
+            or not isinstance(value.get("issues"), list)):
         _raise("semantic review response has invalid shape", "invalid_interface_semantic_review_protocol", path="$")
-    known_ids = {interface["interface_id"] for interface in interface_plan.get("interfaces") or []}
-    issues: list[dict[str, Any]] = []
-    for index, raw in enumerate(value["issues"]):
-        path = f"$.issues[{index}]"
-        if not isinstance(raw, dict) or set(raw) != {"code", "category", "interface_id", "message", "evidence"}:
-            _raise("semantic review issue has invalid shape", "invalid_interface_semantic_review_protocol", path=path)
-        interface_id = str(raw.get("interface_id") or "").strip()
-        if (raw.get("code") != "interface_semantic_inconsistency"
-                or raw.get("category") != "semantic_alignment_error"
-                or interface_id not in known_ids
-                or not isinstance(raw.get("message"), str) or not raw["message"].strip()
-                or not isinstance(raw.get("evidence"), dict) or not raw["evidence"]):
-            _raise("semantic review issue is not auditable", "invalid_interface_semantic_review_protocol", path=path)
-        issues.append({
-            "code": raw["code"], "category": raw["category"],
-            "stage": "interface_semantic_review", "path": f"$.interfaces[{interface_id}]",
-            "interface_id": interface_id, "message": raw["message"],
-            "observed_value": None, "expected_constraint": {"type": "semantic_alignment"},
-            "allowed_scope": [item["target_file"] for item in _compact_function_items(frozen_function_items)],
-            "details": {"evidence": raw["evidence"]},
-        })
+    issues = [
+        normalize_interface_review_issue(raw, frozen_function_items, interface_plan, path=f"$.issues[{index}]")
+        for index, raw in enumerate(value["issues"])
+    ]
     if value["passed"] != (not issues):
         _raise("semantic review passed flag contradicts issues", "invalid_interface_semantic_review_protocol", path="$.passed")
     return issues
@@ -627,15 +660,20 @@ async def _reformat_interface_review_response(
     *, raw_response: str, validation_error: InterfaceIntentPlanError,
     reviewer_model: str, model_call: ModelCall,
 ) -> dict[str, Any]:
-    prompt = """Return only a corrected JSON object matching the supplied review schema.
-Preserve the review's existing semantic conclusions and issue evidence. Do not
-add or remove issues, change interface IDs, or propose repairs. Only correct
-protocol shape and make passed consistent with whether issues is empty.
-Schema: {"passed": boolean, "issues": [{"code": string, "category": string,
-"interface_id": string, "message": string, "evidence": object}]}"""
-    payload = {"raw_response": raw_response, "validation_error": {
-        "code": validation_error.code, "message": str(validation_error), "details": validation_error.details,
-    }}
+    prompt = """Repair only the JSON protocol shape.
+Preserve every semantic conclusion, issue code, category, message, affected
+reference, and evidence.
+Do not add, remove, merge, split, or reinterpret issues.
+Every issue must use the single supplied issue schema, regardless of its code.
+Return only the corrected JSON object."""
+    payload = {
+        "review_schema": INTERFACE_REVIEW_SCHEMA,
+        "raw_response": raw_response,
+        "validation_error": {
+            "code": validation_error.code, "message": str(validation_error),
+            "details": validation_error.details,
+        },
+    }
     logger.info("[Creator][interface_semantic_review_protocol_repair] attempt=1")
     text = await model_call(
         [{"role": "system", "content": prompt},
@@ -654,8 +692,16 @@ async def review_interface_plan_semantically(
     model_call: ModelCall,
 ) -> list[dict[str, Any]]:
     """Ask once for semantic diagnostics; never ask the reviewer for a repair."""
-    prompt = """Review an Interface Intent Plan against the complete supplied system semantics.
-You are reviewing only the Interface Intent layer.
+    prompt = """1. AUTHORITATIVE FACTS
+The payload contains frozen FunctionItems with declared input required/default
+facts, the current Interface Intent Plan, frozen allocations, and platform contract.
+
+2. TASK
+Review an Interface Intent Plan against the complete supplied system semantics.
+You are reviewing only the Interface Intent layer. Build an internal coverage
+checklist from frozen target inputs. For each required target input, determine
+whether one Interface Intent clearly describes its runtime source and transfer.
+Review semantic coverage, not only natural-language direction.
 
 An Interface Intent declares only:
 - whether data flows from the platform to a frozen FunctionItem;
@@ -729,13 +775,31 @@ Every reported issue must be solvable by modifying only one or more of:
 If an alleged concern requires any other field, it is outside this review
 stage and must not be reported.
 
-Return only {"passed": boolean, "issues": array}. Do not modify or return the
-plan. Do not propose the correct source or target. Do not output endpoint or port IDs.
-Do not infer from filenames, roles, keywords, naming conventions, string
-similarity, or a fixed workflow. Every issue must contain code
-"interface_semantic_inconsistency", category "semantic_alignment_error",
-interface_id, message, and a non-empty evidence object grounded in the supplied
-goal, requirement IDs, purposes, or platform contract.
+Reject the plan when a required target input lacks a transfer, an Interface
+combines independently bindable transfers, a member relation is missing, an
+optional/default input is made mandatory without evidence, or a platform source
+is invented without semantic evidence. Report violated facts only; never choose
+a source member, output, endpoint, or repair.
+
+3. INVARIANTS
+Every issue uses the same envelope regardless of code. code is a stable,
+model-defined identifier. category must be one of coverage, atomicity, alignment,
+reference, or other. Every location uses the affected_interfaces,
+affected_members, and affected_inputs arrays; return [] when one is inapplicable.
+evidence must be a non-empty object, including an explanation when all affected
+arrays are empty. Do not reproduce these instructions or include reasoning notes.
+
+4. FINAL SELF-CHECK
+Silently verify every referenced Interface, member, and declared target input
+exists in the authoritative facts, passed equals whether issues is empty, and
+all issues use exactly the same envelope.
+
+5. OUTPUT CONTRACT
+Return only {"passed": boolean, "issues": [{"code": string, "category":
+"coverage|atomicity|alignment|reference|other", "message": string,
+"affected_interfaces": [string], "affected_members": [string],
+"affected_inputs": [{"target_member": string, "target_input": string}],
+"evidence": object}]}. Do not return the plan or graph endpoints.
 
 Some interfaces may already contain deterministic reference or scope errors;
 the backend reports those separately. Do not duplicate deterministic reference
@@ -871,6 +935,7 @@ async def plan_function_item_interfaces(*, original_user_goal: str, frozen_funct
             skill_name=skill_name,
             planner_model=planner_model,
             model_call=model_call,
+            reviewer_model=reviewer_model,
         )
     return validate_interface_intent_plan(plan=parsed, function_items=frozen_function_items)
 
@@ -884,7 +949,7 @@ async def repair_interface_plan_semantically(
     interaction_requirements: list[dict[str, Any]] | None = None,
     platform_contract: dict[str, Any] | None = None, skill_name: str = "",
     repair_stage: str = "initial_interface_validation",
-    planner_model: str, model_call: ModelCall,
+    planner_model: str, model_call: ModelCall, reviewer_model: str | None = None,
 ) -> dict[str, Any]:
     """Perform one bounded, model-driven semantic repair of the full plan."""
     system_requirements_context = (
@@ -900,160 +965,38 @@ async def repair_interface_plan_semantically(
         bool(repair_scope.get("allow_add_interfaces")), bool(repair_scope.get("allow_remove_interfaces")),
     )
 
-    uncovered_inputs: list[dict[str, str]] = []
-    overcomplete_interfaces: list[dict[str, str]] = []
-    for error in validation_issues:
-        details = error.get("details") if isinstance(error, dict) else None
-        if not isinstance(details, dict):
-            continue
-        if error.get("code") == "interface_plan_overcomplete":
-            interface_id = str(details.get("interface_id") or "").strip()
-            if interface_id:
-                overcomplete_interfaces.append({
-                    "interface_id": interface_id,
-                    "obligation_id": str(details.get("obligation_id") or "").strip(),
-                    "kind": str(details.get("kind") or "").strip(),
-                    "reason": str(details.get("reason") or "").strip(),
-                })
-        raw_uncovered = details.get("uncovered_inputs")
-        if not isinstance(raw_uncovered, list):
-            continue
-        for item in raw_uncovered:
-            if not isinstance(item, dict):
-                continue
-            target = str(item.get("target") or "").strip()
-            input_id = str(item.get("input_id") or "").strip()
-            if target and input_id:
-                uncovered_inputs.append({"target": target, "input_id": input_id})
-    prompt = """You are repairing the complete system's Interface Intent Plan.
+    prompt = """1. AUTHORITATIVE FACTS
+The payload contains compact frozen FunctionItems, the failed complete Interface
+Plan, unified blocking issue envelopes, requirement allocations, the platform
+contract, repair_scope, the legal member domain, and the legal Interface schema.
 
-The returned Interface Plan must use exactly the supplied Interface Intent
-schema.
+2. TASK
+Repair the Interface Intent Plan so that the supplied blocking issues are
+resolved. Use the complete system semantics to decide the correct change. The
+validation issues describe violated facts; they do not prescribe the
+business-semantic answer. Make the smallest concrete semantic change.
 
-Never add fields outside the supplied Interface Intent schema.
+3. INVARIANTS
+- Do not modify FunctionItems or add fields outside the Interface schema.
+- Do not infer relationships from filenames or matching field names alone.
+- Do not invent platform inputs merely to close the graph.
+- Preserve unaffected Interfaces byte-for-byte and in order.
+- Repeated member pairs are allowed when transfers are independent.
+- One Interface remains independently bindable to one graph edge.
+- Add or remove Interfaces only when repair_scope permits.
+- Returning an unchanged plan is invalid.
+- Do not add endpoint IDs, port IDs, source paths, or graph edges.
 
-In particular, never add:
-- source_field;
-- target_field;
-- source_id;
-- target_id;
-- input_id;
-- output_id;
-- port_id;
-- stdout_field;
-- platform_slot;
-- source_path;
-- argv;
-- placeholder;
-- runtime binding metadata.
+4. FINAL SELF-CHECK
+Silently verify every supplied blocking issue is addressed by a concrete
+semantic change; every change is within scope; every member is in the frozen
+domain; independent transfers are not merged; no optional/default input is made
+mandatory without evidence; no platform source was invented only for closure;
+and the plan differs meaningfully from the failed plan.
 
-Concrete port, endpoint, platform-slot, stdout-field, and source-path selection
-belongs to the later Endpoint Binding and Graph Expansion stages.
-Do not attempt to solve those later-stage responsibilities inside the
-Interface Intent Plan.
-
-A semantic repair may modify only the Interface Intent fields permitted by the
-supplied schema:
-- interface_id, only when protocol uniqueness requires it;
-- kind;
-- goal;
-- source_member;
-- target_member.
-Do not expand the protocol.
-
-Some validation issues may describe concerns that belong to later endpoint,
-port, platform-slot, serialization, or runtime-binding stages.
-When an issue cannot be resolved using only the allowed Interface Intent
-fields, do not add new fields and do not redesign the plan.
-Treat that issue as outside the current repair layer and preserve the affected
-Interface Intent unless another supplied issue provides a valid Interface
-Intent-level reason to modify it.
-
-Validation issues are deterministic diagnostics. They identify violated
-constraints but do not supply the business-semantic answer. Use the original
-system goal, frozen FunctionItem purposes, inputs and outputs, requirement
-evidence, interaction requirements, current plan, and platform contract to
-choose the smallest correct repair.
-
-FunctionItems are frozen: do not add, remove, merge, split, rename, or modify
-them. target_file is FunctionItem identity; inputs and outputs are port
-declarations at a different level.
-
-Preserve every existing interface unrelated to the supplied validation errors.
-
-The validation errors are authoritative. In particular,
-uncovered_inputs identifies required FunctionItem inputs that still have no
-incoming graph edge.
-
-An existing interface between two members does not prove that every required
-target input is covered, because each interface will materialize exactly one
-source endpoint to one target endpoint.
-
-For every uncovered input, add or adjust one interface intent representing the
-missing logical data transfer.
-
-Multiple interfaces between the same source_member and target_member are
-allowed and required when they represent different missing data transfers.
-
-Do not merge several uncovered inputs into one broad interface.
-
-Do not return the plan unchanged when uncovered_inputs is non-empty.
-
-Source endpoints are reusable.
-
-Do not remove an interface merely because its source member or eventual source
-endpoint is also used by another interface.
-
-interface_plan_overcomplete means only that the interface identified by
-interface_id has no remaining unbound target endpoint.
-
-It does not mean that:
-- the source endpoint has already been used;
-- the source member has too many outputs;
-- the same source and target members already have another interface;
-- source fan-out is invalid.
-
-For interface_plan_overcomplete:
-- inspect the reported interface_id;
-- remove that interface if it repeats an already satisfied target obligation;
-- adjust it only when validation evidence identifies another unsatisfied
-  target obligation;
-- preserve valid source reuse, valid source fan-out, and unrelated interfaces.
-
-Do not return the plan unchanged when interface_plan_overcomplete is present.
-
-When repairing uncovered_inputs:
-- add or adjust only the transfers required for those uncovered target inputs;
-- do not merge independent target obligations into one broad interface;
-- do not create interfaces solely because a source member exposes additional
-  outputs.
-
-Use FunctionItem purposes, declared inputs and outputs, requirement allocations,
-the current interface plan, and the validation errors to determine the semantic
-source of each missing transfer.
-
-Do not infer sources from filenames, suffixes, role names, naming tables, or
-hard-coded business rules.
-
-Do not add endpoint IDs, input IDs, output IDs, port IDs, or ResponsibilityEdges
-to the returned interface objects.
-
-Do not modify FunctionItems.
-Do not redesign unrelated parts of the plan.
-Obey repair_scope. Preserve every unaffected valid interface byte-for-byte and
-in its existing order. Add or remove interfaces only when the scope permits it.
-Do not invent paths or put paths in goals. source_member and target_member must
-nevertheless use an exact supplied target_file because it is member identity.
-
-Before returning, verify:
-1. Every interface contains exactly the fields allowed for its kind.
-2. No endpoint, port, field-binding, platform-slot, or runtime metadata exists.
-3. Every source_member and target_member is an exact frozen target_file.
-4. Unaffected interfaces remain unchanged.
-5. The result can pass the supplied Interface Intent schema without removing
-   any returned fields.
-
-Return only strict JSON matching the supplied interface schema.
+5. OUTPUT CONTRACT
+Return only the complete Interface Plan JSON matching interface_schema. Do not
+include explanations, Markdown, comments, or hidden reasoning.
 """
     payload = {
         "system_goal": original_user_goal,
@@ -1061,11 +1004,9 @@ Return only strict JSON matching the supplied interface schema.
         "function_items": _compact_function_items(frozen_function_items),
         "current_interface_plan": current_interface_plan,
         "validation_issues": validation_issues,
-        # Compatibility aliases retain useful compact graph diagnostics.
-        "validation_errors": validation_issues,
-        "uncovered_inputs": uncovered_inputs,
-        "overcomplete_interfaces": overcomplete_interfaces,
-        "affected_members": repair_scope.get("affected_members") or [],
+        "legal_member_domain": [
+            item["target_file"] for item in _compact_function_items(frozen_function_items)
+        ],
         "requirement_allocations": requirement_allocations or [],
         "requirement_channels": requirement_channels or {},
         "unowned_system_requirements": system_requirements_context,
@@ -1076,6 +1017,11 @@ Return only strict JSON matching the supplied interface schema.
     text = await model_call([{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}], planner_model)
     try:
         candidate = validate_interface_plan_protocol(_parse_object(text))
+        if candidate == current_interface_plan:
+            raise InterfaceIntentPlanError(
+                "interface repair made no progress", code="repair_no_progress",
+                details={"stage": repair_stage, "original_issues": validation_issues},
+            )
         validate_interface_repair_scope(before=current_interface_plan, after=candidate, repair_scope=repair_scope)
         remaining = collect_interface_plan_validation_issues(
             plan=candidate, function_items=frozen_function_items, platform_contract=platform_contract,
@@ -1085,12 +1031,35 @@ Return only strict JSON matching the supplied interface schema.
                 "semantic issues remain after repair", code="semantic_issues_remain",
                 details={"remaining_issues": remaining},
             )
+        if reviewer_model:
+            after_issues = await review_interface_plan_semantically(
+                original_user_goal=original_user_goal,
+                frozen_function_items=frozen_function_items,
+                interface_plan=candidate,
+                requirement_allocations=requirement_allocations,
+                requirement_channels=requirement_channels,
+                system_requirements=system_requirements_context,
+                platform_contract=platform_contract,
+                reviewer_model=reviewer_model,
+                model_call=model_call,
+            )
+            before_fingerprints = {interface_issue_fingerprint(issue) for issue in validation_issues}
+            after_fingerprints = {interface_issue_fingerprint(issue) for issue in after_issues}
+            if (after_fingerprints == before_fingerprints
+                    or (len(after_issues) >= len(validation_issues) and after_issues)):
+                raise InterfaceIntentPlanError(
+                    "interface repair made no progress", code="repair_no_progress",
+                    details={"stage": repair_stage, "original_issues": validation_issues,
+                             "remaining_issues": after_issues},
+                )
         result = validate_interface_intent_plan(plan=candidate, function_items=frozen_function_items)
     except InterfaceIntentPlanError as exc:
         logger.info(
             "[Creator][interface_semantic_repair] stage=%s attempt=1 result=failed error_code=%s",
             repair_stage, exc.code,
         )
+        if exc.code == "repair_no_progress":
+            raise
         raise InterfaceIntentPlanError(
             "interface semantic repair failed", code="interface_semantic_repair_failed",
             details={"stage": repair_stage, "repair_attempts": 1,
@@ -1116,28 +1085,45 @@ async def repair_interface_intents(
 ) -> dict[str, Any]:
     """Compatibility entry point routing all graph feedback to one repairer."""
     issues: list[dict[str, Any]] = []
+    legal_members = {
+        item["target_file"] for item in _compact_function_items(frozen_function_items)
+    }
+    legal_interfaces = {
+        str(item.get("interface_id") or "")
+        for item in current_interface_plan.get("interfaces") or []
+    }
     for error in validation_errors:
         details = dict(error.get("details") or {})
-        code = str(error.get("code") or "interface_plan_validation_error")
-        category = GRAPH_INTERFACE_ISSUE_CATEGORIES.get(code)
-        if category is None:
-            raise InterfaceIntentPlanError(
-                "graph error is not eligible for interface semantic repair",
-                code=code, details=details,
-            )
-        interface_id = str(details.get("interface_id") or "")
-        issues.append({
-            "code": code,
+        affected_inputs = []
+        for value in details.get("uncovered_inputs") or []:
+            if not isinstance(value, dict):
+                continue
+            member = str(value.get("target") or value.get("target_member") or "").strip()
+            target_input = str(value.get("input_id") or value.get("target_input") or "").strip()
+            if member and target_input:
+                affected_inputs.append({"target_member": member, "target_input": target_input})
+        members = [
+            value for value in dict.fromkeys([
+                *(affected_members or []),
+                *(value["target_member"] for value in affected_inputs),
+            ]) if value in legal_members
+        ]
+        interface_id = str(details.get("interface_id") or "").strip()
+        interfaces = [interface_id] if interface_id in legal_interfaces else []
+        category = "coverage" if affected_inputs or details.get("missing_required_final_output_fields") or (members and not interfaces) else (
+            "atomicity" if interfaces else "other"
+        )
+        envelope = {
+            "code": str(error.get("code") or "graph_binding_issue"),
             "category": category,
-            "stage": "graph_validation", "path": "$.interfaces",
-            "interface_id": interface_id, "message": str(error.get("message") or code),
-            "observed_value": None,
-            "expected_constraint": {"type": "graph_completeness"},
-            "allowed_scope": [item["target_file"] for item in _compact_function_items(frozen_function_items)],
-            "details": details,
-        })
-    for issue in issues:
-        issue["details"]["affected_members"] = list(affected_members or [])
+            "message": str(error.get("message") or "Graph validation failed."),
+            "affected_interfaces": interfaces,
+            "affected_members": members,
+            "affected_inputs": affected_inputs,
+            "evidence": {"graph_error": str(error.get("code") or "graph_binding_issue"), "details": details},
+        }
+        issues.append({**envelope, "stage": "graph_validation", "path": "$.interfaces",
+                       "interface_id": interfaces[0] if interfaces else "", "details": envelope})
     scope = build_interface_repair_scope(issues, current_interface_plan)
     if missing_platform_output_fields:
         scope["allow_add_interfaces"] = True

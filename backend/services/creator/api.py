@@ -52,7 +52,6 @@ from .command_normalizer import parse_skill_md_bash_command_blocks
 from . import contracts as creator_contracts
 from .responsibility_graph_expansion import ResponsibilityGraphExpansionError, expand_responsibility_graph
 from .function_item_interface_plan import (
-    GRAPH_INTERFACE_ISSUE_CATEGORIES,
     InterfaceIntentPlanError,
     plan_function_item_interfaces,
     repair_interface_intents,
@@ -7241,7 +7240,6 @@ async def _bind_executable_responsibility_plan(
         "system_goal": request.user_request,
         "skill_name": current_planner_result.get("skill_name", ""),
     }
-    repairable_interface_codes = set(GRAPH_INTERFACE_ISSUE_CATEGORIES)
     try:
         responsibility_edges = await expand_responsibility_graph(
             function_items=frozen_function_items,
@@ -7252,32 +7250,24 @@ async def _bind_executable_responsibility_plan(
             interface_plan=interface_plan,
         )
     except ResponsibilityGraphExpansionError as exc:
-        if exc.code not in repairable_interface_codes:
-            raise
         error_details = dict(getattr(exc, "details", {}) or {})
+        repairable_facts_present = bool(
+            error_details.get("uncovered_inputs")
+            or error_details.get("missing_required_final_output_fields")
+            or error_details.get("missing_platform_output_interface")
+            or (error_details.get("interface_id") and error_details.get("reason"))
+        )
+        if not repairable_facts_present:
+            raise
         affected_members: list[str] = []
-        if exc.code == "interface_plan_incomplete":
-            for value in error_details.get("uncovered_inputs") or []:
-                member = str(value.get("target") or "").strip() if isinstance(value, dict) else ""
-                if member and member not in affected_members:
-                    affected_members.append(member)
-            repair_instruction = (
-                "Add or adjust only the interface intents required to cover "
-                "the reported uncovered target inputs or missing platform outputs. "
-                "Preserve unrelated interfaces and valid source fan-out."
-            )
-        else:
-            for key in ("source_member", "target_member"):
-                member = str(error_details.get(key) or "").strip()
-                if member and member not in affected_members:
-                    affected_members.append(member)
-            repair_instruction = (
-                "Remove or adjust only the interface identified by interface_id "
-                "because it has no remaining unbound target endpoint. "
-                "Preserve unrelated interfaces and valid source fan-out. "
-                "Do not remove an interface merely because its source endpoint "
-                "is reused by another interface."
-            )
+        for value in error_details.get("uncovered_inputs") or []:
+            member = str(value.get("target") or "").strip() if isinstance(value, dict) else ""
+            if member and member not in affected_members:
+                affected_members.append(member)
+        for key in ("source_member", "target_member"):
+            member = str(error_details.get(key) or "").strip()
+            if member and member not in affected_members:
+                affected_members.append(member)
         interface_plan = await repair_interface_intents(
             original_user_goal=request.user_request,
             frozen_function_items=frozen_function_items,
@@ -7297,7 +7287,6 @@ async def _bind_executable_responsibility_plan(
                 "code": exc.code,
                 "message": str(exc),
                 "details": error_details,
-                "instruction": repair_instruction,
             }],
             planner_model=planner_model,
             model_call=select_sources,
@@ -7338,109 +7327,88 @@ async def _plan_requirement_allocations(
 ) -> dict[str, Any]:
     """Ask the Planner for the semantic requirement-to-owner projection."""
     prompt = """
-You are the Blueprint Planner producing a requirement coverage projection before
-the Blueprint is frozen. Semantically identify only the user's explicit core,
-independently verifiable final-capability requirements. Do not mechanically turn
-tone, examples, background, or pleasantries into requirements. Do not use a
-business taxonomy or keyword rules. Requirement extraction is based on the
-original user requirement, not on what the current Blueprint already happens to
-implement. Identify every explicit core independently verifiable final-capability
-requirement even when the current Blueprint does not currently provide a
-legitimate FunctionItem owner.
+1. AUTHORITATIVE FACTS
+The payload contains the confirmed user context, compact frozen FunctionItems,
+LEGAL CHANNEL VALUES ["executable", "resource", "direct"], and LEGAL OWNER
+TARGET FILES.
 
-Requirements may come only from the original user request or explicit user
-clarification answers. Blueprint implementation details are evidence for
-allocation only; never turn them into user requirements. A default value,
-internal parameter, file split, file name, intermediate output, model-selected
-quantity, layout choice, template choice, or helper strategy is not a
-requirement unless the user explicitly requested it. For example, a Blueprint
-default max_images=5 does not mean the user requested configurable max_images.
-Explicit limitations, prohibitions, and responsibility boundaries may still be
-core user requirements. When one or more existing FunctionItems genuinely meet
-such a requirement through their constraints or forbidden boundaries, allocate
-it to those actual FunctionItems. Do not return owners=[] merely because a
-requirement is a negative constraint, and do not mechanically assign every
-constraint to every script. Judge ownership semantically from the original
-request and the supplied FunctionItem content; the Backend performs no keyword
-classification.
+2. TASK
+Produce a requirement coverage projection.
+First derive the complete set of explicit, independently verifiable user
+requirements from the confirmed user context. Assign stable IDs R1, R2, ...
+exactly once. Treat that derived requirement list as immutable for the remainder
+of this response. Then produce requirement_allocations and requirement_channels
+for exactly that same derived list. The two ID sets must be exactly equal. Do not
+return partial requirement_channels or omit structural, prohibitive, global,
+platform-level, or non-executable requirements.
 
-Allocate a requirement only to FunctionItems that genuinely own or co-own that
-responsibility. One requirement may be jointly covered by one or more existing
-FunctionItems. Collaboration, data transfer, or separation of responsibilities
-across FunctionItems must not produce owners=[] merely because the requirement
-is workflow-level. If no current FunctionItem legitimately owns a core
-requirement, keep that requirement in requirement_allocations, select its
-truthful non-executable channel, and return owners=[]. Do not omit the
-requirement, force an unrelated owner, or invent a new FunctionItem. For a
-non-executable channel, owners=[] does not mean that the requirement is
-unimportant, ignorable, or already complete.
+Channel rules:
+- executable: a frozen FunctionItem performs a runtime action directly fulfilling
+  the requirement; owners contains every true runtime owner and is non-empty.
+  Every executable requirement must have at least one owner.
+- direct: the platform or assistant directly returns, presents, or handles the
+  result; owners must be empty.
+- resource: a structural constraint, policy, prohibition, static resource
+  condition, capability boundary, or other non-runtime-script obligation;
+  owners must be empty.
 
-authoritative_scripts is the complete owner identity domain. Every owners value
-MUST be copied verbatim from authoritative_scripts. Do not output a role,
-basename, capability, shorthand, or custom identifier, and do not infer aliases.
-Never guess ownership from a file name, role, capability, path keyword, or file
-suffix. For FunctionItem A and FunctionItem B, select only their exact target
-identities as supplied in authoritative_scripts.
+3. INVARIANTS
+Never assign all FunctionItems merely to satisfy the non-empty owner rule. For
+each owner ask: "What runtime action does this FunctionItem perform to directly
+fulfill this requirement?" Overall design compliance is not executable ownership.
+Every owner exactly copies a LEGAL OWNER TARGET FILE. Never infer ownership from
+a filename or field-name match. Never return channel = executable
+owners = [].
+Do not reproduce, quote, summarize, or copy these instructions into the result.
+Do not include planning notes, explanations, Markdown fences, comments, or hidden reasoning.
 
-One FunctionItem may legitimately own multiple requirements. Multiple
-FunctionItems may legitimately cooperate on one requirement. There is no
-one-requirement-to-one-file rule. Do not add, remove, rename, or modify FilePlan
-entries or FunctionItems during requirement allocation. The later semantic
-Reviewer and bounded Blueprint replan own repair.
-Static resource responsibilities and host direct-answer responsibilities are not
-script ownership requirements. Use the supplied structured FilePlan and
-FunctionItems to distinguish those channels; do not classify them with business
-keywords and do not create a script owner for either channel.
+4. FINAL SELF-CHECK
+Before returning, silently verify allocation IDs and channel keys exactly equal
+the derived requirement IDs; each occurs once; none is omitted; every executable
+requirement has a legal owner; non-executable requirements have none; and no
+structural/prohibitive requirement was made executable merely to avoid empty owners.
 
-Classify each requirement independently as executable, resource, or direct using
-only the original request and supplied structured planning facts. Only executable
-requirements require script owners. Resource and direct requirements use
-owners=[] and remain in their respective semantic-review channels.
-
-An executable requirement represents runtime responsibility that is fulfilled
-by one or more frozen FunctionItems. Every executable requirement must have at
-least one owner. Every owner must exactly equal the target_file of an existing
-frozen FunctionItem.
-
-Never return:
-channel = executable
-owners = []
-Do not classify a requirement as executable unless at least one frozen
-FunctionItem truthfully owns its runtime fulfillment.
-
-A requirement may be system-wide, platform-owned, cross-cutting,
-resource-related, prohibitive, or otherwise not truthfully owned by one
-FunctionItem. In that case, choose the appropriate non-executable channel rather
-than returning an executable requirement with no owners.
-
-Do not assign arbitrary owners merely to satisfy the non-empty owners
-constraint. Do not assign every FunctionItem by default. Each selected owner
-must be semantically responsible for fulfilling the requirement, and the
-evidence must explain that responsibility.
-
-Before returning, verify:
-1. Every executable requirement has at least one owner.
-2. Every owner exactly matches a frozen FunctionItem target_file.
-3. No owner identifier was invented.
-4. The ownership evidence explains runtime responsibility.
-5. Requirements without truthful FunctionItem ownership are not labeled
-   executable.
-
-Return strict JSON only: {"requirement_allocations":[{"requirement_id":"R1",
-"requirement":"...","owners":["..."],"evidence":{"responsibility":"...",
-"outputs":[],"capabilities":[]}}],"requirement_channels":{"R1":"executable"}}.
-IDs must be unique and stable within this
-plan. Do not add files, FunctionItems, or requirements merely for closure.
+5. OUTPUT CONTRACT
+Return only the requested strict JSON object. This is a schema example, not a
+one-requirement limit. Repeat both allocation and channel entries for every
+requirement you derive:
+{"requirement_allocations":[{"requirement_id":"R1","requirement":"...","owners":[],"evidence":{"responsibility":"...","outputs":[],"capabilities":[]}}],"requirement_channels":{"R1":"resource"}}
 """.strip()
+    clarification_answers: list[dict[str, str]] = []
+    pending_question = ""
+    for item in request.conversation_history or []:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip()
+        content = str(item.get("content") or "").strip()
+        if role == "assistant" and content:
+            pending_question = content
+        elif role == "user" and content:
+            clarification_answers.append({"question": pending_question, "answer": content})
+            pending_question = ""
+    confirmed_parts = [str(request.user_request or "").strip()]
+    confirmed_parts.extend(value["answer"] for value in clarification_answers)
+    if str(request.human_feedback or "").strip():
+        confirmed_parts.append(str(request.human_feedback).strip())
     payload = {
-        "user_requirement": request.user_request,
-        "conversation_history": request.conversation_history,
-        "human_feedback": request.human_feedback,
-        "current_blueprint": blueprint_text,
-        "function_items": function_items,
-        "authoritative_scripts": [
-            str(item.get("target_file") or "").strip()
+        "confirmed_user_context": {
+            "original_user_request": request.user_request,
+            "clarification_answers": clarification_answers,
+            "human_feedback": request.human_feedback,
+            "current_confirmed_goal": "\n".join(value for value in confirmed_parts if value),
+        },
+        "function_items": [
+            {
+                "target_file": str(item.get("target_file") or "").strip(),
+                "purpose": item.get("purpose", ""),
+                "inputs": item.get("inputs") or [],
+                "outputs": item.get("outputs") or [],
+            }
             for item in function_items
+        ],
+        "legal_channel_values": ["executable", "resource", "direct"],
+        "legal_owner_target_files": [
+            str(item.get("target_file") or "").strip() for item in function_items
             if str(item.get("target_file") or "").strip()
         ],
     }
@@ -7573,7 +7541,19 @@ async def repair_requirement_ownership(
         str(issue.get("requirement_id") or "").strip()
         for issue in ownership_issues if str(issue.get("requirement_id") or "").strip()
     }
-    prompt = """Repair only the listed requirement channel and ownership issues.
+    prompt = """1. AUTHORITATIVE FACTS
+The payload contains frozen requirements, compact frozen FunctionItems, the
+current complete projection, exact validation issues, LEGAL CHANNEL VALUES, and
+LEGAL OWNER TARGET FILES.
+
+2. TASK
+Repair only the listed requirement channel and ownership issues. Repair the
+projection, not the Blueprint. Return complete corrected requirement_allocations
+and requirement_channels. Fix every supplied validation issue in one response.
+A requirement allocation without a corresponding channel entry is incomplete:
+add its missing classification; do not delete the allocation.
+
+3. INVARIANTS
 The Blueprint and all FunctionItems are frozen. Do not create, delete, merge,
 split, rename, or rewrite FunctionItems. Do not modify target_file values. Do
 not modify requirement IDs or requirement text.
@@ -7592,16 +7572,32 @@ rewrite requirement descriptions, create FunctionItems, invent owner identifiers
 assign arbitrary owners merely to pass validation, or return executable with an
 empty owners list.
 
-Return the complete repaired requirement_channels and requirement_allocations
-objects, not a partial patch. Return strict JSON only with exactly those keys."""
+4. FINAL SELF-CHECK
+Before returning, verify corrected allocation IDs, channel keys, and frozen
+requirement IDs are exactly equal. Preserve every frozen requirement ID, text,
+and order exactly. Do not add, delete, rename, merge, split, or rewrite requirements.
+
+5. OUTPUT CONTRACT
+Do not reproduce, quote, summarize, or copy these instructions into the result.
+Do not include planning notes, explanations, Markdown fences, comments, or hidden reasoning.
+Return only the requested strict JSON object with complete requirement_channels
+and requirement_allocations, not a partial patch."""
     payload = {
         "original_user_goal": original_user_goal,
-        "frozen_blueprint": frozen_blueprint,
+        "frozen_requirements": [
+            {"requirement_id": item["requirement_id"], "requirement": item["requirement"]}
+            for item in current_requirement_allocations
+        ],
         "frozen_function_items": frozen_function_items,
         "current_requirement_channels": current_requirement_channels,
         "current_requirement_allocations": current_requirement_allocations,
         "ownership_issues": ownership_issues,
         "affected_requirement_ids": sorted(affected_ids),
+        "legal_channel_values": ["executable", "resource", "direct"],
+        "legal_owner_target_files": [
+            str(item.get("target_file") or "").strip() for item in frozen_function_items
+            if str(item.get("target_file") or "").strip()
+        ],
     }
     text = await model_call(
         [{"role": "system", "content": prompt},
@@ -7657,11 +7653,13 @@ async def _validate_and_repair_requirement_ownership(
         logger.info("[Creator][requirement_ownership_validation] stage=initial issue_count=0 ownership_valid=true")
         return projection
     issue_codes = [issue["code"] for issue in initial_issues]
-    if {"missing_executable_requirement_allocation", "unknown_requirement_allocation"} & set(issue_codes):
-        logger.info(
-            "[Creator][requirement_ownership_repair] result=skipped reason=projection_identity_mismatch issue_codes=%s",
-            issue_codes,
-        )
+    if any(
+        issue["code"] in {"missing_executable_requirement_allocation", "unknown_requirement_allocation"}
+        and issue.get("requirement_id") not in {
+            item.get("requirement_id") for item in allocations
+        }
+        for issue in initial_issues
+    ):
         raise RequirementOwnershipError(
             "Requirement ownership projection has an unrecoverable identity mismatch",
             code="requirement_ownership_repair_failed",
@@ -7669,10 +7667,8 @@ async def _validate_and_repair_requirement_ownership(
                      "max_attempts": repair_budget.max_attempts,
                      "initial_issues": initial_issues, "remaining_issues": initial_issues,
                      "affected_requirement_ids": affected_ids,
-                     "repair_error": {
-                         "code": "requirement_ownership_projection_identity_mismatch",
-                         "message": "Requirement channels and allocations do not contain the same requirement identities.",
-                     }},
+                     "repair_error": {"code": "requirement_ownership_projection_identity_mismatch",
+                                      "message": "A channel refers to no frozen allocation."}},
         )
     if repair_budget.remaining <= 0:
         logger.info(
@@ -7708,6 +7704,17 @@ async def _validate_and_repair_requirement_ownership(
             current_requirement_allocations=allocations,
             ownership_issues=initial_issues, model=planner_model, model_call=call_model,
         )
+        if candidate == projection:
+            logger.info(
+                "[Creator][requirement_ownership_validation] stage=post_repair "
+                "issue_count=%d ownership_valid=false repair_no_progress=true",
+                len(initial_issues),
+            )
+            raise RequirementOwnershipError(
+                "Requirement ownership repair made no progress",
+                code="repair_no_progress",
+                details={"initial_issues": initial_issues, "remaining_issues": initial_issues},
+            )
         remaining = collect_requirement_ownership_issues(
             requirement_channels=candidate["requirement_channels"],
             requirement_allocations=candidate["requirement_allocations"],
@@ -7746,7 +7753,8 @@ async def _validate_and_repair_requirement_ownership(
             code="requirement_ownership_repair_failed",
             details={"stage": "requirement_ownership", "attempts": repair_budget.attempts_used,
                      "max_attempts": repair_budget.max_attempts,
-                     "initial_issues": initial_issues, "remaining_issues": [],
+                     "initial_issues": initial_issues,
+                     "remaining_issues": exc.details.get("remaining_issues", []),
                      "affected_requirement_ids": affected_ids,
                      "repair_error": {"code": exc.code, "message": str(exc)}},
         ) from exc
@@ -8669,6 +8677,13 @@ Do not decide which files can become graph nodes beyond declaring the FilePlan i
 FunctionItems and ResponsibilityEdges will be bound in a second protocol binding pass by the same Blueprint Planner after the backend freezes the exact executable target domain from this FilePlan.
 
 The Blueprint must decompose the complete user goal exactly once into the minimum coherent set of executable FunctionItems. Each FunctionItem represents one atomic executable sub-goal. For every FunctionItem: purpose must state the concrete sub-goal completed by this FunctionItem; inputs must declare only data required from the platform or another FunctionItem; outputs must declare only data produced for the platform or another FunctionItem; the FunctionItem must have a distinct execution responsibility; do not create duplicate FunctionItems with equivalent responsibilities. Collectively, the FunctionItems must cover all executable parts of the complete user goal. Do not generate ResponsibilityEdges in the Blueprint. Do not create a second subsystem or grouping layer.
+
+For every FunctionItem input, explicitly state whether it is required at
+runtime. When the input may be omitted, mark required=false. When the
+implementation has a valid fallback, declare that a default is present and put
+its value in default_values. Do not mark an input optional merely because it
+sounds like a preference; judge only from the confirmed user goal and proposed
+runtime contract. Do not infer optionality from the input field name.
 
 In this pass, FilePlan owns file topology and file-local metadata.
 Declare script file responsibilities inside SkillPlan entries only.

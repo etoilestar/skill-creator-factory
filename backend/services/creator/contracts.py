@@ -46,6 +46,13 @@ _SEMANTIC_EVIDENCE_STAGES = {
     "blueprint", "graph", "generation", "runtime", "boundary", "resource",
 }
 _SEMANTIC_REPAIR_SCOPES = {"blueprint", "allocation", "graph", "resource", "none"}
+ALLOWED_BLUEPRINT_REVIEW_EVIDENCE_SOURCES = {
+    "requirement_channels",
+    "requirement_allocations",
+    "function_items",
+    "blueprint",
+    "platform_contract",
+}
 
 
 def validate_requirement_allocations(
@@ -62,6 +69,11 @@ def validate_requirement_allocations(
     for index, raw in enumerate(allocations):
         if not isinstance(raw, Mapping):
             raise ValueError(f"requirement_allocations[{index}] must be an object")
+        if set(raw) != {"requirement_id", "requirement", "owners", "evidence"}:
+            raise ValueError(
+                f"requirement_allocations[{index}] must contain exactly "
+                "requirement_id, requirement, owners, and evidence"
+            )
         if not isinstance(raw.get("requirement_id"), str):
             raise ValueError(f"requirement_allocations[{index}].requirement_id must be a string")
         if not isinstance(raw.get("requirement"), str):
@@ -87,6 +99,10 @@ def validate_requirement_allocations(
             )
         if not isinstance(evidence, Mapping):
             raise ValueError(f"requirement_allocations[{index}].evidence must be an object")
+        if set(evidence) != {"responsibility", "outputs", "capabilities"}:
+            raise ValueError(
+                f"requirement_allocations[{index}].evidence has invalid fields"
+            )
         if not isinstance(evidence.get("responsibility"), str):
             raise ValueError(f"requirement_allocations[{index}].evidence.responsibility must be a string")
         if not isinstance(evidence.get("outputs"), list):
@@ -169,7 +185,13 @@ def validate_blueprint_semantic_review(
         for fact in evidence:
             if set(fact) != {"source", "target", "field", "observed"}:
                 raise ValueError(f"blueprint semantic review issue {index} evidence has invalid fields")
-            if fact.get("source") == "function_item" and fact.get("target") not in allowed_targets:
+            if not str(fact.get("source") or "").strip() or not str(fact.get("field") or "").strip():
+                raise ValueError(f"blueprint semantic review issue {index} evidence must identify source and field")
+            if fact["source"] not in ALLOWED_BLUEPRINT_REVIEW_EVIDENCE_SOURCES:
+                raise ValueError(
+                    f"blueprint semantic review issue {index} evidence source is invalid: {fact['source']}"
+                )
+            if fact.get("source") == "function_items" and fact.get("target") not in allowed_targets:
                 raise ValueError(f"blueprint semantic review evidence target is outside current FunctionItem domain: {fact.get('target')}")
         blocking = bool(issue["blocking_now"])
         if blocking and (not evidence or not str(issue.get("expected_fact") or "").strip()):
@@ -186,6 +208,18 @@ def validate_blueprint_semantic_review(
 
     normalized = [normalize_issue(issue, index=index, deferred=False) for index, issue in enumerate(issues)]
     normalized_deferred = [normalize_issue(issue, index=index, deferred=True) for index, issue in enumerate(deferred_checks)]
+    blocking_reasons = {
+        (issue["requirement_id"], str(issue.get("reason") or "").strip())
+        for issue in normalized if str(issue.get("reason") or "").strip()
+    }
+    deferred_reasons = {
+        (issue["requirement_id"], str(issue.get("reason") or "").strip())
+        for issue in normalized_deferred if str(issue.get("reason") or "").strip()
+    }
+    if blocking_reasons & deferred_reasons:
+        raise ValueError(
+            "blueprint semantic review cannot block and defer the same requirement for the same reason"
+        )
     expected_passed = not normalized
     if bool(review["passed"]) != expected_passed:
         raise ValueError("blueprint semantic review passed must reflect blocking issues only")

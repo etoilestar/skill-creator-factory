@@ -29,7 +29,7 @@ def _review_issue(
 ):
     if evidence is None and blocking_now:
         evidence = [{
-            "source": "function_item", "target": "scripts/a.py",
+            "source": "function_items", "target": "scripts/a.py",
             "field": "outputs", "observed": [],
         }]
     return {
@@ -257,16 +257,12 @@ async def test_requirement_planner_keeps_ownerless_core_requirement(monkeypatch)
     assert allocations["requirement_allocations"][2]["owners"] == []
     assert allocations["requirement_channels"]["R3"] == "executable"
     planner_prompt = captured[0]
-    assert "return owners=[]" in planner_prompt
-    assert "do not omit" in planner_prompt
-    assert "do not force an unrelated owner" in planner_prompt
-    assert "Do not add, remove, rename, or modify FilePlan" in planner_prompt
-    assert "negative constraint" in planner_prompt
     normalized_prompt = " ".join(planner_prompt.split())
-    assert "do not mechanically assign every constraint" in normalized_prompt
-    assert "Backend performs no keyword" in normalized_prompt
-    assert "prohibitions, and responsibility boundaries" in planner_prompt
-    assert "Do not return owners=[] merely because" in planner_prompt
+    assert "Every requirement allocation is one complete and separate JSON object" in normalized_prompt
+    assert '"requirement_id": "R1"' in planner_prompt
+    assert '"requirement_id": "R2"' in planner_prompt
+    assert "This example demonstrates JSON structure only" in planner_prompt
+    assert "Validation stage and execution ownership are different concepts" in normalized_prompt
 
 
 @pytest.mark.asyncio
@@ -734,6 +730,30 @@ def test_pre_graph_blocking_issue_requires_current_evidence():
         )
 
 
+def test_pre_graph_evidence_source_is_one_legal_enum_value():
+    invalid = _review_issue(evidence=[{
+        "source": "requirement_channels|function_items", "target": "R1",
+        "field": "R1", "observed": "resource",
+    }])
+    with pytest.raises(ValueError, match="evidence source is invalid"):
+        validate_blueprint_semantic_review(
+            {"passed": False, "issues": [invalid], "deferred_checks": []},
+            allowed_function_item_targets=["scripts/a.py"],
+            supplied_requirement_ids=["R1"],
+        )
+
+    valid = _review_issue(evidence=[{
+        "source": "requirement_channels", "target": "R1",
+        "field": "R1", "observed": "resource",
+    }])
+    review = validate_blueprint_semantic_review(
+        {"passed": False, "issues": [valid], "deferred_checks": []},
+        allowed_function_item_targets=["scripts/a.py"],
+        supplied_requirement_ids=["R1"],
+    )
+    assert review["issues"][0]["evidence"][0]["source"] == "requirement_channels"
+
+
 def test_deferred_graph_check_is_nonblocking():
     deferred = _review_issue(
         issue_type="deferred_verification", blocking_now=False,
@@ -768,6 +788,64 @@ async def test_ownerless_non_executable_channel_remains_passed(monkeypatch, chan
         planner_model="test",
     )
     assert review == {"passed": True, "issues": [], "deferred_checks": []}
+
+
+@pytest.mark.asyncio
+async def test_channel_concern_uses_responsibility_mismatch(monkeypatch):
+    issue = _review_issue(
+        issue_type="responsibility_mismatch", repair_scope="allocation",
+        evidence=[
+            {"source": "requirement_channels", "target": "R1", "field": "R1", "observed": "resource"},
+            {"source": "function_items", "target": "scripts/a.py", "field": "purpose", "observed": "runtime action"},
+        ],
+        reason="R1 actual supplied channel is resource, but the frozen purpose states a runtime action.",
+    )
+
+    async def complete(messages, *_args, **_kwargs):
+        prompt = messages[0]["content"]
+        assert 'issue_type = "responsibility_mismatch"' in prompt
+        assert "Do not invent a new issue_type" in prompt
+        assert "source must be exactly one of" in prompt
+        assert "resource requirements validly use owners=[]" in prompt
+        assert "direct requirements validly use owners=[]" in prompt
+        return json.dumps({"passed": False, "issues": [issue], "deferred_checks": []})
+
+    monkeypatch.setattr(api, "complete_creator_role_once", complete)
+    review = await api._review_blueprint_semantic_closure(
+        request=api.PreparePlanRequest(user_request="abstract requirement"),
+        blueprint_text="abstract blueprint runtime fact",
+        function_items=[{"target_file": "scripts/a.py", "purpose": "runtime action"}],
+        requirement_allocations=[_allocation("R1", [])],
+        requirement_channels={"R1": "resource"}, planner_model="test",
+    )
+    assert review["issues"][0]["issue_type"] == "responsibility_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_unknown_channel_issue_type_is_protocol_repaired_once(monkeypatch):
+    calls = []
+    reason = "The actual supplied resource channel conflicts with a frozen runtime fact."
+    unknown = _review_issue(issue_type="channel_alignment_issue", reason=reason)
+    repaired = _review_issue(issue_type="responsibility_mismatch", reason=reason)
+
+    async def complete(messages, *_args, **_kwargs):
+        calls.append(messages)
+        if len(calls) == 1:
+            return json.dumps({"passed": False, "issues": [unknown], "deferred_checks": []})
+        assert "map an unknown channel concern type" in messages[0]["content"]
+        return json.dumps({"passed": False, "issues": [repaired], "deferred_checks": []})
+
+    monkeypatch.setattr(api, "complete_creator_role_once", complete)
+    review = await api._review_blueprint_semantic_closure(
+        request=api.PreparePlanRequest(user_request="abstract requirement"),
+        blueprint_text="blueprint", function_items=[{"target_file": "scripts/a.py"}],
+        requirement_allocations=[_allocation("R1", ["scripts/a.py"])],
+        requirement_channels={"R1": "executable"}, planner_model="test",
+    )
+    assert len(calls) == 2
+    assert review["issues"][0]["issue_type"] == "responsibility_mismatch"
+    assert review["issues"][0]["requirement_id"] == "R1"
+    assert review["issues"][0]["reason"] == reason
 
 
 @pytest.mark.asyncio
@@ -825,6 +903,51 @@ async def test_semantic_reviewer_protocol_retries_once_locally(monkeypatch):
     assert review["passed"] is True
     assert len(calls) == 2
     assert calls[0]["requirement_allocations"] == calls[1]["requirement_allocations"]
+
+
+@pytest.mark.asyncio
+async def test_semantic_reviewer_repairs_empty_blocking_evidence_from_context(monkeypatch):
+    calls = []
+    invalid = _review_issue(evidence=[])
+    invalid["evidence"] = []
+
+    async def complete(messages, *_args, **_kwargs):
+        calls.append(messages)
+        if len(calls) == 1:
+            return json.dumps({"passed": False, "issues": [invalid], "deferred_checks": []})
+        payload = json.loads(messages[1]["content"])
+        assert payload["authoritative_context"]["requirement_channels"] == {"R1": "executable"}
+        assert "Do not preserve an empty evidence array" in messages[0]["content"]
+        fixed = _review_issue(evidence=[{
+            "source": "requirement_channels", "target": "R1",
+            "field": "R1", "observed": "executable",
+        }])
+        return json.dumps({"passed": False, "issues": [fixed], "deferred_checks": []})
+
+    monkeypatch.setattr(api, "complete_creator_role_once", complete)
+    review = await api._review_blueprint_semantic_closure(
+        request=api.PreparePlanRequest(user_request="opaque"), blueprint_text="blueprint",
+        function_items=[{"target_file": "scripts/a.py"}],
+        requirement_allocations=[_allocation("R1", ["scripts/a.py"])],
+        requirement_channels={"R1": "executable"}, planner_model="test",
+    )
+    assert len(calls) == 2
+    assert review["issues"][0]["evidence"][0]["observed"] == "executable"
+
+
+def test_pre_graph_protocol_rejects_same_blocking_and_deferred_reason():
+    reason = "The identical lifecycle fact is unavailable."
+    blocking = _review_issue(reason=reason)
+    deferred = _review_issue(
+        issue_type="deferred_verification", blocking_now=False,
+        repair_scope="none", evidence_stage="graph", reason=reason,
+    )
+    with pytest.raises(ValueError, match="same reason"):
+        validate_blueprint_semantic_review(
+            {"passed": False, "issues": [blocking], "deferred_checks": [deferred]},
+            allowed_function_item_targets=["scripts/a.py"],
+            supplied_requirement_ids=["R1"],
+        )
 
 
 @pytest.mark.asyncio

@@ -7497,14 +7497,14 @@ def _validate_requirement_projection_protocol(text: str) -> dict[str, Any]:
         raise PreparePlanProtocolError(
             "Requirement Projection must contain exactly requirement_allocations and requirement_channels"
         )
-    return {
-        "requirement_allocations": _validate_requirement_allocations_for_ownership(
-            data["requirement_allocations"]
-        ),
-        "requirement_channels": _validate_requirement_channels_for_ownership(
-            data["requirement_channels"]
-        ),
-    }
+    allocations = _validate_requirement_allocations_for_ownership(
+        data["requirement_allocations"]
+    )
+    channels = _validate_requirement_channels_for_ownership(
+        data["requirement_channels"]
+    )
+    _validate_requirement_channels(channels, allocations)
+    return {"requirement_allocations": allocations, "requirement_channels": channels}
 
 
 async def _reformat_requirement_projection_response(
@@ -7512,7 +7512,7 @@ async def _reformat_requirement_projection_response(
 ) -> dict[str, Any]:
     """Spend the single local retry on Projection transport shape only."""
     prompt = """You are repairing only the JSON transport and protocol shape of a Requirement
-Projection response.
+Projection response. Repair only transport and protocol structure.
 
 Preserve every requirement ID, requirement text, owner, channel, responsibility,
 output, and capability that is present in the raw response.
@@ -7520,9 +7520,29 @@ output, and capability that is present in the raw response.
 Do not add, delete, merge, split, rename, reorder, reclassify, or reinterpret
 requirements. Do not change executable, resource, or direct channel decisions.
 
-Repair malformed object boundaries, array boundaries, commas, braces, field
-placement, and required field types only. Every requirement allocation must be
-a separate object in the requirement_allocations array.
+You may:
+- restore JSON object and array boundaries;
+- move an already-present semantic value into its correct field;
+- wrap already-present allocation fields inside the correct allocation object;
+- restore commas, braces, brackets, and root-level placement;
+- normalize a field container when all of its semantic values are already
+  present in the raw response.
+
+You must not:
+- invent a missing requirement;
+- invent missing requirement text;
+- invent a missing owner;
+- invent a missing channel;
+- invent missing responsibility, outputs, or capabilities;
+- infer semantic content from the required schema;
+- reclassify any requirement.
+
+If a required semantic value is completely absent from the raw response, do not
+guess it. Return the best protocol-preserving result possible; the deterministic
+validator will reject it if the protocol remains incomplete.
+
+Every requirement allocation must be a separate object in the
+requirement_allocations array.
 
 Return exactly one JSON object containing only:
 - requirement_allocations
@@ -8119,10 +8139,22 @@ The review must not pass if an executable requirement has no owner.
 requirement_channels is the authoritative classification produced by the
 Requirement Projection stage for this review pass. Review each requirement
 using its supplied channel. Do not silently reinterpret a resource or direct
-requirement as executable. If a supplied channel appears semantically
-inconsistent with the confirmed user requirement and frozen Blueprint, report a
-channel-alignment issue explicitly: state the actual current channel and the
-proposed concern instead of pretending the channel already has another value.
+requirement as executable.
+
+When the supplied requirement channel appears inconsistent with the confirmed
+user requirement or frozen Blueprint, report the concern using:
+
+issue_type = "responsibility_mismatch"
+
+Do not invent a new issue_type such as:
+- channel_alignment_issue
+- channel_mismatch
+- invalid_channel
+- ownership_channel_conflict
+
+The issue reason and evidence must explicitly state the actual supplied channel,
+the current observed Blueprint or FunctionItem fact, and why the observed fact
+may conflict with that supplied channel.
 
 2. CHANNEL-AWARE REVIEW RULES
 Ownership rules are channel-aware:
@@ -8136,6 +8168,14 @@ but does not require a FunctionItem owner. Do not report resource or direct as
 requirement_uncovered merely because it has no owner. Do not require a validator,
 orchestrator, policy script, output controller, security script, or other new
 FunctionItem for resource or direct requirements.
+
+The absence of FunctionItem owners is not evidence of a defect when the actual
+supplied channel is resource or direct. Do not generate a blocking issue whose
+only evidence is:
+- channel = resource and owners = [];
+- channel = direct and owners = [];
+- a requirement will need later validation;
+- no validator FunctionItem exists.
 
 A requirement may be validly resource or direct while still requiring later
 verification. Later verification does not create executable ownership. Graph,
@@ -8166,6 +8206,11 @@ for the same reason. It may appear in both only when the blocking issue identifi
 one concrete current-stage defect and the deferred check identifies a different
 later-stage fact. Explain the distinction explicitly in their reasons.
 
+Do not describe the same missing lifecycle evidence in both issues and
+deferred_checks, even using different wording. A requirement may appear in both
+only when the blocking entry cites a concrete current-stage defect and the
+deferred entry cites a distinct future-stage fact.
+
 5. FROZEN-SCOPE INVARIANTS
 FunctionItems are frozen. The complete owner domain is
 `authoritative_function_item_targets`. Never propose a new script, file,
@@ -8191,6 +8236,20 @@ Before returning, silently verify:
 - passed is true exactly when no blocking issues remain.
 
 7. OUTPUT CONTRACT
+Use the allowed issue types as follows:
+- requirement_uncovered: a fact required to exist in the current pre-graph
+  payload is absent.
+- requirement_partially_covered: the current pre-graph payload covers only part
+  of an explicit executable responsibility.
+- responsibility_mismatch: the supplied channel, owner, FunctionItem
+  responsibility, or allocation is inconsistent with another concrete
+  current-stage fact.
+- resource_semantic_conflict: a declared resource requirement conflicts with
+  supplied authoritative resource facts and satisfies the resource-specific
+  protocol.
+- deferred_verification: compliance requires evidence from a later Creator
+  stage and is not currently blocking.
+
 Return strict JSON with exactly passed, issues, and deferred_checks. issues has
 only blocking_now=true entries; deferred_checks has only non-blocking
 `deferred_verification` entries. Allowed issue_type values are
@@ -8202,8 +8261,39 @@ repair_scope values are blueprint, allocation, graph, resource, none.
 Every entry contains exactly issue_type, requirement_id, blocking_now,
 evidence_stage, repair_scope, affected_targets, evidence, expected_fact, reason,
 and repair_guidance (plus resource only for resource_semantic_conflict).
-Evidence uses this exact array shape:
-[{"source":"requirement_channels|requirement_allocations|function_items|blueprint|platform_contract","target":"R1 or frozen target","field":"field name","observed":"concrete supplied value"}]
+
+source must be exactly one of:
+- requirement_channels
+- requirement_allocations
+- function_items
+- blueprint
+- platform_contract
+
+source identifies the authoritative payload section. target identifies the exact
+requirement ID, FunctionItem target_file, Blueprint section, or platform-contract
+object being cited. field identifies the exact field within that source.
+observed contains the concrete supplied value. Do not put an explanation,
+multiple sources, or a natural-language sentence in source or field.
+
+Channel-concern protocol example:
+{
+  "issue_type": "responsibility_mismatch",
+  "requirement_id": "R1",
+  "blocking_now": true,
+  "evidence_stage": "blueprint",
+  "repair_scope": "allocation",
+  "affected_targets": ["scripts/a.py"],
+  "evidence": [
+    {"source": "requirement_channels", "target": "R1", "field": "R1", "observed": "resource"},
+    {"source": "function_items", "target": "scripts/a.py", "field": "purpose", "observed": "Performs the runtime action required by R1."}
+  ],
+  "expected_fact": "The requirement channel must align with the supplied current-stage runtime responsibility.",
+  "reason": "R1 is currently classified as resource, while the frozen FunctionItem purpose provides concrete evidence of direct runtime ownership.",
+  "repair_guidance": "Reconsider only the supplied channel and ownership allocation for R1."
+}
+This example demonstrates protocol shape only and does not prescribe that a
+resource channel is normally incorrect.
+
 A blocking entry requires non-empty evidence and expected_fact. A deferred entry
 uses evidence=[], expected_fact="", affected_targets=[], repair_scope="none", and
 empty repair_guidance. Return no explanation outside the JSON object.
@@ -8247,6 +8337,20 @@ Repair protocol shape only. Do not add, remove, merge, split, or reinterpret
 semantic issues. Preserve the original issues and deferred checks, correcting
 only invalid JSON/envelope/field types, reference-domain violations, lifecycle
 routing fields, passed consistency, and required evidence protocol fields.
+
+When repairing evidence protocol:
+- preserve the original issue_type, except map an unknown channel concern type
+  such as channel_alignment_issue to responsibility_mismatch as specified above;
+- preserve requirement_id;
+- preserve blocking_now;
+- preserve the semantic reason;
+- preserve whether the issue is blocking or deferred;
+- do not turn a deferred check into a blocking issue;
+- do not turn a blocking issue into a deferred check;
+- do not introduce a new issue_type.
+
+Only correct JSON shape, legal enum values, evidence structure, reference values,
+and passed consistency.
 Return no repair notes."""
         text = await complete_creator_role_once(
             [{"role": "system", "content": system_prompt},

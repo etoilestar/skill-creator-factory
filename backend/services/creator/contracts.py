@@ -46,6 +46,13 @@ _SEMANTIC_EVIDENCE_STAGES = {
     "blueprint", "graph", "generation", "runtime", "boundary", "resource",
 }
 _SEMANTIC_REPAIR_SCOPES = {"blueprint", "allocation", "graph", "resource", "none"}
+ALLOWED_BLUEPRINT_REVIEW_EVIDENCE_SOURCES = {
+    "requirement_channels",
+    "requirement_allocations",
+    "function_items",
+    "blueprint",
+    "platform_contract",
+}
 
 
 def validate_requirement_allocations(
@@ -180,7 +187,11 @@ def validate_blueprint_semantic_review(
                 raise ValueError(f"blueprint semantic review issue {index} evidence has invalid fields")
             if not str(fact.get("source") or "").strip() or not str(fact.get("field") or "").strip():
                 raise ValueError(f"blueprint semantic review issue {index} evidence must identify source and field")
-            if fact.get("source") == "function_item" and fact.get("target") not in allowed_targets:
+            if fact["source"] not in ALLOWED_BLUEPRINT_REVIEW_EVIDENCE_SOURCES:
+                raise ValueError(
+                    f"blueprint semantic review issue {index} evidence source is invalid: {fact['source']}"
+                )
+            if fact.get("source") == "function_items" and fact.get("target") not in allowed_targets:
                 raise ValueError(f"blueprint semantic review evidence target is outside current FunctionItem domain: {fact.get('target')}")
         blocking = bool(issue["blocking_now"])
         if blocking and (not evidence or not str(issue.get("expected_fact") or "").strip()):

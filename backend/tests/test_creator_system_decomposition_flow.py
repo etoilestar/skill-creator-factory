@@ -439,11 +439,20 @@ async def test_requirement_projection_protocol_repair_is_once_and_shape_only(mon
     async def model(messages, _role, fallback_model=None):
         calls.append(messages)
         if len(calls) == 1:
-            return '{"requirement_allocations":[{"requirement_id":"R1"},"requirement_id":"R2"]}'
+            return json.dumps({
+                "requirement_allocations": [
+                    repaired["requirement_allocations"][0],
+                    "requirement_id", "R2", "requirement", "requirement-R2",
+                    "owners", ["scripts/unit_a.py"], "evidence",
+                    repaired["requirement_allocations"][1]["evidence"],
+                ],
+                "requirement_channels": repaired["requirement_channels"],
+            })
         payload = json.loads(messages[1]["content"])
-        assert payload["raw_response"].endswith('"R2"]}')
+        assert '"requirement-R2"' in payload["raw_response"]
         assert "required_schema" in payload
         assert "repairing only the JSON transport" in messages[0]["content"]
+        assert "invent a missing channel" in messages[0]["content"]
         return json.dumps(repaired)
 
     monkeypatch.setattr(api, "complete_creator_role_once", model)
@@ -471,6 +480,30 @@ async def test_requirement_projection_protocol_repair_does_not_loop(monkeypatch)
             function_items=[], planner_model="p",
         )
     assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_requirement_projection_repair_does_not_invent_missing_channel(monkeypatch):
+    calls = []
+    incomplete = {
+        "requirement_allocations": [_allocation("R1", []), _allocation("R2", [])],
+        "requirement_channels": {"R1": "resource"},
+    }
+
+    async def model(messages, _role, fallback_model=None):
+        calls.append(messages)
+        if len(calls) == 2:
+            prompt = messages[0]["content"]
+            assert "If a required semantic value is completely absent" in prompt
+            assert "invent a missing channel" in prompt
+        return json.dumps(incomplete)
+
+    monkeypatch.setattr(api, "complete_creator_role_once", model)
+    with pytest.raises(api.PreparePlanProtocolError, match="after one repair"):
+        await api._plan_requirement_allocations(
+            request=_request(), blueprint_text=_blueprint(), function_items=[], planner_model="p",
+        )
+    assert len(calls) == 2
 
 
 @pytest.mark.asyncio

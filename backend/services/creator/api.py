@@ -7285,11 +7285,19 @@ async def _bind_executable_responsibility_plan(
             ),
             validation_errors=[{
                 "code": exc.code,
+                "category": (
+                    "coverage"
+                    if error_details.get("uncovered_inputs")
+                    or error_details.get("missing_required_final_output_fields")
+                    or error_details.get("missing_platform_output_interface")
+                    else "other"
+                ),
                 "message": str(exc),
                 "details": error_details,
             }],
             planner_model=planner_model,
             model_call=select_sources,
+            reviewer_model=planner_model,
         )
         try:
             responsibility_edges = await expand_responsibility_graph(

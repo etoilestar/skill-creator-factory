@@ -200,13 +200,6 @@ def validate_blueprint_semantic_review(
             raise ValueError("blocking pre-graph issue has a repair_scope unavailable at this stage")
         if blocking and scope == "allocation" and not requirement_id:
             raise ValueError("allocation repair issue requires a supplied requirement_id")
-        guidance = str(issue.get("repair_guidance") or "").casefold()
-        forbidden_channel_repairs = (
-            "change the channel", "change requirement channel", "reclassify",
-            "replace the channel", "reinterpret the channel", "channel should be",
-        )
-        if any(phrase in guidance for phrase in forbidden_channel_repairs):
-            raise ValueError("blueprint semantic review must not propose changing a frozen requirement channel")
         if deferred and (issue_type != "deferred_verification" or blocking or scope != "none"):
             raise ValueError("deferred_checks must be non-blocking deferred_verification with repair_scope=none")
         if not deferred and not blocking:

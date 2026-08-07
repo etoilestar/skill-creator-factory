@@ -19,6 +19,8 @@ from backend.services.creator.function_item_interface_plan import (
     review_interface_plan_semantically,
     validate_interface_repair_scope,
     validate_interface_intent_plan,
+    validate_interface_repair_critic,
+    serialize_interface_issue_fingerprint,
     _interface_plan_prompt,
 )
 
@@ -32,6 +34,134 @@ def test_interface_prompts_require_atomic_target_input_coverage():
     assert "Repeated source_member and target_member pairs are allowed" in prompt
     assert "default_present=true" in prompt
 
+
+def critic_for_payload(payload, *, action="modify_interface", interface_id=None):
+    """Build protocol-valid abstract Critic output for mocked model flows."""
+    interface_id = interface_id or payload["current_interface_plan"]["interfaces"][0]["interface_id"]
+    action_value = {
+        "action_id": "A1", "action": action, "interface_id": interface_id,
+        "reason": "Address the supplied abstract blocking fact.",
+    }
+    if action == "modify_interface":
+        target = next(item for item in payload["function_items"] if item["inputs"])
+        action_value.update({
+            "correction_goal": "Correct the supplied abstract semantic defect.",
+            "affected_target": {"target_member": target["target_file"], "target_input": target["inputs"][0]["name"]},
+        })
+    elif action == "add_atomic_interface":
+        action_value.pop("interface_id")
+        target = next(item for item in payload["function_items"] if item["inputs"])
+        action_value.update({
+            "target_member": target["target_file"], "target_input": target["inputs"][0]["name"],
+            "semantic_source_requirement": "The semantic runtime value required by the target input.",
+        })
+    return {
+        "diagnosis": "One abstract repair action is required.",
+        "issue_action_map": [
+            {"issue_fingerprint": fingerprint, "action_ids": ["A1"]}
+            for fingerprint in payload["blocking_issue_fingerprints"]
+        ],
+        "repair_actions": [action_value],
+    }
+
+
+def test_repair_critic_validates_all_five_exact_action_schemas():
+    items = [item("scripts/a.py", ["input_x", "input_y"], ["output_x"])]
+    current = plan(p2m("I1", "scripts/a.py"), m2p("I2", "scripts/a.py"))
+    issue = {"code": "abstract_issue", "category": "atomicity", "interface_id": "I1", "details": {"affected_interfaces": ["I1"], "affected_inputs": [{"target_member": "scripts/a.py", "target_input": "input_x"}]}}
+    fingerprint = serialize_interface_issue_fingerprint(issue)
+    actions = [
+        {"action_id": "A1", "action": "add_atomic_interface", "target_member": "scripts/a.py", "target_input": "input_x", "semantic_source_requirement": "A semantic value.", "reason": "Coverage is missing."},
+        {"action_id": "A2", "action": "split_interface", "interface_id": "I1", "target_inputs": [{"target_member": "scripts/a.py", "target_input": "input_x"}, {"target_member": "scripts/a.py", "target_input": "input_y"}], "reason": "Transfers are independent."},
+        {"action_id": "A3", "action": "modify_interface", "interface_id": "I1", "correction_goal": "Correct its direction.", "affected_target": {"target_member": "scripts/a.py", "target_input": "input_x"}, "reason": "The existing intent is retained."},
+        {"action_id": "A4", "action": "preserve_interface", "interface_id": "I2", "reason": "It is unaffected."},
+        {"action_id": "A5", "action": "remove_interface", "interface_id": "I1", "reason": "The explicit issue invalidates it."},
+    ]
+    result = validate_interface_repair_critic(
+        {"diagnosis": "Apply generic actions.", "issue_action_map": [{"issue_fingerprint": fingerprint, "action_ids": [action["action_id"] for action in actions]}], "repair_actions": actions},
+        validation_issues=[issue], current_interface_plan=current,
+        frozen_function_items=items, repair_scope={"affected_interface_ids": ["I1"], "removable_interface_ids": ["I1"], "allow_add_interfaces": True, "allow_remove_interfaces": True},
+    )
+    assert [action["action"] for action in result["repair_actions"]] == ["add_atomic_interface", "split_interface", "modify_interface", "preserve_interface", "remove_interface"]
+
+
+@pytest.mark.parametrize("mutation", ["unknown_field", "duplicate_action_id", "unknown_action_reference", "unmapped_issue"])
+def test_repair_critic_rejects_invalid_protocol_and_mapping(mutation):
+    items = [item("scripts/a.py", ["input_x"], ["output_x"])]
+    current = plan(p2m("I1", "scripts/a.py"))
+    issue = {"code": "abstract_issue", "category": "alignment", "interface_id": "I1", "details": {}}
+    fingerprint = serialize_interface_issue_fingerprint(issue)
+    action = {"action_id": "A1", "action": "preserve_interface", "interface_id": "I1", "reason": "Unaffected."}
+    value = {"diagnosis": "Generic diagnosis.", "issue_action_map": [{"issue_fingerprint": fingerprint, "action_ids": ["A1"]}], "repair_actions": [action]}
+    if mutation == "unknown_field":
+        action["extra"] = True
+    elif mutation == "duplicate_action_id":
+        value["repair_actions"].append(dict(action))
+    elif mutation == "unknown_action_reference":
+        value["issue_action_map"][0]["action_ids"] = ["missing"]
+    else:
+        value["issue_action_map"] = []
+    with pytest.raises(InterfaceIntentPlanError):
+        validate_interface_repair_critic(value, validation_issues=[issue], current_interface_plan=current, frozen_function_items=items, repair_scope={"affected_interface_ids": ["I1"], "removable_interface_ids": [], "allow_add_interfaces": False, "allow_remove_interfaces": False})
+
+
+@pytest.mark.asyncio
+async def test_repair_critic_protocol_reformatter_runs_once_before_generator():
+    items = [item("scripts/a.py", ["input_x"], ["output_x"])]
+    current = plan(p2m("I1", "scripts/a.py", "old goal"))
+    repaired = plan(p2m("I1", "scripts/a.py", "corrected goal"))
+    issue = {"code": "abstract_issue", "category": "alignment", "interface_id": "I1", "details": {"affected_interfaces": ["I1"]}}
+    calls = []
+
+    async def model(messages, _model):
+        calls.append(messages)
+        payload = json.loads(messages[-1]["content"])
+        if len(calls) == 1:
+            return json.dumps({"critic": "misplaced"})
+        if len(calls) == 2:
+            repair_payload = json.loads(messages[-1]["content"])
+            critic_payload = {"current_interface_plan": current, "function_items": [{"target_file": "scripts/a.py", "inputs": [{"name": "input_x"}]}], "blocking_issue_fingerprints": repair_payload["blocking_issue_fingerprints"]}
+            return json.dumps(critic_for_payload(critic_payload))
+        assert payload["repair_critic"]["repair_actions"][0]["action"] == "modify_interface"
+        return json.dumps(repaired)
+
+    result = await repair_interface_plan_semantically(
+        original_user_goal="g", frozen_function_items=items,
+        current_interface_plan=current, validation_issues=[issue],
+        repair_scope=build_interface_repair_scope([issue], current),
+        planner_model="p", model_call=model,
+    )
+    assert result == repaired
+    assert len(calls) == 3
+    assert "repairing only the transport and protocol" in calls[1][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_graph_feedback_routes_only_explicit_structured_facts(monkeypatch):
+    import backend.services.creator.function_item_interface_plan as interface_module
+
+    captured = {}
+
+    async def capture(**kwargs):
+        captured.update(kwargs)
+        return kwargs["current_interface_plan"]
+
+    monkeypatch.setattr(interface_module, "repair_interface_plan_semantically", capture)
+    current = plan(p2m("I1", "scripts/a.py"))
+    await repair_interface_intents(
+        original_user_goal="g", frozen_function_items=[item("scripts/a.py", ["input_x"], ["output_x"])],
+        current_interface_plan=current,
+        validation_errors=[{"code": "endpoint_binding_failed", "category": "alignment", "message": "Binding failed.", "details": {"interface_id": "I1", "reason": "ordinary failure"}}],
+        affected_members=["scripts/a.py"], missing_platform_output_fields=["result_x"],
+        planner_model="p", model_call=lambda *_args: None,
+    )
+    feedback = captured["validation_issues"][0]["details"]["graph_feedback"]
+    assert feedback["non_atomic_interfaces"] == []
+    assert feedback["unresolved_root_inputs"] == []
+    assert feedback["missing_required_platform_outputs"] == [{"required_platform_output": "result_x", "current_covering_interface_ids": []}]
+    assert feedback["reference_or_binding_issues"][0]["category"] == "alignment"
+    assert "current_interface_plan" not in feedback
+    assert "frozen_function_items" not in feedback
 from backend.services.platform_io_contract import build_platform_io_contract
 
 
@@ -234,9 +364,12 @@ async def test_repair_interface_intents_returns_validated_repaired_plan():
         payload = json.loads(messages[-1]["content"])
         assert payload["current_interface_plan"] == {"interfaces": []}
         assert payload["validation_issues"][0]["affected_members"] == ["scripts/a.py"]
+        if "blocking_issue_fingerprints" in payload and "repair_critic" not in payload:
+            fingerprint = payload["blocking_issue_fingerprints"][0]
+            return json.dumps({"diagnosis": "Missing input transfer.", "issue_action_map": [{"issue_fingerprint": fingerprint, "action_ids": ["A1"]}], "repair_actions": [{"action_id": "A1", "action": "add_atomic_interface", "target_member": "scripts/a.py", "target_input": "input_1", "semantic_source_requirement": "The runtime value required by input_1.", "reason": "The required input is uncovered."}]})
         return json.dumps(repaired)
 
-    assert await repair_interface_intents(original_user_goal="g", frozen_function_items=items, current_interface_plan={"interfaces": []}, validation_errors=[{"code": "interface_plan_incomplete"}], affected_members=["scripts/a.py"], missing_platform_output_fields=[], planner_model="p", model_call=model) == repaired
+    assert await repair_interface_intents(original_user_goal="g", frozen_function_items=items, current_interface_plan={"interfaces": []}, validation_errors=[{"code": "interface_plan_incomplete", "category": "coverage", "details": {"uncovered_inputs": [{"target": "scripts/a.py", "input_id": "input_1"}]}}], affected_members=["scripts/a.py"], missing_platform_output_fields=[], planner_model="p", model_call=model) == repaired
 
 
 def allocation(requirement_id, owners):
@@ -299,19 +432,23 @@ async def test_initial_semantic_errors_are_repaired_once_without_backend_inferen
     items = [item("scripts/unit_1.py", ["value_a"], ["value_b"]), item("scripts/unit_2.py", ["value_b"], ["value_a"])]
     responses = iter([
         json.dumps(plan(m2m("I1", "unknown", "scripts/unit_2.py"), m2m("I2", "scripts/unit_1.py", "scripts/unit_1.py"))),
-        json.dumps(plan(m2m("I1", "scripts/unit_1.py", "scripts/unit_2.py"), m2m("I2", "scripts/unit_2.py", "scripts/unit_1.py"))),
     ])
     calls = []
 
     async def model(messages, _model):
         calls.append(messages)
+        payload = json.loads(messages[-1]["content"])
+        if "blocking_issue_fingerprints" in payload and "repair_critic" not in payload:
+            return json.dumps(critic_for_payload(payload))
+        if "repair_critic" in payload:
+            return json.dumps(plan(m2m("I1", "scripts/unit_1.py", "scripts/unit_2.py"), m2m("I2", "scripts/unit_2.py", "scripts/unit_1.py")))
         return next(responses)
 
     repaired = await plan_function_item_interfaces(
         original_user_goal="abstract collaboration", frozen_function_items=items,
         planner_model="p", model_call=model,
     )
-    assert len(calls) == 2
+    assert len(calls) == 3
     repair_payload = json.loads(calls[1][-1]["content"])
     assert len(repair_payload["validation_issues"]) == 2
     assert repaired["interfaces"][0]["source_member"] == "scripts/unit_1.py"
@@ -421,6 +558,8 @@ def test_interface_prompt_uses_five_sections_and_forbids_instruction_leakage():
     async def model(messages, _model):
         captured["system"] = " ".join(messages[0]["content"].lower().split())
         captured["payload"] = json.loads(messages[-1]["content"])
+        if "blocking_issue_fingerprints" in captured["payload"] and "repair_critic" not in captured["payload"]:
+            return json.dumps(critic_for_payload(captured["payload"], action="add_atomic_interface"))
         return json.dumps(repaired)
 
     import asyncio
@@ -434,9 +573,10 @@ def test_interface_prompt_uses_five_sections_and_forbids_instruction_leakage():
                 m2m("I0002", "scripts/a.py", "scripts/b.py", goal="transfer one"),
                 m2p("I0005", "scripts/b.py"),
             ),
-            validation_errors=[{
-                "code": "interface_plan_incomplete",
-                "details": {
+                validation_errors=[{
+                    "code": "interface_plan_incomplete",
+                    "category": "coverage",
+                    "details": {
                     "uncovered_inputs": [
                         {"target": "scripts/b.py", "input_id": "second"},
                         {"target": "scripts/b.py", "input_id": "third"},
@@ -458,7 +598,7 @@ def test_interface_prompt_uses_five_sections_and_forbids_instruction_leakage():
         )
     )
 
-    assert "unified blocking issue envelopes" in captured["system"]
+    assert "apply every validated repair action" in captured["system"]
     assert "returning an unchanged plan is invalid" in captured["system"]
     assert "repeated member pairs are allowed" in captured["system"]
     assert captured["payload"]["validation_issues"][0]["affected_inputs"] == [
@@ -517,9 +657,12 @@ async def test_all_semantic_repair_protocol_failures_are_wrapped(response, under
     items = [item("scripts/unit_1.py", ["value_a"], ["value_b"])]
     calls = 0
 
-    async def model(_messages, _model):
+    async def model(messages, _model):
         nonlocal calls
         calls += 1
+        payload = json.loads(messages[-1]["content"])
+        if "blocking_issue_fingerprints" in payload and "repair_critic" not in payload:
+            return json.dumps(critic_for_payload(payload))
         return response
 
     issue = {"code": "interface_self_connection", "category": "direction_error", "interface_id": "I1", "details": {}}
@@ -530,7 +673,7 @@ async def test_all_semantic_repair_protocol_failures_are_wrapped(response, under
             validation_issues=[issue], repair_scope=build_interface_repair_scope([issue]),
             planner_model="p", model_call=model,
         )
-    assert calls == 1
+    assert calls == 2
     assert raised.value.code == "interface_semantic_repair_failed"
     assert raised.value.details["repair_error"]["code"] == underlying
 
@@ -568,21 +711,25 @@ async def test_semantic_reviewer_drives_one_repair_for_valid_but_reversed_member
     responses = iter([
         json.dumps(reversed_plan),
         json.dumps({"passed": False, "issues": [review_issue("direction_conflict", interfaces=["I1"], message="Direction conflicts with the declared responsibilities.")]}),
+        None,
         json.dumps(corrected_plan),
         json.dumps({"passed": True, "issues": []}),
     ])
     calls = 0
 
-    async def model(_messages, _model):
+    async def model(messages, _model):
         nonlocal calls
         calls += 1
-        return next(responses)
+        response = next(responses)
+        if response is None:
+            return json.dumps(critic_for_payload(json.loads(messages[-1]["content"])))
+        return response
 
     result = await plan_function_item_interfaces(
         original_user_goal="produce then consume", frozen_function_items=items,
         planner_model="p", reviewer_model="r", model_call=model,
     )
-    assert calls == 4
+    assert calls == 5
     assert result == corrected_plan
 
 
@@ -650,6 +797,9 @@ async def test_semantic_repair_prompt_forbids_protocol_expansion_for_later_stage
 
     async def model(messages, _model):
         captured["prompt"] = messages[0]["content"]
+        payload = json.loads(messages[-1]["content"])
+        if "blocking_issue_fingerprints" in payload and "repair_critic" not in payload:
+            return json.dumps(critic_for_payload(payload))
         return json.dumps(current)
 
     with pytest.raises(InterfaceIntentPlanError) as raised:
@@ -676,12 +826,16 @@ async def test_wording_only_interface_repair_with_same_fingerprint_is_no_progres
     )
     issue = {**envelope, "details": envelope, "interface_id": "i1"}
     responses = iter([
+        None,
         json.dumps(changed),
         json.dumps({"passed": False, "issues": [envelope]}),
     ])
 
-    async def model(*_args):
-        return next(responses)
+    async def model(messages, *_args):
+        response = next(responses)
+        if response is None:
+            return json.dumps(critic_for_payload(json.loads(messages[-1]["content"])))
+        return response
 
     with pytest.raises(InterfaceIntentPlanError) as raised:
         await repair_interface_plan_semantically(
@@ -724,6 +878,7 @@ async def test_deterministic_and_review_issues_share_context_and_one_repair():
     responses = iter([
         json.dumps(initial),
         json.dumps({"passed": False, "issues": [review_issue("direction_conflict", interfaces=["I2"], message="Direction conflicts with responsibilities.")]}),
+        None,
         json.dumps(repaired),
         json.dumps({"passed": True, "issues": []}),
     ])
@@ -731,7 +886,10 @@ async def test_deterministic_and_review_issues_share_context_and_one_repair():
 
     async def model(messages, _model):
         payloads.append(json.loads(messages[-1]["content"]))
-        return next(responses)
+        response = next(responses)
+        if response is None:
+            return json.dumps(critic_for_payload(payloads[-1]))
+        return response
 
     result = await plan_function_item_interfaces(
         original_user_goal="g", frozen_function_items=items,
@@ -739,7 +897,7 @@ async def test_deterministic_and_review_issues_share_context_and_one_repair():
         planner_model="p", reviewer_model="r", model_call=model,
     )
     assert result == repaired
-    assert len(payloads) == 4
+    assert len(payloads) == 5
     assert all(payload["unowned_system_requirements"] == allocations for payload in payloads)
     assert [issue["interface_id"] for issue in payloads[2]["validation_issues"]] == ["I1", "I2"]
 
@@ -768,21 +926,25 @@ async def test_reviewer_protocol_repair_runs_once_then_semantic_repair():
         json.dumps(initial),
         json.dumps({"review": {"passed": False}}),
         json.dumps({"passed": False, "issues": [review_issue("boundary_conflict", interfaces=["I1"], message="Boundary conflicts with the goal.")]}),
+        None,
         json.dumps(m2p_plan := plan(m2p("I1", "scripts/unit_1.py"))),
         json.dumps({"passed": True, "issues": []}),
     ])
     calls = 0
 
-    async def model(_messages, _model):
+    async def model(messages, _model):
         nonlocal calls
         calls += 1
-        return next(responses)
+        response = next(responses)
+        if response is None:
+            return json.dumps(critic_for_payload(json.loads(messages[-1]["content"])))
+        return response
 
     assert await plan_function_item_interfaces(
         original_user_goal="g", frozen_function_items=items,
         planner_model="p", reviewer_model="r", model_call=model,
     ) == m2p_plan
-    assert calls == 5
+    assert calls == 6
 
 
 @pytest.mark.asyncio

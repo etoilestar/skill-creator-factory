@@ -17,6 +17,22 @@ from ..skill_plan import GraphValidationError, normalize_structured_function_ite
 
 logger = logging.getLogger(__name__)
 ModelCall = Callable[[list[dict[str, str]], str], Awaitable[str]]
+AUTHORITY_CONTRACT = """CROSS-STAGE AUTHORITY CONTRACT
+
+Upstream confirmed facts remain authoritative unless the current stage is explicitly authorized to repair that fact.
+
+Authority ownership:
+- Confirmed user requirements define the task intent.
+- Blueprint Planner defines the proposed FunctionItem topology and file responsibilities.
+- Requirement Projection assigns requirement channels and executable ownership.
+- Once FunctionItems are frozen, later Interface, Endpoint, Graph, Tool, and Generation stages must not split, merge, rename, add, or remove FunctionItems.
+- Interface Planner defines semantic runtime transfers between the frozen FunctionItems and platform boundary.
+- Interface Reviewer may report defects in the Interface Plan but must not redesign frozen FunctionItems.
+- Endpoint Binder only realizes one already-declared Interface by selecting legal endpoint IDs. It does not redesign the Interface.
+- Protocol repair only repairs transport or schema shape. It never changes business semantics.
+- Concrete runtime tools/helpers are bound by the later Tool Planner. Earlier stages may describe required capabilities but must not prematurely select a concrete helper unless that selection is already authoritative.
+
+When two instructions appear to conflict, preserve the upstream authoritative fact and apply only the permissions of the current stage."""
 INTERFACE_KINDS = {"platform_to_member", "member_to_member", "member_to_platform"}
 PROTOCOL_REPAIRABLE_CODES = {
     "invalid_interface_plan_json",
@@ -124,6 +140,24 @@ def _compact_port_id(value: Any) -> str:
     return str(value or "").strip()
 
 
+def runtime_input_source_facts(raw_input: Any, default_values: dict[str, Any] | None = None) -> dict[str, bool]:
+    """Return the single deterministic required/default interpretation.
+
+    This deliberately answers only whether a runtime source is necessary; it
+    never selects that source.
+    """
+    port_id = _compact_port_id(raw_input)
+    defaults = default_values if isinstance(default_values, dict) else {}
+    inline_default = isinstance(raw_input, dict) and "default" in raw_input
+    default_present = inline_default or (bool(port_id) and port_id in defaults)
+    explicitly_optional = isinstance(raw_input, dict) and raw_input.get("required") is False
+    return {
+        "required": not explicitly_optional,
+        "default_present": default_present,
+        "runtime_source_required": not explicitly_optional and not default_present,
+    }
+
+
 def _compact_function_items(function_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     normalized = normalize_structured_function_items(function_items, source="interface_intent_plan")
     compact_items: list[dict[str, Any]] = []
@@ -135,19 +169,12 @@ def _compact_function_items(function_items: list[dict[str, Any]]) -> list[dict[s
         for raw_input, port_id in zip(raw_inputs, input_ids):
             if not port_id:
                 continue
-            declared_required = raw_input.get("required") if isinstance(raw_input, dict) else None
-            default_present = port_id in default_values or (
-                isinstance(raw_input, dict) and "default" in raw_input
-            )
-            compact_input = {"name": port_id, "default_present": default_present}
-            if isinstance(declared_required, bool):
-                compact_input["required"] = declared_required
-            else:
-                compact_input["required"] = not default_present
+            facts = runtime_input_source_facts(raw_input, default_values)
+            compact_input = {"name": port_id, **facts}
             compact_inputs.append(compact_input)
         required_inputs = [
             value["name"] for value in compact_inputs
-            if value["required"] and not value["default_present"]
+            if value["runtime_source_required"]
         ]
         defaulted_inputs = [value["name"] for value in compact_inputs if value["default_present"]]
         compact_items.append(
@@ -469,31 +496,6 @@ def _interface_plan_without_ids(plan: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-def validate_critic_action_application(
-    *, critic: dict[str, Any], before: dict[str, Any], after: dict[str, Any]
-) -> None:
-    """Verify structural application of validated actions without judging sources."""
-    before_by_id = {item["interface_id"]: item for item in before.get("interfaces") or []}
-    after_by_id = {item["interface_id"]: item for item in after.get("interfaces") or []}
-    additions = set(after_by_id) - set(before_by_id)
-    for action in critic["repair_actions"]:
-        kind = action["action"]
-        interface_id = action.get("interface_id")
-        applied = True
-        if kind == "preserve_interface":
-            applied = after_by_id.get(interface_id) == before_by_id.get(interface_id)
-        elif kind == "modify_interface":
-            applied = interface_id in after_by_id and after_by_id[interface_id] != before_by_id[interface_id]
-        elif kind == "remove_interface":
-            applied = interface_id not in after_by_id
-        elif kind == "split_interface":
-            applied = interface_id not in after_by_id and bool(additions)
-        elif kind == "add_atomic_interface":
-            applied = bool(additions)
-        if not applied:
-            _raise("repair Generator did not apply a Critic action", "interface_repair_action_not_applied", path="$.interfaces", action_id=action["action_id"])
-
-
 def build_graph_obligations_from_interfaces(*, interface_plan: dict[str, Any]) -> list[dict[str, Any]]:
     """Convert declared interface intents to local graph obligations."""
     obligations: list[dict[str, Any]] = []
@@ -514,7 +516,8 @@ def build_graph_obligations_from_interfaces(*, interface_plan: dict[str, Any]) -
 
 
 def _interface_plan_prompt() -> str:
-    return f"""
+    return f"""{AUTHORITY_CONTRACT}
+
 1. AUTHORITATIVE FACTS
 The user payload contains only the complete system goal, frozen FunctionItems,
 the platform contract, and frozen requirement allocations. target_file values
@@ -524,11 +527,17 @@ are the complete legal member domain. FunctionItem inputs and outputs are frozen
 Plan the minimum complete set of atomic runtime transfers required to satisfy
 every required target input and every required platform output.
 
-ATOMIC INTERFACE DEFINITION
+INTERFACE SEMANTIC CONTRACT
 One Interface Intent represents exactly one independently bindable runtime
 transfer: one source value -> one target input. It is not a general relationship,
 an entire member-to-member channel, a bundle of fields, all data exchanged
-between members, or a workflow step containing multiple transfers.
+between members, or a workflow step containing multiple transfers. The goal is
+the authoritative semantic contract for that one transfer, not a workflow
+summary. It unambiguously identifies one semantic source value, one target
+responsibility or input, and why the target consumes it. One Interface must be
+realizable by exactly one source endpoint and exactly one target endpoint.
+source value A -> target input X and source value B -> target input Y must be
+represented as two Interface Intents. Do not merge them because their members match.
 
 You are planning semantic interfaces between already-frozen executable FunctionItems.
 Produce the complete Interface Intent Plan. One Interface Intent represents one
@@ -705,12 +714,19 @@ def serialize_interface_issue_fingerprint(issue: dict[str, Any]) -> str:
     return json.dumps(interface_issue_fingerprint(issue), ensure_ascii=False, separators=(",", ":"))
 
 
-CRITIC_ACTION_FIELDS = {
-    "add_atomic_interface": {"action_id", "action", "target_member", "target_input", "semantic_source_requirement", "reason"},
-    "split_interface": {"action_id", "action", "interface_id", "target_inputs", "reason"},
-    "modify_interface": {"action_id", "action", "interface_id", "correction_goal", "affected_target", "reason"},
-    "preserve_interface": {"action_id", "action", "interface_id", "reason"},
-    "remove_interface": {"action_id", "action", "interface_id", "reason"},
+CRITIC_REPAIR_FIELDS = {
+    "issue_fingerprint", "affected_interfaces", "affected_targets",
+    "repair_intent", "expected_result",
+}
+CRITIC_SCHEMA = {
+    "diagnosis": "string",
+    "repairs": [{
+        "issue_fingerprint": "copy exactly from supplied issue",
+        "affected_interfaces": ["existing interface ID"],
+        "affected_targets": [{"target_member": "string", "target_input": "string"}],
+        "repair_intent": "semantic property that must change",
+        "expected_result": "fact that must be true after repair",
+    }],
 }
 
 
@@ -719,78 +735,50 @@ def validate_interface_repair_critic(
     current_interface_plan: dict[str, Any], frozen_function_items: list[dict[str, Any]],
     repair_scope: dict[str, Any],
 ) -> dict[str, Any]:
-    """Validate Critic transport, references, mappings, and scope—not semantics."""
-    if not isinstance(value, dict) or set(value) != {"diagnosis", "issue_action_map", "repair_actions"}:
+    """Validate the diagnostic Critic envelope and exact frozen references."""
+    if not isinstance(value, dict) or set(value) != {"diagnosis", "repairs"}:
         _raise("repair critic response has invalid top-level fields", "invalid_interface_repair_critic_protocol", path="$")
-    if not isinstance(value.get("diagnosis"), str) or not value["diagnosis"].strip():
-        _raise("repair critic diagnosis must be non-empty", "invalid_interface_repair_critic_protocol", path="$.diagnosis")
-    if not isinstance(value.get("issue_action_map"), list) or not isinstance(value.get("repair_actions"), list):
-        _raise("repair critic mappings and actions must be arrays", "invalid_interface_repair_critic_protocol", path="$")
+    diagnosis = value.get("diagnosis")
+    repairs = value.get("repairs")
+    if not isinstance(diagnosis, str) or not diagnosis.strip() or not isinstance(repairs, list):
+        _raise("repair critic diagnosis and repairs are required", "invalid_interface_repair_critic_protocol", path="$")
     legal_interfaces = {str(item.get("interface_id") or "") for item in current_interface_plan.get("interfaces") or []}
     compact = _compact_function_items(frozen_function_items)
     legal_inputs = {item["target_file"]: {port["name"] for port in item["inputs"]} for item in compact}
-    action_ids: set[str] = set()
-    normalized_actions: list[dict[str, Any]] = []
-
-    def validate_target(raw: Any, path: str) -> dict[str, str]:
-        if not isinstance(raw, dict) or set(raw) != {"target_member", "target_input"}:
-            _raise("target reference has invalid fields", "invalid_interface_repair_critic_protocol", path=path)
-        member, target_input = raw.get("target_member"), raw.get("target_input")
-        if member not in legal_inputs or target_input not in legal_inputs[member]:
-            _raise("repair action references an unknown frozen input", "invalid_interface_repair_critic_reference", path=path)
-        return {"target_member": member, "target_input": target_input}
-
-    for index, raw in enumerate(value["repair_actions"]):
-        path = f"$.repair_actions[{index}]"
-        if not isinstance(raw, dict) or raw.get("action") not in CRITIC_ACTION_FIELDS:
-            _raise("repair critic action is invalid", "invalid_interface_repair_critic_protocol", path=path)
-        action = str(raw["action"])
-        if set(raw) != CRITIC_ACTION_FIELDS[action]:
-            _raise("repair critic action fields do not match its action", "invalid_interface_repair_critic_protocol", path=path)
-        action_id = str(raw.get("action_id") or "").strip()
-        reason = str(raw.get("reason") or "").strip()
-        if not action_id or action_id in action_ids or not reason:
-            _raise("action_id must be unique and reason must be non-empty", "invalid_interface_repair_critic_protocol", path=path)
-        action_ids.add(action_id)
-        if action == "add_atomic_interface":
-            validate_target({"target_member": raw["target_member"], "target_input": raw["target_input"]}, path)
-            if not str(raw.get("semantic_source_requirement") or "").strip() or not repair_scope.get("allow_add_interfaces"):
-                _raise("add action is incomplete or outside repair scope", "invalid_interface_repair_critic_scope", path=path)
-        else:
-            interface_id = str(raw.get("interface_id") or "")
-            if interface_id not in legal_interfaces:
-                _raise("repair action references an unknown interface", "invalid_interface_repair_critic_reference", path=f"{path}.interface_id")
-            if action in {"modify_interface", "split_interface"} and interface_id not in set(repair_scope.get("affected_interface_ids") or []):
-                _raise("action modifies an Interface outside repair scope", "invalid_interface_repair_critic_scope", path=path)
-            if action == "remove_interface" and (not repair_scope.get("allow_remove_interfaces") or interface_id not in set(repair_scope.get("removable_interface_ids") or [])):
-                _raise("remove action is outside repair scope", "invalid_interface_repair_critic_scope", path=path)
-            if action == "split_interface":
-                if not isinstance(raw["target_inputs"], list) or not raw["target_inputs"]:
-                    _raise("split action needs target_inputs", "invalid_interface_repair_critic_protocol", path=f"{path}.target_inputs")
-                for target_index, target in enumerate(raw["target_inputs"]):
-                    validate_target(target, f"{path}.target_inputs[{target_index}]")
-            if action == "modify_interface":
-                validate_target(raw["affected_target"], f"{path}.affected_target")
-                if not str(raw.get("correction_goal") or "").strip():
-                    _raise("modify action needs correction_goal", "invalid_interface_repair_critic_protocol", path=f"{path}.correction_goal")
-        normalized_actions.append(dict(raw))
-
-    expected_fingerprints = {serialize_interface_issue_fingerprint(issue) for issue in validation_issues}
-    mapped: set[str] = set()
-    normalized_map: list[dict[str, Any]] = []
-    for index, raw in enumerate(value["issue_action_map"]):
-        path = f"$.issue_action_map[{index}]"
-        if not isinstance(raw, dict) or set(raw) != {"issue_fingerprint", "action_ids"}:
-            _raise("issue action mapping has invalid fields", "invalid_interface_repair_critic_protocol", path=path)
-        fingerprint = str(raw.get("issue_fingerprint") or "")
-        ids = raw.get("action_ids")
-        if fingerprint not in expected_fingerprints or fingerprint in mapped or not isinstance(ids, list) or not ids or any(value not in action_ids for value in ids):
-            _raise("issue action mapping has an invalid reference", "invalid_interface_repair_critic_reference", path=path)
-        mapped.add(fingerprint)
-        normalized_map.append({"issue_fingerprint": fingerprint, "action_ids": list(ids)})
-    if mapped != expected_fingerprints:
-        _raise("every blocking issue must map to an action", "invalid_interface_repair_critic_protocol", path="$.issue_action_map")
-    return {"diagnosis": value["diagnosis"].strip(), "issue_action_map": normalized_map, "repair_actions": normalized_actions}
+    expected = [serialize_interface_issue_fingerprint(issue) for issue in validation_issues]
+    observed: list[str] = []
+    normalized = []
+    for index, raw in enumerate(repairs):
+        path = f"$.repairs[{index}]"
+        if not isinstance(raw, dict) or set(raw) != CRITIC_REPAIR_FIELDS:
+            _raise("repair diagnosis has invalid fields", "invalid_interface_repair_critic_protocol", path=path)
+        fingerprint = raw.get("issue_fingerprint")
+        interfaces = raw.get("affected_interfaces")
+        targets = raw.get("affected_targets")
+        if fingerprint not in expected or fingerprint in observed:
+            _raise("issue fingerprint must be copied exactly once", "invalid_interface_repair_critic_reference", path=f"{path}.issue_fingerprint")
+        if not isinstance(interfaces, list) or any(value not in legal_interfaces for value in interfaces):
+            _raise("repair diagnosis references an unknown Interface", "invalid_interface_repair_critic_reference", path=f"{path}.affected_interfaces")
+        if not isinstance(targets, list):
+            _raise("affected_targets must be an array", "invalid_interface_repair_critic_protocol", path=f"{path}.affected_targets")
+        normalized_targets = []
+        for target_index, target in enumerate(targets):
+            target_path = f"{path}.affected_targets[{target_index}]"
+            if not isinstance(target, dict) or set(target) != {"target_member", "target_input"}:
+                _raise("affected target has invalid fields", "invalid_interface_repair_critic_protocol", path=target_path)
+            member, target_input = target.get("target_member"), target.get("target_input")
+            if member not in legal_inputs or target_input not in legal_inputs[member]:
+                _raise("repair diagnosis references an unknown frozen input", "invalid_interface_repair_critic_reference", path=target_path)
+            normalized_targets.append(dict(target))
+        intent, result = raw.get("repair_intent"), raw.get("expected_result")
+        if not isinstance(intent, str) or not intent.strip() or not isinstance(result, str) or not result.strip():
+            _raise("repair intent and expected result must be non-empty", "invalid_interface_repair_critic_protocol", path=path)
+        observed.append(fingerprint)
+        normalized.append({**raw, "affected_interfaces": list(interfaces), "affected_targets": normalized_targets,
+                           "repair_intent": intent.strip(), "expected_result": result.strip()})
+    if observed != expected:
+        _raise("every supplied issue must appear exactly once and in order", "invalid_interface_repair_critic_protocol", path="$.repairs")
+    return {"diagnosis": diagnosis.strip(), "repairs": normalized}
 
 
 def _validate_interface_review_response(
@@ -845,11 +833,13 @@ async def review_interface_plan_semantically(
     model_call: ModelCall,
 ) -> list[dict[str, Any]]:
     """Ask once for semantic diagnostics; never ask the reviewer for a repair."""
-    prompt = """1. AUTHORITATIVE FACTS
+    prompt = AUTHORITY_CONTRACT + """
+
+1. AUTHORITATIVE FACTS
 The payload contains frozen FunctionItems with declared input required/default
 facts, the current Interface Intent Plan, frozen allocations, and platform contract.
 
-2. TASK
+2. REVIEW RESPONSIBILITY
 Review an Interface Intent Plan against the complete supplied system semantics.
 You are reviewing only the Interface Intent layer. Build an internal coverage
 checklist from frozen target inputs. For each required target input, determine
@@ -956,7 +946,13 @@ transfer, every required final result for member_to_platform, every downstream
 required input for coverage, and every Interface for atomicity. Any failure means
 passed=false.
 
-3. INVARIANTS
+3. CURRENT-STAGE DEFECT RULE
+Report only a concrete current-stage defect. State the observed fact, expected
+fact, affected existing Interfaces or target inputs, and why the current plan
+cannot realize the transfer. Do not report missing transfer when an existing
+goal already unambiguously supplies it. Do not redesign the workflow or propose
+the final correct connection.
+
 Every issue uses the same envelope regardless of code. code is a stable,
 model-defined identifier. category must be one of coverage, atomicity, alignment,
 reference, or other. Every location uses the affected_interfaces,
@@ -1029,7 +1025,7 @@ invent an issue."""
     return issues
 
 
-async def plan_function_item_interfaces(*, original_user_goal: str, frozen_function_items: list[dict[str, Any]], requirement_allocations: list[dict[str, Any]] | None = None, requirement_channels: dict[str, str] | None = None, system_requirements: list[dict[str, Any]] | None = None, interaction_requirements: list[dict[str, Any]] | None = None, platform_contract: dict[str, Any] | None = None, skill_name: str = "", planner_model: str, model_call: ModelCall, reviewer_model: str | None = None) -> dict[str, Any]:
+async def plan_function_item_interfaces(*, original_user_goal: str, frozen_function_items: list[dict[str, Any]], requirement_allocations: list[dict[str, Any]] | None = None, requirement_channels: dict[str, str] | None = None, system_requirements: list[dict[str, Any]] | None = None, interaction_requirements: list[dict[str, Any]] | None = None, platform_contract: dict[str, Any] | None = None, skill_name: str = "", planner_model: str, model_call: ModelCall, reviewer_model: str | None = None, reviewer_model_call: ModelCall | None = None) -> dict[str, Any]:
     """Ask the model for interaction intents between frozen FunctionItems."""
 
     system_requirements_context = _resolve_system_requirements_context(
@@ -1089,7 +1085,7 @@ async def plan_function_item_interfaces(*, original_user_goal: str, frozen_funct
             system_requirements=system_requirements_context,
             platform_contract=platform_contract,
             reviewer_model=reviewer_model,
-            model_call=model_call,
+            model_call=reviewer_model_call or model_call,
         )
     combined_issues = merge_interface_validation_issues(deterministic_issues, review_issues)
     logger.info(
@@ -1111,6 +1107,7 @@ async def plan_function_item_interfaces(*, original_user_goal: str, frozen_funct
             planner_model=planner_model,
             model_call=model_call,
             reviewer_model=reviewer_model,
+            reviewer_model_call=reviewer_model_call,
         )
     return validate_interface_intent_plan(plan=parsed, function_items=frozen_function_items)
 
@@ -1125,6 +1122,7 @@ async def repair_interface_plan_semantically(
     platform_contract: dict[str, Any] | None = None, skill_name: str = "",
     repair_stage: str = "initial_interface_validation",
     planner_model: str, model_call: ModelCall, reviewer_model: str | None = None,
+    reviewer_model_call: ModelCall | None = None,
 ) -> dict[str, Any]:
     """Perform one bounded Critic + Generator semantic repair cycle."""
     system_requirements_context = (
@@ -1140,7 +1138,9 @@ async def repair_interface_plan_semantically(
         bool(repair_scope.get("allow_add_interfaces")), bool(repair_scope.get("allow_remove_interfaces")),
     )
 
-    critic_prompt = """1. AUTHORITATIVE FACTS
+    critic_prompt = f"""{AUTHORITY_CONTRACT}
+
+1. AUTHORITATIVE FACTS
 The payload contains the failed complete Interface Plan; frozen FunctionItems
 and required/default input facts; the platform contract; requirements; unified
 blocking issues and deterministic Graph feedback; legal member, input, and
@@ -1148,46 +1148,38 @@ Interface ID domains; and repair_scope. Blocking facts identify what is invalid
 or missing. They do not prescribe the business-semantic source.
 
 2. TASK
-Diagnose the smallest set of repair actions required to address every supplied
-blocking issue. Return actions only, not the repaired plan. Map every supplied
-issue_fingerprint to at least one action_id. Preserve unrelated Interfaces and
-distinguish missing coverage, non-atomic transfer, alignment, and removal.
+Diagnose every supplied blocking issue. For each issue state which current
+Interface or target responsibility is affected, what semantic property is
+missing or inconsistent, and what must become true after repair. Do not generate
+the repaired Interface Plan.
 
-3. ACTION PROTOCOL
-Return exactly diagnosis, issue_action_map, and repair_actions. Every action has
-exactly the fields shown in critic_action_schemas. Copy issue fingerprints from
-blocking_issue_fingerprints; never create one. add_atomic_interface describes
-only the target gap and semantic value needed: it does not choose the source.
-
-4. INVARIANTS
+3. INVARIANTS
 Do not select endpoint IDs, create graph edges, choose sources by name similarity,
 invent FunctionItems or inputs, assume uncovered inputs come from the platform,
-assume the first member uses platform input, infer atomicity from Graph binding
-failure, remove an Interface because another is missing, or exceed repair_scope.
+infer a new business requirement, or exceed repair_scope.
 
-5. FINAL SELF-CHECK
-Verify every issue is mapped, every action_id exists, every action is complete,
-every reference exists, unaffected Interfaces are preserved or untouched, no
-action selects a completed source, and no decision relies on names alone.
-Return only strict Critic JSON."""
+4. FINAL SELF-CHECK
+Every supplied issue_fingerprint appears exactly once in repairs. Every reference
+exists. repair_intent describes the semantic change, not an implementation patch.
 
-    prompt = """1. AUTHORITATIVE FACTS
+5. OUTPUT CONTRACT
+Return only strict JSON matching critic_schema."""
+
+    prompt = f"""{AUTHORITY_CONTRACT}
+
+1. AUTHORITATIVE FACTS
 The payload contains the complete failed Interface Plan, frozen FunctionItems,
 requirements and platform contract, blocking issues, deterministic Graph
-feedback, one validated Critic diagnosis and actions, legal Interface schema,
+feedback, one validated Critic diagnosis, legal Interface schema,
 legal member/input domains, and repair_scope.
 
 2. TASK
-Apply every validated repair action and return one complete repaired Interface
-Plan. The Critic identifies what changes; it does not choose the final source.
-For add_atomic_interface inspect target meaning, all upstream outputs, platform
-inputs, purposes, requirements, and workflow semantics; choose one semantic
-source; emit one source-value-to-target-input transfer with a unique ID. Never
-choose by matching names or use the platform merely to close the graph.
-For split_interface remove the bundle and emit one atomic intent for every listed
-independent target, preserving valid relationships and using unique IDs. For
-modify_interface change only the named Interface and retain valid parts. For
-preserve_interface copy it exactly. For remove_interface remove only that ID.
+Apply the validated semantic repair diagnoses and return one complete repaired
+Interface Plan. The Critic tells you what must become true. You decide how to
+realize it within the existing Interface schema, using the complete system
+semantics to determine the correct runtime source. You may add, modify, split,
+preserve, or remove Interfaces only when required by repair_intent and permitted
+by repair_scope.
 
 3. INVARIANTS
 - Do not modify FunctionItems or add fields outside the Interface schema.
@@ -1201,7 +1193,7 @@ preserve_interface copy it exactly. For remove_interface remove only that ID.
 - Do not add endpoint IDs, port IDs, source paths, or graph edges.
 
 4. FINAL SELF-CHECK
-Silently verify every action was applied, every issue is addressed, every required
+Silently verify every repair diagnosis is satisfied and every issue is addressed, every required
 non-default input and required platform output has an atomic intended transfer,
 no independent inputs are bundled, repeated pairs remain legal, FunctionItems
 are unchanged, no source was selected by names alone, unrelated Interfaces are
@@ -1227,9 +1219,10 @@ include explanations, Markdown, comments, or hidden reasoning.
         "repair_scope": repair_scope,
         "interface_schema": INTERFACE_SCHEMA,
         "blocking_issue_fingerprints": [serialize_interface_issue_fingerprint(issue) for issue in validation_issues],
-        "critic_action_schemas": {name: sorted(fields) for name, fields in CRITIC_ACTION_FIELDS.items()},
+        "critic_schema": CRITIC_SCHEMA,
     }
-    critic_text = await model_call(
+    critic_call = reviewer_model_call or model_call
+    critic_text = await critic_call(
         [{"role": "system", "content": critic_prompt},
          {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
         planner_model,
@@ -1243,18 +1236,21 @@ include explanations, Markdown, comments, or hidden reasoning.
         )
     except InterfaceIntentPlanError as original_exc:
         protocol_repair_used = True
-        reformatter_prompt = """You are repairing only the transport and protocol
-shape of an Interface Repair Critic response. Preserve diagnosis, issue-to-action
-relationships, action types, referenced Interface IDs, target members, target
-inputs, and stated reasons. Do not introduce or delete a semantic repair action.
-Do not choose a source member, output, platform input, endpoint ID, or final plan.
-Repair only JSON syntax, top-level placement, required action fields,
-array/object boundaries, action_id references, and unambiguous enum spelling.
-If required semantic content is absent, do not invent it; deterministic validation
-will reject the result. Return only strict Critic JSON."""
-        repaired_text = await model_call(
+        reformatter_prompt = """1. RAW RESPONSE
+Use the supplied raw Critic response.
+2. PROTOCOL ERROR
+Use the supplied structured validation error.
+3. ALLOWED TRANSPORT REPAIRS
+Repair only JSON syntax, exact fields, and array/object boundaries. Preserve
+diagnosis, issue fingerprints, affected references, repair intent, and expected result.
+4. FORBIDDEN SEMANTIC CHANGES
+Do not create, remove, merge, split, or reinterpret repair diagnoses. Do not
+choose sources or endpoint IDs. If semantic content is absent, do not invent it.
+5. OUTPUT CONTRACT
+Return only strict JSON matching critic_schema."""
+        repaired_text = await critic_call(
             [{"role": "system", "content": reformatter_prompt},
-             {"role": "user", "content": json.dumps({"raw_response": critic_text, "validation_error": {"code": original_exc.code, "details": original_exc.details}, "critic_action_schemas": payload["critic_action_schemas"], "blocking_issue_fingerprints": payload["blocking_issue_fingerprints"]}, ensure_ascii=False)}],
+             {"role": "user", "content": json.dumps({"raw_response": critic_text, "validation_error": {"code": original_exc.code, "details": original_exc.details}, "critic_schema": CRITIC_SCHEMA, "blocking_issue_fingerprints": payload["blocking_issue_fingerprints"]}, ensure_ascii=False)}],
             planner_model,
         )
         try:
@@ -1270,12 +1266,11 @@ will reject the result. Return only strict Critic JSON."""
                 details={"original_error": {"code": original_exc.code, "details": original_exc.details}, "repair_error": {"code": repair_exc.code, "details": repair_exc.details}},
             ) from repair_exc
     logger.info(
-        "[Creator][interface_repair_critic] protocol_repair_used=%s action_count=%d action_types=%s mapped_issue_count=%d affected_interface_ids=%s affected_target_inputs=%s",
+        "[Creator][interface_repair_critic] protocol_repair_used=%s repair_count=%d affected_interface_ids=%s affected_target_inputs=%s",
         protocol_repair_used,
-        len(critic["repair_actions"]), [a.get("action") for a in critic["repair_actions"]],
-        len(critic["issue_action_map"]),
-        [a.get("interface_id") for a in critic["repair_actions"] if a.get("interface_id")],
-        [{"target_member": a.get("target_member"), "target_input": a.get("target_input")} for a in critic["repair_actions"] if a.get("target_member")],
+        len(critic["repairs"]),
+        [value for repair in critic["repairs"] for value in repair["affected_interfaces"]],
+        [value for repair in critic["repairs"] for value in repair["affected_targets"]],
     )
     payload["repair_critic"] = critic
     text = await model_call([{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}], planner_model)
@@ -1292,7 +1287,6 @@ will reject the result. Return only strict Critic JSON."""
                 details={"stage": repair_stage, "original_issues": validation_issues},
             )
         validate_interface_repair_scope(before=current_interface_plan, after=candidate, repair_scope=repair_scope)
-        validate_critic_action_application(critic=critic, before=current_interface_plan, after=candidate)
         remaining = collect_interface_plan_validation_issues(
             plan=candidate, function_items=frozen_function_items, platform_contract=platform_contract,
         )
@@ -1311,13 +1305,19 @@ will reject the result. Return only strict Critic JSON."""
                 system_requirements=system_requirements_context,
                 platform_contract=platform_contract,
                 reviewer_model=reviewer_model,
-                model_call=model_call,
+                model_call=reviewer_model_call or model_call,
             )
             before_fingerprints = {interface_issue_fingerprint(issue) for issue in validation_issues}
             after_fingerprints = {interface_issue_fingerprint(issue) for issue in after_issues}
             if after_fingerprints == before_fingerprints:
                 raise InterfaceIntentPlanError(
                     "interface repair made no progress", code="repair_no_progress",
+                    details={"stage": repair_stage, "original_issues": validation_issues,
+                             "remaining_issues": after_issues},
+                )
+            if after_issues:
+                raise InterfaceIntentPlanError(
+                    "semantic issues remain after repair", code="semantic_issues_remain",
                     details={"stage": repair_stage, "original_issues": validation_issues,
                              "remaining_issues": after_issues},
                 )
@@ -1335,7 +1335,7 @@ will reject the result. Return only strict Critic JSON."""
         logger.info(
             "[Creator][interface_repair_result] plan_changed=%s action_application_count=%d before_issue_fingerprints=%s after_issue_fingerprints=%s remaining_uncovered_input_count=%d remaining_non_atomic_interface_count=%d",
             candidate != current_interface_plan,
-            len(critic["repair_actions"]),
+            len(critic["repairs"]),
             [interface_issue_fingerprint(issue) for issue in validation_issues],
             [interface_issue_fingerprint(issue) for issue in final_issues],
             len(remaining_uncovered), remaining_atomicity,
@@ -1369,6 +1369,7 @@ async def repair_interface_intents(
     platform_contract: dict[str, Any] | None = None, skill_name: str = "",
     repair_stage: str = "graph_expansion_feedback",
     planner_model: str, model_call: ModelCall, reviewer_model: str | None = None,
+    reviewer_model_call: ModelCall | None = None,
 ) -> dict[str, Any]:
     """Compatibility entry point routing all graph feedback to one repairer."""
     issues: list[dict[str, Any]] = []
@@ -1470,4 +1471,5 @@ async def repair_interface_intents(
         interaction_requirements=interaction_requirements, platform_contract=platform_contract,
         skill_name=skill_name, repair_stage=repair_stage,
         planner_model=planner_model, model_call=model_call, reviewer_model=reviewer_model,
+        reviewer_model_call=reviewer_model_call,
     )

@@ -8,7 +8,11 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from .function_item_interface_plan import build_graph_obligations_from_interfaces
+from .function_item_interface_plan import (
+    AUTHORITY_CONTRACT,
+    build_graph_obligations_from_interfaces,
+    runtime_input_source_facts,
+)
 from ..skill_plan import GraphValidationError, normalize_structured_function_items, validate_structured_responsibility_edge_transport
 
 logger = logging.getLogger(__name__)
@@ -74,7 +78,8 @@ def build_endpoint_registry(*, function_items: list[dict], platform_contract: di
         for raw_input in item.get("inputs") or []:
             port_id, description, contract = _port(raw_input)
             if port_id:
-                inputs.append({"input_id": f"IN{len(inputs) + 1:04d}", "node_id": node_id, "target_file": item["target_file"], "port_id": port_id, "node_purpose": item.get("purpose", ""), "description": description, "contract": contract})
+                facts = runtime_input_source_facts(raw_input, item.get("default_values"))
+                inputs.append({"input_id": f"IN{len(inputs) + 1:04d}", "node_id": node_id, "target_file": item["target_file"], "port_id": port_id, "node_purpose": item.get("purpose", ""), "description": description, "contract": contract, **facts})
         for raw_output in item.get("outputs") or []:
             port_id, description, contract = _port(raw_output)
             if port_id:
@@ -153,11 +158,11 @@ def _finalize_graph(*, state: GraphExpansionState, function_items: list[dict], t
     incoming = {(edge["to_node"], edge["to_input"]) for edge in state.committed_edges}
     unresolved = []
     for node in state.activation_order:
-        defaults = items[node].get("default_values") or {}
         for raw_input in items[node].get("inputs") or []:
             port_id = _port(raw_input)[0]
-            if port_id and port_id not in defaults and (node, port_id) not in incoming:
-                unresolved.append({"target": node, "input_id": port_id})
+            facts = runtime_input_source_facts(raw_input, items[node].get("default_values"))
+            if port_id and facts["runtime_source_required"] and (node, port_id) not in incoming:
+                unresolved.append({"target": node, "input_id": port_id, "required": True, "default_present": False})
     if unresolved:
         raise ResponsibilityGraphExpansionError("interface plan does not cover all required FunctionItem inputs", code="interface_plan_incomplete", details={"uncovered_inputs": unresolved})
     for node in state.active_nodes:
@@ -177,7 +182,7 @@ def _finalize_graph(*, state: GraphExpansionState, function_items: list[dict], t
 
 
 def _public_script_inputs(registry: dict, member: str) -> list[dict]:
-    return [{key: value[key] for key in ("input_id", "node_id", "node_purpose", "port_id", "description", "contract")} for value in registry["script_inputs"] if value["target_file"] == member]
+    return [{key: value[key] for key in ("input_id", "node_id", "node_purpose", "port_id", "description", "contract", "required", "default_present", "runtime_source_required")} for value in registry["script_inputs"] if value["target_file"] == member]
 
 
 def _public_script_outputs(registry: dict, member: str) -> list[dict]:
@@ -405,17 +410,24 @@ field names alone. Do not return additional fields."""
                 "target_candidate_count": len(payload["allowed_target_endpoints"]),
             },
         )
-    prompt = """1. AUTHORITATIVE FACTS
+    prompt = f"""{AUTHORITY_CONTRACT}
+
+1. AUTHORITATIVE FACTS
 The payload's current obligation, allowed_source_endpoints, and
-allowed_target_endpoints are the only endpoint authority.
+allowed_target_endpoints are the only endpoint authority. The supplied Interface
+goal is authoritative. Candidate ordering has no semantic meaning.
 
 2. TASK
 Select exactly one source endpoint ID and exactly one target endpoint ID from
-the supplied candidate lists. Copy ID values exactly.
+the supplied candidate lists that realize exactly this Interface. Copy IDs exactly.
 
 3. INVARIANTS
 Do not return field names, member paths, labels, descriptions, placeholders, or
 invented IDs. Do not reproduce, quote, summarize, or copy these instructions.
+Do not broaden, narrow, merge, split, reinterpret, or redesign the Interface.
+Do not select the first candidate merely because it appears first. If no pair
+realizes the Interface exactly, return a binding failure rather than an
+approximate pair.
 Do not include planning notes, explanations, Markdown fences, comments, or hidden reasoning.
 """ + prompt + """
 

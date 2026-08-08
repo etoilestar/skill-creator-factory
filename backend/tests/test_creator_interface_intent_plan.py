@@ -35,74 +35,46 @@ def test_interface_prompts_require_atomic_target_input_coverage():
     assert "default_present=true" in prompt
 
 
-def critic_for_payload(payload, *, action="modify_interface", interface_id=None):
-    """Build protocol-valid abstract Critic output for mocked model flows."""
-    interface_id = interface_id or payload["current_interface_plan"]["interfaces"][0]["interface_id"]
-    action_value = {
-        "action_id": "A1", "action": action, "interface_id": interface_id,
-        "reason": "Address the supplied abstract blocking fact.",
-    }
-    if action == "modify_interface":
-        target = next(item for item in payload["function_items"] if item["inputs"])
-        action_value.update({
-            "correction_goal": "Correct the supplied abstract semantic defect.",
-            "affected_target": {"target_member": target["target_file"], "target_input": target["inputs"][0]["name"]},
-        })
-    elif action == "add_atomic_interface":
-        action_value.pop("interface_id")
-        target = next(item for item in payload["function_items"] if item["inputs"])
-        action_value.update({
-            "target_member": target["target_file"], "target_input": target["inputs"][0]["name"],
-            "semantic_source_requirement": "The semantic runtime value required by the target input.",
-        })
+def critic_for_payload(payload, **_ignored):
+    """Build protocol-valid diagnostic Critic output for mocked model flows."""
+    interfaces = {item["interface_id"] for item in payload["current_interface_plan"]["interfaces"]}
+    target = next((item for item in payload["function_items"] if item["inputs"]), None)
+    affected_targets = ([{"target_member": target["target_file"], "target_input": target["inputs"][0]["name"]}]
+                        if target else [])
     return {
-        "diagnosis": "One abstract repair action is required.",
-        "issue_action_map": [
-            {"issue_fingerprint": fingerprint, "action_ids": ["A1"]}
-            for fingerprint in payload["blocking_issue_fingerprints"]
-        ],
-        "repair_actions": [action_value],
+        "diagnosis": "The supplied semantic facts require a bounded repair.",
+        "repairs": [{
+            "issue_fingerprint": fingerprint,
+            "affected_interfaces": [next(iter(interfaces))] if interfaces else [],
+            "affected_targets": affected_targets,
+            "repair_intent": "Change the affected semantic property.",
+            "expected_result": "The supplied blocking fact no longer exists.",
+        } for fingerprint in payload["blocking_issue_fingerprints"]],
     }
 
 
-def test_repair_critic_validates_all_five_exact_action_schemas():
-    items = [item("scripts/a.py", ["input_x", "input_y"], ["output_x"])]
-    current = plan(p2m("I1", "scripts/a.py"), m2p("I2", "scripts/a.py"))
-    issue = {"code": "abstract_issue", "category": "atomicity", "interface_id": "I1", "details": {"affected_interfaces": ["I1"], "affected_inputs": [{"target_member": "scripts/a.py", "target_input": "input_x"}]}}
-    fingerprint = serialize_interface_issue_fingerprint(issue)
-    actions = [
-        {"action_id": "A1", "action": "add_atomic_interface", "target_member": "scripts/a.py", "target_input": "input_x", "semantic_source_requirement": "A semantic value.", "reason": "Coverage is missing."},
-        {"action_id": "A2", "action": "split_interface", "interface_id": "I1", "target_inputs": [{"target_member": "scripts/a.py", "target_input": "input_x"}, {"target_member": "scripts/a.py", "target_input": "input_y"}], "reason": "Transfers are independent."},
-        {"action_id": "A3", "action": "modify_interface", "interface_id": "I1", "correction_goal": "Correct its direction.", "affected_target": {"target_member": "scripts/a.py", "target_input": "input_x"}, "reason": "The existing intent is retained."},
-        {"action_id": "A4", "action": "preserve_interface", "interface_id": "I2", "reason": "It is unaffected."},
-        {"action_id": "A5", "action": "remove_interface", "interface_id": "I1", "reason": "The explicit issue invalidates it."},
-    ]
-    result = validate_interface_repair_critic(
-        {"diagnosis": "Apply generic actions.", "issue_action_map": [{"issue_fingerprint": fingerprint, "action_ids": [action["action_id"] for action in actions]}], "repair_actions": actions},
-        validation_issues=[issue], current_interface_plan=current,
-        frozen_function_items=items, repair_scope={"affected_interface_ids": ["I1"], "removable_interface_ids": ["I1"], "allow_add_interfaces": True, "allow_remove_interfaces": True},
-    )
-    assert [action["action"] for action in result["repair_actions"]] == ["add_atomic_interface", "split_interface", "modify_interface", "preserve_interface", "remove_interface"]
+def test_repair_critic_validates_diagnostic_schema():
+    items = [item("scripts/a.py", ["input_x"], ["output_x"])]
+    current = plan(p2m("I1", "scripts/a.py"))
+    issue = {"code": "abstract_issue", "category": "alignment", "interface_id": "I1", "details": {"affected_interfaces": ["I1"], "affected_inputs": [{"target_member": "scripts/a.py", "target_input": "input_x"}]}}
+    payload = {"current_interface_plan": current, "function_items": [{"target_file": "scripts/a.py", "inputs": [{"name": "input_x"}]}], "blocking_issue_fingerprints": [serialize_interface_issue_fingerprint(issue)]}
+    result = validate_interface_repair_critic(critic_for_payload(payload), validation_issues=[issue], current_interface_plan=current, frozen_function_items=items, repair_scope={})
+    assert result["repairs"][0]["affected_targets"][0]["target_input"] == "input_x"
 
 
-@pytest.mark.parametrize("mutation", ["unknown_field", "duplicate_action_id", "unknown_action_reference", "unmapped_issue"])
+@pytest.mark.parametrize("mutation", ["unknown_field", "duplicate_fingerprint", "unknown_interface", "unmapped_issue"])
 def test_repair_critic_rejects_invalid_protocol_and_mapping(mutation):
     items = [item("scripts/a.py", ["input_x"], ["output_x"])]
     current = plan(p2m("I1", "scripts/a.py"))
     issue = {"code": "abstract_issue", "category": "alignment", "interface_id": "I1", "details": {}}
-    fingerprint = serialize_interface_issue_fingerprint(issue)
-    action = {"action_id": "A1", "action": "preserve_interface", "interface_id": "I1", "reason": "Unaffected."}
-    value = {"diagnosis": "Generic diagnosis.", "issue_action_map": [{"issue_fingerprint": fingerprint, "action_ids": ["A1"]}], "repair_actions": [action]}
-    if mutation == "unknown_field":
-        action["extra"] = True
-    elif mutation == "duplicate_action_id":
-        value["repair_actions"].append(dict(action))
-    elif mutation == "unknown_action_reference":
-        value["issue_action_map"][0]["action_ids"] = ["missing"]
-    else:
-        value["issue_action_map"] = []
+    payload = {"current_interface_plan": current, "function_items": [{"target_file": "scripts/a.py", "inputs": [{"name": "input_x"}]}], "blocking_issue_fingerprints": [serialize_interface_issue_fingerprint(issue)]}
+    value = critic_for_payload(payload)
+    if mutation == "unknown_field": value["repairs"][0]["extra"] = True
+    elif mutation == "duplicate_fingerprint": value["repairs"].append(dict(value["repairs"][0]))
+    elif mutation == "unknown_interface": value["repairs"][0]["affected_interfaces"] = ["missing"]
+    else: value["repairs"] = []
     with pytest.raises(InterfaceIntentPlanError):
-        validate_interface_repair_critic(value, validation_issues=[issue], current_interface_plan=current, frozen_function_items=items, repair_scope={"affected_interface_ids": ["I1"], "removable_interface_ids": [], "allow_add_interfaces": False, "allow_remove_interfaces": False})
+        validate_interface_repair_critic(value, validation_issues=[issue], current_interface_plan=current, frozen_function_items=items, repair_scope={})
 
 
 @pytest.mark.asyncio
@@ -122,7 +94,7 @@ async def test_repair_critic_protocol_reformatter_runs_once_before_generator():
             repair_payload = json.loads(messages[-1]["content"])
             critic_payload = {"current_interface_plan": current, "function_items": [{"target_file": "scripts/a.py", "inputs": [{"name": "input_x"}]}], "blocking_issue_fingerprints": repair_payload["blocking_issue_fingerprints"]}
             return json.dumps(critic_for_payload(critic_payload))
-        assert payload["repair_critic"]["repair_actions"][0]["action"] == "modify_interface"
+        assert payload["repair_critic"]["repairs"][0]["repair_intent"]
         return json.dumps(repaired)
 
     result = await repair_interface_plan_semantically(
@@ -133,7 +105,7 @@ async def test_repair_critic_protocol_reformatter_runs_once_before_generator():
     )
     assert result == repaired
     assert len(calls) == 3
-    assert "repairing only the transport and protocol" in calls[1][0]["content"]
+    assert "ALLOWED TRANSPORT REPAIRS" in calls[1][0]["content"]
 
 
 @pytest.mark.asyncio
@@ -366,7 +338,7 @@ async def test_repair_interface_intents_returns_validated_repaired_plan():
         assert payload["validation_issues"][0]["affected_members"] == ["scripts/a.py"]
         if "blocking_issue_fingerprints" in payload and "repair_critic" not in payload:
             fingerprint = payload["blocking_issue_fingerprints"][0]
-            return json.dumps({"diagnosis": "Missing input transfer.", "issue_action_map": [{"issue_fingerprint": fingerprint, "action_ids": ["A1"]}], "repair_actions": [{"action_id": "A1", "action": "add_atomic_interface", "target_member": "scripts/a.py", "target_input": "input_1", "semantic_source_requirement": "The runtime value required by input_1.", "reason": "The required input is uncovered."}]})
+            return json.dumps(critic_for_payload(payload))
         return json.dumps(repaired)
 
     assert await repair_interface_intents(original_user_goal="g", frozen_function_items=items, current_interface_plan={"interfaces": []}, validation_errors=[{"code": "interface_plan_incomplete", "category": "coverage", "details": {"uncovered_inputs": [{"target": "scripts/a.py", "input_id": "input_1"}]}}], affected_members=["scripts/a.py"], missing_platform_output_fields=[], planner_model="p", model_call=model) == repaired
@@ -598,7 +570,7 @@ def test_interface_prompt_uses_five_sections_and_forbids_instruction_leakage():
         )
     )
 
-    assert "apply every validated repair action" in captured["system"]
+    assert "apply the validated semantic repair diagnoses" in captured["system"]
     assert "returning an unchanged plan is invalid" in captured["system"]
     assert "repeated member pairs are allowed" in captured["system"]
     assert captured["payload"]["validation_issues"][0]["affected_inputs"] == [

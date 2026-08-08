@@ -198,7 +198,7 @@ async def test_structured_port_defaults_and_unresolved_inputs_use_port_ids():
     with pytest.raises(ResponsibilityGraphExpansionError) as raised:
         await expand_responsibility_graph(function_items=missing_items, platform_contract=contract(), planner_model="p", model_call=model, goal_context={}, interface_plan=plan(p2m("I0001", "scripts/a.py"), m2p("I0002", "scripts/a.py")))
     assert raised.value.code == "interface_plan_incomplete"
-    assert raised.value.details["uncovered_inputs"] == [{"target": "scripts/a.py", "input_id": "second"}]
+    assert raised.value.details["uncovered_inputs"] == [{"target": "scripts/a.py", "input_id": "second", "required": True, "default_present": False}]
 
 
 def test_structured_port_description_and_contract_are_preserved_in_registry():

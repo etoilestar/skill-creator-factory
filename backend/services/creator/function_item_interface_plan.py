@@ -802,25 +802,61 @@ The complete result must match INTERFACE_SCHEMA and pass all supplied facts.
 Silently rebuild the complete required-slot coverage ledger before returning.
 7. OUTPUT CONTRACT
 Return strict JSON matching INTERFACE_SCHEMA only."""
-        correction_payload = {**payload, "previous_interface_plan": parsed,
-                              "deterministic_validation_facts": facts,
-                              "interface_schema": INTERFACE_SCHEMA}
-        logger.info("[Creator][interface_plan_correction] attempt=1 issue_count=%d", len(facts))
-        corrected_text = await model_call(
-            [{"role": "system", "content": correction_prompt},
-             {"role": "user", "content": json.dumps(correction_payload, ensure_ascii=False, default=str)}],
-            planner_model,
-        )
-        parsed = validate_interface_plan_protocol(_parse_object(corrected_text))
-        deterministic_issues = collect_interface_plan_validation_issues(
-            plan=parsed, function_items=frozen_function_items,
-            platform_contract=platform_contract,
-        )
-        if deterministic_issues:
+        previous_candidate = parsed
+        previous_protocol_valid = protocol_issue is None
+        for attempt in (1, 2):
+            correction_payload = {
+                **payload,
+                "previous_interface_plan": previous_candidate,
+                "deterministic_validation_facts": facts,
+                "interface_schema": INTERFACE_SCHEMA,
+                "correction_attempt": attempt,
+                "max_correction_attempts": 2,
+            }
+            logger.info(
+                "[Creator][interface_plan_correction] attempt=%d/2 protocol_issue_count=%d deterministic_issue_count=%d",
+                attempt, 0 if previous_protocol_valid else len(facts),
+                len(facts) if previous_protocol_valid else 0,
+            )
+            corrected_text = await model_call(
+                [{"role": "system", "content": correction_prompt},
+                 {"role": "user", "content": json.dumps(correction_payload, ensure_ascii=False, default=str)}],
+                planner_model,
+            )
+            corrected_object: dict[str, Any] | None = None
+            try:
+                corrected_object = _parse_object(corrected_text)
+                candidate = validate_interface_plan_protocol(corrected_object)
+            except InterfaceIntentPlanError as exc:
+                candidate = corrected_object if corrected_object is not None else previous_candidate
+                candidate_protocol_valid = False
+                facts = [{"code": exc.code, "message": str(exc), "details": exc.details}]
+            else:
+                candidate_protocol_valid = True
+                facts = collect_interface_plan_validation_issues(
+                    plan=candidate, function_items=frozen_function_items,
+                    platform_contract=platform_contract,
+                )
+            if (previous_protocol_valid and candidate_protocol_valid
+                    and canonical_logical_binding_signatures(candidate)
+                    == canonical_logical_binding_signatures(previous_candidate)):
+                raise InterfaceIntentPlanError(
+                    "interface plan correction made no semantic progress",
+                    code="repair_no_progress",
+                    details={"stage": "interface_plan_correction", "attempt": attempt,
+                             "remaining_issues": facts},
+                )
+            if candidate_protocol_valid and not facts:
+                parsed = candidate
+                deterministic_issues = []
+                break
+            previous_candidate = candidate
+            previous_protocol_valid = candidate_protocol_valid
+        else:
             raise InterfaceIntentPlanError(
                 "interface plan deterministic closure failed after correction",
                 code="interface_plan_deterministic_closure_failed",
-                details={"correction_attempts": 1, "remaining_issues": deterministic_issues},
+                details={"correction_attempts": 2, "remaining_issues": facts},
             )
     review_issues: list[dict[str, Any]] = []
     if reviewer_model:
@@ -1053,14 +1089,53 @@ Return only strict JSON matching critic_schema."""
     )
     payload["repair_critic"] = critic
     candidate_before = current_interface_plan
+    candidate_before_protocol_valid = True
     residual = validation_issues
+    generator_transport_repair_used = False
     for attempt in (1, 2):
         attempt_payload = {**payload, "current_interface_plan": candidate_before,
                            "residual_acceptance_facts": residual,
                            "generator_attempt": attempt}
         text = await model_call([{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(attempt_payload, ensure_ascii=False, default=str)}], planner_model)
-        candidate = validate_interface_plan_protocol(_parse_object(text))
-        if canonical_logical_binding_signatures(candidate) == canonical_logical_binding_signatures(candidate_before):
+        try:
+            candidate_object = _parse_object(text)
+        except InterfaceIntentPlanError as parse_exc:
+            if generator_transport_repair_used:
+                raise InterfaceIntentPlanError(
+                    "interface semantic repair transport failed",
+                    code="interface_semantic_repair_failed",
+                    details={"stage": repair_stage, "attempt": attempt,
+                             "repair_error": {"code": parse_exc.code, "details": parse_exc.details}},
+                ) from parse_exc
+            generator_transport_repair_used = True
+            try:
+                candidate_object = await _reformat_interface_plan_response(
+                    raw_response=text, validation_error=parse_exc,
+                    planner_model=planner_model, model_call=model_call,
+                )
+            except InterfaceIntentPlanError as repair_exc:
+                raise InterfaceIntentPlanError(
+                    "interface semantic repair transport failed",
+                    code="interface_semantic_repair_failed",
+                    details={"stage": repair_stage, "attempt": attempt,
+                             "repair_error": {"code": repair_exc.code,
+                                              "details": repair_exc.details}},
+                ) from repair_exc
+        try:
+            candidate = validate_interface_plan_protocol(candidate_object)
+        except InterfaceIntentPlanError as protocol_exc:
+            residual = [{"code": protocol_exc.code, "message": str(protocol_exc),
+                         "details": protocol_exc.details}]
+            candidate_before = candidate_object
+            candidate_before_protocol_valid = False
+            logger.info(
+                "[Creator][interface_generator_repair] attempt=%d/2 protocol_valid=false deterministic_issue_count=0 review_issue_count=0",
+                attempt,
+            )
+            continue
+        if (candidate_before_protocol_valid
+                and canonical_logical_binding_signatures(candidate)
+                == canonical_logical_binding_signatures(candidate_before)):
             raise InterfaceIntentPlanError(
                 "interface repair made no semantic progress", code="repair_no_progress",
                 details={"stage": repair_stage, "attempt": attempt, "original_issues": validation_issues},
@@ -1084,11 +1159,16 @@ Return only strict JSON matching critic_schema."""
                 reviewer_model=reviewer_model,
                 model_call=reviewer_model_call or model_call,
             )
+        logger.info(
+            "[Creator][interface_generator_repair] attempt=%d/2 protocol_valid=true deterministic_issue_count=%d review_issue_count=%d",
+            attempt, len(remaining), len(after_issues),
+        )
         residual = merge_interface_validation_issues(remaining, after_issues)
         if not residual:
             logger.info("[Creator][interface_semantic_repair] stage=%s attempt=%d result=candidate_valid", repair_stage, attempt)
             return validate_interface_intent_plan(plan=candidate, function_items=frozen_function_items)
         candidate_before = candidate
+        candidate_before_protocol_valid = True
     raise InterfaceIntentPlanError(
         "semantic issues remain after repair", code="semantic_issues_remain",
         details={"stage": repair_stage, "repair_attempts": 2,

@@ -6,6 +6,7 @@ from backend.services.creator.function_item_interface_plan import (
     _interface_plan_prompt, build_graph_obligations_from_interfaces,
     build_interface_repair_scope, collect_interface_plan_validation_issues,
     canonical_logical_binding_signatures,
+    existing_binding_references_valid,
     normalize_interface_review_issue, repair_interface_plan_semantically,
     plan_function_item_interfaces, review_interface_plan_semantically,
     validate_interface_intent_plan, validate_interface_repair_critic,
@@ -254,7 +255,7 @@ async def test_planner_correction_uses_second_attempt_for_staged_residual():
                                m2p("I3", "scripts/unit_b.py")]}
     planner_responses = iter([initial, first, complete])
     correction_payloads = []
-    reviewer_calls = 0
+    reviewer_modes = []
 
     async def planner(messages, _model):
         value = next(planner_responses)
@@ -262,9 +263,10 @@ async def test_planner_correction_uses_second_attempt_for_staged_residual():
             correction_payloads.append(json.loads(messages[-1]["content"]))
         return json.dumps(value)
 
-    async def reviewer(_messages, _model):
-        nonlocal reviewer_calls
-        reviewer_calls += 1
+    async def reviewer(messages, _model):
+        reviewer_modes.append(
+            "existing" if "EXISTING-BINDING-ONLY MODE" in messages[0]["content"] else "full"
+        )
         return json.dumps({"passed": True, "issues": []})
 
     result = await plan_function_item_interfaces(
@@ -278,8 +280,7 @@ async def test_planner_correction_uses_second_attempt_for_staged_residual():
     assert correction_payloads[1]["previous_interface_plan"] == first
     assert any(value["code"] == "uncovered_required_logical_input"
                for value in correction_payloads[1]["refinement_feedback"]["acceptance_facts"])
-    # Each deterministic-invalid candidate is now audited as well as the final plan.
-    assert reviewer_calls == 3
+    assert reviewer_modes == ["existing", "full"]
 
 
 @pytest.mark.asyncio
@@ -494,6 +495,7 @@ async def test_correction_receives_uncovered_slot_and_existing_binding_semantic_
         m2p("I2", "scripts/c.py", "result"),
     ]}
     correction_facts = []
+    reviewer_modes = []
 
     async def planner(messages, _model):
         payload = json.loads(messages[-1]["content"])
@@ -503,6 +505,9 @@ async def test_correction_receives_uncovered_slot_and_existing_binding_semantic_
         return json.dumps(corrected)
 
     async def reviewer(messages, _model):
+        reviewer_modes.append(
+            "existing" if "EXISTING-BINDING-ONLY MODE" in messages[0]["content"] else "full"
+        )
         payload = json.loads(messages[-1]["content"])
         binding = payload["current_interface_plan"]["interfaces"][0]
         if binding.get("source_output") == "alpha":
@@ -529,6 +534,40 @@ async def test_correction_receives_uncovered_slot_and_existing_binding_semantic_
         "message": "declared alpha does not satisfy beta",
         "expected_constraint": "Declared semantic source must satisfy declared receiving slot.",
     }]
+    assert reviewer_modes == ["existing", "full"]
+
+
+@pytest.mark.asyncio
+async def test_invalid_existing_reference_skips_early_semantic_audit():
+    items = [item("scripts/a.py", [], ["alpha"])]
+    initial = {"interfaces": [
+        m2m("I1", "scripts/missing.py", "alpha", "scripts/a.py", "alpha"),
+        m2p("I2", "scripts/a.py", "alpha"),
+    ]}
+    corrected = {"interfaces": [m2p("I2", "scripts/a.py", "alpha")]}
+    reviewer_modes = []
+
+    assert not existing_binding_references_valid(
+        plan=initial, function_items=items, platform_contract=platform(),
+    )
+
+    async def planner(messages, _model):
+        payload = json.loads(messages[-1]["content"])
+        return json.dumps(corrected if "refinement_feedback" in payload else initial)
+
+    async def reviewer(messages, _model):
+        reviewer_modes.append(
+            "existing" if "EXISTING-BINDING-ONLY MODE" in messages[0]["content"] else "full"
+        )
+        return json.dumps({"passed": True, "issues": []})
+
+    assert await plan_function_item_interfaces(
+        original_user_goal="produce alpha", frozen_function_items=items,
+        platform_contract=platform(), planner_model="planner-test-model",
+        model_call=planner, reviewer_model="reviewer-test-model",
+        reviewer_model_call=reviewer,
+    ) == corrected
+    assert reviewer_modes == ["full"]
 
 
 @pytest.mark.asyncio

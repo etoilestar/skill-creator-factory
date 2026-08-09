@@ -782,16 +782,35 @@ Return only strict JSON matching this schema:
     return issues
 
 
-_LOGICAL_REFERENCE_ISSUE_CODES = {
-    "unknown_platform_logical_input", "unknown_interface_logical_input",
-    "unknown_interface_logical_output", "unknown_platform_logical_output",
-    "interface_self_connection", "invalid_required_platform_output",
-}
-
-
-def _logical_references_are_valid(issues: list[dict[str, Any]]) -> bool:
-    """Return whether semantic review can safely resolve every declared record."""
-    return not any(issue.get("code") in _LOGICAL_REFERENCE_ISSUE_CODES for issue in issues)
+def existing_binding_references_valid(
+    *, plan: dict[str, Any], function_items: list[dict[str, Any]],
+    platform_contract: dict[str, Any] | None = None,
+) -> bool:
+    """Return whether every declared binding resolves to existing logical ports."""
+    try:
+        validated = validate_interface_intent_plan(
+            plan=plan, function_items=function_items,
+        )
+    except InterfaceIntentPlanError:
+        return False
+    boundary = (platform_contract or {}).get(
+        "platform_skill_boundary", platform_contract or {},
+    )
+    platform_inputs = {
+        _compact_port_id(value)
+        for value in boundary.get("input_envelope_fields") or []
+    }
+    platform_outputs = {
+        _compact_port_id(value)
+        for value in boundary.get("final_output_fields") or []
+    }
+    return all(
+        (interface["kind"] != "platform_to_member"
+         or interface["source_platform_input"] in platform_inputs)
+        and (interface["kind"] != "member_to_platform"
+             or interface["target_platform_output"] in platform_outputs)
+        for interface in validated["interfaces"]
+    )
 
 
 def _existing_binding_acceptance_facts(
@@ -901,7 +920,10 @@ async def plan_function_item_interfaces(*, original_user_goal: str, frozen_funct
     early_semantic_facts: list[dict[str, Any]] = []
     early_semantic_audit_available = False
     if (protocol_issue is None and deterministic_issues and reviewer_model
-            and _logical_references_are_valid(deterministic_issues)):
+            and existing_binding_references_valid(
+                plan=parsed, function_items=frozen_function_items,
+                platform_contract=platform_contract,
+            )):
         early_semantic_facts, early_semantic_audit_available = await _audit_existing_bindings_fail_open(
             original_user_goal=original_user_goal,
             frozen_function_items=frozen_function_items,
@@ -990,7 +1012,11 @@ Return strict JSON matching INTERFACE_SCHEMA only."""
                 platform_contract=platform_contract,
             )
             semantic_facts: list[dict[str, Any]] = []
-            if reviewer_model and _logical_references_are_valid(remaining):
+            references_valid = bool(remaining) and existing_binding_references_valid(
+                plan=candidate, function_items=frozen_function_items,
+                platform_contract=platform_contract,
+            )
+            if reviewer_model and references_valid:
                 semantic_facts, _ = await _audit_existing_bindings_fail_open(
                     original_user_goal=original_user_goal,
                     frozen_function_items=frozen_function_items,

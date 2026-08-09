@@ -2,7 +2,7 @@
 
 from .common import *  # noqa: F403
 from typing import Any, Iterable, Mapping
-from ..creator_model_profiles import complete_creator_role_once as _profile_creator_role_once
+from .model_gateway import creator_model_call
 from .command_normalizer import parse_skill_md_bash_command_blocks
 from .tool_pool_models import (ToolPoolModel, ToolPoolTool, ToolPoolFileBinding, ToolPoolGateEvent, ToolPoolDeniedRequest, ToolPoolMissingRequest, ToolPoolPatch, ToolPoolAddToolRequest, RuntimeImportGuardResult)
 
@@ -6755,8 +6755,8 @@ from .repair import *  # noqa: F403  # late import for blueprint repair helpers
 
 async def complete_creator_role_once(messages, role, *, fallback_model, stage="creator"):
     """Injectable contract seam that retains production role-profile routing."""
-    return await _profile_creator_role_once(
-        messages, role, fallback_model=fallback_model, stage=stage,
+    return await creator_model_call(
+        messages, role=role, fallback_model=fallback_model, stage=stage,
         model_call=complete_chat_once,
     )
 

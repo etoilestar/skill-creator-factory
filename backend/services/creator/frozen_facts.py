@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import copy
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -42,6 +43,11 @@ FACT_OWNERS: dict[str, str] = {
     "generated_file_content": "generation",
     "review_summary_prose": "review_summary",
 }
+SNAPSHOT_AUTHORITATIVE_FIELDS = frozenset({
+    "confirmed_requirements", "file_plan", "function_items",
+    "requirement_projection", "resource_authority", "platform_contract",
+    "interface_plan", "graph",
+})
 
 
 @dataclass(frozen=True)
@@ -56,6 +62,34 @@ class CreatorFactsSnapshot:
     platform_contract: dict[str, Any] = field(default_factory=dict)
     interface_plan: dict[str, Any] = field(default_factory=dict)
     graph: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_mutable(cls, **facts: Any) -> "CreatorFactsSnapshot":
+        """Defensively detach a frozen handoff from mutable stage-owned data."""
+        unknown = set(facts) - SNAPSHOT_AUTHORITATIVE_FIELDS
+        if unknown:
+            raise ValueError(f"Unknown Creator snapshot facts: {sorted(unknown)}")
+        copied = copy.deepcopy(facts)
+        for name in ("confirmed_requirements", "file_plan", "function_items"):
+            if name in copied:
+                copied[name] = tuple(copied[name] or ())
+        return cls(**copied)
+
+    @property
+    def authoritative_files(self) -> tuple[str, ...]:
+        return tuple(str(item.get("path") if isinstance(item, dict) else item) for item in self.file_plan)
+
+    @property
+    def authoritative_references(self) -> tuple[str, ...]:
+        return tuple(str(value) for value in self.resource_authority.get("authoritative_references", ()))
+
+    @property
+    def authoritative_assets(self) -> tuple[str, ...]:
+        return tuple(str(value) for value in self.resource_authority.get("authoritative_assets", ()))
+
+    @property
+    def authoritative_upload_assets(self) -> tuple[str, ...]:
+        return tuple(str(value) for value in self.resource_authority.get("authoritative_upload_assets", ()))
 
 
 def _digest(value: Any) -> str:

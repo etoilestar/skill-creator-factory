@@ -66,7 +66,7 @@ from .frozen_facts import (
     log_frozen_fact_digests,
     project_frozen_facts_to_summary,
 )
-from ..creator_model_profiles import complete_creator_role_once as _profile_creator_role_once
+from .model_gateway import creator_model_call
 
 
 async def complete_creator_role_once(
@@ -74,9 +74,55 @@ async def complete_creator_role_once(
     fallback_model: str, stage: str = "creator",
 ) -> str:
     """Injectable API seam that retains production role-profile routing."""
-    return await _profile_creator_role_once(
-        messages, role, fallback_model=fallback_model, stage=stage,
+    return await creator_model_call(
+        messages, role=role, fallback_model=fallback_model, stage=stage,
         model_call=complete_chat_once,
+    )
+
+
+def _freeze_creator_facts_snapshot(
+    *, request: "PreparePlanRequest", plan_files: list[Any],
+    function_items: list[dict[str, Any]] | None = None,
+    requirement_allocations: list[dict[str, Any]] | None = None,
+    requirement_channels: dict[str, str] | None = None,
+    allowed_resources: list[str] | set[str] | None = None,
+    platform_contract: dict[str, Any] | None = None,
+) -> CreatorFactsSnapshot:
+    """Single parser/resource-authority boundary for the downstream handoff."""
+    file_plan: list[dict[str, Any]] = []
+    references: list[str] = []
+    assets: list[str] = []
+    upload_assets: list[str] = []
+    for spec in plan_files or []:
+        path = str(getattr(spec, "path", "") or "").strip()
+        file_type = str(getattr(spec, "file_type", "") or "").strip()
+        asset_source = str(getattr(spec, "asset_source", "") or "").strip()
+        if not path:
+            continue
+        file_plan.append({"path": path, "file_type": file_type, "asset_source": asset_source})
+        # Classification is copied from the validated parser contract; paths are
+        # identities only and are never used here to infer a resource role.
+        if file_type == "reference":
+            references.append(path)
+        elif file_type == "asset":
+            assets.append(path)
+            if asset_source == "user_upload":
+                upload_assets.append(path)
+    return CreatorFactsSnapshot.from_mutable(
+        confirmed_requirements=[request.user_request],
+        file_plan=file_plan,
+        function_items=function_items or [],
+        requirement_projection={
+            "allocations": requirement_allocations or [],
+            "channels": requirement_channels or {},
+        },
+        resource_authority={
+            "authoritative_references": references,
+            "authoritative_assets": assets,
+            "authoritative_upload_assets": upload_assets,
+            "allowed_resources": sorted(allowed_resources or []),
+        },
+        platform_contract=platform_contract or {},
     )
 
 
@@ -9806,24 +9852,16 @@ Blueprint Planner 只规划业务责任。
                 "Pre-graph semantic closure has unresolved blocking issues; "
                 f"issues={blocking_issues}"
             )
-        authoritative_paths = _extract_prepare_skill_plan_paths(frozen_blueprint_text)
-        facts_snapshot = CreatorFactsSnapshot(
-            confirmed_requirements=(request.user_request,),
-            file_plan=tuple(authoritative_paths),
-            function_items=tuple(copy.deepcopy(semantic_function_items)),
-            requirement_projection={
-                "allocations": copy.deepcopy(requirement_allocations),
-                "channels": copy.deepcopy(requirement_channels),
-            },
-            resource_authority={
-                "authoritative_references": [
-                    path for path in authoritative_paths if path.startswith("references/")
-                ],
-                "authoritative_assets": [
-                    path for path in authoritative_paths if path.startswith("assets/")
-                ],
-                "allowed_resources": sorted(allowed_resource_paths),
-            },
+        frozen_canonical_plan = parse_blueprint(
+            [{"role": "assistant", "content": frozen_blueprint_text}], strict=True,
+        )
+        facts_snapshot = _freeze_creator_facts_snapshot(
+            request=request,
+            plan_files=frozen_canonical_plan.files,
+            function_items=semantic_function_items,
+            requirement_allocations=requirement_allocations,
+            requirement_channels=requirement_channels,
+            allowed_resources=allowed_resource_paths,
         )
         log_frozen_fact_digests(stage="blueprint_closure", snapshot=facts_snapshot)
         first_planner_result = {
@@ -9831,6 +9869,7 @@ Blueprint Planner 只规划业务责任。
             "internal_blueprint_text": frozen_blueprint_text,
             "requirement_allocations": requirement_allocations,
             "requirement_channels": requirement_channels,
+            "_facts_snapshot": facts_snapshot,
         }
 
         binding_data = (
@@ -9873,10 +9912,11 @@ Blueprint Planner 只规划业务责任。
 
     return data
 
-async def _project_prepare_review_summary_from_blueprint(
+async def _project_prepare_review_summary(
     *,
     request: PreparePlanRequest,
-    blueprint_text: str,
+    facts_snapshot: CreatorFactsSnapshot,
+    blueprint_explanatory_text: str,
     prepared: dict[str, Any] | None = None,
 ) -> PreparePlanReviewSummary:
     """Project the full internal blueprint into a user-facing review summary.
@@ -9892,12 +9932,12 @@ async def _project_prepare_review_summary_from_blueprint(
     - code generation;
     - E2E.
 
-    The model owns prose only. Frozen file/resource identities are attached by
-    deterministic projection after parsing the canonical structured Blueprint.
+    The model owns prose only. Frozen file/resource identities are attached
+    directly from the supplied snapshot.
     """
 
     source_blueprint = str(
-        blueprint_text or ""
+        blueprint_explanatory_text or ""
     ).strip()
 
     prepared = (
@@ -9915,26 +9955,10 @@ async def _project_prepare_review_summary_from_blueprint(
         )
     )
 
-    authoritative_files: list[str] = []
-    authoritative_upload_assets: list[str] = []
-    if source_blueprint:
-        try:
-            frozen_plan = parse_blueprint(
-                [{"role": "assistant", "content": source_blueprint}], strict=True
-            )
-            for file_spec in frozen_plan.files:
-                path = str(getattr(file_spec, "path", "") or "").strip()
-                if path and path not in authoritative_files:
-                    authoritative_files.append(path)
-                if (str(getattr(file_spec, "file_type", "") or "") == "asset"
-                        and str(getattr(file_spec, "asset_source", "") or "") == "user_upload"
-                        and path not in authoritative_upload_assets):
-                    authoritative_upload_assets.append(path)
-        except Exception:
-            # Blueprint protocol validation owns this failure elsewhere. Summary
-            # projection never repairs or infers identities from malformed text.
-            authoritative_files = []
-            authoritative_upload_assets = []
+    if not isinstance(facts_snapshot, CreatorFactsSnapshot):
+        raise PreparePlanProtocolError("Review Summary requires a frozen CreatorFactsSnapshot")
+    authoritative_files = list(facts_snapshot.authoritative_files)
+    authoritative_upload_assets = list(facts_snapshot.authoritative_upload_assets)
 
     if not source_blueprint:
         return PreparePlanReviewSummary(**project_frozen_facts_to_summary(
@@ -10011,7 +10035,7 @@ those facts. Do not introduce facts absent from the frozen structured context.
 
 这是只读 projection。
 
-internal_blueprint_text 是唯一事实来源。
+internal_blueprint_text 只提供说明性上下文；facts_snapshot 中的冻结事实具有权威性。
 
 禁止：
 
@@ -11152,17 +11176,27 @@ async def _prepare_plan_impl(
         previous_blueprint_text
     )
 
+    facts_snapshot: CreatorFactsSnapshot | None = None
+
     async def project_summary(
         current_blueprint_text: str,
         current_prepared: (
             dict[str, Any] | None
         ) = None,
     ) -> PreparePlanReviewSummary:
+        nonlocal facts_snapshot
+        prepared_snapshot = (
+            (current_prepared or {}).get("_facts_snapshot")
+            if isinstance(current_prepared, dict) else None
+        )
+        if isinstance(prepared_snapshot, CreatorFactsSnapshot):
+            facts_snapshot = prepared_snapshot
+        active_snapshot = facts_snapshot or CreatorFactsSnapshot.from_mutable()
         return (
-            await _project_prepare_review_summary_from_blueprint(
+            await _project_prepare_review_summary(
                 request=request,
-
-                blueprint_text=(
+                facts_snapshot=active_snapshot,
+                blueprint_explanatory_text=(
                     current_blueprint_text
                 ),
 
@@ -11199,20 +11233,6 @@ async def _prepare_plan_impl(
             if isinstance(current_prepared, dict) and current_prepared.get("responsibility_edges") is not None
             else []
         )
-        projected = _structured_plan_review_summary(
-            {"function_items": function_items, "review_summary": (current_prepared or {}).get("review_summary") if isinstance(current_prepared, dict) else {}},
-            projected,
-        )
-        try:
-            frozen_projection = parse_blueprint(
-                [{"role": "assistant", "content": current_blueprint_text}], strict=True
-            )
-            _sync_prepare_summary_files_from_skill_plan(projected, frozen_projection.files)
-        except Exception:
-            # Protocol validation reports malformed blueprints elsewhere; summary
-            # projection must never become a reverse authority or repair source.
-            projected.files_to_create_or_update = []
-            projected.assets_to_upload = []
         current_blueprint_text = _render_structured_responsibility_view(
             current_blueprint_text,
             function_items,
@@ -12078,6 +12098,14 @@ async def _prepare_plan_impl(
         asset_requirements=plan.asset_requirements,
         uploaded_files=request.uploaded_files,
         review_summary=None,
+    )
+    facts_snapshot = _freeze_creator_facts_snapshot(
+        request=request,
+        plan_files=plan.files,
+        function_items=(prepared.get("function_items") or []) if isinstance(prepared, dict) else [],
+        requirement_allocations=(prepared.get("requirement_allocations") or []) if isinstance(prepared, dict) else [],
+        requirement_channels=(prepared.get("requirement_channels") or {}) if isinstance(prepared, dict) else {},
+        allowed_resources=allowed_resource_paths,
     )
 
     required_upload_assets = (

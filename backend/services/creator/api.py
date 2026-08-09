@@ -7261,7 +7261,7 @@ async def _bind_executable_responsibility_plan(
             error_details.get("uncovered_inputs")
             or error_details.get("missing_required_final_output_fields")
             or error_details.get("missing_platform_output_interface")
-            or (error_details.get("interface_id") and error_details.get("reason"))
+            or error_details.get("interface_id")
         )
         if not repairable_facts_present:
             raise

@@ -240,8 +240,16 @@ def _validate_interface_selection_protocol(*, obligation: dict, response: Any) -
             },
         )
 
+    status = response.get("status")
+    if status == "unbound":
+        if set(response) != {"status", "reason"} or not isinstance(response.get("reason"), str) or not response["reason"].strip():
+            raise ResponsibilityGraphExpansionError("unbound selection has invalid protocol", code="invalid_interface_endpoint_protocol", details={"path": "$", "observed_response": response})
+        return {"status": "unbound", "reason": response["reason"].strip()}
+    if status != "bound":
+        raise ResponsibilityGraphExpansionError("endpoint selection status must be bound or unbound", code="invalid_interface_endpoint_protocol", details={"path": "$.status", "observed_response": response})
+
     kind = obligation.get("kind")
-    expected = {"source_id", "target_id", "source_path"} if kind == "platform_to_script" else {"source_id", "target_id"}
+    expected = {"status", "source_id", "target_id", "source_path"} if kind == "platform_to_script" else {"status", "source_id", "target_id"}
 
     if set(response) != expected:
         raise ResponsibilityGraphExpansionError(
@@ -347,8 +355,8 @@ async def _select_interface_endpoint_reference(*, obligation: dict, registry: di
                     "reason": "no_remaining_target_endpoint",
                 },
             )
-        prompt = """For this platform_to_script obligation, return exactly:
-{"source_id":"<allowed platform input ID>","target_id":"<allowed target input ID>","source_path":[]}
+        prompt = """For a successful platform_to_script binding, return exactly:
+{"status":"bound","source_id":"<allowed platform input ID>","target_id":"<allowed target input ID>","source_path":[]}
 source_path is an array of nested keys within the selected platform input; use
 [] for direct binding. Use [] when no nested key is needed. source_path is
 never a script path, member path, filename, or endpoint ID."""
@@ -367,8 +375,8 @@ never a script path, member path, filename, or endpoint ID."""
                     "reason": "no_remaining_platform_target",
                 },
             )
-        prompt = """For this script_to_platform obligation, return exactly:
-{"source_id":"<allowed source output ID>","target_id":"<allowed platform output ID>"}
+        prompt = """For a successful script_to_platform binding, return exactly:
+{"status":"bound","source_id":"<allowed source output ID>","target_id":"<allowed platform output ID>"}
 Do not return source_path or any additional field."""
     else:
         payload["source_member_outputs"] = _public_script_outputs(registry, obligation["source_member"])
@@ -386,8 +394,8 @@ Do not return source_path or any additional field."""
                     "reason": "no_remaining_target_endpoint",
                 },
             )
-        prompt = """For this script_to_script obligation, return exactly:
-{"source_id":"<allowed source output ID>","target_id":"<allowed target input ID>"}
+        prompt = """For a successful script_to_script binding, return exactly:
+{"status":"bound","source_id":"<allowed source output ID>","target_id":"<allowed target input ID>"}
 Use the Interface goal and declared contracts as semantic evidence. Reused
 source outputs are legal. Do not infer a mapping from filenames or matching
 field names alone. Do not return additional fields."""
@@ -415,7 +423,9 @@ field names alone. Do not return additional fields."""
 1. AUTHORITATIVE FACTS
 The payload's current obligation, allowed_source_endpoints, and
 allowed_target_endpoints are the only endpoint authority. The supplied Interface
-goal is authoritative. Candidate ordering has no semantic meaning.
+goal is authoritative. Candidate ordering has no semantic meaning. Candidate
+list position is transport order only: never preference, score, recommendation,
+or fallback priority.
 
 2. TASK
 Select exactly one source endpoint ID and exactly one target endpoint ID from
@@ -426,8 +436,9 @@ Do not return field names, member paths, labels, descriptions, placeholders, or
 invented IDs. Do not reproduce, quote, summarize, or copy these instructions.
 Do not broaden, narrow, merge, split, reinterpret, or redesign the Interface.
 Do not select the first candidate merely because it appears first. If no pair
-realizes the Interface exactly, return a binding failure rather than an
-approximate pair.
+realizes the Interface exactly, return exactly
+{{"status":"unbound","reason":"No legal candidate pair realizes the supplied Interface goal."}}
+rather than an approximate pair. Do not enumerate or try candidate pairs.
 Do not include planning notes, explanations, Markdown fences, comments, or hidden reasoning.
 """ + prompt + """
 
@@ -437,7 +448,7 @@ and target_id appears verbatim in allowed_target_endpoints.
 
 5. OUTPUT CONTRACT
 Return only the requested JSON object. For non-platform-input obligations it is
-exactly {"source_id":"<legal ID>","target_id":"<legal ID>"}. A
+exactly {"status":"bound","source_id":"<legal ID>","target_id":"<legal ID>"}. A
 platform_to_script obligation additionally requires only source_path as already
 defined above.
 """
@@ -465,9 +476,19 @@ For platform_to_script:
 - [] means direct binding;
 - source_path is never a script or file path.
 
-Return only the corrected strict JSON object."""
+    Return only the corrected strict JSON object."""
     text = await model_call([{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}], planner_model)
-    return _validate_interface_selection_protocol(obligation=obligation, response=_parse_object(text, "invalid_interface_endpoint_protocol"))
+    selection = _validate_interface_selection_protocol(obligation=obligation, response=_parse_object(text, "invalid_interface_endpoint_protocol"))
+    if selection["status"] == "unbound":
+        raise ResponsibilityGraphExpansionError(
+            "no legal endpoint pair realizes the Interface goal", code="interface_endpoint_unbound",
+            details={
+                "interface_id": obligation.get("interface_id", ""), "goal": obligation.get("goal", ""),
+                "candidate_domains": {"sources": payload["allowed_source_endpoints"], "targets": payload["allowed_target_endpoints"]},
+                "deterministic_contract_facts": {"kind": kind}, "model_reason": selection["reason"],
+            },
+        )
+    return selection
 
 def _materialize_interface_obligation(*, obligation: dict, selection: dict, registry: dict, state: GraphExpansionState) -> dict:
     selection = _validate_interface_selection_protocol(obligation=obligation, response=selection)
@@ -559,7 +580,7 @@ async def _expand_from_interface_plan(*, normalized: list[dict], platform_contra
                 )
                 if (
                     isinstance(exc, ResponsibilityGraphExpansionError)
-                    and (error_code == "interface_plan_overcomplete"
+                    and (error_code in {"interface_plan_overcomplete", "interface_endpoint_unbound"}
                          or "source_candidate_count" in details
                          or "target_candidate_count" in details)
                 ):

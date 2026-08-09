@@ -89,6 +89,7 @@ def _build_payload(
     model: str,
     stream: bool,
     max_tokens: int | None = None,
+    temperature: float | None = None,
 ) -> dict:
     payload = {
         "model": model,
@@ -96,8 +97,9 @@ def _build_payload(
         "stream": stream,
     }
 
-    if settings.temperature is not None:
-        payload["temperature"] = settings.temperature
+    effective_temperature = temperature if temperature is not None else settings.temperature
+    if effective_temperature is not None:
+        payload["temperature"] = effective_temperature
 
     effective_max_tokens = max_tokens if max_tokens is not None else settings.max_tokens
     if effective_max_tokens is not None:
@@ -139,13 +141,15 @@ def _build_image_headers() -> dict:
 async def complete_chat_once(
     messages: list[dict], model: str, *, base_url: str | None = None,
     api_key: str | None = None, max_tokens: int | None = None,
+    temperature: float | None = None,
 ) -> str:
     """Non-streaming chat completion.
 
     用于 metadata 阶段的静默模型调用。
     """
     url = _build_chat_completions_url(base_url or settings.llm_base_url)
-    payload = _build_payload(messages=messages, model=model, stream=False, max_tokens=max_tokens)
+    payload = _build_payload(messages=messages, model=model, stream=False, max_tokens=max_tokens,
+                             temperature=temperature)
     headers = _build_headers(api_key)
     timeout = float(settings.llm_timeout_seconds)
 

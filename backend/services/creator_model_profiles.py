@@ -26,7 +26,8 @@ def _profile_path() -> Path:
 
 
 def _empty() -> dict:
-    return {role: {"base_url": "", "api_key": "", "model": "", "max_tokens": None} for role in ROLES}
+    return {role: {"base_url": "", "api_key": "", "model": "", "max_tokens": None,
+                   "temperature": None} for role in ROLES}
 
 
 def _load() -> dict:
@@ -69,6 +70,7 @@ class CreatorModelProfile:
     api_key: str | None
     model: str
     max_tokens: int | None
+    temperature: float | None
 
 
 def resolve_creator_model_profile(
@@ -82,6 +84,7 @@ def resolve_creator_model_profile(
         api_key=str(saved["api_key"]) if saved.get("api_key") else None,
         model=str(saved.get("model") or fallback_model),
         max_tokens=saved.get("max_tokens") if saved.get("max_tokens") is not None else settings.max_tokens,
+        temperature=saved.get("temperature") if saved.get("temperature") is not None else settings.temperature,
     )
 
 
@@ -90,8 +93,12 @@ async def complete_creator_role_once(
     stage: str = "creator",
 ) -> str:
     profile = resolve_creator_model_profile(role, fallback_model=fallback_model)
-    logger.info("[Creator][model] stage=%s role=%s resolved_model=%s provider_base_url=%s", stage, role, profile.model, profile.base_url)
-    return await complete_chat_once(messages, profile.model, base_url=profile.base_url, api_key=profile.api_key, max_tokens=profile.max_tokens)
+    logger.info("[Creator][model] stage=%s role=%s model=%s temperature=%s max_tokens=%s provider_base_url=%s", stage, role, profile.model, profile.temperature, profile.max_tokens, profile.base_url)
+    call_options = {"base_url": profile.base_url, "api_key": profile.api_key,
+                    "max_tokens": profile.max_tokens}
+    if profile.temperature is not None:
+        call_options["temperature"] = profile.temperature
+    return await complete_chat_once(messages, profile.model, **call_options)
 
 
 class ProfileUpdate(BaseModel):
@@ -99,6 +106,7 @@ class ProfileUpdate(BaseModel):
     api_key: str | None = None
     model: str | None = None
     max_tokens: int | None = None
+    temperature: float | None = None
     clear_api_key: bool = False
     restore_defaults: bool = False
 
@@ -127,9 +135,18 @@ class ProfileUpdate(BaseModel):
             raise ValueError("max_tokens must be a positive integer")
         return value
 
+    @field_validator("temperature")
+    @classmethod
+    def valid_temperature(cls, value: float | None) -> float | None:
+        if value is not None and not 0 <= value <= 2:
+            raise ValueError("temperature must be between 0 and 2")
+        return value
+
 
 def _public(role: str, profile: dict) -> dict:
-    return {"role": role, "base_url": profile["base_url"], "model": profile["model"], "max_tokens": profile["max_tokens"], "api_key_configured": bool(profile["api_key"])}
+    return {"role": role, "base_url": profile["base_url"], "model": profile["model"],
+            "max_tokens": profile["max_tokens"], "temperature": profile.get("temperature"),
+            "api_key_configured": bool(profile["api_key"])}
 
 
 router = APIRouter(prefix="/api/creator/model-profiles", tags=["creator"])
@@ -151,9 +168,11 @@ def put_profile(role: str, update: ProfileUpdate) -> dict:
         profiles[role] = _empty()[role]
     else:
         values = update.model_dump(exclude_unset=True)
-        for field in ("base_url", "model", "max_tokens"):
+        for field in ("base_url", "model", "max_tokens", "temperature"):
             if field in values:
-                current[field] = values[field] if values[field] is not None else (None if field == "max_tokens" else "")
+                current[field] = values[field] if values[field] is not None else (
+                    None if field in {"max_tokens", "temperature"} else ""
+                )
         if update.clear_api_key:
             current["api_key"] = ""
         elif update.api_key:

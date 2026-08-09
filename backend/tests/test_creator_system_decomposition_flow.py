@@ -527,7 +527,7 @@ async def test_prepare_main_path_reconciles_decomposition_then_interface_binds_g
             "blockers": [],
         })
 
-    async def creator_model(messages, role, fallback_model=None):
+    async def creator_model(messages, role, fallback_model=None, **_kwargs):
         system = str(messages[0].get("content") or "")
         payload = json.loads(messages[-1]["content"])
         if "Skill Creator 模式" in system:
@@ -562,17 +562,17 @@ async def test_prepare_main_path_reconciles_decomposition_then_interface_binds_g
                 "requirement_allocations": [_allocation("R1", ["scripts/a.py"]), _allocation("R2", ["scripts/b.py"])],
                 "requirement_channels": {"R1": "executable", "R2": "executable"},
             })
-        if "planning semantic interfaces between already-frozen executable FunctionItems" in system:
+        if "minimum complete semantic Interface Plan" in system:
             calls.append("interface_intent_planner")
             interface_payloads.append(payload)
             return json.dumps({
                 "interfaces": [
-                    {"interface_id": "I0001", "kind": "platform_to_member", "goal": "runtime input", "target_member": "scripts/a.py"},
-                    {"interface_id": "I0002", "kind": "member_to_member", "goal": "handoff", "source_member": "scripts/a.py", "target_member": "scripts/b.py"},
-                    {"interface_id": "I0003", "kind": "member_to_platform", "goal": "final output", "source_member": "scripts/b.py"},
+                    {"interface_id": "I0001", "kind": "platform_to_member", "source_platform_input": "fields", "source_path": [], "goal": "runtime input", "target_member": "scripts/a.py", "target_input": "input_1"},
+                    {"interface_id": "I0002", "kind": "member_to_member", "goal": "handoff", "source_member": "scripts/a.py", "source_output": "output_1", "target_member": "scripts/b.py", "target_input": "input_1"},
+                    {"interface_id": "I0003", "kind": "member_to_platform", "goal": "final output", "source_member": "scripts/b.py", "source_output": "output_1", "target_platform_output": "text"},
                 ]
             })
-        if "Review an Interface Intent Plan" in system:
+        if "Independently determine whether the complete" in system:
             calls.append("interface_semantic_review")
             return json.dumps({"passed": True, "issues": []})
         if "source_path" in system or "Return exactly one strict JSON object" in system:
@@ -606,9 +606,7 @@ async def test_prepare_main_path_reconciles_decomposition_then_interface_binds_g
     assert interface_payloads
     assert {item["target_file"] for item in interface_payloads[0]["function_items"]} == {"scripts/a.py", "scripts/b.py"}
     assert not {"subsystems", "subsystem_links", "members"} & set(interface_payloads[0])
-    assert endpoint_payloads
-    assert all("binding_candidates" not in payload for payload in endpoint_payloads)
-    assert all("legacy_" + "goal_expansion" not in json.dumps(payload) for payload in endpoint_payloads)
+    assert endpoint_payloads == []
     assert calls[:5] == [
         "blueprint_planner",
         "requirement_allocation",
@@ -617,7 +615,7 @@ async def test_prepare_main_path_reconciles_decomposition_then_interface_binds_g
         "interface_intent_planner",
     ]
     assert calls[5] == "interface_semantic_review"
-    assert calls.count("endpoint_planner") == 3
+    assert calls.count("endpoint_planner") == 0
 
 
 @pytest.mark.asyncio
@@ -669,8 +667,8 @@ async def test_bind_plan_repairs_overcomplete_interface_once(monkeypatch):
         error = kwargs["validation_errors"][0]
         assert error["code"] == "interface_plan_overcomplete"
         assert error["details"]["interface_id"] == "I0003"
+        assert "category" not in error
         assert "instruction" not in error
-        assert kwargs["affected_members"] == ["scripts/source.py", "scripts/target.py"]
         assert kwargs["missing_platform_output_fields"] == []
         assert kwargs["system_requirements"] == planning_calls[0]["system_requirements"]
         return repaired_plan
@@ -699,56 +697,75 @@ async def test_bind_plan_repairs_overcomplete_interface_once(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_graph_revalidation_failure_is_wrapped_without_third_attempt(monkeypatch):
+async def test_unknown_graph_revalidation_failure_is_wrapped_without_second_repair(monkeypatch):
     plan_value = {"interfaces": []}
     monkeypatch.setattr(api, "_frozen_function_items_from_blueprint", lambda **_kwargs: [])
     monkeypatch.setattr(api, "plan_function_item_interfaces", lambda **_kwargs: _async_value(plan_value))
     attempts = 0
+    repair_attempts = 0
 
     async def expand_graph(**_kwargs):
         nonlocal attempts
         attempts += 1
         raise api.ResponsibilityGraphExpansionError(
-            "still incomplete", code="interface_plan_incomplete",
-            details={"uncovered_inputs": []},
+            "novel graph invariant failed", code="novel_graph_failure_xyz",
+            details={"fact_x": "value_a", "fact_y": "value_b"},
         )
 
     async def repair(**_kwargs):
+        nonlocal repair_attempts
+        repair_attempts += 1
         return plan_value
 
     monkeypatch.setattr(api, "expand_responsibility_graph", expand_graph)
     monkeypatch.setattr(api, "repair_interface_intents", repair)
-    with pytest.raises(api.ResponsibilityGraphExpansionError) as raised:
+    with pytest.raises(api.InterfaceIntentPlanError) as raised:
         await api._bind_executable_responsibility_plan(
             request=_request(), current_planner_result={"internal_blueprint_text": _blueprint()},
             planner_model="p", allowed_function_item_targets=[],
         )
-    assert attempts == 1
-    assert raised.value.code == "interface_plan_incomplete"
+    assert attempts == 2
+    assert repair_attempts == 1
+    assert raised.value.code == "graph_revalidation_failed"
 
 
 @pytest.mark.asyncio
-async def test_unknown_graph_error_bypasses_semantic_repair(monkeypatch):
+async def test_unknown_graph_failure_enters_one_semantic_repair_and_revalidation(monkeypatch):
     monkeypatch.setattr(api, "_frozen_function_items_from_blueprint", lambda **_kwargs: [])
-    monkeypatch.setattr(api, "plan_function_item_interfaces", lambda **_kwargs: _async_value({"interfaces": []}))
-    repair_called = False
+    initial = {"interfaces": []}
+    repaired = {"interfaces": [{"interface_id": "I1"}]}
+    monkeypatch.setattr(api, "plan_function_item_interfaces", lambda **_kwargs: _async_value(initial))
+    graph_attempts = 0
+    repair_calls = []
 
     async def expand_graph(**_kwargs):
-        raise api.ResponsibilityGraphExpansionError("cycle", code="cycle_error", details={})
+        nonlocal graph_attempts
+        graph_attempts += 1
+        if graph_attempts == 1:
+            raise api.ResponsibilityGraphExpansionError(
+                "novel graph invariant failed", code="novel_graph_failure_xyz",
+                details={"fact_x": "value_a", "fact_y": "value_b"},
+            )
+        return []
 
-    async def repair(**_kwargs):
-        nonlocal repair_called
-        repair_called = True
+    async def repair(**kwargs):
+        repair_calls.append(kwargs)
+        return repaired
 
     monkeypatch.setattr(api, "expand_responsibility_graph", expand_graph)
     monkeypatch.setattr(api, "repair_interface_intents", repair)
-    with pytest.raises(api.ResponsibilityGraphExpansionError) as raised:
-        await api._bind_executable_responsibility_plan(
-            request=_request(), current_planner_result={"internal_blueprint_text": _blueprint()},
-            planner_model="p", allowed_function_item_targets=[],
-        )
-    assert raised.value.code == "cycle_error"
-    assert repair_called is False
+    result = await api._bind_executable_responsibility_plan(
+        request=_request(), current_planner_result={"internal_blueprint_text": _blueprint()},
+        planner_model="p", allowed_function_item_targets=[],
+    )
+    assert graph_attempts == 2
+    assert len(repair_calls) == 1
+    assert repair_calls[0]["validation_errors"] == [{
+        "code": "novel_graph_failure_xyz",
+        "message": "novel graph invariant failed",
+        "details": {"fact_x": "value_a", "fact_y": "value_b"},
+    }]
+    assert result["responsibility_edges"] == []
 
 
 async def _async_value(value):

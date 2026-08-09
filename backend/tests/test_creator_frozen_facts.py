@@ -99,14 +99,16 @@ async def test_review_summary_model_schema_is_prose_only(monkeypatch):
     monkeypatch.setattr(api, "_complete_creator_json_object_once", complete)
     snapshot = CreatorFactsSnapshot.from_mutable(
         file_plan=[{"path": "A"}, {"path": "B"}],
-        resource_authority={"authoritative_upload_assets": []},
+        resource_authority={"authoritative_upload_assets": ["resource_a"]},
     )
     summary = await api._project_prepare_review_summary(
         request=api.PreparePlanRequest(user_request="abstract"),
         facts_snapshot=snapshot,
         blueprint_explanatory_text="structured blueprint",
+        pending_upload_assets=[],
     )
     assert "files_to_create_or_update" not in captured["schema"]["properties"]
     assert "assets_to_upload" not in captured["schema"]["properties"]
     assert summary.files_to_create_or_update == ["A", "B"]
     assert summary.assets_to_upload == []
+    assert snapshot.authoritative_upload_assets == ("resource_a",)

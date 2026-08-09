@@ -4384,73 +4384,6 @@ def _is_concrete_prepare_summary_file_path(path: str, *, asset_source: str = "")
     return True
 
 
-def _sync_prepare_summary_files_from_skill_plan(
-    summary: PreparePlanReviewSummary,
-    plan_files: list[Any] | None,
-) -> list[dict[str, Any]]:
-    """Make prepare review file display follow the analyzed SkillPlan files.
-
-    The analyzed SkillPlan is authoritative. This helper only updates the
-    front-end review/double-check field from the final plan; it never mutates
-    or expands the execution plan from model-authored summary text.
-    """
-    original_summary_files = [
-        _normalize_skill_path(str(path or ""))
-        for path in (summary.files_to_create_or_update or [])
-        if str(path or "").strip()
-    ]
-    original_summary_assets = [
-        _normalize_skill_path(str(path or ""))
-        for path in (summary.assets_to_upload or [])
-        if str(path or "").strip()
-    ]
-    authoritative: list[str] = []
-    authoritative_upload_assets: list[str] = []
-    for file_spec in plan_files or []:
-        path = _normalize_skill_path(str(getattr(file_spec, "path", "") or ""))
-        file_type = str(getattr(file_spec, "file_type", "") or "").strip()
-        asset_source = str(getattr(file_spec, "asset_source", "") or "").strip()
-        if _is_concrete_prepare_summary_file_path(path, asset_source=asset_source) and path not in authoritative:
-            authoritative.append(path)
-        if file_type == "asset" and asset_source == "user_upload" and path not in authoritative_upload_assets:
-            authoritative_upload_assets.append(path)
-    summary.files_to_create_or_update = authoritative
-    summary.assets_to_upload = authoritative_upload_assets
-    extra_summary_files = [
-        path
-        for path in original_summary_files
-        if path and path not in set(authoritative) and _is_concrete_prepare_summary_file_path(path, asset_source="bundled" if path.startswith("assets/") else "")
-    ]
-    extra_summary_assets = [
-        path
-        for path in original_summary_assets
-        if path and path not in set(authoritative_upload_assets)
-    ]
-    warnings: list[dict[str, Any]] = []
-    if extra_summary_files:
-        warnings.append({
-        "severity": "planning_warning",
-        "code": "summary_files_not_in_skill_plan",
-        "source": "prepare_plan",
-        "path": "",
-        "field": "review_summary.files_to_create_or_update",
-        "files": extra_summary_files,
-        "message": "review_summary listed files not present in analyzed SkillPlan; ignored because SkillPlan is authoritative.",
-        })
-    if extra_summary_assets:
-        warnings.append({
-            "severity": "planning_warning",
-            "code": "summary_asset_not_in_file_plan",
-            "source": "prepare_plan",
-            "path": "",
-            "field": "review_summary.assets_to_upload",
-            "files": extra_summary_assets,
-            "message": "review_summary listed assets not present in analyzed FilePlan user-upload assets; ignored because FilePlan is authoritative.",
-        })
-    return warnings
-
-
-
 def _is_concrete_assets_file_path(path: str) -> bool:
     normalized = _normalize_skill_path(str(path or ""))
 
@@ -9917,6 +9850,7 @@ async def _project_prepare_review_summary(
     request: PreparePlanRequest,
     facts_snapshot: CreatorFactsSnapshot,
     blueprint_explanatory_text: str,
+    pending_upload_assets: list[str] | None = None,
     prepared: dict[str, Any] | None = None,
 ) -> PreparePlanReviewSummary:
     """Project the full internal blueprint into a user-facing review summary.
@@ -9958,13 +9892,13 @@ async def _project_prepare_review_summary(
     if not isinstance(facts_snapshot, CreatorFactsSnapshot):
         raise PreparePlanProtocolError("Review Summary requires a frozen CreatorFactsSnapshot")
     authoritative_files = list(facts_snapshot.authoritative_files)
-    authoritative_upload_assets = list(facts_snapshot.authoritative_upload_assets)
+    pending_upload_assets = list(pending_upload_assets or [])
 
     if not source_blueprint:
         return PreparePlanReviewSummary(**project_frozen_facts_to_summary(
             summary_prose=fallback.model_dump(exclude={"files_to_create_or_update", "assets_to_upload"}),
             authoritative_files=authoritative_files,
-            authoritative_upload_assets=authoritative_upload_assets,
+            authoritative_upload_assets=pending_upload_assets,
         ))
 
     response_schema: dict[
@@ -10149,7 +10083,7 @@ changes：
     return PreparePlanReviewSummary(**project_frozen_facts_to_summary(
         summary_prose=summary.model_dump(exclude={"files_to_create_or_update", "assets_to_upload"}),
         authoritative_files=authoritative_files,
-        authoritative_upload_assets=authoritative_upload_assets,
+        authoritative_upload_assets=pending_upload_assets,
     ))
 
 def _tool_names_from_entry_contract(entry: Any) -> list[str]:
@@ -11183,22 +11117,41 @@ async def _prepare_plan_impl(
         current_prepared: (
             dict[str, Any] | None
         ) = None,
+        *,
+        pending_upload_assets: list[str] | None = None,
     ) -> PreparePlanReviewSummary:
         nonlocal facts_snapshot
         prepared_snapshot = (
             (current_prepared or {}).get("_facts_snapshot")
             if isinstance(current_prepared, dict) else None
         )
-        if isinstance(prepared_snapshot, CreatorFactsSnapshot):
+        if facts_snapshot is None and isinstance(prepared_snapshot, CreatorFactsSnapshot):
             facts_snapshot = prepared_snapshot
-        active_snapshot = facts_snapshot or CreatorFactsSnapshot.from_mutable()
+        if facts_snapshot is None:
+            if current_blueprint_text.strip():
+                canonical_plan = parse_blueprint(
+                    [{"role": "assistant", "content": current_blueprint_text}],
+                    strict=True,
+                )
+                facts_snapshot = _freeze_creator_facts_snapshot(
+                    request=request,
+                    plan_files=canonical_plan.files,
+                    function_items=(current_prepared or {}).get("function_items") or [],
+                    requirement_allocations=(current_prepared or {}).get("requirement_allocations") or [],
+                    requirement_channels=(current_prepared or {}).get("requirement_channels") or {},
+                )
+            else:
+                facts_snapshot = _freeze_creator_facts_snapshot(
+                    request=request, plan_files=[],
+                )
         return (
             await _project_prepare_review_summary(
                 request=request,
-                facts_snapshot=active_snapshot,
+                facts_snapshot=facts_snapshot,
                 blueprint_explanatory_text=(
                     current_blueprint_text
                 ),
+                pending_upload_assets=pending_upload_assets,
 
                 prepared=(
                     current_prepared
@@ -12148,14 +12101,9 @@ async def _prepare_plan_impl(
         summary = await project_summary(
             final_blueprint_text,
             prepared,
+            pending_upload_assets=missing_required_upload_assets,
         )
-        summary_sync_warnings = (
-            _sync_prepare_summary_files_from_skill_plan(
-                summary,
-                plan.files,
-            )
-        )
-        summary.assets_to_upload = missing_required_upload_assets
+        summary_sync_warnings: list[dict[str, Any]] = []
         return PreparePlanResponse(
             status="needs_clarification",
             prepare_stage="asset_upload_required",
@@ -12257,6 +12205,17 @@ async def _prepare_plan_impl(
         )
     ]
 
+    # The canonical plan changed after confirmed-upload filtering. Refresh the
+    # handoff before any downstream projection so it cannot observe stale facts.
+    facts_snapshot = _freeze_creator_facts_snapshot(
+        request=request,
+        plan_files=plan.files,
+        function_items=(prepared.get("function_items") or []) if isinstance(prepared, dict) else [],
+        requirement_allocations=(prepared.get("requirement_allocations") or []) if isinstance(prepared, dict) else [],
+        requirement_channels=(prepared.get("requirement_channels") or {}) if isinstance(prepared, dict) else {},
+        allowed_resources=allowed_resource_paths,
+    )
+
     final_blueprint_text = (
         plan.blueprint_text
         or blueprint_text
@@ -12265,14 +12224,10 @@ async def _prepare_plan_impl(
     summary = await project_summary(
         final_blueprint_text,
         prepared,
+        pending_upload_assets=[],
     )
 
-    summary_sync_warnings = (
-        _sync_prepare_summary_files_from_skill_plan(
-            summary,
-            plan.files,
-        )
-    )
+    summary_sync_warnings: list[dict[str, Any]] = []
 
     graph_payload = (
         plan.requirement_graph.model_dump(

@@ -244,17 +244,15 @@ async def test_feedback_wants_supplement_blocks_ready(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_asset_placeholder_ready_returns_confirmation_not_blocked(monkeypatch):
+async def test_asset_placeholder_without_frozen_snapshot_is_invariant_failure(monkeypatch):
     async def fake_generate(_request):
         return {"status": "ready", "internal_blueprint_text": _ready_blueprint("- path: `assets/<name.ext>`\n  role: asset\n  source: user_upload")}
     async def no_repair(**kwargs):
         return kwargs["blueprint_text"]
     monkeypatch.setattr(api, "_generate_internal_blueprint_or_questions", fake_generate)
     monkeypatch.setattr(api, "_repair_prepare_blueprint_protocol", no_repair)
-    resp = await api.prepare_plan(_request())
-    assert resp.status == "needs_clarification"
-    assert resp.review_summary.risks == []
-    assert "要点" in resp.clarifying_questions[0] or "按这些" in resp.clarifying_questions[0]
+    with pytest.raises(api.BlueprintShapeError):
+        await api.prepare_plan(_request())
 
 
 @pytest.mark.asyncio
@@ -513,18 +511,15 @@ async def test_ready_does_not_add_summary_hallucinated_file_to_execution_plan(mo
 
 
 def test_summary_hallucinated_asset_is_not_projected_to_uploads():
-    summary = api.PreparePlanReviewSummary(
-        files_to_create_or_update=["SKILL.md"],
-        assets_to_upload=["assets/hallucinated.png"],
+    snapshot = api._freeze_creator_facts_snapshot(
+        request=_request(), plan_files=[_file("SKILL.md")],
     )
-
-    warnings = api._sync_prepare_summary_files_from_skill_plan(
-        summary,
-        [_file("SKILL.md")],
+    projected = api.project_frozen_facts_to_summary(
+        summary_prose={"assets_to_upload": ["assets/hallucinated.png"]},
+        authoritative_files=list(snapshot.authoritative_files),
+        authoritative_upload_assets=[],
     )
-
-    assert summary.assets_to_upload == []
-    assert any(w.get("code") == "summary_asset_not_in_file_plan" and "assets/hallucinated.png" in w.get("files", []) for w in warnings)
+    assert projected["assets_to_upload"] == []
 
 
 def test_required_user_upload_asset_missing_is_detectable_before_ready():
@@ -587,14 +582,11 @@ async def test_prepare_plan_blocks_ready_when_required_user_upload_asset_missing
 
 
 def test_no_user_upload_asset_keeps_assets_to_upload_empty():
-    summary = api.PreparePlanReviewSummary(assets_to_upload=["assets/bundled.png"])
-
-    api._sync_prepare_summary_files_from_skill_plan(
-        summary,
-        [_file("SKILL.md"), _file("assets/bundled.png", asset_source="bundled")],
+    snapshot = api._freeze_creator_facts_snapshot(
+        request=_request(),
+        plan_files=[_file("SKILL.md"), _file("assets/bundled.png", asset_source="bundled")],
     )
-
-    assert summary.assets_to_upload == []
+    assert snapshot.authoritative_upload_assets == ()
 
 
 def test_bundled_asset_requires_real_inventory_evidence(tmp_path, monkeypatch):
@@ -607,26 +599,14 @@ def test_bundled_asset_requires_real_inventory_evidence(tmp_path, monkeypatch):
     assert api._unresolved_bundled_asset_paths(files, skill_name="demo") == []
 
 
-def test_sync_prepare_summary_files_filters_directories_and_dynamic_paths():
-    summary = api.PreparePlanReviewSummary(files_to_create_or_update=["SKILL.md"])
-    warnings = api._sync_prepare_summary_files_from_skill_plan(summary, [
+def test_snapshot_copies_only_validated_plan_identities_without_summary_filtering():
+    files = [
         _file("SKILL.md"),
-        _file("scripts/"),
-        _file("references/"),
-        _file("assets/"),
-        _file("scripts/${name}.py"),
-        _file("references/[file].md"),
-        _file("assets/logo.png"),
         _file("assets/bundled.png", asset_source="bundled"),
         _file("references/output-patterns.md"),
-    ])
-
-    assert warnings == []
-    assert summary.files_to_create_or_update == ["SKILL.md", "assets/bundled.png", "references/output-patterns.md"]
-    assert "scripts/" not in summary.files_to_create_or_update
-    assert "references/" not in summary.files_to_create_or_update
-    assert "assets/" not in summary.files_to_create_or_update
-    assert not any("${" in path or "[" in path for path in summary.files_to_create_or_update)
+    ]
+    snapshot = api._freeze_creator_facts_snapshot(request=_request(), plan_files=files)
+    assert list(snapshot.authoritative_files) == [item.path for item in files]
 
 
 def _blueprint_with_reference_mention(reference_line: str) -> str:

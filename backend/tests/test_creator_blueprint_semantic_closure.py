@@ -466,17 +466,16 @@ def test_resource_conflict_may_have_no_affected_target():
 
 
 def test_summary_file_sets_are_authoritative_file_plan_projection():
-    summary = api.PreparePlanReviewSummary(
-        files_to_create_or_update=["extra.file"], assets_to_upload=["wrong.asset"]
-    )
     files = [
         api.FileSpecOut(path="scripts/a.py", purpose="work", file_type="script", required=True, can_skip=False),
         api.FileSpecOut(path="resources/upload.opaque", purpose="static", file_type="asset", asset_source="user_upload", required=True, can_skip=False),
         api.FileSpecOut(path="references/info.opaque", purpose="guidance", file_type="reference", asset_source="user_upload", required=True, can_skip=False),
     ]
-    api._sync_prepare_summary_files_from_skill_plan(summary, files)
-    assert summary.files_to_create_or_update == [item.path for item in files]
-    assert summary.assets_to_upload == ["resources/upload.opaque"]
+    snapshot = api._freeze_creator_facts_snapshot(
+        request=api.PreparePlanRequest(user_request="abstract"), plan_files=files,
+    )
+    assert list(snapshot.authoritative_files) == [item.path for item in files]
+    assert list(snapshot.authoritative_upload_assets) == ["resources/upload.opaque"]
 
 
 @pytest.mark.asyncio

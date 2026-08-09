@@ -4,8 +4,8 @@ from unittest.mock import AsyncMock, patch
 
 def _empty_profiles():
     return {
-        "planner": {"base_url": "", "api_key": "", "model": "", "max_tokens": None},
-        "reviewer": {"base_url": "", "api_key": "", "model": "", "max_tokens": None},
+        "planner": {"base_url": "", "api_key": "", "model": "", "max_tokens": None, "temperature": None},
+        "reviewer": {"base_url": "", "api_key": "", "model": "", "max_tokens": None, "temperature": None},
     }
 
 
@@ -50,7 +50,7 @@ def test_empty_fields_clear_overrides_and_keep_api_key(tmp_path, monkeypatch):
     profiles._save({"planner": {"base_url": "https://remote.test", "api_key": "key-A", "model": "model-A", "max_tokens": 12}, "reviewer": _empty_profiles()["reviewer"]})
 
     response = profiles.put_profile("planner", profiles.ProfileUpdate(base_url="", model="", max_tokens=None))
-    assert response["profile"] == {"role": "planner", "base_url": "", "model": "", "max_tokens": None, "api_key_configured": True}
+    assert response["profile"] == {"role": "planner", "base_url": "", "model": "", "max_tokens": None, "temperature": None, "api_key_configured": True}
     resolved = profiles.resolve_creator_model_profile("planner", fallback_model="original-model")
     assert (resolved.base_url, resolved.api_key, resolved.model, resolved.max_tokens) == ("http://global.test", "key-A", "original-model", 321)
 
@@ -69,3 +69,38 @@ def test_public_profile_never_contains_api_key():
     result = _public("planner", {"base_url": "https://example.test", "api_key": "top-secret", "model": "model", "max_tokens": 1})
     assert "top-secret" not in str(result)
     assert result["api_key_configured"] is True
+
+
+def test_role_temperature_override_is_forwarded(tmp_path, monkeypatch, caplog):
+    from backend.config import settings
+    from backend.services import creator_model_profiles as profiles
+
+    caplog.set_level("INFO")
+    monkeypatch.setattr(settings, "governance_path", tmp_path)
+    saved = _empty_profiles()
+    saved["planner"]["temperature"] = 0.15
+    profiles._save(saved)
+    with patch.object(profiles, "complete_chat_once", new=AsyncMock(return_value="ok")) as call:
+        asyncio.run(profiles.complete_creator_role_once(
+            [], "planner", fallback_model="planner-model", stage="interface_plan",
+        ))
+    assert call.await_args.kwargs["temperature"] == 0.15
+    assert "temperature=0.15" in caplog.text
+
+
+def test_temperature_inherits_global_and_role_override_wins(tmp_path, monkeypatch):
+    from backend.config import settings
+    from backend.services import creator_model_profiles as profiles
+
+    monkeypatch.setattr(settings, "governance_path", tmp_path)
+    monkeypatch.setattr(settings, "temperature", 0.2)
+    saved = _empty_profiles()
+    profiles._save(saved)
+    assert profiles.resolve_creator_model_profile(
+        "planner", fallback_model="model"
+    ).temperature == 0.2
+    saved["planner"]["temperature"] = 0.05
+    profiles._save(saved)
+    assert profiles.resolve_creator_model_profile(
+        "planner", fallback_model="model"
+    ).temperature == 0.05

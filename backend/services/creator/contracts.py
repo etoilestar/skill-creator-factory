@@ -2,8 +2,10 @@
 
 from .common import *  # noqa: F403
 from typing import Any, Iterable, Mapping
+from .model_gateway import creator_model_call
 from .command_normalizer import parse_skill_md_bash_command_blocks
 from .tool_pool_models import (ToolPoolModel, ToolPoolTool, ToolPoolFileBinding, ToolPoolGateEvent, ToolPoolDeniedRequest, ToolPoolMissingRequest, ToolPoolPatch, ToolPoolAddToolRequest, RuntimeImportGuardResult)
+
 
 @dataclass(frozen=True)
 class ContractCheckResult:
@@ -6749,5 +6751,13 @@ def validate_file_contract(
     return []
 
 from .repair import *  # noqa: F403  # late import for blueprint repair helpers
+
+
+async def complete_creator_role_once(messages, role, *, fallback_model, stage="creator"):
+    """Injectable contract seam that retains production role-profile routing."""
+    return await creator_model_call(
+        messages, role=role, fallback_model=fallback_model, stage=stage,
+        model_call=complete_chat_once,
+    )
 
 __all__ = [name for name in globals() if not name.startswith("__")]

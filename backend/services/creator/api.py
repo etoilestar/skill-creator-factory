@@ -57,6 +57,73 @@ from .function_item_interface_plan import (
     plan_function_item_interfaces,
     repair_interface_intents,
 )
+from .frozen_facts import (
+    CANONICAL_PROJECTION_PRINCIPLE,
+    FACT_OWNERS,
+    FACT_OWNERSHIP_CONTRACT,
+    FROZEN_FACT_AUTHORITY,
+    CreatorFactsSnapshot,
+    log_frozen_fact_digests,
+    project_frozen_facts_to_summary,
+)
+from .model_gateway import creator_model_call
+
+
+async def complete_creator_role_once(
+    messages: list[dict[str, Any]], role: Literal["planner", "reviewer"], *,
+    fallback_model: str, stage: str = "creator",
+) -> str:
+    """Injectable API seam that retains production role-profile routing."""
+    return await creator_model_call(
+        messages, role=role, fallback_model=fallback_model, stage=stage,
+        model_call=complete_chat_once,
+    )
+
+
+def _freeze_creator_facts_snapshot(
+    *, request: "PreparePlanRequest", plan_files: list[Any],
+    function_items: list[dict[str, Any]] | None = None,
+    requirement_allocations: list[dict[str, Any]] | None = None,
+    requirement_channels: dict[str, str] | None = None,
+    allowed_resources: list[str] | set[str] | None = None,
+    platform_contract: dict[str, Any] | None = None,
+) -> CreatorFactsSnapshot:
+    """Single parser/resource-authority boundary for the downstream handoff."""
+    file_plan: list[dict[str, Any]] = []
+    references: list[str] = []
+    assets: list[str] = []
+    upload_assets: list[str] = []
+    for spec in plan_files or []:
+        path = str(getattr(spec, "path", "") or "").strip()
+        file_type = str(getattr(spec, "file_type", "") or "").strip()
+        asset_source = str(getattr(spec, "asset_source", "") or "").strip()
+        if not path:
+            continue
+        file_plan.append({"path": path, "file_type": file_type, "asset_source": asset_source})
+        # Classification is copied from the validated parser contract; paths are
+        # identities only and are never used here to infer a resource role.
+        if file_type == "reference":
+            references.append(path)
+        elif file_type == "asset":
+            assets.append(path)
+            if asset_source == "user_upload":
+                upload_assets.append(path)
+    return CreatorFactsSnapshot.from_mutable(
+        confirmed_requirements=[request.user_request],
+        file_plan=file_plan,
+        function_items=function_items or [],
+        requirement_projection={
+            "allocations": requirement_allocations or [],
+            "channels": requirement_channels or {},
+        },
+        resource_authority={
+            "authoritative_references": references,
+            "authoritative_assets": assets,
+            "authoritative_upload_assets": upload_assets,
+            "allowed_resources": sorted(allowed_resources or []),
+        },
+        platform_contract=platform_contract or {},
+    )
 
 
 def _tool_binding_digest(binding: dict[str, Any]) -> str:
@@ -4317,73 +4384,6 @@ def _is_concrete_prepare_summary_file_path(path: str, *, asset_source: str = "")
     return True
 
 
-def _sync_prepare_summary_files_from_skill_plan(
-    summary: PreparePlanReviewSummary,
-    plan_files: list[Any] | None,
-) -> list[dict[str, Any]]:
-    """Make prepare review file display follow the analyzed SkillPlan files.
-
-    The analyzed SkillPlan is authoritative. This helper only updates the
-    front-end review/double-check field from the final plan; it never mutates
-    or expands the execution plan from model-authored summary text.
-    """
-    original_summary_files = [
-        _normalize_skill_path(str(path or ""))
-        for path in (summary.files_to_create_or_update or [])
-        if str(path or "").strip()
-    ]
-    original_summary_assets = [
-        _normalize_skill_path(str(path or ""))
-        for path in (summary.assets_to_upload or [])
-        if str(path or "").strip()
-    ]
-    authoritative: list[str] = []
-    authoritative_upload_assets: list[str] = []
-    for file_spec in plan_files or []:
-        path = _normalize_skill_path(str(getattr(file_spec, "path", "") or ""))
-        file_type = str(getattr(file_spec, "file_type", "") or "").strip()
-        asset_source = str(getattr(file_spec, "asset_source", "") or "").strip()
-        if _is_concrete_prepare_summary_file_path(path, asset_source=asset_source) and path not in authoritative:
-            authoritative.append(path)
-        if file_type == "asset" and asset_source == "user_upload" and path not in authoritative_upload_assets:
-            authoritative_upload_assets.append(path)
-    summary.files_to_create_or_update = authoritative
-    summary.assets_to_upload = authoritative_upload_assets
-    extra_summary_files = [
-        path
-        for path in original_summary_files
-        if path and path not in set(authoritative) and _is_concrete_prepare_summary_file_path(path, asset_source="bundled" if path.startswith("assets/") else "")
-    ]
-    extra_summary_assets = [
-        path
-        for path in original_summary_assets
-        if path and path not in set(authoritative_upload_assets)
-    ]
-    warnings: list[dict[str, Any]] = []
-    if extra_summary_files:
-        warnings.append({
-        "severity": "planning_warning",
-        "code": "summary_files_not_in_skill_plan",
-        "source": "prepare_plan",
-        "path": "",
-        "field": "review_summary.files_to_create_or_update",
-        "files": extra_summary_files,
-        "message": "review_summary listed files not present in analyzed SkillPlan; ignored because SkillPlan is authoritative.",
-        })
-    if extra_summary_assets:
-        warnings.append({
-            "severity": "planning_warning",
-            "code": "summary_asset_not_in_file_plan",
-            "source": "prepare_plan",
-            "path": "",
-            "field": "review_summary.assets_to_upload",
-            "files": extra_summary_assets,
-            "message": "review_summary listed assets not present in analyzed FilePlan user-upload assets; ignored because FilePlan is authoritative.",
-        })
-    return warnings
-
-
-
 def _is_concrete_assets_file_path(path: str) -> bool:
     normalized = _normalize_skill_path(str(path or ""))
 
@@ -8163,6 +8163,19 @@ be executable. Do not create an issue whose repair_guidance asks to change a
 requirement channel. Review only whether the current Blueprint and allocations
 are valid under the supplied channel.
 
+REVERSE PROVENANCE AUDIT
+
+For every frozen substantive executable FunctionItem, determine whether its
+runtime responsibility is semantically justified by the confirmed requirement
+set and executable allocations. A FunctionItem may synthesize several
+requirements, and one requirement may justify several FunctionItems. A derived
+helper is valid when its necessity follows semantically from confirmed
+requirements and upstream frozen responsibilities. Do not infer provenance from
+filename, role label, matching field names, or array position. If provenance is
+missing or contradictory, report a responsibility_mismatch with evidence that
+references only supplied requirement and FunctionItem identities. Diagnose the
+gap; do not prescribe reclassification, a new owner, or a repair operation.
+
 2. CHANNEL-AWARE REVIEW RULES
 Ownership rules are channel-aware:
 - For executable requirements, at least one owner must exist; every owner must
@@ -8735,7 +8748,17 @@ async def _generate_internal_blueprint_or_questions(
         load_kernel_creator_for_phase(
             "prepare_plan"
         )
+        + "\n\n" + FACT_OWNERSHIP_CONTRACT
+        + "\n\n" + CANONICAL_PROJECTION_PRINCIPLE
         + """
+
+SINGLE DEFINITION PRINCIPLE
+Define every executable logical input and output exactly once in the structured
+SkillPlan/FunctionItem contract. Prose, command examples, and host-execution
+notes are explanatory only and must reference rather than redefine logical port,
+dependency, or runtime-ownership identities. Downstream stages freeze ports only
+from the normalized structured contract.
+
 你现在服务 /api/creator/prepare-plan。
 
 只输出严格 JSON object。
@@ -9127,8 +9150,6 @@ F. lightweight runtime-contract self-check
     "input": "",
     "output": "",
     "workflow": [],
-    "files_to_create_or_update": [],
-    "assets_to_upload": [],
     "risks": [],
     "changes": []
   },
@@ -9764,11 +9785,24 @@ Blueprint Planner 只规划业务责任。
                 "Pre-graph semantic closure has unresolved blocking issues; "
                 f"issues={blocking_issues}"
             )
+        frozen_canonical_plan = parse_blueprint(
+            [{"role": "assistant", "content": frozen_blueprint_text}], strict=True,
+        )
+        facts_snapshot = _freeze_creator_facts_snapshot(
+            request=request,
+            plan_files=frozen_canonical_plan.files,
+            function_items=semantic_function_items,
+            requirement_allocations=requirement_allocations,
+            requirement_channels=requirement_channels,
+            allowed_resources=allowed_resource_paths,
+        )
+        log_frozen_fact_digests(stage="blueprint_closure", snapshot=facts_snapshot)
         first_planner_result = {
             **first_planner_result,
             "internal_blueprint_text": frozen_blueprint_text,
             "requirement_allocations": requirement_allocations,
             "requirement_channels": requirement_channels,
+            "_facts_snapshot": facts_snapshot,
         }
 
         binding_data = (
@@ -9811,10 +9845,12 @@ Blueprint Planner 只规划业务责任。
 
     return data
 
-async def _project_prepare_review_summary_from_blueprint(
+async def _project_prepare_review_summary(
     *,
     request: PreparePlanRequest,
-    blueprint_text: str,
+    facts_snapshot: CreatorFactsSnapshot,
+    blueprint_explanatory_text: str,
+    pending_upload_assets: list[str] | None = None,
     prepared: dict[str, Any] | None = None,
 ) -> PreparePlanReviewSummary:
     """Project the full internal blueprint into a user-facing review summary.
@@ -9830,11 +9866,12 @@ async def _project_prepare_review_summary_from_blueprint(
     - code generation;
     - E2E.
 
-    Projection input is the full blueprint only.
+    The model owns prose only. Frozen file/resource identities are attached
+    directly from the supplied snapshot.
     """
 
     source_blueprint = str(
-        blueprint_text or ""
+        blueprint_explanatory_text or ""
     ).strip()
 
     prepared = (
@@ -9852,21 +9889,17 @@ async def _project_prepare_review_summary_from_blueprint(
         )
     )
 
+    if not isinstance(facts_snapshot, CreatorFactsSnapshot):
+        raise PreparePlanProtocolError("Review Summary requires a frozen CreatorFactsSnapshot")
+    authoritative_files = list(facts_snapshot.authoritative_files)
+    pending_upload_assets = list(pending_upload_assets or [])
+
     if not source_blueprint:
-        fallback.risks = []
-
-        fallback.assets_to_upload = [
-            str(path).strip()
-            for path in (
-                fallback.assets_to_upload
-                or []
-            )
-            if str(path).strip().startswith(
-                "assets/"
-            )
-        ]
-
-        return fallback
+        return PreparePlanReviewSummary(**project_frozen_facts_to_summary(
+            summary_prose=fallback.model_dump(exclude={"files_to_create_or_update", "assets_to_upload"}),
+            authoritative_files=authoritative_files,
+            authoritative_upload_assets=pending_upload_assets,
+        ))
 
     response_schema: dict[
         str,
@@ -9888,22 +9921,6 @@ async def _project_prepare_review_summary_from_blueprint(
             },
 
             "workflow": {
-                "type": "array",
-
-                "items": {
-                    "type": "string",
-                },
-            },
-
-            "files_to_create_or_update": {
-                "type": "array",
-
-                "items": {
-                    "type": "string",
-                },
-            },
-
-            "assets_to_upload": {
                 "type": "array",
 
                 "items": {
@@ -9933,8 +9950,6 @@ async def _project_prepare_review_summary_from_blueprint(
             "input",
             "output",
             "workflow",
-            "files_to_create_or_update",
-            "assets_to_upload",
             "risks",
             "changes",
         ],
@@ -9942,12 +9957,19 @@ async def _project_prepare_review_summary_from_blueprint(
         "additionalProperties": False,
     }
 
-    prompt = """
+    prompt = FACT_OWNERSHIP_CONTRACT + "\n\n" + FROZEN_FACT_AUTHORITY + "\n\n" + CANONICAL_PROJECTION_PRINCIPLE + """
+
+REVIEW SUMMARY AUTHORITY
+You own only goal, input, output, workflow, risks, and changes prose. You do not
+own file, asset, reference, FunctionItem, requirement-channel, Interface, Graph,
+or tool identities. The response schema intentionally grants no write access to
+those facts. Do not introduce facts absent from the frozen structured context.
+
 你只负责把 internal_blueprint_text 映射成给用户展示的“创建要点”。
 
 这是只读 projection。
 
-internal_blueprint_text 是唯一事实来源。
+internal_blueprint_text 只提供说明性上下文；facts_snapshot 中的冻结事实具有权威性。
 
 禁止：
 
@@ -9975,12 +9997,6 @@ output：
 
 workflow：
 按蓝图工作流逻辑映射为简短步骤。
-
-files_to_create_or_update：
-映射 SkillPlan 中声明的文件。
-
-assets_to_upload：
-只映射 SkillPlan 中明确声明的静态 assets。
 
 risks：
 必须为空数组。
@@ -10039,11 +10055,15 @@ changes：
             )
         )
 
-        summary = (
-            _coerce_prepare_summary(
-                projected
+        forbidden = sorted(set(projected) & {
+            "files_to_create_or_update", "assets_to_upload", "references_to_use",
+        })
+        for field_name in forbidden:
+            logger.warning(
+                "[Creator][authority] stage=review_summary ignored_non_authoritative_field=%s",
+                field_name,
             )
-        )
+        summary = _coerce_prepare_summary(projected)
 
     except Exception as exc:
         logger.warning(
@@ -10059,40 +10079,12 @@ changes：
 
         summary = fallback
 
-    plan_paths = (
-        _extract_prepare_skill_plan_paths(
-            source_blueprint
-        )
-    )
-
-    # File list is a deterministic projection.
-    summary.files_to_create_or_update = (
-        plan_paths
-    )
-
-    asset_plan_paths = {
-        path
-        for path in plan_paths
-        if path.startswith(
-            "assets/"
-        )
-    }
-
-    summary.assets_to_upload = [
-        str(path).strip()
-        for path in (
-            summary.assets_to_upload
-            or []
-        )
-        if (
-            str(path).strip()
-            in asset_plan_paths
-        )
-    ]
-
     summary.risks = []
-
-    return summary
+    return PreparePlanReviewSummary(**project_frozen_facts_to_summary(
+        summary_prose=summary.model_dump(exclude={"files_to_create_or_update", "assets_to_upload"}),
+        authoritative_files=authoritative_files,
+        authoritative_upload_assets=pending_upload_assets,
+    ))
 
 def _tool_names_from_entry_contract(entry: Any) -> list[str]:
     data = entry if isinstance(entry, dict) else getattr(entry, "__dict__", {})
@@ -11118,19 +11110,48 @@ async def _prepare_plan_impl(
         previous_blueprint_text
     )
 
+    facts_snapshot: CreatorFactsSnapshot | None = None
+
     async def project_summary(
         current_blueprint_text: str,
         current_prepared: (
             dict[str, Any] | None
         ) = None,
+        *,
+        pending_upload_assets: list[str] | None = None,
     ) -> PreparePlanReviewSummary:
+        nonlocal facts_snapshot
+        prepared_snapshot = (
+            (current_prepared or {}).get("_facts_snapshot")
+            if isinstance(current_prepared, dict) else None
+        )
+        if facts_snapshot is None and isinstance(prepared_snapshot, CreatorFactsSnapshot):
+            facts_snapshot = prepared_snapshot
+        if facts_snapshot is None:
+            if current_blueprint_text.strip():
+                canonical_plan = parse_blueprint(
+                    [{"role": "assistant", "content": current_blueprint_text}],
+                    strict=True,
+                )
+                facts_snapshot = _freeze_creator_facts_snapshot(
+                    request=request,
+                    plan_files=canonical_plan.files,
+                    function_items=(current_prepared or {}).get("function_items") or [],
+                    requirement_allocations=(current_prepared or {}).get("requirement_allocations") or [],
+                    requirement_channels=(current_prepared or {}).get("requirement_channels") or {},
+                )
+            else:
+                facts_snapshot = _freeze_creator_facts_snapshot(
+                    request=request, plan_files=[],
+                )
         return (
-            await _project_prepare_review_summary_from_blueprint(
+            await _project_prepare_review_summary(
                 request=request,
-
-                blueprint_text=(
+                facts_snapshot=facts_snapshot,
+                blueprint_explanatory_text=(
                     current_blueprint_text
                 ),
+                pending_upload_assets=pending_upload_assets,
 
                 prepared=(
                     current_prepared
@@ -11165,20 +11186,6 @@ async def _prepare_plan_impl(
             if isinstance(current_prepared, dict) and current_prepared.get("responsibility_edges") is not None
             else []
         )
-        projected = _structured_plan_review_summary(
-            {"function_items": function_items, "review_summary": (current_prepared or {}).get("review_summary") if isinstance(current_prepared, dict) else {}},
-            projected,
-        )
-        try:
-            frozen_projection = parse_blueprint(
-                [{"role": "assistant", "content": current_blueprint_text}], strict=True
-            )
-            _sync_prepare_summary_files_from_skill_plan(projected, frozen_projection.files)
-        except Exception:
-            # Protocol validation reports malformed blueprints elsewhere; summary
-            # projection must never become a reverse authority or repair source.
-            projected.files_to_create_or_update = []
-            projected.assets_to_upload = []
         current_blueprint_text = _render_structured_responsibility_view(
             current_blueprint_text,
             function_items,
@@ -12045,6 +12052,14 @@ async def _prepare_plan_impl(
         uploaded_files=request.uploaded_files,
         review_summary=None,
     )
+    facts_snapshot = _freeze_creator_facts_snapshot(
+        request=request,
+        plan_files=plan.files,
+        function_items=(prepared.get("function_items") or []) if isinstance(prepared, dict) else [],
+        requirement_allocations=(prepared.get("requirement_allocations") or []) if isinstance(prepared, dict) else [],
+        requirement_channels=(prepared.get("requirement_channels") or {}) if isinstance(prepared, dict) else {},
+        allowed_resources=allowed_resource_paths,
+    )
 
     required_upload_assets = (
         _required_file_plan_user_upload_asset_paths(
@@ -12086,14 +12101,9 @@ async def _prepare_plan_impl(
         summary = await project_summary(
             final_blueprint_text,
             prepared,
+            pending_upload_assets=missing_required_upload_assets,
         )
-        summary_sync_warnings = (
-            _sync_prepare_summary_files_from_skill_plan(
-                summary,
-                plan.files,
-            )
-        )
-        summary.assets_to_upload = missing_required_upload_assets
+        summary_sync_warnings: list[dict[str, Any]] = []
         return PreparePlanResponse(
             status="needs_clarification",
             prepare_stage="asset_upload_required",
@@ -12195,6 +12205,17 @@ async def _prepare_plan_impl(
         )
     ]
 
+    # The canonical plan changed after confirmed-upload filtering. Refresh the
+    # handoff before any downstream projection so it cannot observe stale facts.
+    facts_snapshot = _freeze_creator_facts_snapshot(
+        request=request,
+        plan_files=plan.files,
+        function_items=(prepared.get("function_items") or []) if isinstance(prepared, dict) else [],
+        requirement_allocations=(prepared.get("requirement_allocations") or []) if isinstance(prepared, dict) else [],
+        requirement_channels=(prepared.get("requirement_channels") or {}) if isinstance(prepared, dict) else {},
+        allowed_resources=allowed_resource_paths,
+    )
+
     final_blueprint_text = (
         plan.blueprint_text
         or blueprint_text
@@ -12203,14 +12224,10 @@ async def _prepare_plan_impl(
     summary = await project_summary(
         final_blueprint_text,
         prepared,
+        pending_upload_assets=[],
     )
 
-    summary_sync_warnings = (
-        _sync_prepare_summary_files_from_skill_plan(
-            summary,
-            plan.files,
-        )
-    )
+    summary_sync_warnings: list[dict[str, Any]] = []
 
     graph_payload = (
         plan.requirement_graph.model_dump(

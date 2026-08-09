@@ -273,15 +273,15 @@ async def test_planner_correction_uses_second_attempt_for_staged_residual():
         reviewer_model_call=reviewer,
     )
     assert result == complete
-    assert [value["correction_attempt"] for value in correction_payloads] == [1, 2]
+    assert [value["refinement_feedback"]["attempt"] for value in correction_payloads] == [1, 2]
     assert correction_payloads[1]["previous_interface_plan"] == first
     assert any(value["code"] == "uncovered_required_logical_input"
-               for value in correction_payloads[1]["deterministic_validation_facts"])
+               for value in correction_payloads[1]["refinement_feedback"]["acceptance_facts"])
     assert reviewer_calls == 1
 
 
 @pytest.mark.asyncio
-async def test_planner_correction_stops_on_semantic_no_progress():
+async def test_planner_correction_no_progress_uses_full_budget():
     from backend.services.creator.function_item_interface_plan import plan_function_item_interfaces
     items = [item("scripts/unit_a.py", ["slot_x", "slot_y"], ["result_z"])]
     initial = {"interfaces": [p2m("I1", "scripts/unit_a.py"), m2p("I2", "scripts/unit_a.py")]}
@@ -289,7 +289,8 @@ async def test_planner_correction_stops_on_semantic_no_progress():
     presentation_only["interfaces"].reverse()
     presentation_only["interfaces"][0]["interface_id"] = "I9"
     presentation_only["interfaces"][0]["goal"] = "value_x"
-    responses = iter([initial, presentation_only])
+    repeated = json.loads(json.dumps(presentation_only))
+    responses = iter([initial, presentation_only, repeated])
     calls = 0
 
     async def planner(_messages, _model):
@@ -303,8 +304,9 @@ async def test_planner_correction_stops_on_semantic_no_progress():
             platform_contract=platform(), planner_model="planner-test-model",
             model_call=planner,
         )
-    assert raised.value.code == "repair_no_progress"
-    assert calls == 2
+    assert raised.value.code == "interface_plan_deterministic_closure_failed"
+    assert raised.value.details["semantic_changed"] is False
+    assert calls == 3
 
 
 @pytest.mark.asyncio
@@ -376,7 +378,7 @@ async def test_generator_schema_invalid_candidate_becomes_second_attempt_residua
     assert critic_calls == 1
     assert len(generator_payloads) == 2
     assert generator_payloads[1]["current_interface_plan"] == invalid
-    assert generator_payloads[1]["residual_acceptance_facts"][0]["code"] == "invalid_interface_protocol"
+    assert generator_payloads[1]["refinement_feedback"]["acceptance_facts"][0]["code"] == "invalid_interface_protocol"
     assert reviewer_calls == 1
 
 

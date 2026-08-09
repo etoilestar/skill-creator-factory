@@ -74,6 +74,7 @@ def test_platform_selection_rejects_string_source_path():
         _validate_interface_selection_protocol(
             obligation=obligation,
             response={
+                "status": "bound",
                 "source_id": "PIN0001",
                 "target_id": "IN0001",
                 "source_path": "scripts/a.py",
@@ -89,6 +90,7 @@ def test_platform_selection_accepts_empty_source_path():
     result = _validate_interface_selection_protocol(
         obligation={"kind": "platform_to_script"},
         response={
+            "status": "bound",
             "source_id": "PIN0001",
             "target_id": "IN0001",
             "source_path": [],
@@ -102,6 +104,7 @@ def test_platform_selection_accepts_nested_source_path():
     result = _validate_interface_selection_protocol(
         obligation={"kind": "platform_to_script"},
         response={
+            "status": "bound",
             "source_id": "PIN0001",
             "target_id": "IN0001",
             "source_path": ["article", "text"],
@@ -142,11 +145,11 @@ async def test_two_script_interface_expansion_uses_endpoint_references_without_g
         obligation = payload["obligation"]
         if obligation["kind"] == "platform_to_script":
             slot = next(value for value in payload["platform_inputs"] if value["field"] == "fields")
-            return json.dumps({"source_id": slot["slot_id"], "target_id": payload["target_member_inputs"][0]["input_id"], "source_path": ["future_91ab"]})
+            return json.dumps({"status": "bound", "source_id": slot["slot_id"], "target_id": payload["target_member_inputs"][0]["input_id"], "source_path": ["future_91ab"]})
         if obligation["kind"] == "script_to_platform":
             slot = next(value for value in payload["platform_outputs"] if value["field"] == "text")
-            return json.dumps({"source_id": payload["source_member_outputs"][0]["output_id"], "target_id": slot["slot_id"]})
-        return json.dumps({"source_id": payload["source_member_outputs"][0]["output_id"], "target_id": payload["target_member_inputs"][0]["input_id"]})
+            return json.dumps({"status": "bound", "source_id": payload["source_member_outputs"][0]["output_id"], "target_id": slot["slot_id"]})
+        return json.dumps({"status": "bound", "source_id": payload["source_member_outputs"][0]["output_id"], "target_id": payload["target_member_inputs"][0]["input_id"]})
 
     edges = await expand_responsibility_graph(function_items=items, platform_contract=build_platform_io_contract(), planner_model="p", goal_context={"system_goal": "random"}, model_call=model, interface_plan=plan(p2m("I0001", "scripts/a.py"), m2m("I0002", "scripts/a.py", "scripts/b.py"), m2p("I0003", "scripts/b.py")))
     assert [(edge["from_node"], edge["to_node"]) for edge in edges] == [("platform_input_node", "scripts/a.py"), ("scripts/a.py", "scripts/b.py"), ("scripts/b.py", "platform_output_node")]
@@ -171,10 +174,10 @@ async def test_endpoint_selection_retries_only_current_interface():
         calls.append(payload)
         if payload["obligation"]["kind"] == "platform_to_script":
             if len(calls) == 1:
-                return json.dumps({"source_id": "PIN9999", "target_id": payload["target_member_inputs"][0]["input_id"], "source_path": []})
-            return json.dumps({"source_id": payload["platform_inputs"][0]["slot_id"], "target_id": payload["target_member_inputs"][0]["input_id"], "source_path": []})
+                return json.dumps({"status": "bound", "source_id": "PIN9999", "target_id": payload["target_member_inputs"][0]["input_id"], "source_path": []})
+            return json.dumps({"status": "bound", "source_id": payload["platform_inputs"][0]["slot_id"], "target_id": payload["target_member_inputs"][0]["input_id"], "source_path": []})
         slot = next(value for value in payload["platform_outputs"] if value["field"] == "text")
-        return json.dumps({"source_id": payload["source_member_outputs"][0]["output_id"], "target_id": slot["slot_id"]})
+        return json.dumps({"status": "bound", "source_id": payload["source_member_outputs"][0]["output_id"], "target_id": slot["slot_id"]})
 
     await expand_responsibility_graph(function_items=items, platform_contract=contract(), planner_model="p", model_call=model, goal_context={}, interface_plan=plan(p2m("I0001", "scripts/a.py"), m2p("I0002", "scripts/a.py")))
     assert calls[1]["validation_error"]["code"] == "invalid_interface_endpoint_reference"
@@ -187,9 +190,9 @@ async def test_structured_port_defaults_and_unresolved_inputs_use_port_ids():
     async def model(messages, _model):
         payload = json.loads(messages[-1]["content"])
         if payload["obligation"]["kind"] == "platform_to_script":
-            return json.dumps({"source_id": payload["platform_inputs"][0]["slot_id"], "target_id": payload["target_member_inputs"][0]["input_id"], "source_path": []})
+            return json.dumps({"status": "bound", "source_id": payload["platform_inputs"][0]["slot_id"], "target_id": payload["target_member_inputs"][0]["input_id"], "source_path": []})
         slot = next(value for value in payload["platform_outputs"] if value["field"] == "text")
-        return json.dumps({"source_id": payload["source_member_outputs"][0]["output_id"], "target_id": slot["slot_id"]})
+        return json.dumps({"status": "bound", "source_id": payload["source_member_outputs"][0]["output_id"], "target_id": slot["slot_id"]})
 
     edges = await expand_responsibility_graph(function_items=items, platform_contract=contract(), planner_model="p", model_call=model, goal_context={}, interface_plan=plan(p2m("I0001", "scripts/a.py"), m2p("I0002", "scripts/a.py")))
     assert ("scripts/a.py", "provided") in {(edge["to_node"], edge["to_input"]) for edge in edges}
@@ -198,7 +201,7 @@ async def test_structured_port_defaults_and_unresolved_inputs_use_port_ids():
     with pytest.raises(ResponsibilityGraphExpansionError) as raised:
         await expand_responsibility_graph(function_items=missing_items, platform_contract=contract(), planner_model="p", model_call=model, goal_context={}, interface_plan=plan(p2m("I0001", "scripts/a.py"), m2p("I0002", "scripts/a.py")))
     assert raised.value.code == "interface_plan_incomplete"
-    assert raised.value.details["uncovered_inputs"] == [{"target": "scripts/a.py", "input_id": "second"}]
+    assert raised.value.details["uncovered_inputs"] == [{"target": "scripts/a.py", "input_id": "second", "required": True, "default_present": False}]
 
 
 def test_structured_port_description_and_contract_are_preserved_in_registry():
@@ -237,11 +240,11 @@ async def test_endpoint_payload_keeps_structured_port_metadata_and_type_conflict
         captured.append(payload)
         obligation = payload["obligation"]
         if obligation["kind"] == "platform_to_script":
-            return json.dumps({"source_id": payload["platform_inputs"][0]["slot_id"], "target_id": payload["target_member_inputs"][0]["input_id"], "source_path": []})
+            return json.dumps({"status": "bound", "source_id": payload["platform_inputs"][0]["slot_id"], "target_id": payload["target_member_inputs"][0]["input_id"], "source_path": []})
         if obligation["kind"] == "script_to_script":
-            return json.dumps({"source_id": payload["source_member_outputs"][0]["output_id"], "target_id": payload["target_member_inputs"][0]["input_id"]})
+            return json.dumps({"status": "bound", "source_id": payload["source_member_outputs"][0]["output_id"], "target_id": payload["target_member_inputs"][0]["input_id"]})
         slot = next(value for value in payload["platform_outputs"] if value["field"] == "text")
-        return json.dumps({"source_id": payload["source_member_outputs"][0]["output_id"], "target_id": slot["slot_id"]})
+        return json.dumps({"status": "bound", "source_id": payload["source_member_outputs"][0]["output_id"], "target_id": slot["slot_id"]})
 
     with pytest.raises(ResponsibilityGraphExpansionError) as raised:
         await expand_responsibility_graph(function_items=items, platform_contract=contract(), planner_model="p", model_call=model, goal_context={}, interface_plan=plan(p2m("I0001", "scripts/a.py"), m2m("I0002", "scripts/a.py", "scripts/b.py"), m2p("I0003", "scripts/b.py")))
@@ -286,6 +289,7 @@ async def test_repeated_member_interfaces_bind_distinct_unbound_inputs():
         obligation = payload["obligation"]
         if obligation["kind"] == "platform_to_script":
             return json.dumps({
+                "status": "bound",
                 "source_id": payload["platform_inputs"][0]["slot_id"],
                 "target_id": payload["target_member_inputs"][0]["input_id"],
                 "source_path": [],
@@ -293,10 +297,12 @@ async def test_repeated_member_interfaces_bind_distinct_unbound_inputs():
         if obligation["kind"] == "script_to_script":
             seen_target_lists.append([value["port_id"] for value in payload["target_member_inputs"]])
             return json.dumps({
+                "status": "bound",
                 "source_id": payload["source_member_outputs"][len(seen_target_lists) - 1]["output_id"],
                 "target_id": payload["target_member_inputs"][0]["input_id"],
             })
         return json.dumps({
+            "status": "bound",
             "source_id": payload["source_member_outputs"][0]["output_id"],
             "target_id": payload["platform_outputs"][0]["slot_id"],
         })
@@ -339,6 +345,7 @@ async def test_source_output_may_fan_out_to_multiple_targets():
         obligation = payload["obligation"]
         if obligation["kind"] == "platform_to_script":
             return json.dumps({
+                "status": "bound",
                 "source_id": payload["platform_inputs"][0]["slot_id"],
                 "target_id": payload["target_member_inputs"][0]["input_id"],
                 "source_path": [],
@@ -347,10 +354,12 @@ async def test_source_output_may_fan_out_to_multiple_targets():
             source_id = payload["source_member_outputs"][0]["output_id"]
             selected_source_ids.append(source_id)
             return json.dumps({
+                "status": "bound",
                 "source_id": source_id,
                 "target_id": payload["target_member_inputs"][0]["input_id"],
             })
         return json.dumps({
+            "status": "bound",
             "source_id": payload["source_member_outputs"][0]["output_id"],
             "target_id": payload["platform_outputs"][0]["slot_id"],
         })
@@ -382,6 +391,7 @@ async def test_target_input_is_removed_after_first_binding():
         obligation = payload["obligation"]
         if obligation["kind"] == "platform_to_script":
             return json.dumps({
+                "status": "bound",
                 "source_id": payload["platform_inputs"][0]["slot_id"],
                 "target_id": payload["target_member_inputs"][0]["input_id"],
                 "source_path": [],
@@ -390,10 +400,12 @@ async def test_target_input_is_removed_after_first_binding():
             seen_target_lists.append([value["port_id"] for value in payload["target_member_inputs"]])
             seen_source_lists.append([value["port_id"] for value in payload["source_member_outputs"]])
             return json.dumps({
+                "status": "bound",
                 "source_id": payload["source_member_outputs"][0]["output_id"],
                 "target_id": payload["target_member_inputs"][0]["input_id"],
             })
         return json.dumps({
+            "status": "bound",
             "source_id": payload["source_member_outputs"][0]["output_id"],
             "target_id": payload["platform_outputs"][0]["slot_id"],
         })
@@ -431,6 +443,7 @@ async def test_overcomplete_only_when_no_remaining_target_endpoint():
         obligation = payload["obligation"]
         if obligation["kind"] == "platform_to_script":
             return json.dumps({
+                "status": "bound",
                 "source_id": payload["platform_inputs"][0]["slot_id"],
                 "target_id": payload["target_member_inputs"][0]["input_id"],
                 "source_path": [],
@@ -438,10 +451,12 @@ async def test_overcomplete_only_when_no_remaining_target_endpoint():
         if obligation["kind"] == "script_to_script":
             script_to_script_calls += 1
             return json.dumps({
+                "status": "bound",
                 "source_id": payload["source_member_outputs"][0]["output_id"],
                 "target_id": payload["target_member_inputs"][0]["input_id"],
             })
         return json.dumps({
+            "status": "bound",
             "source_id": payload["source_member_outputs"][0]["output_id"],
             "target_id": payload["platform_outputs"][0]["slot_id"],
         })
@@ -488,6 +503,7 @@ async def test_platform_endpoint_retry_corrects_string_source_path_to_array():
         if obligation["kind"] == "platform_to_script":
             if len(calls) == 1:
                 return json.dumps({
+                    "status": "bound",
                     "source_id": payload["platform_inputs"][0]["slot_id"],
                     "target_id": payload["target_member_inputs"][0]["input_id"],
                     "source_path": "scripts/a.py",
@@ -504,6 +520,7 @@ async def test_platform_endpoint_retry_corrects_string_source_path_to_array():
             )
 
             return json.dumps({
+                "status": "bound",
                 "source_id": payload["platform_inputs"][0]["slot_id"],
                 "target_id": payload["target_member_inputs"][0]["input_id"],
                 "source_path": [],
@@ -516,6 +533,7 @@ async def test_platform_endpoint_retry_corrects_string_source_path_to_array():
         )
 
         return json.dumps({
+            "status": "bound",
             "source_id": payload["source_member_outputs"][0]["output_id"],
             "target_id": text_slot["slot_id"],
         })
@@ -536,3 +554,24 @@ async def test_platform_endpoint_retry_corrects_string_source_path_to_array():
     assert edges[0]["from_node"] == "platform_input_node"
     assert edges[0]["to_node"] == "scripts/a.py"
     assert edges[0]["constraints"] == []
+
+@pytest.mark.asyncio
+async def test_endpoint_unbound_is_structured_and_not_retried():
+    items = [item("scripts/unit_a.py", ["slot_x"], ["value_a"])]
+    calls = 0
+
+    async def model(_messages, _model):
+        nonlocal calls
+        calls += 1
+        return json.dumps({"status": "unbound", "reason": "No legal candidate pair realizes the supplied Interface goal."})
+
+    with pytest.raises(ResponsibilityGraphExpansionError) as raised:
+        await expand_responsibility_graph(
+            function_items=items, platform_contract=contract(required=["text"]),
+            planner_model="p", goal_context={}, model_call=model,
+            interface_plan=plan(p2m("I1", "scripts/unit_a.py"), m2p("I2", "scripts/unit_a.py")),
+        )
+    assert raised.value.code == "interface_endpoint_unbound"
+    assert raised.value.details["interface_id"] == "I1"
+    assert raised.value.details["candidate_domains"]["sources"]
+    assert calls == 1

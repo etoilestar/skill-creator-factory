@@ -2,6 +2,15 @@
 
 from .common import *  # noqa: F403
 from collections.abc import Mapping, Sequence
+from ..creator_model_profiles import complete_creator_role_once as _profile_creator_role_once
+
+
+async def complete_creator_role_once(messages, role, *, fallback_model, stage="creator"):
+    """Injectable repair seam that retains production role-profile routing."""
+    return await _profile_creator_role_once(
+        messages, role, fallback_model=fallback_model, stage=stage,
+        model_call=complete_chat_once,
+    )
 
 
 def _failure_layer_from_error_text(error_text: str) -> str | None:

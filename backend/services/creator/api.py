@@ -57,6 +57,27 @@ from .function_item_interface_plan import (
     plan_function_item_interfaces,
     repair_interface_intents,
 )
+from .frozen_facts import (
+    CANONICAL_PROJECTION_PRINCIPLE,
+    FACT_OWNERS,
+    FACT_OWNERSHIP_CONTRACT,
+    FROZEN_FACT_AUTHORITY,
+    CreatorFactsSnapshot,
+    log_frozen_fact_digests,
+    project_frozen_facts_to_summary,
+)
+from ..creator_model_profiles import complete_creator_role_once as _profile_creator_role_once
+
+
+async def complete_creator_role_once(
+    messages: list[dict[str, Any]], role: Literal["planner", "reviewer"], *,
+    fallback_model: str, stage: str = "creator",
+) -> str:
+    """Injectable API seam that retains production role-profile routing."""
+    return await _profile_creator_role_once(
+        messages, role, fallback_model=fallback_model, stage=stage,
+        model_call=complete_chat_once,
+    )
 
 
 def _tool_binding_digest(binding: dict[str, Any]) -> str:
@@ -8163,6 +8184,19 @@ be executable. Do not create an issue whose repair_guidance asks to change a
 requirement channel. Review only whether the current Blueprint and allocations
 are valid under the supplied channel.
 
+REVERSE PROVENANCE AUDIT
+
+For every frozen substantive executable FunctionItem, determine whether its
+runtime responsibility is semantically justified by the confirmed requirement
+set and executable allocations. A FunctionItem may synthesize several
+requirements, and one requirement may justify several FunctionItems. A derived
+helper is valid when its necessity follows semantically from confirmed
+requirements and upstream frozen responsibilities. Do not infer provenance from
+filename, role label, matching field names, or array position. If provenance is
+missing or contradictory, report a responsibility_mismatch with evidence that
+references only supplied requirement and FunctionItem identities. Diagnose the
+gap; do not prescribe reclassification, a new owner, or a repair operation.
+
 2. CHANNEL-AWARE REVIEW RULES
 Ownership rules are channel-aware:
 - For executable requirements, at least one owner must exist; every owner must
@@ -8735,7 +8769,17 @@ async def _generate_internal_blueprint_or_questions(
         load_kernel_creator_for_phase(
             "prepare_plan"
         )
+        + "\n\n" + FACT_OWNERSHIP_CONTRACT
+        + "\n\n" + CANONICAL_PROJECTION_PRINCIPLE
         + """
+
+SINGLE DEFINITION PRINCIPLE
+Define every executable logical input and output exactly once in the structured
+SkillPlan/FunctionItem contract. Prose, command examples, and host-execution
+notes are explanatory only and must reference rather than redefine logical port,
+dependency, or runtime-ownership identities. Downstream stages freeze ports only
+from the normalized structured contract.
+
 你现在服务 /api/creator/prepare-plan。
 
 只输出严格 JSON object。
@@ -9127,8 +9171,6 @@ F. lightweight runtime-contract self-check
     "input": "",
     "output": "",
     "workflow": [],
-    "files_to_create_or_update": [],
-    "assets_to_upload": [],
     "risks": [],
     "changes": []
   },
@@ -9764,6 +9806,26 @@ Blueprint Planner 只规划业务责任。
                 "Pre-graph semantic closure has unresolved blocking issues; "
                 f"issues={blocking_issues}"
             )
+        authoritative_paths = _extract_prepare_skill_plan_paths(frozen_blueprint_text)
+        facts_snapshot = CreatorFactsSnapshot(
+            confirmed_requirements=(request.user_request,),
+            file_plan=tuple(authoritative_paths),
+            function_items=tuple(copy.deepcopy(semantic_function_items)),
+            requirement_projection={
+                "allocations": copy.deepcopy(requirement_allocations),
+                "channels": copy.deepcopy(requirement_channels),
+            },
+            resource_authority={
+                "authoritative_references": [
+                    path for path in authoritative_paths if path.startswith("references/")
+                ],
+                "authoritative_assets": [
+                    path for path in authoritative_paths if path.startswith("assets/")
+                ],
+                "allowed_resources": sorted(allowed_resource_paths),
+            },
+        )
+        log_frozen_fact_digests(stage="blueprint_closure", snapshot=facts_snapshot)
         first_planner_result = {
             **first_planner_result,
             "internal_blueprint_text": frozen_blueprint_text,
@@ -9830,7 +9892,8 @@ async def _project_prepare_review_summary_from_blueprint(
     - code generation;
     - E2E.
 
-    Projection input is the full blueprint only.
+    The model owns prose only. Frozen file/resource identities are attached by
+    deterministic projection after parsing the canonical structured Blueprint.
     """
 
     source_blueprint = str(
@@ -9852,21 +9915,33 @@ async def _project_prepare_review_summary_from_blueprint(
         )
     )
 
+    authoritative_files: list[str] = []
+    authoritative_upload_assets: list[str] = []
+    if source_blueprint:
+        try:
+            frozen_plan = parse_blueprint(
+                [{"role": "assistant", "content": source_blueprint}], strict=True
+            )
+            for file_spec in frozen_plan.files:
+                path = str(getattr(file_spec, "path", "") or "").strip()
+                if path and path not in authoritative_files:
+                    authoritative_files.append(path)
+                if (str(getattr(file_spec, "file_type", "") or "") == "asset"
+                        and str(getattr(file_spec, "asset_source", "") or "") == "user_upload"
+                        and path not in authoritative_upload_assets):
+                    authoritative_upload_assets.append(path)
+        except Exception:
+            # Blueprint protocol validation owns this failure elsewhere. Summary
+            # projection never repairs or infers identities from malformed text.
+            authoritative_files = []
+            authoritative_upload_assets = []
+
     if not source_blueprint:
-        fallback.risks = []
-
-        fallback.assets_to_upload = [
-            str(path).strip()
-            for path in (
-                fallback.assets_to_upload
-                or []
-            )
-            if str(path).strip().startswith(
-                "assets/"
-            )
-        ]
-
-        return fallback
+        return PreparePlanReviewSummary(**project_frozen_facts_to_summary(
+            summary_prose=fallback.model_dump(exclude={"files_to_create_or_update", "assets_to_upload"}),
+            authoritative_files=authoritative_files,
+            authoritative_upload_assets=authoritative_upload_assets,
+        ))
 
     response_schema: dict[
         str,
@@ -9888,22 +9963,6 @@ async def _project_prepare_review_summary_from_blueprint(
             },
 
             "workflow": {
-                "type": "array",
-
-                "items": {
-                    "type": "string",
-                },
-            },
-
-            "files_to_create_or_update": {
-                "type": "array",
-
-                "items": {
-                    "type": "string",
-                },
-            },
-
-            "assets_to_upload": {
                 "type": "array",
 
                 "items": {
@@ -9933,8 +9992,6 @@ async def _project_prepare_review_summary_from_blueprint(
             "input",
             "output",
             "workflow",
-            "files_to_create_or_update",
-            "assets_to_upload",
             "risks",
             "changes",
         ],
@@ -9942,7 +9999,14 @@ async def _project_prepare_review_summary_from_blueprint(
         "additionalProperties": False,
     }
 
-    prompt = """
+    prompt = FACT_OWNERSHIP_CONTRACT + "\n\n" + FROZEN_FACT_AUTHORITY + "\n\n" + CANONICAL_PROJECTION_PRINCIPLE + """
+
+REVIEW SUMMARY AUTHORITY
+You own only goal, input, output, workflow, risks, and changes prose. You do not
+own file, asset, reference, FunctionItem, requirement-channel, Interface, Graph,
+or tool identities. The response schema intentionally grants no write access to
+those facts. Do not introduce facts absent from the frozen structured context.
+
 你只负责把 internal_blueprint_text 映射成给用户展示的“创建要点”。
 
 这是只读 projection。
@@ -9975,12 +10039,6 @@ output：
 
 workflow：
 按蓝图工作流逻辑映射为简短步骤。
-
-files_to_create_or_update：
-映射 SkillPlan 中声明的文件。
-
-assets_to_upload：
-只映射 SkillPlan 中明确声明的静态 assets。
 
 risks：
 必须为空数组。
@@ -10039,11 +10097,15 @@ changes：
             )
         )
 
-        summary = (
-            _coerce_prepare_summary(
-                projected
+        forbidden = sorted(set(projected) & {
+            "files_to_create_or_update", "assets_to_upload", "references_to_use",
+        })
+        for field_name in forbidden:
+            logger.warning(
+                "[Creator][authority] stage=review_summary ignored_non_authoritative_field=%s",
+                field_name,
             )
-        )
+        summary = _coerce_prepare_summary(projected)
 
     except Exception as exc:
         logger.warning(
@@ -10059,40 +10121,12 @@ changes：
 
         summary = fallback
 
-    plan_paths = (
-        _extract_prepare_skill_plan_paths(
-            source_blueprint
-        )
-    )
-
-    # File list is a deterministic projection.
-    summary.files_to_create_or_update = (
-        plan_paths
-    )
-
-    asset_plan_paths = {
-        path
-        for path in plan_paths
-        if path.startswith(
-            "assets/"
-        )
-    }
-
-    summary.assets_to_upload = [
-        str(path).strip()
-        for path in (
-            summary.assets_to_upload
-            or []
-        )
-        if (
-            str(path).strip()
-            in asset_plan_paths
-        )
-    ]
-
     summary.risks = []
-
-    return summary
+    return PreparePlanReviewSummary(**project_frozen_facts_to_summary(
+        summary_prose=summary.model_dump(exclude={"files_to_create_or_update", "assets_to_upload"}),
+        authoritative_files=authoritative_files,
+        authoritative_upload_assets=authoritative_upload_assets,
+    ))
 
 def _tool_names_from_entry_contract(entry: Any) -> list[str]:
     data = entry if isinstance(entry, dict) else getattr(entry, "__dict__", {})

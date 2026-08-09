@@ -86,3 +86,21 @@ def test_role_temperature_override_is_forwarded(tmp_path, monkeypatch, caplog):
         ))
     assert call.await_args.kwargs["temperature"] == 0.15
     assert "temperature=0.15" in caplog.text
+
+
+def test_temperature_inherits_global_and_role_override_wins(tmp_path, monkeypatch):
+    from backend.config import settings
+    from backend.services import creator_model_profiles as profiles
+
+    monkeypatch.setattr(settings, "governance_path", tmp_path)
+    monkeypatch.setattr(settings, "temperature", 0.2)
+    saved = _empty_profiles()
+    profiles._save(saved)
+    assert profiles.resolve_creator_model_profile(
+        "planner", fallback_model="model"
+    ).temperature == 0.2
+    saved["planner"]["temperature"] = 0.05
+    profiles._save(saved)
+    assert profiles.resolve_creator_model_profile(
+        "planner", fallback_model="model"
+    ).temperature == 0.05

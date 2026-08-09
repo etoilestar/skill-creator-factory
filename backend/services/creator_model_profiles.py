@@ -5,10 +5,11 @@ import json
 import os
 import tempfile
 import logging
+import inspect
 from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
-from typing import Literal
+from typing import Awaitable, Callable, Literal
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, field_validator
@@ -91,6 +92,7 @@ def resolve_creator_model_profile(
 async def complete_creator_role_once(
     messages: list[dict], role: Literal["planner", "reviewer"], *, fallback_model: str,
     stage: str = "creator",
+    model_call: Callable[..., Awaitable[str]] | None = None,
 ) -> str:
     profile = resolve_creator_model_profile(role, fallback_model=fallback_model)
     logger.info("[Creator][model] stage=%s role=%s model=%s temperature=%s max_tokens=%s provider_base_url=%s", stage, role, profile.model, profile.temperature, profile.max_tokens, profile.base_url)
@@ -98,7 +100,16 @@ async def complete_creator_role_once(
                     "max_tokens": profile.max_tokens}
     if profile.temperature is not None:
         call_options["temperature"] = profile.temperature
-    return await complete_chat_once(messages, profile.model, **call_options)
+    selected_call = model_call or complete_chat_once
+    signature = inspect.signature(selected_call)
+    accepts_var_kwargs = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+    supported_options = call_options if accepts_var_kwargs else {
+        key: value for key, value in call_options.items() if key in signature.parameters
+    }
+    return await selected_call(messages, profile.model, **supported_options)
 
 
 class ProfileUpdate(BaseModel):

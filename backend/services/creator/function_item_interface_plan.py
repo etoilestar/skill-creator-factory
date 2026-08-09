@@ -19,19 +19,18 @@ logger = logging.getLogger(__name__)
 ModelCall = Callable[[list[dict[str, str]], str], Awaitable[str]]
 AUTHORITY_CONTRACT = """CROSS-STAGE AUTHORITY CONTRACT
 
-Upstream confirmed facts remain authoritative unless the current stage is explicitly authorized to repair that fact.
-
-Authority ownership:
-- Confirmed user requirements define the task intent.
-- Blueprint and FunctionItem planning define executable responsibilities and logical ports.
-- Requirement Projection assigns requirement channels and executable ownership.
-- Interface Planner chooses semantic logical-port transfers.
-- Interface Reviewer evaluates those declared transfers.
-- Endpoint and Graph layers resolve logical ports to opaque IDs and validate topology.
-- Critic diagnoses supplied blocking facts; Generator repairs only the editable layer.
-- Tool Planner owns concrete tool/helper binding.
-
-When two instructions appear to conflict, preserve the upstream authoritative fact and apply only the permissions of the current stage."""
+Confirmed user requirements define task intent.
+Blueprint and FunctionItem planning define frozen executable responsibilities and logical ports.
+Requirement Projection assigns requirement channels and executable ownership.
+Interface Planner owns semantic logical-port binding decisions.
+Interface Planner Correction may repair only the Interface layer when a previous Planner result fails deterministic Interface acceptance.
+Interface Reviewer evaluates semantic correctness only after deterministic Interface validity has been established.
+Critic diagnoses semantic or Graph blocking facts and states only the required postcondition.
+Repair Generator repairs only the editable Interface layer.
+Graph materialization deterministically resolves already-declared logical bindings to opaque runtime endpoint IDs and validates execution topology.
+Graph materialization does not reselect semantic business ports.
+Tool Planner owns concrete tool/helper binding.
+No later stage may silently revise an upstream frozen fact outside its declared authority."""
 PLATFORM_OUTPUT_CONTRACT = """PLATFORM OUTPUT CONTRACT
 
 final_output_fields defines the legal platform-output domain.
@@ -48,15 +47,17 @@ A normal logical FunctionItem input represents one runtime receiving slot.
 In the current execution contract, one receiving slot has one runtime
 provenance. The same source output may fan out to multiple different receiving
 slots. Multiple independent sources must not target the same logical input."""
+SOURCE_PATH_CONTRACT = """SOURCE PATH CONTRACT
+
+Every platform_to_member Interface MUST explicitly contain source_path.
+source_platform_input identifies the selected top-level platform source slot.
+source_path is relative to that selected top-level source slot.
+Use source_path=[] when the entire selected top-level platform source value is transferred.
+Use a non-empty source_path only when the semantic source value is nested inside the selected top-level platform source.
+Never omit source_path.
+Do not repeat source_platform_input inside source_path merely to satisfy the schema."""
 INTERFACE_KINDS = {"platform_to_member", "member_to_member", "member_to_platform"}
 _DANGEROUS_PATH_PARTS = {"__proto__", "prototype", "constructor"}
-PROTOCOL_REPAIRABLE_CODES = {
-    "invalid_interface_plan_json",
-    "invalid_interface_plan_protocol",
-    "invalid_interface_protocol",
-    "invalid_interface_kind",
-    "duplicate_interface_id",
-}
 INTERFACE_FIELDS = {
     "platform_to_member": {"interface_id", "kind", "source_platform_input", "source_path", "target_member", "target_input", "goal"},
     "member_to_member": {"interface_id", "kind", "source_member", "source_output", "target_member", "target_input", "goal"},
@@ -391,7 +392,7 @@ def build_interface_repair_scope(
             "confirmed_requirements", "function_items", "requirement_channels",
         ],
         "preserve_unaffected_semantics": True,
-        "max_semantic_repair_cycles": 1,
+        "max_semantic_repair_cycles": 2,
     }
 
 
@@ -412,13 +413,21 @@ def validate_interface_repair_scope(
         _raise("repair cannot erase the complete Interface Plan", "interface_repair_scope_error", path="$.interfaces")
 
 
-def _interface_plan_without_ids(plan: dict[str, Any]) -> list[dict[str, Any]]:
-    """Normalize away model-owned IDs for deterministic no-progress checks."""
-    return [
-        {key: value for key, value in interface.items() if key != "interface_id"}
-        for interface in plan.get("interfaces") or []
-        if isinstance(interface, dict)
-    ]
+def canonical_logical_binding_signatures(plan: dict[str, Any]) -> tuple[tuple[Any, ...], ...]:
+    """Return a multiplicity-preserving semantic identity, ignoring presentation."""
+    signatures = []
+    for value in plan.get("interfaces") or []:
+        kind = value.get("kind")
+        if kind == "platform_to_member":
+            signature = (kind, value.get("source_platform_input"), tuple(value.get("source_path") or []), value.get("target_member"), value.get("target_input"))
+        elif kind == "member_to_member":
+            signature = (kind, value.get("source_member"), value.get("source_output"), value.get("target_member"), value.get("target_input"))
+        elif kind == "member_to_platform":
+            signature = (kind, value.get("source_member"), value.get("source_output"), value.get("target_platform_output"))
+        else:
+            signature = (str(kind), json.dumps(value, sort_keys=True, default=str))
+        signatures.append(signature)
+    return tuple(sorted(signatures, key=repr))
 
 
 def build_graph_obligations_from_interfaces(*, interface_plan: dict[str, Any]) -> list[dict[str, Any]]:
@@ -447,6 +456,8 @@ def _interface_plan_prompt() -> str:
 
 {RUNTIME_INPUT_PROVENANCE_CONTRACT}
 
+{SOURCE_PATH_CONTRACT}
+
 1. AUTHORITATIVE FACTS
 The payload contains confirmed requirements, frozen FunctionItems and their
 logical input/output contracts, runtime_source_required facts, and the platform
@@ -455,13 +466,25 @@ logical input/output contract. These facts are authoritative.
 Logical ports are declared FunctionItem/platform input or output names. Opaque
 endpoint IDs are later registry identities such as INxxxx/OUTxxxx/PINxxxx/POUTxxxx.
 
-2. CURRENT TASK
-Produce the minimum complete semantic Interface Plan over frozen logical ports.
+2. SHARED CONTRACTS
+WIRE CONTRACT
+platform_to_member always contains: interface_id, kind, source_platform_input,
+source_path, target_member, target_input, goal.
+member_to_member always contains: interface_id, kind, source_member,
+source_output, target_member, target_input, goal.
+member_to_platform always contains: interface_id, kind, source_member,
+source_output, target_platform_output, goal.
+This wire contract and INTERFACE_SCHEMA describe the same protocol. Do not omit
+a required field because its value is empty-like; source_path=[] is the explicit
+representation of whole-slot platform binding.
+
+3. CURRENT TASK
+Produce a complete semantic Interface Plan over frozen logical ports.
 For every runtime_source_required FunctionItem input choose the semantic source
 value. For every required platform output choose the frozen FunctionItem output.
 Record each choice in structured logical binding fields.
 
-3. CURRENT SEMANTIC AUTHORITY
+4. CURRENT AUTHORITY
 You, not the backend, choose the semantic producer using responsibilities, port
 descriptions and contracts, confirmed requirements, workflow semantics, and the
 platform contract. Do not choose by field-name similarity alone.
@@ -474,23 +497,28 @@ one declared logical source -> one declared receiving slot -> one future edge.
 Two independently selectable receiving slots require separate records. A source
 output may be reused by separate Interfaces.
 
-For platform_to_member, choose the top-level platform logical port and declare
-source_path only when the required value is nested inside it. Use source_path=[]
-for direct whole-port binding. Do not invent nested paths to make an Interface
-possible. Do not assign multiple producers to one ordinary receiving logical
-port.
+5. HARD ACCEPTANCE CONDITIONS
+COMPLETENESS PRIORITY
+Completeness is a hard acceptance condition. First construct a complete
+semantic Interface Plan that covers every runtime_source_required receiving
+slot and every semantically required platform output. Only after completeness
+is established may redundant Interfaces be avoided. Never omit a required
+receiving slot in order to reduce Interface count.
 
-4. FROZEN FACTS / INVARIANTS
 Do not modify FunctionItems, requirements, channels, or logical ports. Do not
 return opaque endpoint IDs, Graph edges, or extra fields. Do not
 invent platform inputs to close coverage.
 
-5. SELF-CHECK
-Verify every runtime_source_required logical input and required platform output
-is covered by at least one Interface. Verify every structured logical reference
-exists and every Interface declares exactly one receiving slot.
+6. SILENT SELF-CHECK
+Before returning JSON, silently construct a coverage ledger. For every frozen
+FunctionItem: (1) enumerate every input whose runtime_source_required=true; (2)
+identify exactly which Interface supplies that receiving slot. For every
+semantically required platform output: (3) identify the member_to_platform
+Interface that produces it. Do not return until every required receiving slot
+and required final result is accounted for. The coverage ledger is internal
+verification only. Do not output the ledger.
 
-6. OUTPUT CONTRACT
+7. OUTPUT CONTRACT
 Return only strict JSON matching this schema:
 {json.dumps(INTERFACE_SCHEMA, ensure_ascii=False)}
 """.strip()
@@ -498,20 +526,19 @@ Return only strict JSON matching this schema:
 
 async def _reformat_interface_plan_response(*, raw_response: str, validation_error: InterfaceIntentPlanError, planner_model: str, model_call: ModelCall) -> dict[str, Any]:
     logger.info("[Creator][interface_protocol_repair] attempt=1 error_paths=%s", [validation_error.details.get("path", "$")])
-    prompt = """1. RAW RESPONSE
-Use the supplied raw response.
-2. TRANSPORT FAILURE
-Use the supplied structured protocol error.
-3. ALLOWED SHAPE CHANGES
-Repair JSON syntax, array/object boundaries, field placement, duplicate-ID
-formatting, and already-present values in the wrong container.
-4. FORBIDDEN SEMANTIC CHANGES
-Preserve all semantic bindings. Do not infer source_output or target_input from
-goal or names, invent a missing logical port, add/remove an Interface, or change
-direction. If required semantic binding information is absent, do not invent it;
-protocol repair cannot solve missing semantic content.
-5. OUTPUT CONTRACT
-Return only strict JSON matching schema."""
+    prompt = """PROTOCOL REPAIR AUTHORITY
+Your only task is to restore parseable JSON transport while preserving all
+semantic content already present in the raw response.
+Allowed: repair JSON syntax; remove accidental Markdown fencing when needed;
+restore valid JSON object/array syntax; repair quoting, commas, brackets, and
+equivalent serialization defects.
+Forbidden: create a missing Interface; create a missing logical binding field;
+choose a source or target; invent source_path; infer source_output or
+target_input; change Interface direction; invent or replace business-semantic
+values.
+If the response becomes parseable JSON but does not satisfy the Interface
+contract, stop there. Semantic correction belongs to the Interface Planner.
+Return strict parseable JSON only."""
     payload = {"schema": INTERFACE_SCHEMA, "raw_response": raw_response, "validation_error": {"code": validation_error.code, "details": validation_error.details, "message": str(validation_error)}}
     text = await model_call([{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}], planner_model)
     return _parse_object(text)
@@ -541,18 +568,18 @@ def normalize_interface_review_issue(raw_issue: dict[str, Any], frozen_function_
     return {**envelope, "stage": "interface_semantic_review", "path": path, "interface_id": interface_ids[0] if interface_ids else "", "details": envelope}
 
 
-CRITIC_SCHEMA = {"diagnosis": "string", "repair_objective": "string"}
+CRITIC_SCHEMA = {"diagnosis": "string", "required_postcondition": "string"}
 
 
 def validate_interface_repair_critic(value: dict[str, Any], *, validation_issues: list[dict[str, Any]], current_interface_plan: dict[str, Any], frozen_function_items: list[dict[str, Any]], repair_scope: dict[str, Any]) -> dict[str, Any]:
     """Validate Critic transport only; revalidation proves semantic repair."""
     _ = validation_issues, current_interface_plan, frozen_function_items, repair_scope
-    if not isinstance(value, dict) or set(value) != {"diagnosis", "repair_objective"}:
+    if not isinstance(value, dict) or set(value) != {"diagnosis", "required_postcondition"}:
         _raise("repair critic response has invalid fields", "invalid_interface_repair_critic_protocol", path="$")
-    for field in ("diagnosis", "repair_objective"):
+    for field in ("diagnosis", "required_postcondition"):
         if not isinstance(value[field], str) or not value[field].strip():
             _raise(f"{field} must be non-empty", "invalid_interface_repair_critic_protocol", path=f"$.{field}")
-    return {field: value[field].strip() for field in ("diagnosis", "repair_objective")}
+    return {field: value[field].strip() for field in ("diagnosis", "required_postcondition")}
 
 
 def _validate_interface_review_response(
@@ -612,27 +639,36 @@ async def review_interface_plan_semantically(
 
 """ + RUNTIME_INPUT_PROVENANCE_CONTRACT + """
 
+""" + SOURCE_PATH_CONTRACT + """
+
 1. AUTHORITATIVE FACTS
 The payload contains confirmed requirements, frozen FunctionItem responsibilities
 and logical port contracts, runtime_source_required facts, the platform logical
 contract, and the complete Interface Plan. Structured logical binding fields are
 part of the Interface semantic layer and are authoritative for transfer identity.
 
-2. REVIEW TASK
+2. DETERMINISTIC VALIDITY PRECONDITION
+The backend has already established Interface protocol validity,
+logical-reference validity, runtime-required receiving-slot structural
+coverage, single-provenance validity, and legal platform terminal existence.
+Do not repeat those deterministic checks.
+
+3. SEMANTIC REVIEW TASK
 Do not trust the Planner conclusion. Independently determine whether the complete
 Interface Plan faithfully realizes confirmed requirements over frozen logical
 ports. For every transfer, decide whether its declared semantic source can
-faithfully satisfy its declared receiving slot. For every required receiving
-slot, decide whether the plan semantically covers it. Do not search for predefined
-error categories and do not propose a repair.
+faithfully satisfy its declared receiving slot, whether source_path selects the
+intended semantic platform value, and whether selected final platform results
+semantically satisfy the requested output. Do not search for predefined error
+categories and do not propose a repair.
 
-3. EVIDENCE STANDARD
+4. EVIDENCE STANDARD
 A structurally valid logical reference is not automatically semantically correct.
 A different valid design is not a defect. Report only a concrete defect in this
 plan, supported by observed and expected facts. An issue is not a record that a
 fact was reviewed.
 
-4. AUTHORITY LIMIT
+5. AUTHORITY LIMIT
 Do not select opaque Graph endpoint IDs, generate edges, change Interface records,
 or prescribe add/split/remove operations. The Interface
 stage declares logical FunctionItem/platform ports; it does not declare registry
@@ -640,11 +676,9 @@ IDs, argv serialization, or runtime placeholder paths. When source_path is
 declared, evaluate whether that nested platform value can semantically satisfy
 target_input. Report a defect without proposing another path.
 
-5. SELF-CHECK
+6. OUTPUT CONTRACT
 Verify every affected Interface and logical input exists. passed=true exactly
 when issues is empty.
-
-6. OUTPUT CONTRACT
 Return only strict JSON matching this schema:
 """ + json.dumps(INTERFACE_REVIEW_SCHEMA, ensure_ascii=False)
     payload = {
@@ -719,30 +753,75 @@ async def plan_function_item_interfaces(*, original_user_goal: str, frozen_funct
     }
     raw_response = await model_call([{"role": "system", "content": _interface_plan_prompt()}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}], planner_model)
     try:
-        parsed = validate_interface_plan_protocol(_parse_object(raw_response))
-        logger.info("[Creator][interface_protocol_validation] result=success")
+        transport = _parse_object(raw_response)
     except InterfaceIntentPlanError as exc:
-        logger.info("[Creator][interface_protocol_validation] result=failed error_code=%s", exc.code)
-        if exc.code in PROTOCOL_REPAIRABLE_CODES:
-            try:
-                reformatted = await _reformat_interface_plan_response(raw_response=raw_response, validation_error=exc, planner_model=planner_model, model_call=model_call)
-                parsed = validate_interface_plan_protocol(reformatted)
-                logger.info("[Creator][interface_protocol_repair] attempt=1 result=success")
-            except InterfaceIntentPlanError as repair_exc:
-                logger.info("[Creator][interface_protocol_repair] attempt=1 result=failed")
-                raise InterfaceIntentPlanError(
-                    "interface plan protocol repair failed",
-                    code="interface_plan_protocol_repair_failed",
-                    details={
-                        "original_error": {"code": exc.code, "details": exc.details},
-                        "repair_error": {"code": repair_exc.code, "details": repair_exc.details},
-                    },
-                ) from repair_exc
-        else:
-            raise
+        # Routing is by the failed parse stage, never by a semantic error code.
+        transport = await _reformat_interface_plan_response(
+            raw_response=raw_response, validation_error=exc,
+            planner_model=planner_model, model_call=model_call,
+        )
+        logger.info("[Creator][interface_protocol_repair] attempt=1 result=transport_parseable")
+    protocol_issue: InterfaceIntentPlanError | None = None
+    try:
+        parsed = validate_interface_plan_protocol(transport)
+    except InterfaceIntentPlanError as exc:
+        protocol_issue = exc
+        parsed = transport
     deterministic_issues = collect_interface_plan_validation_issues(
         plan=parsed, function_items=frozen_function_items, platform_contract=platform_contract,
-    )
+    ) if protocol_issue is None else []
+    if protocol_issue is not None or deterministic_issues:
+        facts = ([{"code": protocol_issue.code, "message": str(protocol_issue), "details": protocol_issue.details}]
+                 if protocol_issue is not None else deterministic_issues)
+        correction_prompt = f"""{AUTHORITY_CONTRACT}
+
+{PLATFORM_OUTPUT_CONTRACT}
+
+{RUNTIME_INPUT_PROVENANCE_CONTRACT}
+
+{SOURCE_PATH_CONTRACT}
+
+INTERFACE PLAN CORRECTION
+1. AUTHORITATIVE FACTS
+Confirmed requirements, frozen FunctionItems, logical ports, runtime source
+facts, platform contract, and shared Interface contracts remain authoritative.
+2. SHARED CONTRACTS
+INTERFACE_SCHEMA and the shared contracts above define the protocol.
+3. CURRENT TASK
+The previous plan failed deterministic acceptance. Reconstruct one complete
+corrected Interface Plan and resolve every supplied acceptance failure
+simultaneously. Facts describe invalid state; they do not prescribe a producer.
+Do not patch only visible wording. Return the complete corrected plan.
+4. CURRENT AUTHORITY
+Modify only the Interface semantic layer. You may add or remove an Interface,
+revise a logical binding or source_path, and preserve correct bindings. You
+decide the semantic repair; the backend does not choose the producer.
+5. HARD ACCEPTANCE CONDITIONS
+The complete result must match INTERFACE_SCHEMA and pass all supplied facts.
+6. SILENT SELF-CHECK
+Silently rebuild the complete required-slot coverage ledger before returning.
+7. OUTPUT CONTRACT
+Return strict JSON matching INTERFACE_SCHEMA only."""
+        correction_payload = {**payload, "previous_interface_plan": parsed,
+                              "deterministic_validation_facts": facts,
+                              "interface_schema": INTERFACE_SCHEMA}
+        logger.info("[Creator][interface_plan_correction] attempt=1 issue_count=%d", len(facts))
+        corrected_text = await model_call(
+            [{"role": "system", "content": correction_prompt},
+             {"role": "user", "content": json.dumps(correction_payload, ensure_ascii=False, default=str)}],
+            planner_model,
+        )
+        parsed = validate_interface_plan_protocol(_parse_object(corrected_text))
+        deterministic_issues = collect_interface_plan_validation_issues(
+            plan=parsed, function_items=frozen_function_items,
+            platform_contract=platform_contract,
+        )
+        if deterministic_issues:
+            raise InterfaceIntentPlanError(
+                "interface plan deterministic closure failed after correction",
+                code="interface_plan_deterministic_closure_failed",
+                details={"correction_attempts": 1, "remaining_issues": deterministic_issues},
+            )
     review_issues: list[dict[str, Any]] = []
     if reviewer_model:
         review_issues = await review_interface_plan_semantically(
@@ -756,7 +835,7 @@ async def plan_function_item_interfaces(*, original_user_goal: str, frozen_funct
             reviewer_model=reviewer_model,
             model_call=reviewer_model_call or model_call,
         )
-    combined_issues = merge_interface_validation_issues(deterministic_issues, review_issues)
+    combined_issues = merge_interface_validation_issues(review_issues)
     logger.info(
         "[Creator][interface_validation] stage=initial deterministic_issue_count=%d review_issue_count=%d combined_issue_count=%d repairable=%s",
         len(deterministic_issues), len(review_issues), len(combined_issues), bool(combined_issues),
@@ -793,7 +872,7 @@ async def repair_interface_plan_semantically(
     planner_model: str, model_call: ModelCall, reviewer_model: str | None = None,
     reviewer_model_call: ModelCall | None = None,
 ) -> dict[str, Any]:
-    """Perform one bounded Critic + Generator semantic repair cycle."""
+    """Perform one Critic call and at most two Generator attempts."""
     system_requirements_context = (
         list(system_requirements) if system_requirements is not None
         else _resolve_system_requirements_context(
@@ -812,6 +891,8 @@ async def repair_interface_plan_semantically(
 {PLATFORM_OUTPUT_CONTRACT}
 
 {RUNTIME_INPUT_PROVENANCE_CONTRACT}
+
+{SOURCE_PATH_CONTRACT}
 
 1. AUTHORITATIVE FACTS
 The payload contains the failed complete Interface Plan; frozen FunctionItems
@@ -832,18 +913,20 @@ Graph feedback reports deterministic observations only. A graph failure does
 not itself explain the semantic cause. Do not treat an error code as a repair
 instruction.
 
-3. AUTHORITY LIMIT
-Do not output a repaired plan, select endpoint IDs, prescribe add/remove/split
-operations, modify frozen FunctionItems, or infer repair from error-code names.
-
-4. OUTPUT CONTRACT
-Return only {{"diagnosis":"...","repair_objective":"..."}}."""
+3. REQUIRED POSTCONDITION CONTRACT
+required_postcondition is a declarative condition that must be true after repair, not an edit operation.
+4. AUTHORITY LIMIT
+Do not output a repaired plan, modify frozen FunctionItems, or prescribe adding/removing/splitting/merging an Interface, an Interface ID, a patch, an edit sequence, or endpoint IDs. The Generator owns all repair operations.
+5. OUTPUT CONTRACT
+Return only {{"diagnosis":"...","required_postcondition":"..."}}."""
 
     prompt = f"""{AUTHORITY_CONTRACT}
 
 {PLATFORM_OUTPUT_CONTRACT}
 
 {RUNTIME_INPUT_PROVENANCE_CONTRACT}
+
+{SOURCE_PATH_CONTRACT}
 
 1. AUTHORITATIVE FACTS
 The payload contains the complete failed Interface Plan, frozen FunctionItems,
@@ -855,18 +938,30 @@ legal member/input domains, and repair_scope.
 Repair the Interface Plan so all supplied blocking facts are resolved simultaneously.
 
 3. SEMANTIC RESPONSIBILITY
-The Critic describes semantic repair goals, not edit operations. Determine the
-smallest coherent change satisfying all goals simultaneously. You decide whether
+The Critic is authoritative only for diagnosis and required_postcondition. Any concrete Interface ID, edit operation, patch wording, source choice, or target choice appearing incidentally in Critic text is non-authoritative. Independently determine the repair from upstream facts and validation evidence. Prefer the smallest coherent SEMANTIC change that fully satisfies all acceptance facts. Completeness and correctness take priority over minimizing edits. You decide whether
 an Interface is added, revised, separated into multiple transfers, removed, or
 preserved, and which semantic source supplies each receiving slot. Use all
 requirements, frozen FunctionItems, Interface goals, platform contract, and
 graph facts.
 
-4. INVARIANTS
+4. AUTHORITY PRIORITY
+1. confirmed user requirements
+2. frozen FunctionItems and logical-port contracts
+3. shared platform / provenance / source-path contracts
+4. deterministic validation facts
+5. semantic Reviewer / Graph evidence
+6. Critic diagnosis and required_postcondition
+7. previous Interface Plan
+
+5. CRITIC AUTHORITY
+The Critic is not edit authority; independently choose the actual repair.
+
+6. ACCEPTANCE CONDITIONS
 - Do not modify FunctionItems or add fields outside the Interface schema.
 - Do not infer relationships from filenames or matching field names alone.
 - Do not invent platform inputs merely to close the graph.
-- Preserve unaffected Interfaces byte-for-byte and in order.
+- Preserve unrelated logical bindings. Do not change an unrelated semantic source/receiving-slot identity unless necessary for the complete corrected plan.
+- Record order, Interface IDs, and goal wording are not semantic preservation requirements.
 - Repeated member pairs are allowed when transfers are independent.
 - One Interface remains independently bindable to one graph edge.
 - Revise Interface structure as necessary within the editable Interface layer.
@@ -874,19 +969,20 @@ graph facts.
 - Use the explicit logical binding fields defined by the Interface schema.
 - Do not add opaque endpoint IDs or Graph edges.
 - For platform_to_member, source_path is part of the declared logical binding.
-  It may be revised when the supplied semantic repair objective requires a
+      It may be revised when the supplied required postcondition requires a
   different nested platform value.
 - Do not invent or modify source_path without support from confirmed requirements
   and platform-input semantics.
 
-5. SELF-CHECK
+7. SELF-CHECK
+A valid repair must change logical binding semantics whenever blocking facts require it. Changing only goal wording, Interface IDs, or record order is not semantic progress.
 Silently verify every repair diagnosis is satisfied and every issue is addressed, every required
 non-default input and required platform output has an atomic intended transfer,
 no independent inputs are bundled, repeated pairs remain legal, FunctionItems
 are unchanged, no source was selected by names alone, unrelated Interfaces are
 unchanged, and the result differs meaningfully from the failed plan.
 
-6. OUTPUT CONTRACT
+8. OUTPUT CONTRACT
 Return only the complete Interface Plan JSON matching interface_schema. Do not
 include explanations, Markdown, comments, or hidden reasoning.
 """
@@ -928,7 +1024,7 @@ Use the supplied raw Critic response.
 Use the supplied structured validation error.
 3. ALLOWED TRANSPORT REPAIRS
 Repair only JSON syntax, exact fields, and array/object boundaries. Preserve
-diagnosis and repair_objective.
+diagnosis and required_postcondition.
 4. FORBIDDEN SEMANTIC CHANGES
 Do not create, remove, merge, split, or reinterpret repair diagnoses. Do not
 choose sources or endpoint IDs. If semantic content is absent, do not invent it.
@@ -956,29 +1052,27 @@ Return only strict JSON matching critic_schema."""
         protocol_repair_used,
     )
     payload["repair_critic"] = critic
-    text = await model_call([{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}], planner_model)
-    try:
+    candidate_before = current_interface_plan
+    residual = validation_issues
+    for attempt in (1, 2):
+        attempt_payload = {**payload, "current_interface_plan": candidate_before,
+                           "residual_acceptance_facts": residual,
+                           "generator_attempt": attempt}
+        text = await model_call([{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(attempt_payload, ensure_ascii=False, default=str)}], planner_model)
         candidate = validate_interface_plan_protocol(_parse_object(text))
-        if candidate == current_interface_plan:
+        if canonical_logical_binding_signatures(candidate) == canonical_logical_binding_signatures(candidate_before):
             raise InterfaceIntentPlanError(
-                "interface repair made no progress", code="repair_no_progress",
-                details={"stage": repair_stage, "original_issues": validation_issues},
+                "interface repair made no semantic progress", code="repair_no_progress",
+                details={"stage": repair_stage, "attempt": attempt, "original_issues": validation_issues},
             )
-        if _interface_plan_without_ids(candidate) == _interface_plan_without_ids(current_interface_plan):
-            raise InterfaceIntentPlanError(
-                "interface repair changed only interface IDs", code="repair_no_progress",
-                details={"stage": repair_stage, "original_issues": validation_issues},
-            )
-        validate_interface_repair_scope(before=current_interface_plan, after=candidate, repair_scope=repair_scope)
+        validate_interface_repair_scope(before=candidate_before, after=candidate, repair_scope=repair_scope)
         remaining = collect_interface_plan_validation_issues(
-            plan=candidate, function_items=frozen_function_items, platform_contract=platform_contract,
+            plan=candidate, function_items=frozen_function_items,
+            platform_contract=platform_contract,
         )
-        if remaining:
-            raise InterfaceIntentPlanError(
-                "semantic issues remain after repair", code="semantic_issues_remain",
-                details={"remaining_issues": remaining},
-            )
-        if reviewer_model:
+        after_issues: list[dict[str, Any]] = []
+        # Reviewer precondition: deterministic closure has passed.
+        if not remaining and reviewer_model:
             after_issues = await review_interface_plan_semantically(
                 original_user_goal=original_user_goal,
                 frozen_function_items=frozen_function_items,
@@ -990,41 +1084,16 @@ Return only strict JSON matching critic_schema."""
                 reviewer_model=reviewer_model,
                 model_call=reviewer_model_call or model_call,
             )
-            if after_issues:
-                raise InterfaceIntentPlanError(
-                    "semantic issues remain after repair", code="semantic_issues_remain",
-                    details={"stage": repair_stage, "original_issues": validation_issues,
-                             "remaining_issues": after_issues},
-                )
-            if after_issues:
-                raise InterfaceIntentPlanError(
-                    "semantic issues remain after repair", code="semantic_issues_remain",
-                    details={"stage": repair_stage, "original_issues": validation_issues,
-                             "remaining_issues": after_issues},
-                )
-        result = validate_interface_intent_plan(plan=candidate, function_items=frozen_function_items)
-        final_issues = after_issues if reviewer_model else remaining
-        logger.info(
-            "[Creator][interface_repair_result] plan_changed=%s critic_present=true original_issue_count=%d remaining_issue_count=%d",
-            candidate != current_interface_plan,
-            len(validation_issues),
-            len(final_issues),
-        )
-    except InterfaceIntentPlanError as exc:
-        logger.info(
-            "[Creator][interface_semantic_repair] stage=%s attempt=1 result=failed error_code=%s",
-            repair_stage, exc.code,
-        )
-        if exc.code in {"repair_no_progress", "semantic_issues_remain"}:
-            raise
-        raise InterfaceIntentPlanError(
-            "interface semantic repair failed", code="interface_semantic_repair_failed",
-            details={"stage": repair_stage, "repair_attempts": 1,
-                     "original_issues": validation_issues,
-                     "repair_error": {"code": exc.code, "message": str(exc), "details": exc.details}},
-        ) from exc
-    logger.info("[Creator][interface_semantic_repair] stage=%s attempt=1 result=candidate_valid", repair_stage)
-    return result
+        residual = merge_interface_validation_issues(remaining, after_issues)
+        if not residual:
+            logger.info("[Creator][interface_semantic_repair] stage=%s attempt=%d result=candidate_valid", repair_stage, attempt)
+            return validate_interface_intent_plan(plan=candidate, function_items=frozen_function_items)
+        candidate_before = candidate
+    raise InterfaceIntentPlanError(
+        "semantic issues remain after repair", code="semantic_issues_remain",
+        details={"stage": repair_stage, "repair_attempts": 2,
+                 "original_issues": validation_issues, "remaining_issues": residual},
+    )
 
 
 async def repair_interface_intents(

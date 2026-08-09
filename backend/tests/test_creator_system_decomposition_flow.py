@@ -562,7 +562,7 @@ async def test_prepare_main_path_reconciles_decomposition_then_interface_binds_g
                 "requirement_allocations": [_allocation("R1", ["scripts/a.py"]), _allocation("R2", ["scripts/b.py"])],
                 "requirement_channels": {"R1": "executable", "R2": "executable"},
             })
-        if "minimum complete semantic Interface Plan" in system:
+        if "Produce a complete semantic Interface Plan" in system:
             calls.append("interface_intent_planner")
             interface_payloads.append(payload)
             return json.dumps({

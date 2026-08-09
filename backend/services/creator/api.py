@@ -7217,7 +7217,7 @@ async def _bind_executable_responsibility_plan(
     )
     async def select_sources(messages: list[dict[str, str]], model: str) -> str:
         return await complete_creator_role_once(
-            messages, "planner", fallback_model=model, stage="Interface Planner / Repair Generator / Endpoint Binder",
+            messages, "planner", fallback_model=model, stage="Interface Planner / Repair Generator",
         )
     async def review_interfaces(messages: list[dict[str, str]], model: str) -> str:
         return await complete_creator_role_once(
@@ -7257,23 +7257,6 @@ async def _bind_executable_responsibility_plan(
         )
     except ResponsibilityGraphExpansionError as exc:
         error_details = dict(getattr(exc, "details", {}) or {})
-        repairable_facts_present = bool(
-            error_details.get("uncovered_inputs")
-            or error_details.get("missing_required_final_output_fields")
-            or error_details.get("missing_platform_output_interface")
-            or error_details.get("interface_id")
-        )
-        if not repairable_facts_present:
-            raise
-        affected_members: list[str] = []
-        for value in error_details.get("uncovered_inputs") or []:
-            member = str(value.get("target") or "").strip() if isinstance(value, dict) else ""
-            if member and member not in affected_members:
-                affected_members.append(member)
-        for key in ("source_member", "target_member"):
-            member = str(error_details.get(key) or "").strip()
-            if member and member not in affected_members:
-                affected_members.append(member)
         interface_plan = await repair_interface_intents(
             original_user_goal=request.user_request,
             frozen_function_items=frozen_function_items,
@@ -7283,21 +7266,11 @@ async def _bind_executable_responsibility_plan(
             platform_contract=platform_contract,
             skill_name=str(current_planner_result.get("skill_name") or ""),
             current_interface_plan=interface_plan,
-            affected_members=affected_members,
             missing_platform_output_fields=(
                 error_details.get("missing_required_final_output_fields") or []
-                if exc.code == "interface_plan_incomplete"
-                else []
             ),
             validation_errors=[{
                 "code": exc.code,
-                "category": (
-                    "coverage"
-                    if error_details.get("uncovered_inputs")
-                    or error_details.get("missing_required_final_output_fields")
-                    or error_details.get("missing_platform_output_interface")
-                    else "other"
-                ),
                 "message": str(exc),
                 "details": error_details,
             }],
@@ -7322,7 +7295,7 @@ async def _bind_executable_responsibility_plan(
             )
             raise InterfaceIntentPlanError(
                 "interface semantic repair did not produce a valid responsibility graph",
-                code="interface_semantic_repair_failed",
+                code="graph_revalidation_failed",
                 details={
                     "stage": "graph_expansion_feedback", "repair_attempts": 1,
                     "original_graph_error": {"code": exc.code, "details": exc.details},

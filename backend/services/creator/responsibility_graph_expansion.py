@@ -371,7 +371,18 @@ def _validate_platform_terminal_edges(*, terminal_edges: list[dict], platform_co
         raise ResponsibilityGraphExpansionError("terminal selection does not cover every required platform output", code="interface_plan_incomplete", details={"missing_required_final_output_fields": missing})
 
 
-async def _expand_from_interface_plan(*, normalized: list[dict], platform_contract: dict, registry: dict, interface_plan: dict, planner_model: str, goal_context: dict, model_call: ModelCall) -> list[dict]:
+def validate_responsibility_graph_candidate(
+    *, function_items: list[dict], platform_contract: dict, interface_plan: dict,
+) -> list[dict]:
+    """Materialize and authoritatively validate an Interface Plan's graph."""
+    normalized = normalize_structured_function_items(function_items, source="graph_expansion")
+    registry = build_endpoint_registry(
+        function_items=normalized, platform_contract=platform_contract,
+    )
+    logger.info(
+        "[Creator][graph_expansion] mode=function_item_interface_expansion script_output_count=%d platform_input_count=%d platform_output_count=%d",
+        len(registry["script_outputs"]), len(registry["platform_inputs"]), len(registry["platform_outputs"]),
+    )
     obligations = build_graph_obligations_from_interfaces(interface_plan=interface_plan)
     logger.info("[Creator][graph_expansion] mode=function_item_interface_expansion obligation_count=%d", len(obligations))
     item_by_target = {item["target_file"]: item for item in normalized}
@@ -390,19 +401,7 @@ async def _expand_from_interface_plan(*, normalized: list[dict], platform_contra
 
 async def expand_responsibility_graph(*, function_items: list[dict], platform_contract: dict, planner_model: str, goal_context: dict | None = None, model_call: ModelCall | None = None, interface_plan: dict) -> list[dict]:
     """Select endpoint references from a required FunctionItem interface plan."""
-    if model_call is None:
-        from ..creator_model_profiles import complete_creator_role_once
-        async def model_call(messages: list[dict[str, str]], model: str) -> str:
-            return await complete_creator_role_once(messages, "planner", fallback_model=model)
-    normalized = normalize_structured_function_items(function_items, source="graph_expansion")
-    context = dict(goal_context or {})
-    registry = build_endpoint_registry(function_items=normalized, platform_contract=platform_contract)
-    logger.info(
-        "[Creator][graph_expansion] mode=function_item_interface_expansion script_output_count=%d platform_input_count=%d platform_output_count=%d",
-        len(registry["script_outputs"]), len(registry["platform_inputs"]), len(registry["platform_outputs"]),
-    )
-    return await _expand_from_interface_plan(
-        normalized=normalized, platform_contract=platform_contract, registry=registry,
-        interface_plan=interface_plan, planner_model=planner_model,
-        goal_context=context, model_call=model_call,
+    return validate_responsibility_graph_candidate(
+        function_items=function_items, platform_contract=platform_contract,
+        interface_plan=interface_plan,
     )

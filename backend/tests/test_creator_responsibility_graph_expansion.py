@@ -45,6 +45,26 @@ async def test_graph_preserves_interface_logical_identity_without_model_binding(
     ]
 
 
+def test_normal_expansion_and_repair_acceptance_share_graph_validator(monkeypatch):
+    calls = 0
+
+    def validator(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return []
+
+    monkeypatch.setattr(
+        "backend.services.creator.responsibility_graph_expansion.validate_responsibility_graph_candidate",
+        validator,
+    )
+    import asyncio
+    asyncio.run(expand_responsibility_graph(
+        function_items=[], platform_contract=platform(), planner_model="p",
+        interface_plan={"interfaces": []},
+    ))
+    assert calls == 1
+
+
 @pytest.mark.asyncio
 async def test_reusable_logical_output_fans_out_without_candidate_search():
     items = [item("scripts/unit_a.py", ["slot_x"], ["value_a"]), item("scripts/unit_b.py", ["slot_x"], ["result_z"]), item("scripts/unit_c.py", ["slot_y"], ["result_z"])]

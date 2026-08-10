@@ -6706,7 +6706,8 @@ def _build_responsibility_graph_construction_context(
                 node_contract["frozen_defaults"] = dict(entry.default_values)
             node_contracts.append(node_contract)
 
-    platform_boundary = build_platform_io_contract()["platform_skill_boundary"]
+    platform_contract = build_platform_io_contract()
+    platform_boundary = platform_contract["platform_skill_boundary"]
     legal_sources = [
         {"from_node": "platform_input_node", "from_output": field}
         for field in platform_boundary["input_envelope_fields"]
@@ -6744,7 +6745,7 @@ def _build_responsibility_graph_construction_context(
             item["node"]: list(item["inputs"])
             for item in node_contracts
         },
-        "platform_output_node": list(platform_boundary["final_output_fields"]),
+        "platform_output_node": platform_output_names(platform_contract),
     }
     return {
         "allowed_nodes": allowed_nodes,
@@ -6757,7 +6758,7 @@ def _build_responsibility_graph_construction_context(
             "preferred_structured_input_root": platform_boundary["preferred_structured_input_root"],
         },
         "platform_output_contract": {
-            "final_output_fields": list(platform_boundary["final_output_fields"]),
+            "final_output_fields": platform_output_names(platform_contract),
         },
         "input_source_domains": input_source_domains,
         "current_edges": list(responsibility_edges or []),

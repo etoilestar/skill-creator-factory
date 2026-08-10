@@ -2,7 +2,7 @@ import json
 import pytest
 
 from backend.services.creator.function_item_interface_plan import (
-    CRITIC_SCHEMA, InterfaceIntentPlanError, _compact_function_items,
+    CRITIC_SCHEMA, PLATFORM_BOUNDARY_CONTRACT, InterfaceIntentPlanError, _compact_function_items,
     _interface_plan_prompt, build_graph_obligations_from_interfaces,
     build_interface_repair_scope, collect_interface_plan_validation_issues,
     canonical_logical_binding_signatures,
@@ -11,6 +11,118 @@ from backend.services.creator.function_item_interface_plan import (
     plan_function_item_interfaces, review_interface_plan_semantically,
     validate_interface_intent_plan, validate_interface_repair_critic,
 )
+
+
+def test_platform_boundary_contract_standard_internal_data_flow():
+    items = [
+        item("scripts/a.py", ["request"], ["alpha"]),
+        item("scripts/b.py", ["alpha"], ["result"]),
+    ]
+    contract = {"platform_skill_boundary": {
+        "input_envelope_fields": ["request"],
+        "final_output_fields": ["result"],
+        "required_final_output_fields": ["result"],
+    }}
+    plan = {"interfaces": [
+        p2m("I1", "scripts/a.py", "request", "request"),
+        m2m("I2", "scripts/a.py", "alpha", "scripts/b.py", "alpha"),
+        m2p("I3", "scripts/b.py", "result", "result"),
+    ]}
+    assert collect_interface_plan_validation_issues(
+        plan=plan, function_items=items, platform_contract=contract,
+    ) == []
+
+
+@pytest.mark.asyncio
+async def test_platform_boundary_contract_reviewer_rejects_platform_as_internal_relay():
+    items = [
+        item("scripts/a.py", ["request"], [{"port_id": "alpha", "description": "derived semantic value"}]),
+        item("scripts/b.py", [{"port_id": "alpha", "description": "derived semantic value from A"}], ["result"]),
+    ]
+    candidate = {"interfaces": [
+        p2m("I1", "scripts/a.py", "request", "request"),
+        m2p("I2", "scripts/a.py", "alpha", "result"),
+        p2m("I3", "scripts/b.py", "alpha", "request"),
+    ]}
+
+    async def reviewer(messages, _model):
+        assert PLATFORM_BOUNDARY_CONTRACT in messages[0]["content"]
+        return json.dumps({"passed": False, "issues": [{
+            "message": "The external request does not provide A's derived alpha value.",
+            "affected_interfaces": ["I3"],
+            "affected_inputs": [{"target_member": "scripts/b.py", "target_input": "alpha"}],
+            "evidence": {"observed": "platform request", "expected": "alpha produced by A"},
+        }]})
+
+    for review_mode in ("existing_bindings_only", "full"):
+        issues = await review_interface_plan_semantically(
+            original_user_goal="transform a request in two stages",
+            frozen_function_items=items, interface_plan=candidate,
+            requirement_allocations=None, requirement_channels=None,
+            system_requirements=None,
+            platform_contract={"platform_skill_boundary": {
+                "input_envelope_fields": ["request"], "final_output_fields": ["result"]}},
+            reviewer_model="reviewer", model_call=reviewer,
+            review_mode=review_mode,
+        )
+        assert len(issues) == 1
+        assert "code" not in issues[0]["details"]
+
+
+def test_platform_boundary_contract_allows_nested_platform_source():
+    items = [item("scripts/b.py", ["data"], ["result"])]
+    plan = {"interfaces": [
+        {**p2m("I1", "scripts/b.py", "data", "payload"), "source_path": ["data"]},
+        m2p("I2", "scripts/b.py", "result", "result"),
+    ]}
+    contract = {"platform_skill_boundary": {
+        "input_envelope_fields": ["payload"], "final_output_fields": ["result"],
+        "required_final_output_fields": ["result"],
+    }}
+    assert collect_interface_plan_validation_issues(
+        plan=plan, function_items=items, platform_contract=contract,
+    ) == []
+
+
+@pytest.mark.asyncio
+async def test_platform_boundary_contract_planner_uses_semantics_with_randomized_identifiers():
+    items = [
+        item("scripts/a.py", ["request"], [{"port_id": "zeta_83", "description": "normalized value for the next stage"}]),
+        item("scripts/b.py", [{"port_id": "q17", "description": "normalized value emitted by the first stage"}], ["result"]),
+    ]
+    expected = {"interfaces": [
+        p2m("I1", "scripts/a.py", "request", "request"),
+        m2m("I2", "scripts/a.py", "zeta_83", "scripts/b.py", "q17"),
+        m2p("I3", "scripts/b.py", "result", "result"),
+    ]}
+
+    incomplete = {"interfaces": [
+        p2m("I1", "scripts/a.py", "request", "request"),
+        m2p("I3", "scripts/b.py", "result", "result"),
+    ]}
+    planner_calls = 0
+
+    async def planner(messages, _model):
+        nonlocal planner_calls
+        planner_calls += 1
+        prompt = messages[0]["content"]
+        assert PLATFORM_BOUNDARY_CONTRACT in prompt
+        if planner_calls == 1:
+            assert "For each receiving slot, first identify where" in prompt
+            return json.dumps(incomplete)
+        assert "INTERFACE PLAN CORRECTION" in prompt
+        return json.dumps(expected)
+
+    result = await plan_function_item_interfaces(
+        original_user_goal="run two semantic transformation stages",
+        frozen_function_items=items,
+        platform_contract={"platform_skill_boundary": {
+            "input_envelope_fields": ["request"], "final_output_fields": ["result"],
+            "required_final_output_fields": ["result"]}},
+        planner_model="planner", model_call=planner,
+    )
+    assert planner_calls == 2
+    assert result["interfaces"][1]["kind"] == "member_to_member"
 
 
 def item(name, inputs, outputs):

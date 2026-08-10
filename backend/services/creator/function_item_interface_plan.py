@@ -46,6 +46,33 @@ When no explicit required_final_output_fields are supplied, use the confirmed
 user requirements and Blueprint semantics to determine which legal final
 outputs are semantically required.
 Every selected platform output must belong to final_output_fields."""
+PLATFORM_BOUNDARY_CONTRACT = """PLATFORM BOUNDARY CONTRACT
+
+Platform logical inputs are semantic values supplied by the host at or
+before Skill invocation.
+
+Platform logical outputs are semantic values returned by the Skill to the
+host after Skill execution.
+
+The platform boundary is an external boundary. It is not intermediate
+storage, a relay, scratchpad, or message bus between FunctionItems.
+
+Choose Interface kind from the actual semantic provenance:
+
+- Use platform_to_member when the required semantic value is actually
+  supplied by a legal platform input. source_path may select a nested
+  semantic value from that platform input.
+
+- Use member_to_member when the required semantic value is produced by
+  one frozen FunctionItem and consumed by another frozen FunctionItem.
+
+- Use member_to_platform when a FunctionItem-produced semantic value is
+  intended to leave the Skill through a legal platform output.
+
+Do not route a FunctionItem-produced intermediate semantic value through
+the platform merely so another FunctionItem can consume it.
+
+Do not choose Interface kind from field-name similarity."""
 RUNTIME_INPUT_PROVENANCE_CONTRACT = """RUNTIME INPUT PROVENANCE CONTRACT
 
 A normal logical FunctionItem input represents one runtime receiving slot.
@@ -475,6 +502,8 @@ def _interface_plan_prompt() -> str:
 
 {PLATFORM_OUTPUT_CONTRACT}
 
+{PLATFORM_BOUNDARY_CONTRACT}
+
 {RUNTIME_INPUT_PROVENANCE_CONTRACT}
 
 {SOURCE_PATH_CONTRACT}
@@ -531,6 +560,17 @@ return opaque endpoint IDs, Graph edges, or extra fields. Do not
 invent platform inputs to close coverage.
 
 6. SILENT SELF-CHECK
+For each receiving slot, first identify where the required semantic value
+actually exists.
+
+If it exists in the external platform input contract, choose
+platform_to_member.
+
+If it is produced by another frozen FunctionItem, choose member_to_member.
+
+Use member_to_platform only for a semantic value that leaves the Skill
+through the platform output boundary.
+
 Before returning, for every receiving slot identify the semantic value that
 slot requires, then choose the authoritative upstream source that actually
 provides it. Do not bind merely because a source/output exists or because
@@ -687,6 +727,8 @@ A plausible goal cannot make an incorrect structured source/target binding valid
     prompt = AUTHORITY_CONTRACT + """
 
 """ + PLATFORM_OUTPUT_CONTRACT + """
+
+""" + PLATFORM_BOUNDARY_CONTRACT + """
 
 """ + RUNTIME_INPUT_PROVENANCE_CONTRACT + """
 
@@ -947,6 +989,8 @@ async def plan_function_item_interfaces(*, original_user_goal: str, frozen_funct
         correction_prompt = f"""{AUTHORITY_CONTRACT}
 
 {PLATFORM_OUTPUT_CONTRACT}
+
+{PLATFORM_BOUNDARY_CONTRACT}
 
 {RUNTIME_INPUT_PROVENANCE_CONTRACT}
 

@@ -252,6 +252,137 @@ async def test_unknown_semantic_defect_runs_generic_repair_and_revalidation():
     assert result == repaired and reviewer_calls == 2
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_code", ["graph_failure_alpha", "graph_failure_beta"])
+async def test_graph_triggered_repair_requires_authoritative_graph_acceptance(
+    monkeypatch, failure_code,
+):
+    from backend.services.creator import responsibility_graph_expansion as graph_expansion
+
+    items = [item("scripts/unit_q.py", ["slot_k"], ["value_r"])]
+    candidate = {"interfaces": [
+        p2m("I1", "scripts/unit_q.py", "slot_k"),
+        m2p("I2", "scripts/unit_q.py", "value_r"),
+    ]}
+    issue = {"message": "observed graph condition", "affected_interfaces": [],
+             "affected_inputs": [], "evidence": {"observed": "blocked"},
+             "details": {}, "stage": "graph_validation", "path": "$.interfaces"}
+    payloads = []
+
+    def reject(**_kwargs):
+        raise graph_expansion.ResponsibilityGraphExpansionError(
+            "observed invalid graph state", code=failure_code,
+            details={"observation": "constraint remains false"},
+        )
+
+    monkeypatch.setattr(graph_expansion, "validate_responsibility_graph_candidate", reject)
+
+    async def critic_or_reviewer(messages, _model):
+        payload = json.loads(messages[-1]["content"])
+        return json.dumps(
+            {"diagnosis": "graph condition remains invalid", "required_postcondition": "graph condition is valid"}
+            if "validation_issues" in payload else {"passed": True, "issues": []}
+        )
+
+    async def generator(messages, _model):
+        payloads.append(json.loads(messages[-1]["content"]))
+        return json.dumps(candidate)
+
+    with pytest.raises(InterfaceIntentPlanError) as raised:
+        await repair_interface_plan_semantically(
+            original_user_goal="process an abstract payload", frozen_function_items=items,
+            current_interface_plan=candidate, validation_issues=[issue],
+            repair_scope=build_interface_repair_scope([issue]),
+            platform_contract=platform(), repair_stage="graph_expansion_feedback",
+            planner_model="planner-test-model", model_call=generator,
+            reviewer_model="reviewer-test-model", reviewer_model_call=critic_or_reviewer,
+        )
+
+    assert raised.value.code == "semantic_issues_remain"
+    assert raised.value.details["remaining_issues"][0] == {
+        "code": failure_code,
+        "message": "observed invalid graph state",
+        "details": {"observation": "constraint remains false"},
+        "stage": "graph_validation",
+    }
+    assert payloads[1]["refinement_feedback"]["acceptance_facts"][0]["code"] == failure_code
+
+
+@pytest.mark.asyncio
+async def test_graph_triggered_repair_accepts_after_authoritative_graph_validation(monkeypatch):
+    from backend.services.creator import responsibility_graph_expansion as graph_expansion
+
+    items = [item("scripts/unit_q.py", ["slot_k"], ["value_r"])]
+    candidate = {"interfaces": [
+        p2m("I1", "scripts/unit_q.py", "slot_k"),
+        m2p("I2", "scripts/unit_q.py", "value_r"),
+    ]}
+    calls = 0
+
+    def accept(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return []
+
+    monkeypatch.setattr(graph_expansion, "validate_responsibility_graph_candidate", accept)
+
+    async def critic_or_reviewer(messages, _model):
+        payload = json.loads(messages[-1]["content"])
+        return json.dumps(
+            {"diagnosis": "graph condition failed", "required_postcondition": "graph condition is valid"}
+            if "validation_issues" in payload else {"passed": True, "issues": []}
+        )
+
+    async def generator(_messages, _model):
+        return json.dumps(candidate)
+
+    result = await repair_interface_plan_semantically(
+        original_user_goal="process an abstract payload", frozen_function_items=items,
+        current_interface_plan=candidate,
+        validation_issues=[{"message": "graph condition", "details": {}}],
+        repair_scope=build_interface_repair_scope([]), platform_contract=platform(),
+        repair_stage="graph_expansion_feedback", planner_model="planner-test-model",
+        model_call=generator, reviewer_model="reviewer-test-model",
+        reviewer_model_call=critic_or_reviewer,
+    )
+    assert result == candidate
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_interface_only_repair_does_not_run_graph_acceptance(monkeypatch):
+    from backend.services.creator import responsibility_graph_expansion as graph_expansion
+
+    monkeypatch.setattr(
+        graph_expansion, "validate_responsibility_graph_candidate",
+        lambda **_kwargs: pytest.fail("ordinary Interface repair must not construct a graph"),
+    )
+    items = [item("scripts/unit_q.py", ["slot_k"], ["value_r"])]
+    candidate = {"interfaces": [
+        p2m("I1", "scripts/unit_q.py", "slot_k"),
+        m2p("I2", "scripts/unit_q.py", "value_r"),
+    ]}
+
+    async def critic_or_reviewer(messages, _model):
+        payload = json.loads(messages[-1]["content"])
+        return json.dumps(
+            {"diagnosis": "Interface condition failed", "required_postcondition": "Interface condition is valid"}
+            if "validation_issues" in payload else {"passed": True, "issues": []}
+        )
+
+    async def generator(_messages, _model):
+        return json.dumps(candidate)
+
+    assert await repair_interface_plan_semantically(
+        original_user_goal="process an abstract payload", frozen_function_items=items,
+        current_interface_plan=candidate,
+        validation_issues=[{"message": "Interface condition", "details": {}}],
+        repair_scope=build_interface_repair_scope([]), platform_contract=platform(),
+        planner_model="planner-test-model", model_call=generator,
+        reviewer_model="reviewer-test-model", reviewer_model_call=critic_or_reviewer,
+    ) == candidate
+
+
 def test_planner_prompt_separates_logical_ports_from_endpoint_ids():
     prompt = _interface_plan_prompt()
     assert "Structured logical binding fields are authoritative" in prompt

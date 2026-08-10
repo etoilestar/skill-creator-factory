@@ -1395,7 +1395,28 @@ Return only strict JSON matching critic_schema."""
                 reviewer_model=reviewer_model,
                 model_call=reviewer_model_call or model_call,
             )
-        residual = merge_interface_validation_issues(remaining, review_issues)
+        graph_issues: list[dict[str, Any]] = []
+        if not remaining and not review_issues and repair_stage == "graph_expansion_feedback":
+            # Local import avoids the module cycle: graph expansion consumes Interface helpers.
+            from .responsibility_graph_expansion import (
+                validate_responsibility_graph_candidate,
+            )
+            try:
+                validate_responsibility_graph_candidate(
+                    function_items=frozen_function_items,
+                    platform_contract=platform_contract or {},
+                    interface_plan=candidate,
+                )
+            except GraphValidationError as graph_exc:
+                graph_issues = [{
+                    "code": graph_exc.code,
+                    "message": str(graph_exc),
+                    "details": dict(graph_exc.details or {}),
+                    "stage": "graph_validation",
+                }]
+        residual = merge_interface_validation_issues(
+            remaining, review_issues, graph_issues,
+        )
         return CandidateEvaluation(
             accepted=not residual, candidate=candidate,
             acceptance_facts=residual, semantic_comparable=True,

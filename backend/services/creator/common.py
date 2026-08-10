@@ -43,7 +43,7 @@ from ..model_router import VALIDATOR_TASK, route_creator_file_model, route_model
 from ..skill_executor import _build_script_runtime_env, run_action
 from ..skill_creator_dry_run import build_creator_external_input_context
 from ..artifact_validator import validate_stdout_file_outputs, FileOutputValidationError
-from ..platform_io_contract import build_platform_io_contract, platform_io_contract_prompt_text
+from ..platform_io_contract import build_platform_io_contract, platform_io_contract_prompt_text, platform_output_names
 from ..markdown_metadata import (
     parse_frontmatter,
     validate_skill_frontmatter,
@@ -378,7 +378,7 @@ def _platform_boundary_nodes() -> tuple[dict[str, Any], dict[str, Any]]:
     if not isinstance(boundary, dict):
         boundary = {}
     input_fields = boundary.get("input_envelope_fields")
-    output_fields = boundary.get("final_output_fields")
+    output_fields = platform_output_names(contract)
     if not isinstance(input_fields, list):
         input_fields = []
     if not isinstance(output_fields, list):

@@ -3,6 +3,8 @@ import sys
 from pathlib import Path
 
 from backend.services.creator import e2e
+from backend.services.creator.common import ResponsibilityGraph
+from backend.services.platform_io_contract import build_platform_io_contract
 
 
 def _write_skill(skill_dir: Path) -> None:
@@ -136,6 +138,43 @@ def test_two_step_e2e_trace_files_verified_bindings_and_checkpoint_reuse(tmp_pat
         assert step1_checkpoint["runtime_binding_trace"]["topic"]["source_provenance"]["source_kind"] == "external_context"
         assert "story_text" in step1_checkpoint["context_after"]
         assert "story_text" in step1_checkpoint["value_provenance"]
+    finally:
+        if session.temp_handle is not None:
+            session.temp_handle.cleanup()
+
+
+def test_runtime_projects_graph_terminal_edge_and_transactionally_commits(tmp_path, monkeypatch):
+    source = tmp_path / "trace-skill"
+    source.mkdir()
+    _write_skill(source)
+
+    graph = ResponsibilityGraph(
+        platform_io_contract=build_platform_io_contract(),
+        dataflow_edges=[{
+            "from_node": "scripts/step2.py",
+            "from_output": "file_outputs",
+            "to_node": "platform_output_node",
+            "to_input": "file_outputs",
+            "purpose": "deliver",
+            "constraints": [],
+        }],
+    )
+    monkeypatch.setattr(e2e, "_load_requirement_graph_for_e2e", lambda _skill_dir: graph)
+    monkeypatch.setattr(e2e, "_get_skill_venv_python", lambda _skill_dir: Path(sys.executable))
+    monkeypatch.setattr(e2e, "_install_capability_dependencies", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(e2e, "_install_declared_dependency_packages", lambda *_args, **_kwargs: None)
+
+    session = e2e._create_e2e_session("trace-skill", source_skill_dir=source)
+    try:
+        assert e2e._run_skill_workflow_e2e_once(
+            "trace-skill",
+            source_skill_dir=source,
+            external_context={"user_request": "value_x"},
+            e2e_session=session,
+        ) == []
+        commits = [event for event in session.events if event.get("event") == "terminal_outputs_committed"]
+        assert commits[-1]["terminal_edge_count"] == 1
+        assert commits[-1]["platform_output_payload"] == {"file_outputs": ["outputs/result.dat"]}
     finally:
         if session.temp_handle is not None:
             session.temp_handle.cleanup()

@@ -88,7 +88,7 @@ def value_matches_platform_schema(value: Any, schema: dict[str, Any]) -> bool:
 
 
 def commit_platform_output_emissions(contract: dict[str, Any], emissions: list[dict[str, Any]]) -> dict[str, Any]:
-    """Transactionally compose emissions in their canonical interface/edge order."""
+    """Validate and compose already structurally ordered terminal emissions."""
     grouped: dict[str, list[Any]] = {}
     for emission in emissions:
         grouped.setdefault(str(emission.get("sink") or ""), []).append(emission.get("value"))
@@ -110,6 +110,34 @@ def commit_platform_output_emissions(contract: dict[str, Any], emissions: list[d
     return committed
 
 
+def project_and_commit_platform_outputs(
+    contract: dict[str, Any],
+    terminal_edges: list[dict[str, Any]],
+    completed_outputs: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Project successful member outputs in authoritative terminal-edge order.
+
+    ``completed_outputs`` may be populated in any execution-completion order.  The
+    immutable ResponsibilityGraph edge list is the transport ordering authority.
+    """
+    emissions: list[dict[str, Any]] = []
+    for edge_index, edge in enumerate(terminal_edges):
+        if str(edge.get("to_node") or "") != "platform_output_node":
+            continue
+        member = str(edge.get("from_node") or "")
+        output = str(edge.get("from_output") or "")
+        sink = str(edge.get("to_input") or "")
+        member_outputs = completed_outputs.get(member)
+        if not isinstance(member_outputs, dict) or output not in member_outputs:
+            raise ValueError(f"missing terminal emission value: edge {edge_index}")
+        emissions.append({
+            "sink": sink,
+            "value": member_outputs[output],
+            "order_key": edge_index,
+        })
+    return commit_platform_output_emissions(contract, emissions)
+
+
 def build_platform_io_contract() -> dict[str, Any]:
     """Return the immutable sandbox artifact IO contract for Creator prompts."""
     return {
@@ -119,7 +147,18 @@ def build_platform_io_contract() -> dict[str, Any]:
         "platform_skill_boundary": {
             "input_envelope_fields": ["user_request", "input", "text", "payload", "fields", "options", "input_files", "files", "resources"],
             "preferred_structured_input_root": "fields",
-            "final_output_fields": ["text", "markdown", "image_path", "image_paths", "pdf_path", "docx_path", "pptx_path", "html_path", "file_paths", "file_outputs"],
+            "final_output_fields": [
+                {"name": "text", "value_schema": {"type": "string", "minLength": 1}, "cardinality": "many", "write_semantics": "append"},
+                {"name": "markdown", "value_schema": {"type": "string", "minLength": 1}, "cardinality": "many", "write_semantics": "append"},
+                {"name": "image_path", "value_schema": {"type": "string", "minLength": 1}, "cardinality": "one", "write_semantics": "single"},
+                {"name": "image_paths", "value_schema": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1}, "cardinality": "one", "write_semantics": "single"},
+                {"name": "pdf_path", "value_schema": {"type": "string", "minLength": 1}, "cardinality": "one", "write_semantics": "single"},
+                {"name": "docx_path", "value_schema": {"type": "string", "minLength": 1}, "cardinality": "one", "write_semantics": "single"},
+                {"name": "pptx_path", "value_schema": {"type": "string", "minLength": 1}, "cardinality": "one", "write_semantics": "single"},
+                {"name": "html_path", "value_schema": {"type": "string", "minLength": 1}, "cardinality": "one", "write_semantics": "single"},
+                {"name": "file_paths", "value_schema": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1}, "cardinality": "one", "write_semantics": "single"},
+                {"name": "file_outputs", "value_schema": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1}, "cardinality": "one", "write_semantics": "single"},
+            ],
             "protocol_notes": [
                 "Platform input_envelope_fields are source slots the platform can provide to a generated SKILL.",
                 "Platform final_output_fields are terminal slots the platform can consume from the final stdout JSON.",

@@ -9,6 +9,12 @@ from .contracts import *  # noqa: F403
 from .command_normalizer import canonicalize_skill_md_runtime_commands
 from .basic_format import check_patch_candidate_basic_format
 from ..skill_plan import parse_responsibility_edges
+from ..platform_io_contract import (
+    get_platform_output_sink,
+    normalize_platform_output_sinks,
+    project_and_commit_platform_outputs,
+    value_matches_platform_schema,
+)
 
 
 
@@ -611,9 +617,10 @@ def _format_json_shape(obj: dict[str, Any]) -> str:
     shape = _json_object_shape(obj)
     return json.dumps(shape, ensure_ascii=False, sort_keys=True)
 
-_SANDBOX_TERMINAL_OUTPUT_KEYS = set(
-    build_platform_io_contract().get("platform_skill_boundary", {}).get("final_output_fields", [])
-)
+_SANDBOX_OUTPUT_CONTRACT = build_platform_io_contract()
+_SANDBOX_TERMINAL_OUTPUT_KEYS = {
+    sink["name"] for sink in normalize_platform_output_sinks(_SANDBOX_OUTPUT_CONTRACT)
+}
 
 
 def _e2e_trace_line(trace: E2EStepTrace) -> str:
@@ -637,23 +644,13 @@ def _format_e2e_trace(traces: list[E2EStepTrace]) -> str:
 
 
 def _terminal_output_expected_type(key: str) -> str:
-    if key in {"text", "markdown", "image_path", "pdf_path", "docx_path", "pptx_path", "html_path"}:
-        return "non-empty string"
-    if key in {"image_paths", "file_paths", "file_outputs"}:
-        return "non-empty list[string]"
-    return "platform terminal field"
+    sink = get_platform_output_sink(_SANDBOX_OUTPUT_CONTRACT, key)
+    return json.dumps(sink["value_schema"], ensure_ascii=False, sort_keys=True) if sink else "platform terminal field"
 
 
 def _valid_terminal_output_value(key: str, value: Any) -> bool:
-    if key in {"text", "markdown", "image_path", "pdf_path", "docx_path", "pptx_path", "html_path"}:
-        return isinstance(value, str) and bool(value.strip())
-    if key in {"image_paths", "file_paths", "file_outputs"}:
-        return (
-            isinstance(value, list)
-            and bool(value)
-            and all(isinstance(item, str) and item.strip() for item in value)
-        )
-    return False
+    sink = get_platform_output_sink(_SANDBOX_OUTPUT_CONTRACT, key)
+    return bool(sink and value_matches_platform_schema(value, sink["value_schema"]))
 
 
 def _invalid_terminal_output_values(payload: dict[str, Any]) -> list[dict[str, str]]:
@@ -3779,6 +3776,7 @@ def _run_skill_workflow_e2e_once(
             skill_dir=trial_skill_dir,
         )
         traces: list[E2EStepTrace] = []
+        completed_outputs: dict[str, dict[str, Any]] = {}
 
         venv_python: Path | None = None
 
@@ -3844,6 +3842,10 @@ def _run_skill_workflow_e2e_once(
                     resume_from_step = prior_step
                     break
                 payload = dict(checkpoint.get("context_after") or payload)
+                checkpoint_script = str(checkpoint.get("script_path") or "")
+                checkpoint_stdout = checkpoint.get("stdout_json")
+                if checkpoint_script and isinstance(checkpoint_stdout, dict):
+                    completed_outputs[checkpoint_script] = dict(checkpoint_stdout)
                 value_provenance.update(dict(checkpoint.get("value_provenance") or {}))
                 if e2e_session is not None:
                     script_key = str(checkpoint.get("script_path") or "")
@@ -4000,6 +4002,7 @@ def _run_skill_workflow_e2e_once(
                     filesystem_diff=filesystem_diff,
                     runtime_binding_trace=runtime_binding_trace,
                 )
+                completed_outputs[command.script_path] = dict(stdout_json)
 
                 artifact_paths = _stdout_artifact_paths(stdout_json, entry, None)
 
@@ -4132,6 +4135,38 @@ def _run_skill_workflow_e2e_once(
                     message += "\n\n已成功执行的前序边界 trace：\n" + _format_e2e_trace(traces)
                 errors.append(message)
                 break
+
+        if not errors:
+            terminal_edges = [
+                dict(edge) for edge in (requirement_graph.dataflow_edges or [])
+                if str(edge.get("to_node") or "") == "platform_output_node"
+            ]
+            if terminal_edges:
+                try:
+                    final_platform_payload = project_and_commit_platform_outputs(
+                        requirement_graph.platform_io_contract,
+                        terminal_edges,
+                        completed_outputs,
+                    )
+                    if not final_platform_payload:
+                        raise ValueError("terminal output projection produced no platform payload")
+                    payload.update(final_platform_payload)
+                    if e2e_session is not None:
+                        e2e_session.events.append({
+                            **e2e_session.to_event_base(),
+                            "event": "terminal_outputs_committed",
+                            "phase": "e2e_run",
+                            "status": "passed",
+                            "terminal_edge_count": len(terminal_edges),
+                            "platform_output_keys": sorted(final_platform_payload),
+                            "platform_output_payload": final_platform_payload,
+                        })
+                except ValueError as exc:
+                    errors.append(_e2e_error(
+                        target="SKILL.md",
+                        layer="terminal_output_commit",
+                        message=str(exc),
+                    ))
 
     finally:
         if tmp_handle is not None:

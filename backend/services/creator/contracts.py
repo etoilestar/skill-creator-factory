@@ -2991,9 +2991,12 @@ async def _review_skill_md_command_block_with_model(
     logger.info("[Creator][skill_md][block_review] skill=%s script=%s ordinal=%d", skill_name, script_path, ordinal)
     prompt = (
         "你是 Creator 第一轮 SKILL.md 单 command block 接口审查器，只输出严格 JSON object。\n"
+        "COMMAND BINDING AUTHORITY\n"
+        "A confirmed upstream binding in exact_target_provenance is authoritative. You may verify that SKILL.md preserves it, but must not replace it with another legal platform source. If it conflicts with confirmed requirements, report an upstream binding conflict rather than rewriting provenance. For targets without a confirmed binding, do not guess a source; leave semantic selection to the model stage with that authority.\n"
+        "Do not infer a new source from a target argv key name, script filename, business keywords, apparent modality, Blueprint runtime examples, or runtime sentinel appearance. A repair may correct SKILL.md's expression of a frozen binding, but must not replan the frozen Interface.\n"
         "你一次只审查当前 script_path 的当前 command_block；不得审查完整 SKILL.md 或其他脚本。\n"
         "只判断：1) command block 是否调用目标脚本；3) argv key 是否被目标脚本接口接受；4) 整值占位符根来源是否存在于 available_source_fields；5) literal value 是否与目标类型明显冲突；6) 占位符形式是否符合平台既有语法。\n"
-        "判断占位符来源是否合法时，只检查占位符根字段是否存在于 available_source_fields；incoming_edges、prior_available_stdout 和 input bindings 仅作为构造 available_source_fields 的结构化证据。\n"
+        "For a target with exact_target_provenance, verify that the command preserves that exact source identity; mere membership in available_source_fields is not sufficient. For a target without exact_target_provenance, only verify that a referenced source belongs to the legal available source domain; do not infer a new semantic source from names, modality, filenames, Blueprint prose, or runtime sentinels. incoming_edges and prior stdout remain structured source evidence and must not be reinterpreted by the reviewer.\n"
         "SKILL.md 统一使用平台现有 {{source}} 占位符语法，不要求将来源容器名写入占位符，不得发明其他占位符语法。\n"
         "当 JSON value 完全由一个占位符构成时，它是运行时引用，不是普通字符串常量；运行时在 JSON object 解析完成后解析该引用，并保持来源值的原生 JSON 类型。不得仅依据模板中的引号判断最终运行时类型。\n"
         "当占位符只是较长字符串中的组成部分时，结果才按字符串插值处理。不得要求集合类型额外套一层数组、对象类型额外套一层对象，也不得要求把来源容器名拼入占位符。\n"

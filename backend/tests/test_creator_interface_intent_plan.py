@@ -2,7 +2,7 @@ import json
 import pytest
 
 from backend.services.creator.function_item_interface_plan import (
-    CRITIC_SCHEMA, PLATFORM_BOUNDARY_CONTRACT, InterfaceIntentPlanError, _compact_function_items,
+    CRITIC_SCHEMA, MULTIMODAL_INPUT_PROVENANCE_CONTRACT, PLATFORM_BOUNDARY_CONTRACT, InterfaceIntentPlanError, _compact_function_items,
     _interface_plan_prompt, build_graph_obligations_from_interfaces,
     build_interface_repair_scope, collect_interface_plan_validation_issues,
     canonical_logical_binding_signatures,
@@ -209,6 +209,66 @@ def test_optional_and_default_inputs_do_not_require_interfaces():
     inputs = [{"port_id": "slot_x", "required": False}, {"port_id": "slot_y", "default": "v"}]
     issues = collect_interface_plan_validation_issues(plan={"interfaces": [m2p("I1", "scripts/unit_a.py")]}, function_items=[item("scripts/unit_a.py", inputs, ["result_z"])], platform_contract=platform())
     assert issues == []
+
+
+def test_optional_input_may_keep_a_valid_binding_and_prompt_assigns_semantic_authority():
+    inputs = [{"port_id": "arbitrary_name", "required": False}]
+    plan = {"interfaces": [
+        p2m("I1", "scripts/unit_a.py", "arbitrary_name", "input_files"),
+        m2p("I2", "scripts/unit_a.py"),
+    ]}
+    contract = {"platform_skill_boundary": {
+        "input_envelope_fields": ["user_request", "input_files"],
+        "final_output_fields": ["text"], "required_final_output_fields": ["text"],
+    }}
+    assert collect_interface_plan_validation_issues(
+        plan=plan, function_items=[item("scripts/unit_a.py", inputs, ["result_z"])],
+        platform_contract=contract,
+    ) == []
+    prompt = _interface_plan_prompt()
+    assert MULTIMODAL_INPUT_PROVENANCE_CONTRACT in prompt
+    assert "receiver-local interface identity" in prompt
+    assert "structured-parameter source" in prompt
+    assert "existing source_path protocol" in prompt
+    assert "parameter must already be declared" in prompt
+
+
+def test_structured_parameter_uses_top_level_source_and_nested_source_path():
+    plan = {"interfaces": [
+        {**p2m("I1", "scripts/unit_a.py", "arbitrary_name", "fields"), "source_path": ["declared_param"]},
+        m2p("I2", "scripts/unit_a.py"),
+    ]}
+    contract = {"platform_skill_boundary": {
+        "input_envelope_fields": ["fields"],
+        "input_source_semantics": {
+            "structured_parameters": {"canonical": "fields", "globally_required": False},
+        },
+        "final_output_fields": ["text"], "required_final_output_fields": ["text"],
+    }}
+    assert collect_interface_plan_validation_issues(
+        plan=plan,
+        function_items=[item("scripts/unit_a.py", ["arbitrary_name"], ["result_z"])],
+        platform_contract=contract,
+    ) == []
+
+
+def test_unclassified_input_envelope_source_remains_legal():
+    plan = {"interfaces": [
+        p2m("I1", "scripts/unit_a.py", "arbitrary_name", "payload"),
+        m2p("I2", "scripts/unit_a.py"),
+    ]}
+    contract = {"platform_skill_boundary": {
+        "input_envelope_fields": ["user_request", "payload"],
+        "input_source_semantics": {
+            "freeform_request": {"canonical": "user_request", "globally_required": False},
+        },
+        "final_output_fields": ["text"], "required_final_output_fields": ["text"],
+    }}
+    assert collect_interface_plan_validation_issues(
+        plan=plan,
+        function_items=[item("scripts/unit_a.py", ["arbitrary_name"], ["result_z"])],
+        platform_contract=contract,
+    ) == []
 
 
 def test_reusable_output_can_cover_multiple_receiving_slots():

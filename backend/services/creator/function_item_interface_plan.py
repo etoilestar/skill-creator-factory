@@ -80,6 +80,39 @@ A normal logical FunctionItem input represents one runtime receiving slot.
 In the current execution contract, one receiving slot has one runtime
 provenance. The same source output may fan out to multiple different receiving
 slots. Multiple independent sources must not target the same logical input."""
+MULTIMODAL_INPUT_PROVENANCE_CONTRACT = """MULTIMODAL INPUT PROVENANCE CONTRACT
+
+No platform input source is universally required.
+For each FunctionItem receiving slot, independently determine the semantic
+value required by that slot and where that value actually originates.
+If it is the user's runtime free-form instruction, use the platform contract's
+canonical free-form-request representation. If it is runtime-uploaded file or
+multimodal content, use the runtime-file representation. If the required value
+is a Skill-specific structured parameter, select the platform contract's
+structured-parameter source and represent any nested parameter using the
+existing source_path protocol. The parameter must already be declared by the
+current Skill and must not be invented merely to close coverage.
+If another FunctionItem produces the value, use member_to_member.
+A FunctionItem may consume multiple different source families simultaneously.
+
+INPUT SOURCE SEMANTICS ARE DESCRIPTIVE, NOT A CLOSED WHITELIST.
+input_source_semantics describes canonical and related representations whose
+relationships are known. input_envelope_fields remains the legal source domain;
+the metadata does not remove or forbid another declared source. When confirmed
+requirements establish that another legal platform source owns the value, it
+may be selected. Do not invent an unknown platform source.
+
+Interface Planner is the owner of semantic provenance decisions. The backend
+only validates candidate domain, logical references, coverage, single
+provenance, and graph materialization; it does not infer a business source.
+A FunctionItem logical input name is a receiver-local interface identity and
+does not redefine external provenance. Do not choose a platform source because
+its name resembles the target input, and do not force user_request when another
+source owns the value.
+
+runtime_source_required=true requires provenance. When it is false, backend
+coverage is not required, but optional does not mean forbidden: a valid binding
+may remain when the Skill explicitly supports that optional runtime input."""
 SOURCE_PATH_CONTRACT = """SOURCE PATH CONTRACT
 
 Every platform_to_member Interface MUST explicitly contain source_path.
@@ -511,6 +544,8 @@ def _interface_plan_prompt() -> str:
 
 {RUNTIME_INPUT_PROVENANCE_CONTRACT}
 
+{MULTIMODAL_INPUT_PROVENANCE_CONTRACT}
+
 {SOURCE_PATH_CONTRACT}
 
 1. AUTHORITATIVE FACTS
@@ -540,9 +575,10 @@ value. For every required platform output choose the frozen FunctionItem output.
 Record each choice in structured logical binding fields.
 
 4. CURRENT AUTHORITY
-You, not the backend, choose the semantic producer using responsibilities, port
+You, not the backend, own and choose the semantic producer using responsibilities, port
 descriptions and contracts, confirmed requirements, workflow semantics, and the
-platform contract. Do not choose by field-name similarity alone.
+platform contract. Do not choose by field-name similarity alone. Never choose
+from target-port name similarity.
 
 INTERFACE BINDING AUTHORITY
 Structured logical binding fields are authoritative for transfer identity. goal

@@ -2,6 +2,7 @@ from backend.services.creator.e2e import (
     _artifact_runtime_state,
     _e2e_behavior_fingerprint,
     _e2e_candidate_improved,
+    _e2e_failure_position,
     _runtime_binding_trace,
     _verified_bindings_from_runtime_trace,
 )
@@ -26,6 +27,55 @@ def _failure(filesystem_trace, *, code="artifact_not_created", layer=None, actua
             },
         })
     )
+
+
+def _positioned_failure(*, step, target, layer, code, actual):
+    return (
+        f"E2E_REPAIR_TARGET={target}\n"
+        f"E2E_LAYER={layer}\n"
+        "E2E_STRUCTURED_FAILURE="
+        + __import__("json").dumps({
+            "failed_step_index": step,
+            "target_file": target,
+            "target_region": "command JSON argv" if layer == "argv_schema_error" else "frozen terminal binding",
+            "layer": layer,
+            "actual": actual,
+            "details": {"failure_code": code},
+        })
+    )
+
+
+def test_terminal_phase_after_argv_failure_is_progress_but_same_breakpoint_is_not():
+    argv_failure = _positioned_failure(
+        step=1,
+        target="SKILL.md",
+        layer="argv_schema_error",
+        code="argv_schema_error",
+        actual="TypeError: argv must be a non-empty list",
+    )
+    repeated_argv_failure = _positioned_failure(
+        step=1,
+        target="SKILL.md",
+        layer="argv_schema_error",
+        code="argv_schema_error",
+        actual="TypeError: argv must be a non-empty list",
+    )
+    terminal_failure = _positioned_failure(
+        step=3,
+        target="INTERFACE",
+        layer="terminal_output_commit",
+        code="upstream_interface_contract_conflict",
+        actual="invalid emission value for sink: text",
+    )
+
+    improved = _e2e_candidate_improved([argv_failure], [terminal_failure], target_file="SKILL.md")
+    assert improved is True
+    assert {"candidate_retained": improved, "candidate_rolled_back": not improved} == {
+        "candidate_retained": True,
+        "candidate_rolled_back": False,
+    }
+    assert _e2e_failure_position(terminal_failure) > (2, 999)
+    assert _e2e_candidate_improved([argv_failure], [repeated_argv_failure], target_file="SKILL.md") is False
 
 
 def test_runtime_binding_trace_uses_source_root_provenance_and_verified_binding():

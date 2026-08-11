@@ -2367,6 +2367,7 @@ _E2E_LAYER_RANK = {
     "artifact": 5,
     "downstream_handoff": 6,
     "final_output": 7,
+    "terminal_output_commit": 8,
 }
 
 
@@ -4163,9 +4164,16 @@ def _run_skill_workflow_e2e_once(
                         })
                 except ValueError as exc:
                     errors.append(_e2e_error(
-                        target="SKILL.md",
+                        target="INTERFACE",
                         layer="terminal_output_commit",
                         message=str(exc),
+                        failed_step_index=len(commands) + 1,
+                        failure_code="upstream_interface_contract_conflict",
+                        target_region="frozen terminal binding",
+                        repair_instruction=(
+                            "Report the frozen terminal binding and platform sink contract conflict to the "
+                            "upstream Interface owner; E2E must not modify SKILL.md, scripts, or the graph."
+                        ),
                     ))
 
     finally:
@@ -4541,6 +4549,17 @@ async def _repair_existing_file_for_e2e_failure(
     第一轮已经完成的职责审查、ToolPool、helper 权限、required_capabilities、
     coverage requirements 和工具选择，不在这里重新判断。
     """
+
+    structured_failure = _structured_failure_from_errors(e2e_errors)
+    if _failure_code_from_structured(structured_failure) == "upstream_interface_contract_conflict":
+        return {
+            "status": "upstream_handoff_required",
+            "repaired_target": None,
+            "next_target": "INTERFACE",
+            "next_failure": e2e_errors,
+            "error_type": "upstream_interface_contract_conflict",
+            "sandbox_executed": False,
+        }
 
     # target_path is the runtime symptom location supplied by the validator, not a
     # confirmed repair target. Diagnose before any localized-scope decision.

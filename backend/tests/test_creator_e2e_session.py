@@ -27,6 +27,66 @@ def _commands():
     ]
 
 
+@pytest.mark.asyncio
+async def test_upstream_interface_conflict_bypasses_local_repair(tmp_path, monkeypatch):
+    root = tmp_path / "skills"
+    skill_dir = _make_skill(root)
+    monkeypatch.setattr(e2e.settings, "skills_path", root)
+    skill_before = (skill_dir / "SKILL.md").read_bytes()
+    scripts_before = {
+        path.relative_to(skill_dir): path.read_bytes()
+        for path in (skill_dir / "scripts").glob("*.py")
+    }
+    calls = []
+
+    async def fail_if_called(**kwargs):
+        calls.append(kwargs)
+        raise AssertionError("local diagnosis/patch flow must not run")
+
+    def fail_if_routed(**kwargs):
+        calls.append(kwargs)
+        raise AssertionError("local model routing must not run")
+
+    monkeypatch.setattr(e2e, "_diagnose_e2e_failure_for_repair", fail_if_called)
+    monkeypatch.setattr(e2e, "_request_and_apply_repair_patch", fail_if_called)
+    monkeypatch.setattr(e2e, "route_creator_file_model", fail_if_routed)
+    failure = (
+        "E2E_REPAIR_TARGET=INTERFACE\n"
+        "E2E_LAYER=terminal_output_commit\n"
+        "E2E_STRUCTURED_FAILURE="
+        + json.dumps({
+            "failed_step_index": 3,
+            "target_file": "INTERFACE",
+            "target_region": "frozen terminal binding",
+            "layer": "terminal_output_commit",
+            "actual": "invalid emission value for sink: text",
+            "details": {"failure_code": "upstream_interface_contract_conflict"},
+        })
+    )
+
+    result = await e2e._repair_existing_file_for_e2e_failure(
+        skill_name="demo",
+        target_path="INTERFACE",
+        e2e_errors=[failure],
+    )
+
+    assert result == {
+        "status": "upstream_handoff_required",
+        "repaired_target": None,
+        "next_target": "INTERFACE",
+        "next_failure": [failure],
+        "error_type": "upstream_interface_contract_conflict",
+        "sandbox_executed": False,
+    }
+    assert calls == []
+    assert (skill_dir / "SKILL.md").read_bytes() == skill_before
+    assert {
+        path.relative_to(skill_dir): path.read_bytes()
+        for path in (skill_dir / "scripts").glob("*.py")
+    } == scripts_before
+    assert not (skill_dir / "INTERFACE").exists()
+
+
 def _patch_fast_e2e(monkeypatch):
     commands = _commands()
     monkeypatch.setattr(e2e, "_validate_skill_md_contract", lambda *args, **kwargs: None)

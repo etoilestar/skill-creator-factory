@@ -4550,6 +4550,17 @@ async def _repair_existing_file_for_e2e_failure(
     coverage requirements 和工具选择，不在这里重新判断。
     """
 
+    structured_failure = _structured_failure_from_errors(e2e_errors)
+    if _failure_code_from_structured(structured_failure) == "upstream_interface_contract_conflict":
+        return {
+            "status": "upstream_handoff_required",
+            "repaired_target": None,
+            "next_target": "INTERFACE",
+            "next_failure": e2e_errors,
+            "error_type": "upstream_interface_contract_conflict",
+            "sandbox_executed": False,
+        }
+
     # target_path is the runtime symptom location supplied by the validator, not a
     # confirmed repair target. Diagnose before any localized-scope decision.
     skill_dir = settings.skills_path / skill_name

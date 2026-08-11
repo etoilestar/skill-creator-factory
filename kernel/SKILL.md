@@ -102,7 +102,23 @@ the protocol permits omission.
 
 - 当前平台没有显式 loop/map/foreach 节点；批量处理、逐项处理、顺序映射或局部聚合由拥有该业务责任的脚本内部承担。内部循环本身不构成拆脚本理由，也不改变 script boundary IO cardinality。
 
-- `uploaded_files` 是 Creator 创建阶段上下文文件，不等于 Skill assets。上传文件必须先判断是参考文件、运行时输入文件，还是静态 assets 候选。没有用户明确确认，不得写入 `assets/**`。
+- `uploaded_files` 是 Creator 创建阶段上下文文件，不等于 Skill assets。
+  上传文件必须先判断是参考文件、运行时输入文件，还是静态 assets 候选。
+
+- 新建 Skill 时，只有用户已经明确要求提供、上传、包含或使用某个现有静态素材，
+  才允许规划新的 `assets/**`。
+
+- 不得因为某个模板、样式文件、示例文件、logo、背景或其他静态资源
+  对实现“可能有帮助”，就自行创造 asset requirement。
+
+- `source=user_upload` 只描述已经由用户需求授权的 asset
+  在 Creation 阶段如何提供，不构成新增 asset 的权限。
+
+- 用户没有明确静态素材需求时，应规划不依赖额外 asset 的实现，
+  不得为了 Planner 自己选择的实现方案主动要求用户上传素材。
+
+- revise 模式可以保留已有 Skill 中仍然有效的 asset；
+  新增 asset 仍需当前用户需求明确授权。
 
 - Blueprint 只声明脚本所需的抽象能力、必须由运行时工具实现的能力约束，以及用户明确指定且不可替换的外部依赖。普通场景不得提前绑定 `selected_tools` 或具体 helper；最终绑定归后续 Tool Planner。reference 文件和 asset 文件不得声明运行时工具能力。
 

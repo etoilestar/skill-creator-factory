@@ -5395,6 +5395,25 @@ Creator 协议边界：
 - 不要把运行时用户输入文件写入 assets。
 - 不要输出 assets/、assets/<name.ext>、assets/* 或动态 assets path。
 - 如果不需要静态素材，删除 assets 文件计划。
+- 不得把当前 Blueprint 中已经存在的 assets/** dependency/reference
+  当成该 asset 合法存在的依据；当前 Blueprint 本身可能规划错误。
+
+- 新增 assets/** 必须有 confirmed_user_context 中明确的用户静态素材需求。
+
+- 如果 dependency_missing_from_skill_plan 或 reference_missing_from_skill_plan
+  指向 assets/**，且 confirmed_user_context 没有明确要求该静态素材，
+  正确修复是删除所属脚本中的 asset dependency/reference；
+  不得新增对应 asset SkillPlan entry。
+
+- 如果 asset_missing_source 指向一个没有明确用户素材需求的 asset，
+  正确修复是删除该 asset 以及相关 dependency/reference；
+  不得通过增加 source=user_upload 或 source=bundled 来修复。
+
+- source=user_upload 只描述已经合法规划的 asset 的后续上传方式，
+  不能把 Planner 自行创造的 asset 变成合法 asset。
+
+- references/*.md 不受上述 asset 准入规则限制；
+  Creator 可以规划并生成真正需要的 reference。
 - 目录结构不要列具体文件名。
 - 目录结构和 SkillPlan path 必须一致。
 - dependencies 只能写运行前静态依赖。
@@ -5432,9 +5451,17 @@ Creator 协议边界：
                     "content": json.dumps(
                         {
                             "blueprint_text": repaired,
+
+                            "confirmed_user_context": {
+                                "original_user_request": request.user_request,
+                                "human_feedback": request.human_feedback,
+                                "conversation_history": request.conversation_history,
+                            },
+
                             "protocol_errors": (
                                 current_errors
                             ),
+
                             "remaining_issues_from_previous_repair": repeated_errors,
                             "repair_directive": (
                                 "The listed issue remains unresolved; directly eliminate it and do not repeat an almost identical Blueprint."
@@ -8749,6 +8776,36 @@ The first pass only follows the FilePlan protocol. It may plan SKILL.md, scripts
 
 不得根据扩展名、文件名或业务领域词判断资源角色，不得自动迁移资源路径。返回 status=ready 前逐项自检：谁创建该资源；创建发生在 Creator 阶段还是运行时；用户上传/系统预置资源是否误作 reference；运行时产物是否误入 static FilePlan；reference 是否确为 Creator 生成的语义指导材料。
 
+## Asset planning authority
+
+`assets/**` 不是 Planner 可以为了实现方便自行增加的实现资源。
+
+对于新建 Skill，只有 confirmed user context 已经明确说明：
+用户会提供、上传、包含或使用某个现有静态素材时，
+才允许在 Blueprint / SkillPlan 中新增 `assets/**`。
+
+必须遵守：
+
+- 用户没有明确提出静态素材需求时，不得规划任何新的 `assets/**`。
+- 不得因为模板、样式文件、示例文件、背景、logo 或其他静态素材
+  “可能有帮助”就自行增加 asset。
+- 不得先自行创造 asset，再通过 `source=user_upload` 使它看起来合法。
+- `source=user_upload` 只描述一个已经由用户需求授权的 asset
+  在 Creation 阶段如何提供；它不是新增 asset 的权限。
+- `source=bundled` 也不是新增 asset 的权限，只能用于已有 bundled inventory
+  或已有 Skill 中已经存在的静态素材。
+- 如果用户没有明确提出静态素材需求，应选择不依赖额外 asset 的实现方案，
+  不得为了 Planner 自己选择的实现方式要求用户额外上传素材。
+- reference 与 asset 不同。Creator 可以根据实现需要规划并生成
+  `references/*.md` 语义指导文件。
+- revise 模式可以保留已有 Skill 中仍然有效的 asset；
+  新增 asset 仍然需要当前 confirmed user context 的明确依据。
+
+返回 `status=ready` 前，对每个新规划的 `assets/**` 做一次自检：
+“哪一条 confirmed user fact 明确要求这个静态素材？”
+如果没有明确答案，删除这个 asset SkillPlan entry，
+并删除 scripts 对它的 dependencies/references。
+
 review_summary 只是同一响应中的临时展示摘要。
 后端不会使用 review_summary 重建蓝图。
 
@@ -8987,6 +9044,23 @@ Blueprint / FilePlan 中必须存在真正拥有并执行该 action 的 scripts/
 如果四项中任何一项无法回答，
 当前 Blueprint 尚未形成 FilePlan 责任闭包，
 不得返回 status=ready。
+
+## FilePlan path identity uniqueness
+
+每个 normalized SkillPlan path 代表唯一一个 Skill 文件 identity。
+
+必须满足：
+
+- 同一个 exact path 在 SkillPlan 中只能出现一个 `- path:` entry。
+- 不得为同一个文件创建两个 FilePlan entries。
+- script 在 dependencies/references 中使用某个资源，
+  只是引用该已有 file identity，不代表创建第二个 FilePlan entry。
+- 一个 asset 即使同时具有“FilePlan 文件”和“需要用户上传”的状态，
+  仍然只有一个文件 identity。
+
+返回 status=ready 前必须检查：
+SkillPlan path entry 数量 == normalized distinct SkillPlan path 数量。
+如果不相等，合并重复 entry，只保留一个 canonical FilePlan entry。
 
 ## file-local responsibility metadata
 

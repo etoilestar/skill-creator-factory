@@ -176,6 +176,7 @@ def build_platform_io_contract() -> dict[str, Any]:
             ],
             "protocol_notes": [
                 "Platform input_envelope_fields are source slots the platform can provide to a generated SKILL.",
+                "input_source_semantics is descriptive canonical/relationship guidance, not a closed whitelist; input_envelope_fields remains the legal source domain.",
                 "Platform final_output_fields are terminal slots the platform can consume from the final stdout JSON.",
                 "Platform boundary fields are not a whitelist for script argv keys.",
                 "SKILL.md should document which argv.<key> comes from which platform input slot, reference file, asset file, literal default, runtime constant, or previous stdout field.",
@@ -236,6 +237,9 @@ def platform_io_contract_prompt_text() -> str:
         "- input_files represents runtime-uploaded file or multimodal content; files may be its derived compatibility view.",
         "- fields is the namespace for Skill-specific structured parameters.",
         "- A Skill may consume zero, one, or multiple source families according to confirmed requirements.",
+        "- INPUT SOURCE SEMANTICS ARE DESCRIPTIVE, NOT A CLOSED WHITELIST.",
+        "- input_source_semantics describes known canonical/related representations; it does not remove or forbid any legal source declared in input_envelope_fields.",
+        "- When confirmed requirements establish that another legal platform source owns the required semantic value, the Interface Planner may select it; do not invent an unknown platform source.",
         "- Platform final output terminal slots: text, markdown, image_path, image_paths, pdf_path, docx_path, pptx_path, html_path, file_paths, file_outputs.",
         "- Platform boundary fields are source/terminal slots, not a whitelist for script argv keys.",
         "- SKILL.md should document how platform source slots map to script argv keys.",

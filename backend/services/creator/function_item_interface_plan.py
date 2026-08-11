@@ -87,12 +87,20 @@ For each FunctionItem receiving slot, independently determine the semantic
 value required by that slot and where that value actually originates.
 If it is the user's runtime free-form instruction, use the platform contract's
 canonical free-form-request representation. If it is runtime-uploaded file or
-multimodal content, use the runtime-file representation. If it is a
-Skill-specific structured parameter, use fields.<current-skill-declared-param>;
-that parameter must already be declared by the confirmed requirement,
-Blueprint, or FunctionItem contract and must not be invented to close coverage.
+multimodal content, use the runtime-file representation. If the required value
+is a Skill-specific structured parameter, select the platform contract's
+structured-parameter source and represent any nested parameter using the
+existing source_path protocol. The parameter must already be declared by the
+current Skill and must not be invented merely to close coverage.
 If another FunctionItem produces the value, use member_to_member.
 A FunctionItem may consume multiple different source families simultaneously.
+
+INPUT SOURCE SEMANTICS ARE DESCRIPTIVE, NOT A CLOSED WHITELIST.
+input_source_semantics describes canonical and related representations whose
+relationships are known. input_envelope_fields remains the legal source domain;
+the metadata does not remove or forbid another declared source. When confirmed
+requirements establish that another legal platform source owns the value, it
+may be selected. Do not invent an unknown platform source.
 
 Interface Planner is the owner of semantic provenance decisions. The backend
 only validates candidate domain, logical references, coverage, single

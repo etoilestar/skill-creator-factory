@@ -54,6 +54,7 @@ def test_platform_input_source_families_are_optional_and_wire_fields_are_unchang
     prompt = platform_io_contract_prompt_text()
     assert "PLATFORM INPUT SEMANTICS" in prompt
     assert "No platform input source is globally required" in prompt
+    assert "DESCRIPTIVE, NOT A CLOSED WHITELIST" in prompt
 
 
 def test_requirement_graph_injects_and_normalize_overrides_platform_io_contract():

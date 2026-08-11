@@ -178,3 +178,44 @@ def test_runtime_projects_graph_terminal_edge_and_transactionally_commits(tmp_pa
     finally:
         if session.temp_handle is not None:
             session.temp_handle.cleanup()
+
+
+def test_runtime_terminal_schema_conflict_routes_to_upstream_interface(tmp_path, monkeypatch):
+    source = tmp_path / "trace-skill"
+    source.mkdir()
+    _write_skill(source)
+    contract = build_platform_io_contract()
+    graph = ResponsibilityGraph(
+        platform_io_contract=contract,
+        dataflow_edges=[{
+            "from_node": "scripts/step2.py",
+            "from_output": "file_outputs",
+            "to_node": "platform_output_node",
+            "to_input": "text",
+            "purpose": "deliver",
+            "constraints": [],
+        }],
+    )
+    monkeypatch.setattr(e2e, "_load_requirement_graph_for_e2e", lambda _skill_dir: graph)
+    monkeypatch.setattr(e2e, "_get_skill_venv_python", lambda _skill_dir: Path(sys.executable))
+    monkeypatch.setattr(e2e, "_install_capability_dependencies", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(e2e, "_install_declared_dependency_packages", lambda *_args, **_kwargs: None)
+
+    session = e2e._create_e2e_session("trace-skill", source_skill_dir=source)
+    try:
+        errors = e2e._run_skill_workflow_e2e_once(
+            "trace-skill",
+            source_skill_dir=source,
+            external_context={"user_request": "value_x"},
+            e2e_session=session,
+        )
+        failure = e2e._structured_failure_from_errors(errors)
+        assert failure["failed_step_index"] == 3
+        assert failure["layer"] == "terminal_output_commit"
+        assert failure["target_file"] == "INTERFACE"
+        assert failure["details"]["failure_code"] == "upstream_interface_contract_conflict"
+        assert e2e._e2e_repair_target_from_errors(errors) == "INTERFACE"
+        assert "must not modify SKILL.md" in failure["repair_instruction"]
+    finally:
+        if session.temp_handle is not None:
+            session.temp_handle.cleanup()

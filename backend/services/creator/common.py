@@ -1790,11 +1790,24 @@ def _reject_creator_flow_leak(content: str) -> None:
             "这是平台创建流程泄露，不属于 Skill 使用说明。请删除这些流程文本，只保留 Skill 的使用说明、资源引用和可执行命令示例。"
         )
 
-def _e2e_error(*, target: str, layer: str, message: str) -> str:
+def _e2e_error(
+    *,
+    target: str,
+    layer: str,
+    message: str,
+    failed_step_index: int = 0,
+    failure_code: str = "",
+    target_region: str = "",
+    repair_instruction: str = "",
+) -> str:
     failure = {
-        "failed_step_index": 0,
+        "failed_step_index": failed_step_index,
         "target_file": target,
-        "target_region": "frontmatter" if "frontmatter" in layer else ("workflow block" if target == "SKILL.md" else "run()"),
+        "target_region": target_region or (
+            "frontmatter"
+            if "frontmatter" in layer
+            else ("workflow block" if target == "SKILL.md" else "run()")
+        ),
         "failed_command": "",
         "input_payload": {},
         "stdout": "",
@@ -1802,8 +1815,11 @@ def _e2e_error(*, target: str, layer: str, message: str) -> str:
         "return_code": None,
         "expected": "Creator E2E step must be executable and produce valid JSON/artifacts.",
         "actual": message,
-        "repair_instruction": f"只修改 {target} 中与 {layer} 失败相关的最小区域，不修改其它文件。",
+        "repair_instruction": repair_instruction or (
+            f"只修改 {target} 中与 {layer} 失败相关的最小区域，不修改其它文件。"
+        ),
         "layer": layer,
+        "details": {"failure_code": failure_code} if failure_code else {},
     }
     return f"E2E_REPAIR_TARGET={target}\nE2E_LAYER={layer}\nE2E_STRUCTURED_FAILURE={json.dumps(failure, ensure_ascii=False, sort_keys=True)}\n{message}"
 

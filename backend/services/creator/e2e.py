@@ -2367,6 +2367,7 @@ _E2E_LAYER_RANK = {
     "artifact": 5,
     "downstream_handoff": 6,
     "final_output": 7,
+    "terminal_output_commit": 8,
 }
 
 
@@ -4163,9 +4164,16 @@ def _run_skill_workflow_e2e_once(
                         })
                 except ValueError as exc:
                     errors.append(_e2e_error(
-                        target="SKILL.md",
+                        target="INTERFACE",
                         layer="terminal_output_commit",
                         message=str(exc),
+                        failed_step_index=len(commands) + 1,
+                        failure_code="upstream_interface_contract_conflict",
+                        target_region="frozen terminal binding",
+                        repair_instruction=(
+                            "Report the frozen terminal binding and platform sink contract conflict to the "
+                            "upstream Interface owner; E2E must not modify SKILL.md, scripts, or the graph."
+                        ),
                     ))
 
     finally:

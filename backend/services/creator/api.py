@@ -4818,17 +4818,6 @@ def _preflight_prepare_blueprint_text(
         plan_paths
     )
 
-    if allowed_resource_paths is not None:
-        for path in plan_paths:
-            normalized = _normalize_skill_path(path)
-            if _is_prepare_resource_path(normalized) and normalized not in allowed_resource_paths:
-                issues.append(_prepare_protocol_issue(
-                    "unjustified_resource_reference",
-                    "Resource path has no frozen upstream authority. Remove this SkillPlan entry; source=bundled is not provenance.",
-                    path=normalized,
-                    field="SkillPlan",
-                ))
-
     dynamic_re = re.compile(
         (
             r"[<>{}\*]|\$\{|"
@@ -5085,18 +5074,6 @@ def _preflight_prepare_blueprint_text(
                 )
             )
 
-            if (
-                allowed_resource_paths is not None
-                and _is_prepare_resource_path(normalized_dependency)
-                and normalized_dependency not in allowed_resource_paths
-            ):
-                issues.append(_prepare_protocol_issue(
-                    "unjustified_resource_reference",
-                    "Resource path has no frozen upstream authority. Remove this dependency from the owning script; do not add a resource SkillPlan entry or invent source=bundled.",
-                    path=normalized_dependency,
-                    field="dependencies",
-                ))
-                continue
 
             if (
                 normalized_dependency.startswith(
@@ -5133,19 +5110,6 @@ def _preflight_prepare_blueprint_text(
                     reference
                 )
             )
-
-            if (
-                allowed_resource_paths is not None
-                and _is_prepare_resource_path(normalized_reference)
-                and normalized_reference not in allowed_resource_paths
-            ):
-                issues.append(_prepare_protocol_issue(
-                    "unjustified_resource_reference",
-                    "Resource path has no frozen upstream authority. Remove this reference from the owning script; do not add a resource SkillPlan entry or invent source=bundled.",
-                    path=normalized_reference,
-                    field="references",
-                ))
-                continue
 
             if (
                 normalized_reference.startswith(
@@ -5316,10 +5280,6 @@ def _normalize_prepare_blueprint_references(
             text
         )
         if path not in plan_paths
-        and (
-            allowed_resource_paths is None
-            or path in allowed_resource_paths
-        )
     )
 
     if not missing:
@@ -9586,13 +9546,9 @@ Blueprint Planner 只规划业务责任。
             }
             data = dict(first_planner_result)
 
-        frozen_blueprint_text, rejected_resources = _remove_unauthorized_prepare_resources(
-            frozen_blueprint_text,
-            allowed_resource_paths,
-        )
         logger.info(
-            "[Creator][resource_authority] allowed_resources=%s rejected_resources=%s",
-            sorted(allowed_resource_paths), rejected_resources,
+            "[Creator][resource_authority] allowed_resources=%s",
+            sorted(allowed_resource_paths),
         )
         authoritative_paths = _extract_prepare_skill_plan_paths(frozen_blueprint_text)
         logger.info(
@@ -9722,12 +9678,9 @@ Blueprint Planner 只规划业务责任。
                 requirement_allocations=requirement_allocations,
                 blocking_issues=blueprint_issues, planner_model=route.model,
             )
-            replanned_blueprint, rejected_resources = _remove_unauthorized_prepare_resources(
-                replanned_blueprint, allowed_resource_paths,
-            )
             logger.info(
-                "[Creator][resource_authority] allowed_resources=%s rejected_resources=%s",
-                sorted(allowed_resource_paths), rejected_resources,
+                "[Creator][resource_authority] allowed_resources=%s",
+                sorted(allowed_resource_paths),
             )
             validate_blueprint_shape_for_creator(replanned_blueprint)
             protocol_errors = _preflight_prepare_blueprint_text(
@@ -12032,15 +11985,6 @@ async def _prepare_plan_impl(
             )],
         )
 
-    rejected_resources = _enforce_prepare_plan_resource_authority(
-        plan,
-        allowed_resource_paths,
-    )
-    logger.info(
-        "[Creator][resource_authority] allowed_resources=%s rejected_resources=%s",
-        sorted(allowed_resource_paths), rejected_resources,
-    )
-
     (
         confirmed_uploaded_assets,
         unselected_uploaded_files,
@@ -12058,13 +12002,7 @@ async def _prepare_plan_impl(
         for item
         in confirmed_uploaded_assets
     }
-
-    asset_filter_warnings = _filter_unconfirmed_asset_plan(
-        files=plan.files,
-        asset_requirements=plan.asset_requirements,
-        uploaded_files=request.uploaded_files,
-        review_summary=None,
-    )
+    asset_filter_warnings = []
     facts_snapshot = _freeze_creator_facts_snapshot(
         request=request,
         plan_files=plan.files,
@@ -12106,118 +12044,6 @@ async def _prepare_plan_impl(
         if path not in confirmed_asset_paths
     ]
 
-    if missing_required_upload_assets:
-        final_blueprint_text = (
-            plan.blueprint_text
-            or blueprint_text
-        )
-        summary = await project_summary(
-            final_blueprint_text,
-            prepared,
-            pending_upload_assets=missing_required_upload_assets,
-        )
-        summary_sync_warnings: list[dict[str, Any]] = []
-        return PreparePlanResponse(
-            status="needs_clarification",
-            prepare_stage="asset_upload_required",
-            clarifying_questions=[
-                "请先上传创建该 Skill 必需的静态资源文件，然后继续。"
-            ],
-            review_summary=(
-                _strip_prepare_summary_risks(
-                    summary
-                )
-            ),
-            blueprint_text=final_blueprint_text,
-            skill_name=plan.skill_name,
-            files=plan.files,
-            warnings=[
-                *(
-                    plan.warnings
-                    or []
-                ),
-                *summary_sync_warnings,
-                *asset_filter_warnings,
-            ],
-            asset_requirements=plan.asset_requirements,
-            creation_blockers=[
-                {
-                    "code": "required_asset_not_uploaded",
-                    "type": "required_asset_not_uploaded",
-                    "blocking": True,
-                    "assets_to_upload": missing_required_upload_assets,
-                    "message": "Required user-upload assets from the FilePlan have not been uploaded.",
-                }
-            ],
-        )
-
-    plan.files = [
-        file_spec
-        for file_spec
-        in (
-            plan.files or []
-        )
-        if not (
-            str(
-                getattr(
-                    file_spec,
-                    "path",
-                    "",
-                )
-                or ""
-            ).startswith(
-                "assets/"
-            )
-            and str(
-                getattr(
-                    file_spec,
-                    "asset_source",
-                    "",
-                )
-                or ""
-            )
-            == "user_upload"
-            and str(
-                getattr(
-                    file_spec,
-                    "path",
-                    "",
-                )
-                or ""
-            )
-            not in confirmed_asset_paths
-        )
-    ]
-
-    plan.asset_requirements = [
-        asset
-        for asset
-        in (
-            plan.asset_requirements
-            or []
-        )
-        if (
-            str(
-                getattr(
-                    asset,
-                    "source",
-                    "",
-                )
-                or ""
-            )
-            != "user_upload"
-            or str(
-                getattr(
-                    asset,
-                    "path",
-                    "",
-                )
-                or ""
-            )
-            in confirmed_asset_paths
-        )
-    ]
-
     # The canonical plan changed after confirmed-upload filtering. Refresh the
     # handoff before any downstream projection so it cannot observe stale facts.
     facts_snapshot = _freeze_creator_facts_snapshot(
@@ -12237,7 +12063,7 @@ async def _prepare_plan_impl(
     summary = await project_summary(
         final_blueprint_text,
         prepared,
-        pending_upload_assets=[],
+        pending_upload_assets=missing_required_upload_assets,
     )
 
     summary_sync_warnings: list[dict[str, Any]] = []

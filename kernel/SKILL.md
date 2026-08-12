@@ -196,6 +196,9 @@ the protocol permits omission.
          vision_analyzer | search_reader | database_reader |
          wechat_draft_creator | wechat_publisher |
          html_asset_builder | generic_script>
+  purpose: [一句简洁的总体责任摘要]
+  must_do: [当前 script 必须完成的业务动作/责任条件]
+  must_not_do: [当前 script 明确不得承担的业务责任或禁止行为]
   inputs: [列出确定的 JSON argv/stdin 字段；不要使用候选/别名/组合写法]
   outputs: [列出确定的 stdout JSON 字段；文件产物路径只在这里表达，运行时中间数据和最终产物不要列入资源清单]
   dependencies: [需要读取的 references/assets 静态输入路径；不要写 outputs/、OUTPUT_DIR、最终产物或动态文件名]
@@ -206,6 +209,8 @@ the protocol permits omission.
                           wechat_draft | wechat_publish | deterministic_execution | file_output]
   forbidden_capabilities: [列出当前 role 边界内必须禁止的 runtime capability；不要用业务描述自动补充]
   references: [需要引用的 references/*.md]
+
+`purpose` 只是摘要。`must_do` 表达“缺少后该 script 就不能算完成职责”的业务责任；`must_not_do` 表达责任边界和明确禁止事项。两者不使用固定业务词表，不得根据 filename、role 或 capability 自动生成业务责任，不要求一条 requirement 对应一个 `must_do`，也不要求固定数量。`must_do` / `must_not_do` 必须来自 confirmed user intent 和当前 Blueprint responsibility boundary，不得发明新的用户需求。
 - path: `references/<name>.md`
   role: reference
   inputs: []

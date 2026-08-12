@@ -1043,6 +1043,56 @@ def _semantic_closure_response(messages):
     return None
 
 
+@pytest.mark.asyncio
+async def test_requirement_projection_receives_function_item_responsibility_boundaries(monkeypatch):
+    captured_payload = {}
+
+    async def fake_role(messages, role, fallback_model):
+        assert role == "planner"
+        captured_payload.update(json.loads(messages[1]["content"]))
+        return json.dumps({
+            "requirement_allocations": [{
+                "requirement_id": "R1",
+                "requirement": "Complete the confirmed worker responsibility",
+                "owners": ["scripts/worker_a.py"],
+                "evidence": {
+                    "responsibility": "Owned by worker_a",
+                    "outputs": ["result"],
+                    "capabilities": [],
+                },
+            }],
+            "requirement_channels": {"R1": "executable"},
+        })
+
+    monkeypatch.setattr(api, "complete_creator_role_once", fake_role)
+    projection = await api._plan_requirement_allocations(
+        request=_request(user_request="Complete the confirmed worker responsibility"),
+        blueprint_text="frozen blueprint",
+        function_items=[{
+            "target_file": "scripts/worker_a.py",
+            "purpose": "Worker summary",
+            "must_do": ["Perform complete worker responsibility"],
+            "must_not_do": ["Do not perform peer responsibility"],
+            "inputs": ["payload"],
+            "outputs": ["result"],
+        }],
+        planner_model="planner-test-model",
+    )
+
+    assert captured_payload["function_items"] == [{
+        "target_file": "scripts/worker_a.py",
+        "purpose": "Worker summary",
+        "must_do": ["Perform complete worker responsibility"],
+        "must_not_do": ["Do not perform peer responsibility"],
+        "inputs": ["payload"],
+        "outputs": ["result"],
+    }]
+    assert set(projection) == {"requirement_allocations", "requirement_channels"}
+    assert set(projection["requirement_allocations"][0]) == {
+        "requirement_id", "requirement", "owners", "evidence",
+    }
+
+
 def _mock_creator_completion(monkeypatch, fake_complete):
     async def fake_role(messages, role, fallback_model):
         return await fake_complete(messages, fallback_model)
@@ -2538,6 +2588,46 @@ def test_structured_function_items_reject_unknown_fields():
     item['action_type'] = 'forbidden'
     with pytest.raises(ValueError, match='unknown_fields'):
         normalize_structured_function_items([item], source='planner')
+
+
+def test_structured_function_items_transport_optional_responsibility_boundaries_verbatim():
+    from backend.services.skill_plan import normalize_structured_function_items
+    item = _abstract_function_item('scripts/worker_a.py')
+    item['must_do'] = ['Preserve the confirmed transformation exactly.']
+    item['must_not_do'] = ['Do not perform worker_b responsibility.']
+    normalized = normalize_structured_function_items([item], source='planner')[0]
+    assert normalized['must_do'] == item['must_do']
+    assert normalized['must_not_do'] == item['must_not_do']
+
+    legacy = normalize_structured_function_items([_abstract_function_item('scripts/worker_b.py')], source='planner')[0]
+    assert legacy['must_do'] == []
+    assert legacy['must_not_do'] == []
+
+
+def test_legacy_structured_function_item_does_not_erase_skill_plan_responsibility():
+    from backend.services.blueprint_parser import FileSpec, build_skill_plan_from_files
+
+    blueprint = """- path: `scripts/worker_a.py`
+  role: generic_script
+  purpose: Worker responsibility
+  must_do: [Preserve complete worker responsibility]
+  must_not_do: [Do not perform peer responsibility]
+  inputs: []
+  outputs: [result]
+  required_capabilities: []
+  constraints: []
+"""
+    legacy_item = _abstract_function_item('scripts/worker_a.py', 'Worker responsibility')
+    plan = build_skill_plan_from_files(
+        skill_name='demo',
+        files=[FileSpec(path='scripts/worker_a.py', purpose='Worker responsibility')],
+        blueprint_text=blueprint,
+        function_items=[legacy_item],
+        responsibility_edges=[],
+    )
+    entry = plan.files[0]
+    assert entry.must_do == ['Preserve complete worker responsibility']
+    assert entry.must_not_do == ['Do not perform peer responsibility']
 
 
 def test_structured_function_items_reject_duplicate_targets():

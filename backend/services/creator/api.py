@@ -8875,6 +8875,128 @@ def _planner_convergence_review_event_from_result(result: dict[str, Any]) -> dic
     }
 
 
+async def _final_blueprint_cleanup(
+    *,
+    request: PreparePlanRequest,
+    blueprint_text: str,
+    existing_resource_facts: dict[str, Any],
+    planner_model: str,
+) -> str:
+    """Run one narrow semantic cleanup before Blueprint facts become downstream facts."""
+    prompt = """
+FINAL BLUEPRINT CLEANUP
+
+You are performing one final semantic cleanup of the complete Blueprint before
+its file identities become downstream facts.
+
+Use confirmed user context and supplied existing-resource facts as the authority
+for user intent and externally existing materials.
+
+The current Blueprint is a proposal.
+A proposal is not evidence that its own implementation choices were requested
+by the user.
+
+Your task is not to redesign the Skill from scratch.
+Preserve all confirmed user decisions and unrelated script responsibilities.
+
+RESOURCE SEMANTICS
+
+references/**:
+- internal Creator-generated static semantic resources;
+- may be planned when they serve a real Skill responsibility;
+- do not require explicit user upload intent.
+
+assets/**:
+- external or already-existing static materials;
+- a newly planned asset must have independent support from confirmed user
+  static-material intent, a confirmed uploaded asset, a valid existing/revise
+  asset, or a real bundled resource fact supplied by the system.
+
+The following are NOT independent support for creating an asset:
+- the current Blueprint saying that the asset exists;
+- a script dependency created by the same Blueprint;
+- source=user_upload;
+- implementation convenience;
+- a preferred architecture;
+- the fact that such a static file would make implementation easier.
+
+Do not infer asset authorization from filename, suffix, domain, or business
+keywords.
+
+If a planned asset lacks independent support:
+- remove that asset from the structured SkillPlan;
+- remove dependencies/references that rely on it;
+- synchronize workflow/resource prose and inventories;
+- choose an implementation that does not require that unsupported asset.
+
+Do not introduce a replacement resource merely to preserve the previous design.
+
+Before returning:
+- structured SkillPlan and Blueprint prose must describe one consistent file plan;
+- every remaining asset must have independent external/static-resource support;
+- every reference must serve a real semantic responsibility;
+- unrelated script responsibilities must remain unchanged.
+
+Return the complete corrected Blueprint only.
+""".strip()
+    confirmed_uploaded_assets, _ = _split_uploaded_asset_decisions(
+        request.uploaded_files
+    )
+    bundled_resource_facts: list[str] = []
+    if request.skill_name:
+        bundled_root = settings.bundled_skills_path / _validate_skill_name(
+            request.skill_name
+        )
+        if bundled_root.is_dir():
+            bundled_resource_facts = sorted(
+                path.relative_to(bundled_root).as_posix()
+                for path in bundled_root.rglob("*")
+                if path.is_file()
+                and path.relative_to(bundled_root).as_posix().startswith(
+                    ("references/", "assets/")
+                )
+            )
+    payload = {
+        "confirmed_user_context": {
+            "user_request": request.user_request,
+            "conversation_history": request.conversation_history,
+            "human_feedback": request.human_feedback,
+        },
+        "current_complete_internal_blueprint_text": blueprint_text,
+        "confirmed_uploaded_resource_facts": confirmed_uploaded_assets,
+        "revise_existing_resource_facts": {
+            "references": existing_resource_facts.get("references", []),
+            "assets": existing_resource_facts.get("assets", []),
+        },
+        "bundled_resource_facts": bundled_resource_facts,
+    }
+    cleaned = await complete_creator_role_once(
+        [
+            {"role": "system", "content": prompt},
+            {
+                "role": "user",
+                "content": json.dumps(payload, ensure_ascii=False, default=str),
+            },
+        ],
+        "planner",
+        fallback_model=planner_model,
+    )
+    cleaned = str(cleaned or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:markdown|md)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+    cleaned = _normalize_prepare_blueprint_references(cleaned)
+    validate_blueprint_shape_for_creator(cleaned)
+    parse_blueprint([{"role": "assistant", "content": cleaned}], strict=True)
+    preflight_issues = _preflight_prepare_blueprint_text(cleaned)
+    if preflight_issues:
+        raise PreparePlanProtocolError(
+            "Final Blueprint Cleanup failed strict FilePlan validation: "
+            f"{preflight_issues}"
+        )
+    return cleaned
+
+
 async def _generate_internal_blueprint_or_questions(
     request: PreparePlanRequest,
     event_emitter: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
@@ -9764,6 +9886,23 @@ Blueprint Planner 只规划业务责任。
         )
         data["responsibility_edges"] = normalized_edges
     elif status == "ready":
+        frozen_blueprint_text = await _final_blueprint_cleanup(
+            request=request,
+            blueprint_text=frozen_blueprint_text,
+            existing_resource_facts=existing_context,
+            planner_model=route.model,
+        )
+        first_planner_result = {
+            **first_planner_result,
+            "internal_blueprint_text": frozen_blueprint_text,
+        }
+        data = dict(first_planner_result)
+        logger.info("[Creator][final_blueprint_cleanup] completed")
+        if event_emitter is not None:
+            await event_emitter({
+                "event": "final_blueprint_cleanup",
+                "status": "ready",
+            })
         normalized_function_items = None
         binding_data: dict[str, Any] = {
             "function_items": [],

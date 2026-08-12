@@ -216,8 +216,13 @@ the protocol permits omission.
   references: []
 只有确实需要 Creator 静态素材时，才添加 assets 文件计划。assets 文件计划必须满足：
 
-- path 必须是具体文件路径，例如 `assets/template.docx`。
-- path 不能是 `assets/`、`assets/<name.ext>`、`assets/*`、`assets/{name}.ext` 或任何动态占位符。
+- Asset path 必须是根据当前 confirmed user context 真实规划得到的 concrete normalized path。
+- 协议中的 schema metavariable 只用于解释字段结构，不是候选资源，也不得直接复制为实际 Blueprint file identity。
+- 如果需要表达 asset entry schema，只使用以下抽象形式：
+  - path: <concrete-authorized-asset-path>
+    role: asset
+    source: user_upload | bundled
+- 尖括号内容仅表示 schema metavariable，实际 Blueprint 必须根据当前需求重新确定具体 path，不得复制协议示例作为真实资源。
 - source 必须是 `user_upload` 或 `bundled`。
 - inputs / outputs / dependencies 必须为空。
 - required_capabilities 必须为空。

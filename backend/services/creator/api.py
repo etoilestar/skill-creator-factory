@@ -8189,6 +8189,13 @@ actual file declarations. Do not infer resource semantics from filenames,
 extensions, or business keywords. Repair must target the complete Blueprint,
 not an independently edited normalized FilePlan.
 
+Classify every blocking resource consistency defect as
+`resource_semantic_conflict` with repair_scope=blueprint. Executable script
+target identities are frozen and must not be added, removed, or renamed. A
+resource identity may be added, removed, or adjusted only when that exact
+resource is within the reported issue scope and the complete Blueprint is
+updated consistently.
+
 2. CHANNEL-AWARE REVIEW RULES
 Ownership rules are channel-aware:
 - For executable requirements, at least one owner must exist; every owner must
@@ -8264,10 +8271,14 @@ deferred entry cites a distinct future-stage fact.
 
 5. FROZEN-SCOPE INVARIANTS
 FunctionItems are frozen. The complete owner domain is
-`authoritative_function_item_targets`. Never propose a new script, file,
-FunctionItem, owner identity, or changed target_file outside that domain.
+`authoritative_function_item_targets`. Never propose a new script or
+FunctionItem, owner identity, or changed executable target_file outside that
+domain. This freezes executable identities, not resource identities: an exact
+resource named by a `resource_semantic_conflict` may be locally added, removed,
+or adjusted within that issue's Blueprint repair scope.
 Every owner must be an exact frozen FunctionItem target_file from that domain.
-Do not create a blocking issue whose repair requires adding a FunctionItem/file,
+Do not create a blocking issue whose repair requires adding a FunctionItem or
+executable file,
 inventing a validator/orchestrator, changing frozen target_file identities, or
 accessing unavailable graph/runtime evidence. Such concerns are deferred unless
 a separate current Blueprint defect is already evidenced.
@@ -8282,7 +8293,8 @@ Before returning, silently verify:
 - every blocking issue can be repaired without changing requirement_channels;
 - only executable requirements are required to have owners;
 - no issue proposes an owner outside authoritative_function_item_targets;
-- no issue proposes a new FunctionItem or file;
+- no issue proposes a new FunctionItem or executable file; resource identity
+  changes remain limited to an exact resource_semantic_conflict scope;
 - no blocking issue depends only on future graph/runtime evidence;
 - the same reason is not both blocking and deferred;
 - every blocking issue has non-empty expected_fact and valid non-empty evidence;
@@ -8323,6 +8335,8 @@ source must be exactly one of:
 - function_items
 - blueprint
 - platform_contract
+- uploaded_resource_facts
+- revise_existing_resource_facts
 
 source identifies the authoritative payload section. target identifies the exact
 requirement ID, FunctionItem target_file, Blueprint section, or platform-contract
@@ -8344,6 +8358,14 @@ empty repair_guidance. Return no explanation outside the JSON object.
         for item in requirement_allocations
         if str(item.get("requirement_id") or "").strip()
     ]
+    confirmed_uploaded_assets, unselected_uploaded_files = (
+        _split_uploaded_asset_decisions(request.uploaded_files)
+    )
+    existing_resource_facts = (
+        _read_prepare_existing_skill_context(request.skill_name)
+        if request.mode == "revise"
+        else {}
+    )
     payload = {
         "original_user_requirement": request.user_request,
         "user_requirement": request.user_request,
@@ -8354,6 +8376,15 @@ empty repair_guidance. Return no explanation outside the JSON object.
         "requirement_allocations": requirement_allocations,
         "requirement_channels": requirement_channels,
         "authoritative_function_item_targets": authoritative_targets,
+        "confirmed_uploaded_assets": confirmed_uploaded_assets,
+        "uploaded_resource_facts": {
+            "uploaded_files": request.uploaded_files,
+            "unselected_uploaded_files": unselected_uploaded_files,
+        },
+        "revise_existing_resource_facts": {
+            "references": existing_resource_facts.get("references", []),
+            "assets": existing_resource_facts.get("assets", []),
+        },
     }
     review: dict[str, Any] | None = None
     raw_review_response = ""
@@ -8469,7 +8500,11 @@ have no one-to-one rule. Report the exact structural patch you made. For an
 uncovered requirement with no preidentified affected target, explicitly declare
 the minimum existing targets whose purpose, inputs, outputs, or constraints you
 clarify, or add a minimum new responsibility carrier only when no existing target
-can legitimately cover the requirement. Do not remove existing paths. Return
+can legitimately cover the requirement. Do not remove, rename, or replace
+existing executable script paths. Resource paths may be added, removed, or
+adjusted only for an exact `resource_semantic_conflict` in the supplied blocking
+issue scope, and only by repairing every corresponding statement in the complete
+Blueprint. Return
 strict JSON only:
 
 This is coverage repair, not Skill redesign. Repair only the supplied blocking
@@ -8497,11 +8532,37 @@ reference. An asset must be existing user-uploaded or bundled static material;
 Backend will parse the repaired structured SkillPlan again; do not assume the
 old normalized FilePlan survives.
 
+PLANNED VERSUS MATERIALIZED ASSET
+
+A valid planned `source=user_upload` asset does not need to have been uploaded
+or materialized during Blueprint planning or semantic repair. Explicit confirmed
+user intent to provide or use existing static material authorizes planning it;
+`confirmed_uploaded_assets` only records materialization already completed.
+Never reject or remove an otherwise authorized planned asset merely because its
+upload is still pending.
+
 {"internal_blueprint_text":"...","changed_targets":[],"added_targets":[],"changed_resources":[]}
 """.strip()
+    confirmed_uploaded_assets, unselected_uploaded_files = (
+        _split_uploaded_asset_decisions(request.uploaded_files)
+    )
+    existing_resource_facts = (
+        _read_prepare_existing_skill_context(request.skill_name)
+        if request.mode == "revise"
+        else {}
+    )
     payload = {"original_user_requirement": request.user_request, "current_blueprint": blueprint_text,
                "current_function_items": function_items, "requirement_allocations": requirement_allocations,
-               "blocking_issues": blocking_issues}
+               "blocking_issues": blocking_issues,
+               "confirmed_uploaded_assets": confirmed_uploaded_assets,
+               "uploaded_resource_facts": {
+                   "uploaded_files": request.uploaded_files,
+                   "unselected_uploaded_files": unselected_uploaded_files,
+               },
+               "revise_existing_resource_facts": {
+                   "references": existing_resource_facts.get("references", []),
+                   "assets": existing_resource_facts.get("assets", []),
+               }}
     text = await complete_creator_role_once(
         [{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
         "planner", fallback_model=planner_model)
@@ -8840,7 +8901,7 @@ The first pass only follows the FilePlan protocol. It may plan SKILL.md, scripts
 ## Resource lifecycle authority（只按来源、生命周期、使用方式判断）
 
 - reference：`references/**` 是 Skill 内部静态语义指导材料。Creator 可以基于真实任务责任主动规划，且不要求用户预先上传；它主要由 Creator 在文件生成阶段创建，供 Skill scripts/runtime 按计划读取。它应承载规则、说明、约束、模板原则、领域指导等真实责任所需内容，不得只为补全目录而机械增加。
-- asset：已经存在且脚本在运行时直接消费的静态文件。来源必须显式为 source=user_upload 或 source=bundled；Creator 不重新创作其内容。
+- asset：用户承诺提供/上传或已有 bundled、且脚本在运行时直接消费的静态文件。来源必须显式为 source=user_upload 或 source=bundled；Creator 不重新创作其内容。Blueprint 中合法规划的 source=user_upload asset 可以尚未上传，planned identity 不等于 materialized state；Creation 阶段再完成上传。
 - runtime artifact：运行脚本后才产生的图片、文档、JSON、中间或最终文件，属于 script outputs、stdout、file_outputs 或 OUTPUT_DIR；不得进入 Blueprint FilePlan 的 references/** 或 assets/**。
 
 不得根据扩展名、文件名或业务领域词判断资源角色，不得自动迁移资源路径。返回 status=ready 前逐项自检：谁创建该资源；创建发生在 Creator 阶段还是运行时；用户上传/系统预置资源是否误作 reference；运行时产物是否误入 static FilePlan；reference 是否确为 Creator 生成的语义指导材料。
@@ -9318,9 +9379,10 @@ Blueprint Planner 只规划业务责任。
 - 只有用户需求或实际 Script responsibility 明确需要持久资源时才创建 references/assets；
   能直接由 Script 或 Tool 完成的内容，不要额外创建静态模板、logo 或说明资源。
 
-- references/assets 默认应为空。只有用户明确要求、用户实际上传/提供，或核心责任确实需要无法合理放入
-  Script 或现有 Tool usage 的持久静态可复用内容时，才创建持久资源。不得仅为让 Skill 显得完整而创建资源。
-  除非当前请求上下文包含用户实际提供的文件，绝不能声明 source=user_upload。
+- references/assets 默认应为空。reference 可在核心责任确实需要无法合理放入 Script 或现有 Tool usage
+  的持久静态语义指导时规划；asset 只有用户明确要求提供、上传、包含或使用现有静态素材时才规划。
+  不得仅为让 Skill 显得完整而创建资源。用户对现有静态素材的明确需求足以规划 source=user_upload；
+  Blueprint planning 时可以尚未实际上传，planned asset identity 不等于 materialized asset state，Creation 阶段再上传。
 
 - Script 声明的 references/assets 必须已经属于当前 FilePlan。
 

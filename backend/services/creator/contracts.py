@@ -54,6 +54,8 @@ ALLOWED_BLUEPRINT_REVIEW_EVIDENCE_SOURCES = {
     "function_items",
     "blueprint",
     "platform_contract",
+    "uploaded_resource_facts",
+    "revise_existing_resource_facts",
 }
 
 
@@ -202,6 +204,10 @@ def validate_blueprint_semantic_review(
             raise ValueError("blocking pre-graph issue has a repair_scope unavailable at this stage")
         if blocking and scope == "allocation" and not requirement_id:
             raise ValueError("allocation repair issue requires a supplied requirement_id")
+        if issue_type == "resource_semantic_conflict" and blocking and scope != "blueprint":
+            raise ValueError(
+                "blocking resource_semantic_conflict must repair the complete Blueprint"
+            )
         if deferred and (issue_type != "deferred_verification" or blocking or scope != "none"):
             raise ValueError("deferred_checks must be non-blocking deferred_verification with repair_scope=none")
         if not deferred and not blocking:

@@ -988,6 +988,9 @@ async def test_skill_md_reviewer_accepts_concise_authorized_resource_runtime_pro
     assert "source=user_upload is Creation-stage materialization metadata" in captured["prompt"]
     assert "Do not interpret ‘not a runtime input’ as ‘the script may not read it’" in captured["prompt"]
     assert "Missing internal lifecycle prose is not an unsupported resource claim" in captured["prompt"]
+    assert "A source=user_upload fact must NEVER by itself produce a blocking issue" in captured["prompt"]
+    assert "Absence is not contradiction" in captured["prompt"]
+    assert "A runtime script may read, use, consult, follow, or reference it" in captured["prompt"]
     assert "assets/example.bin" in captured["payload"]
     assert "references/example.md" in captured["payload"]
 

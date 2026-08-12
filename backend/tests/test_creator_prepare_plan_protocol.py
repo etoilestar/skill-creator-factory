@@ -1023,6 +1023,9 @@ def _semantic_closure_response(messages):
     import json
 
     system = str(messages[0].get("content") or "") if messages else ""
+    if "FINAL BLUEPRINT CLEANUP" in system:
+        payload = json.loads(messages[1]["content"])
+        return payload["current_complete_internal_blueprint_text"]
     if "requirement coverage projection" in system:
         payload = json.loads(messages[1]["content"])
         owners = [
@@ -1050,6 +1053,85 @@ def _mock_creator_completion(monkeypatch, fake_complete):
 
 class _SemanticClosureGraphCalled(BaseException):
     pass
+
+
+class _RequirementProjectionObserved(BaseException):
+    pass
+
+
+@pytest.mark.asyncio
+async def test_final_blueprint_cleanup_uses_pre_decomposition_fact_scope(monkeypatch):
+    blueprint = _ready_blueprint(
+        _skill_plan_block("\n" + _script_plan_block("scripts/a.py"))
+    )
+    captured = {}
+
+    async def fake_complete(messages, _role, fallback_model):
+        captured["system"] = messages[0]["content"]
+        captured["payload"] = json.loads(messages[1]["content"])
+        return blueprint
+
+    monkeypatch.setattr(api, "complete_creator_role_once", fake_complete)
+    result = await api._final_blueprint_cleanup(
+        request=_request(),
+        blueprint_text=blueprint,
+        existing_resource_facts={"references": [], "assets": []},
+        planner_model="unit-test-model",
+    )
+
+    assert result == blueprint.strip()
+    assert set(captured["payload"]) == {
+        "confirmed_user_context",
+        "current_complete_internal_blueprint_text",
+        "confirmed_uploaded_resource_facts",
+        "revise_existing_resource_facts",
+        "bundled_resource_facts",
+    }
+    assert "FunctionItems" not in json.dumps(captured["payload"])
+    assert "Requirement Projection" not in json.dumps(captured["payload"])
+    assert "A proposal is not evidence" in captured["system"]
+
+
+@pytest.mark.asyncio
+async def test_final_blueprint_cleanup_precedes_requirement_projection(monkeypatch):
+    proposed = _ready_blueprint(
+        _skill_plan_block(
+            "\n" + _script_plan_block("scripts/a.py").replace(
+                "dependencies: []", "dependencies: [assets/example-resource.bin]"
+            )
+            + "\n- path: `assets/example-resource.bin`\n"
+            "  role: asset\n  source: user_upload\n  inputs: []\n  outputs: []\n"
+            "  dependencies: []\n  required_capabilities: []\n"
+            "  forbidden_capabilities: [runtime_execution]\n  references: []"
+        )
+    )
+    cleaned = _ready_blueprint(
+        _skill_plan_block("\n" + _script_plan_block("scripts/a.py"))
+    )
+    calls = []
+
+    async def fake_complete(_messages, *_args, **_kwargs):
+        calls.append("planner")
+        return json.dumps(_ready_payload(proposed))
+
+    async def fake_cleanup(**_kwargs):
+        calls.append("final_blueprint_cleanup")
+        return cleaned
+
+    async def observe_projection(*, blueprint_text, **_kwargs):
+        calls.append("requirement_projection")
+        assert blueprint_text == cleaned
+        assert "assets/example-resource.bin" not in blueprint_text
+        raise _RequirementProjectionObserved()
+
+    _mock_creator_completion(monkeypatch, fake_complete)
+    monkeypatch.setattr(api, "_final_blueprint_cleanup", fake_cleanup)
+    monkeypatch.setattr(api, "_plan_executable_requirement_allocations", observe_projection)
+
+    with pytest.raises(_RequirementProjectionObserved):
+        await api._generate_internal_blueprint_or_questions(_request())
+
+    assert calls == ["planner", "final_blueprint_cleanup", "requirement_projection"]
 
 
 def _with_script_purpose(blueprint, target, purpose):
@@ -1080,6 +1162,9 @@ async def _run_semantic_closure_until_graph(
     async def semantic_models(messages, role, fallback_model):
         nonlocal allocations, reconciliations, review_calls, replan_calls, blueprint_calls
         system = str(messages[0].get("content") or "")
+        if "FINAL BLUEPRINT CLEANUP" in system:
+            payload = json.loads(messages[1]["content"])
+            return payload["current_complete_internal_blueprint_text"]
         if "reconciling a requirement allocation exactly once" in system:
             reconciliations += 1
             if reconciliation_responses is None:

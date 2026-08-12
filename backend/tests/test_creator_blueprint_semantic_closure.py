@@ -659,6 +659,33 @@ def test_ownerless_replan_rejects_unrelated_resource_change():
         )
 
 
+def test_resource_consistency_replan_can_remove_the_identified_resource():
+    before = _blueprint([
+        _entry("scripts/a.py"),
+        _entry("references/a.md", "Unsupported semantic material", "reference"),
+    ])
+    after = _blueprint([_entry("scripts/a.py")])
+
+    actual = api._validate_blueprint_semantic_replan_scope(
+        before_blueprint_text=before,
+        after_blueprint_text=after,
+        blocking_issues=[{
+            "issue_type": "resource_semantic_conflict",
+            "requirement_id": "R1",
+            "affected_targets": [],
+            "resource": "references/a.md",
+        }],
+        patch_manifest={
+            "changed_targets": [],
+            "added_targets": [],
+            "changed_resources": ["references/a.md"],
+        },
+    )
+
+    assert actual["actual_removed_paths"] == ["references/a.md"]
+    assert actual["actual_changed_resources"] == ["references/a.md"]
+
+
 def test_replan_uses_actual_noop_instead_of_false_manifest():
     before = _blueprint([_entry("scripts/a.py")])
     actual = api._validate_blueprint_semantic_replan_scope(

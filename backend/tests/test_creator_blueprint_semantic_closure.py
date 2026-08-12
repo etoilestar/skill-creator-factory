@@ -315,15 +315,33 @@ async def test_reviewer_unknown_requirement_is_protocol_invalid(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_resource_semantic_conflict_is_reported_by_reviewer_not_suffix_logic(monkeypatch):
-    async def complete(*_args, **_kwargs):
+    async def complete(messages, *_args, **_kwargs):
+        prompt = messages[0]["content"]
+        payload = json.loads(messages[1]["content"])
+        assert "resource_semantic_conflict` with repair_scope=blueprint" in prompt
+        assert payload["confirmed_uploaded_assets"][0]["asset_target_path"] == "assets/user.png"
+        assert payload["uploaded_resource_facts"]["unselected_uploaded_files"][0]["asset_decision"] == "unknown"
+        assert payload["revise_existing_resource_facts"] == {
+            "references": ["references/existing.md"],
+            "assets": ["assets/existing.opaque"],
+        }
         return json.dumps({"passed": False, "issues": [_review_issue(
             issue_type="resource_semantic_conflict", requirement_id="",
-            repair_scope="resource", affected_targets=["scripts/a.py"],
+            repair_scope="blueprint", affected_targets=["scripts/a.py"],
             resource="static/content.opaque",
         )], "deferred_checks": []})
     monkeypatch.setattr(api, "complete_creator_role_once", complete)
+    monkeypatch.setattr(api, "_read_prepare_existing_skill_context", lambda _name: {
+        "references": ["references/existing.md"], "assets": ["assets/existing.opaque"],
+    })
     review = await api._review_blueprint_semantic_closure(
-        request=api.PreparePlanRequest(user_request="完成责任"), blueprint_text="dependency without provenance",
+        request=api.PreparePlanRequest(
+            mode="revise", skill_name="existing-skill", user_request="完成责任",
+            uploaded_files=[
+                {"asset_decision": "include_as_asset", "asset_target_path": "assets/user.png"},
+                {"asset_decision": "unknown", "name": "candidate.opaque"},
+            ],
+        ), blueprint_text="dependency without provenance",
         function_items=[{"target_file": "scripts/a.py"}],
         requirement_allocations=[_allocation("R1", ["scripts/a.py"])],
         requirement_channels={"R1": "executable"}, planner_model="test",
@@ -456,7 +474,7 @@ def test_semantic_review_rejects_unknown_target_exactly():
 def test_resource_conflict_may_have_no_affected_target():
     review = validate_blueprint_semantic_review(
         {"passed": False, "issues": [_review_issue(
-            issue_type="resource_semantic_conflict", repair_scope="resource",
+            issue_type="resource_semantic_conflict", repair_scope="blueprint",
             affected_targets=[], resource="resources/r.opaque",
         )], "deferred_checks": []},
         allowed_function_item_targets=["scripts/a.py"],
@@ -483,15 +501,27 @@ async def test_localized_replan_prompt_requires_minimal_change(monkeypatch):
     calls = []
     async def complete(messages, *_args, **_kwargs):
         calls.append(messages)
+        payload = json.loads(messages[1]["content"])
+        assert payload["confirmed_uploaded_assets"][0]["asset_target_path"] == "assets/pending.png"
+        assert payload["revise_existing_resource_facts"]["assets"] == ["assets/existing.opaque"]
         return json.dumps({
             "internal_blueprint_text": after,
             "changed_targets": ["scripts/a.py"], "added_targets": [], "changed_resources": [],
         })
     monkeypatch.setattr(api, "complete_creator_role_once", complete)
+    monkeypatch.setattr(api, "_read_prepare_existing_skill_context", lambda _name: {
+        "references": [], "assets": ["assets/existing.opaque"],
+    })
     before = _blueprint([_entry("scripts/a.py"), _entry("scripts/b.py")])
     after = _blueprint([_entry("scripts/a.py", "revised responsibility"), _entry("scripts/b.py")])
     result = await api._replan_blueprint_for_semantic_closure(
-        request=api.PreparePlanRequest(user_request="完成 A、B、C"), blueprint_text=before,
+        request=api.PreparePlanRequest(
+            mode="revise", skill_name="existing-skill", user_request="完成 A、B、C",
+            uploaded_files=[{
+                "asset_decision": "include_as_asset",
+                "asset_target_path": "assets/pending.png",
+            }],
+        ), blueprint_text=before,
         function_items=[], requirement_allocations=[], blocking_issues=[{
             "issue_type": "responsibility_mismatch", "affected_targets": ["scripts/a.py"],
         }], planner_model="test",
@@ -499,6 +529,8 @@ async def test_localized_replan_prompt_requires_minimal_change(monkeypatch):
     assert result == after.strip()
     assert len(calls) == 1
     assert "minimum Blueprint facts" in calls[0][0]["content"]
+    assert "Do not remove existing paths" not in calls[0][0]["content"]
+    assert "planned `source=user_upload` asset does not need to have been uploaded" in calls[0][0]["content"]
 
 
 def test_replan_scope_rejects_unrelated_existing_target_change():
@@ -657,6 +689,33 @@ def test_ownerless_replan_rejects_unrelated_resource_change():
                 "changed_resources": ["references/r.md"],
             },
         )
+
+
+def test_resource_consistency_replan_can_remove_the_identified_resource():
+    before = _blueprint([
+        _entry("scripts/a.py"),
+        _entry("references/a.md", "Unsupported semantic material", "reference"),
+    ])
+    after = _blueprint([_entry("scripts/a.py")])
+
+    actual = api._validate_blueprint_semantic_replan_scope(
+        before_blueprint_text=before,
+        after_blueprint_text=after,
+        blocking_issues=[{
+            "issue_type": "resource_semantic_conflict",
+            "requirement_id": "R1",
+            "affected_targets": [],
+            "resource": "references/a.md",
+        }],
+        patch_manifest={
+            "changed_targets": [],
+            "added_targets": [],
+            "changed_resources": ["references/a.md"],
+        },
+    )
+
+    assert actual["actual_removed_paths"] == ["references/a.md"]
+    assert actual["actual_changed_resources"] == ["references/a.md"]
 
 
 def test_replan_uses_actual_noop_instead_of_false_manifest():

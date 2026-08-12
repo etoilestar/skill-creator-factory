@@ -114,6 +114,12 @@ the protocol permits omission.
 - `source=user_upload` 只描述已经由用户需求授权的 asset
   在 Creation 阶段如何提供，不构成新增 asset 的权限。
 
+- `references/**` 可由 Creator 根据 Skill 的真实语义责任规划，且主要由 Creator 模型在文件生成阶段创建；它不要求用户预先上传，也不得为补全目录而机械增加。
+
+- `assets/**` 只代表用户提供/上传或实际已有 bundled 的静态素材。新建 Skill 没有明确静态素材需求时，不得新增 asset requirement；`source=user_upload` 只表示合法规划后的上传生命周期，不提供规划权限。
+
+- runtime-generated artifact 属于 script outputs、stdout、file_outputs 或 `OUTPUT_DIR`，不是 asset，也不得放入 `references/**`。
+
 - 用户没有明确静态素材需求时，应规划不依赖额外 asset 的实现，
   不得为了 Planner 自己选择的实现方案主动要求用户上传素材。
 

@@ -358,8 +358,40 @@ function emitExecutionEvent({ phase, label, detail = '', content = [], filePath 
 // ---------------------------------------------------------------------------
 
 // File status: 'pending' | 'generating' | 'preview' | 'writing' | 'done' | 'skipped' | 'error' | 'needs_repair'
+function normalizeCreationFilePath(path) {
+  return String(path || '')
+    .trim()
+    .replace(/\\/g, '/')
+    .replace(/^\.\/+/, '')
+}
+
+function mergeCreationFilesByPath(files) {
+  const byPath = new Map()
+  for (const raw of files || []) {
+    if (!raw || typeof raw !== 'object') continue
+    const path = normalizeCreationFilePath(raw.path)
+    if (!path) continue
+    const previous = byPath.get(path)
+    if (!previous) {
+      byPath.set(path, { ...raw, path })
+      continue
+    }
+    byPath.set(path, {
+      ...previous,
+      ...raw,
+      path,
+      purpose: previous.purpose || raw.purpose || '',
+      required: Boolean(previous.required || raw.required),
+      uploaded_provided: Boolean(previous.uploaded_provided || raw.uploaded_provided),
+      asset_requirement: Boolean(previous.asset_requirement || raw.asset_requirement),
+      asset_source: raw.asset_source || previous.asset_source || '',
+    })
+  }
+  return [...byPath.values()]
+}
+
 const localFiles = ref(
-  [
+  mergeCreationFilesByPath([
     ...props.files,
     ...(props.confirmedUploadedAssets || []).map(asset => ({
       path: asset.asset_target_path,
@@ -398,7 +430,7 @@ const localFiles = ref(
       asset_source: 'user_upload',
       asset_requirement: true,
     })),
-  ]
+  ])
     .filter(f => f.asset_requirement || isMaterializedSkillFilePath(f.path))
     .sort((a, b) => (Number(a.generation_order ?? 99) - Number(b.generation_order ?? 99)) || String(a.path || '').localeCompare(String(b.path || '')))
     .map(f => ({

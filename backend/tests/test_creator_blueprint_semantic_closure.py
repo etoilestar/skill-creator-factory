@@ -282,6 +282,36 @@ async def test_empty_function_item_domain_does_not_override_executable_channel(m
     assert projection["requirement_allocations"][0]["owners"] == []
 
 
+@pytest.mark.asyncio
+async def test_requirement_projection_does_not_promote_implementation_facts(monkeypatch):
+    async def complete(messages, *_args, **_kwargs):
+        prompt = messages[0]["content"]
+        payload = json.loads(messages[1]["content"])
+        assert payload["function_items"][0]["target_file"] == "scripts/story.py"
+        normalized_prompt = " ".join(prompt.split())
+        assert "Requirement identity and requirement meaning may originate ONLY from" in normalized_prompt
+        assert "The supplied FunctionItems are NOT requirement sources" in normalized_prompt
+        assert "do NOT create a user requirement saying that capability must be forbidden" in normalized_prompt
+        assert "do NOT create a user requirement requiring that resource" in normalized_prompt
+        return json.dumps({
+            "requirement_allocations": [_allocation("R1", ["scripts/story.py"])],
+            "requirement_channels": {"R1": "executable"},
+        })
+
+    monkeypatch.setattr(api, "complete_creator_role_once", complete)
+    projection = await api._plan_requirement_allocations(
+        request=api.PreparePlanRequest(user_request="生成一个图文故事 DOCX"),
+        blueprint_text="assets/example.bin source=user_upload",
+        function_items=[{
+            "target_file": "scripts/story.py",
+            "dependencies": ["assets/example.bin"],
+            "forbidden_capabilities": ["network_access"],
+        }],
+        planner_model="test",
+    )
+    assert [item["requirement_id"] for item in projection["requirement_allocations"]] == ["R1"]
+
+
 def test_requirement_ids_are_unique_and_requirements_non_empty():
     with pytest.raises(ValueError, match="duplicate requirement_id"):
         validate_requirement_allocations(
@@ -347,6 +377,38 @@ async def test_resource_semantic_conflict_is_reported_by_reviewer_not_suffix_log
         requirement_channels={"R1": "executable"}, planner_model="test",
     )
     assert review["issues"][0]["resource"] == "static/content.opaque"
+
+
+@pytest.mark.asyncio
+async def test_unprovenanced_asset_can_trigger_existing_blueprint_repair_scope(monkeypatch):
+    async def complete(messages, *_args, **_kwargs):
+        prompt = messages[0]["content"]
+        payload = json.loads(messages[1]["content"])
+        assert payload["user_requirement"] == "没有静态素材需求"
+        assert payload["confirmed_uploaded_assets"] == []
+        assert payload["revise_existing_resource_facts"]["assets"] == []
+        assert "Requirement Projection is useful for coverage" in prompt
+        assert "are NOT independent asset provenance" in prompt
+        return json.dumps({"passed": False, "issues": [_review_issue(
+            issue_type="resource_semantic_conflict",
+            requirement_id="",
+            repair_scope="blueprint",
+            affected_targets=["scripts/a.py"],
+            resource="assets/example.bin",
+        )], "deferred_checks": []})
+
+    monkeypatch.setattr(api, "complete_creator_role_once", complete)
+    review = await api._review_blueprint_semantic_closure(
+        request=api.PreparePlanRequest(user_request="没有静态素材需求"),
+        blueprint_text="assets/example.bin source=user_upload",
+        function_items=[{"target_file": "scripts/a.py", "dependencies": ["assets/example.bin"]}],
+        requirement_allocations=[_allocation("R1", ["scripts/a.py"])],
+        requirement_channels={"R1": "executable"},
+        planner_model="test",
+    )
+    assert review["issues"][0]["issue_type"] == "resource_semantic_conflict"
+    assert review["issues"][0]["repair_scope"] == "blueprint"
+    assert review["issues"][0]["resource"] == "assets/example.bin"
 
 
 @pytest.mark.asyncio

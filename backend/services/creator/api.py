@@ -7318,6 +7318,39 @@ for exactly that same derived list. The two ID sets must be exactly equal. Do no
 return partial requirement_channels or omit structural, prohibitive, global,
 platform-level, or non-executable requirements.
 
+REQUIREMENT SOURCE AUTHORITY
+
+Requirement identity and requirement meaning may originate ONLY from
+confirmed_user_context.
+
+The supplied FunctionItems are NOT requirement sources. FunctionItems exist
+only to determine whether an already-confirmed requirement has an executable
+owner; provide ownership/evidence for an already-confirmed requirement; and
+help classify how an already-confirmed requirement is fulfilled.
+
+Never create a new requirement solely because a fact appears in FunctionItem
+purpose, inputs, outputs, dependencies, references, required_capabilities,
+forbidden_capabilities, Blueprint implementation details, resource identities,
+architecture decisions, or Planner-selected implementation constraints.
+
+A Planner-created implementation decision must never be promoted into a user
+requirement. If the Blueprint adds a static resource, do NOT create a requirement
+saying that resource must exist. If a FunctionItem contains
+forbidden_capabilities, do NOT create a user requirement saying that capability
+must be forbidden unless confirmed_user_context actually requires that
+prohibition. If a FunctionItem depends on a resource, do NOT create a user
+requirement requiring that resource unless confirmed_user_context independently
+requires it.
+
+The instruction to preserve structural, prohibitive, global, resource,
+platform-level, or non-executable requirements applies ONLY to such requirements
+that actually exist in confirmed_user_context. It does NOT authorize deriving
+new requirements from implementation facts.
+
+Before emitting every R*, silently answer: “Which confirmed user statement
+establishes this requirement?” If no confirmed user statement establishes it,
+do not emit that requirement.
+
 Channel rules:
 executable:
 A frozen FunctionItem performs a runtime action that directly fulfills the
@@ -8188,6 +8221,37 @@ examples, negative examples, protocol descriptions, and prohibitions are not
 actual file declarations. Do not infer resource semantics from filenames,
 extensions, or business keywords. Repair must target the complete Blueprint,
 not an independently edited normalized FilePlan.
+
+ASSET PROVENANCE INDEPENDENCE
+
+Blueprint, FunctionItems, dependencies, and Requirement Projection cannot
+authorize a new asset merely by referring to that asset. For every newly planned
+assets/** identity, independently verify its authorization against confirmed
+resource facts.
+
+Valid asset provenance may come from original_user_requirement; explicit user
+clarification answers contained in conversation_history; human_feedback;
+confirmed_uploaded_assets / explicit include_as_asset decisions;
+revise_existing_resource_facts; or actual bundled resource facts supplied by
+the system.
+
+The current Blueprint itself, a FunctionItem dependency or purpose,
+requirement_allocations derived from the current Blueprint/FunctionItems,
+requirement_channels, required_capabilities / forbidden_capabilities, and an
+implementation choice made by Planner are NOT independent asset provenance.
+
+This provenance cycle is invalid: Blueprint invents asset → Requirement
+Projection describes that asset as a requirement → Reviewer uses that projected
+requirement to justify the asset. Requirement Projection is useful for coverage
+and ownership review, but it must not be treated as independent authorization
+for a new asset.
+
+If a newly planned asset has no independent confirmed provenance, return
+issue_type=resource_semantic_conflict, repair_scope=blueprint, and resource=the
+exact affected asset path. The repair should remove that unsupported asset
+identity and synchronize all corresponding Blueprint dependencies/prose. Do not
+remove an authorized planned user_upload asset merely because
+materialization/upload is still pending.
 
 Classify every blocking resource consistency defect as
 `resource_semantic_conflict` with repair_scope=blueprint. Executable script
@@ -9376,8 +9440,25 @@ Blueprint Planner 只规划业务责任。
 
 - workflow 必须覆盖每一个 substantive script 的核心责任，顺序与主要数据依赖一致。
 
-- 只有用户需求或实际 Script responsibility 明确需要持久资源时才创建 references/assets；
-  能直接由 Script 或 Tool 完成的内容，不要额外创建静态模板、logo 或说明资源。
+- RESOURCE PLANNING SOURCE AUTHORITY
+
+  references/** 与 assets/** 的 planning authority 不相同。
+
+  reference：references/** 可以由 confirmed user requirement 或真实 Script semantic
+  responsibility 授权规划。当某个稳定语义规则、指导、约束确实需要作为独立静态
+  参考文件供脚本读取时，Creator 可以主动规划 reference。reference 后续主要由
+  Creator 模型生成，不要求用户上传。
+
+  asset：assets/** 不能仅由 Script responsibility、implementation choice、
+  architecture convenience 或 Planner 自己选择的实现方式授权。新建 Skill 的 asset
+  identity 只能来自 confirmed user context 中明确的静态素材意图：用户明确表示会
+  提供、上传、包含、沿用或使用某个现有静态素材。revise 模式中已存在且仍有效的
+  asset 可以保留。实际 confirmed uploaded asset 可以保留。source=bundled 只能描述实际
+  已有 bundled resource。不得先创造 asset，再通过 dependency、FunctionItem
+  responsibility、Requirement Projection 或 source=user_upload 使它合法。
+
+  因此，Script responsibility 可以独立支持新增 reference，但不能独立支持新增
+  asset。如果用户没有明确静态素材需求，必须选择不依赖额外 asset 的实现方案。
 
 - references/assets 默认应为空。reference 可在核心责任确实需要无法合理放入 Script 或现有 Tool usage
   的持久静态语义指导时规划；asset 只有用户明确要求提供、上传、包含或使用现有静态素材时才规划。

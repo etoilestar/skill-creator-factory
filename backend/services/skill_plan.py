@@ -281,6 +281,8 @@ class SkillPlanEntry:
     file_type: FileType
     role: FileRole
     purpose: str
+    must_do: list[str] = field(default_factory=list)
+    must_not_do: list[str] = field(default_factory=list)
     asset_source: str = ""
     file_kind: FileKind = "config"
     component_hint: str = ""
@@ -339,6 +341,8 @@ _ALLOWED_FUNCTION_ITEM_FIELDS = {
     "target_file",
     "role",
     "purpose",
+    "must_do",
+    "must_not_do",
     "inputs",
     "outputs",
     "required_capabilities",
@@ -408,7 +412,7 @@ def normalize_structured_function_items(raw_items: object, *, source: str = "pla
     normalized: list[dict[str, object]] = []
     seen_targets: set[str] = set()
     invalid: list[dict[str, object]] = []
-    required = set(_ALLOWED_FUNCTION_ITEM_FIELDS) - {"default_values"}
+    required = set(_ALLOWED_FUNCTION_ITEM_FIELDS) - {"default_values", "must_do", "must_not_do"}
     for index, item in enumerate(raw_items):
         if not isinstance(item, dict):
             invalid.append({"index": index, "type": type(item).__name__})
@@ -446,6 +450,8 @@ def normalize_structured_function_items(raw_items: object, *, source: str = "pla
             inputs = _normalize_port_array(item.get("inputs"), source=source, index=index, field="inputs")
             outputs = _normalize_port_array(item.get("outputs"), source=source, index=index, field="outputs")
             required_capabilities = _normalize_string_array(item.get("required_capabilities"), source=source, index=index, field="required_capabilities")
+            must_do = _normalize_string_array(item.get("must_do", []), source=source, index=index, field="must_do")
+            must_not_do = _normalize_string_array(item.get("must_not_do", []), source=source, index=index, field="must_not_do")
         except ValueError as exc:
             invalid.append({"index": index, "error": str(exc)})
             continue
@@ -479,6 +485,8 @@ def normalize_structured_function_items(raw_items: object, *, source: str = "pla
             "target_file": target,
             "role": role,
             "purpose": purpose.strip(),
+            "must_do": must_do,
+            "must_not_do": must_not_do,
             "inputs": inputs,
             "outputs": outputs,
             "required_capabilities": required_capabilities,
@@ -1169,7 +1177,7 @@ _FIELD_AMBIGUOUS_RE = re.compile(
     r"(?:[|/+&]|\b(?:or|alias|aka|alternative|alternatives)\b|或|或者|别名|候选|可选)",
     re.I,
 )
-_FIELD_LIST_NAMES_RE = r"role|inputs|outputs|dependencies|constraints|required_capabilities|optional_capabilities|allowed_capabilities|business_forbidden_capabilities|forbidden_capabilities|side_effects|required_tool_slots|language|runtime"
+_FIELD_LIST_NAMES_RE = r"role|purpose|must_do|must_not_do|inputs|outputs|dependencies|constraints|required_capabilities|optional_capabilities|allowed_capabilities|business_forbidden_capabilities|forbidden_capabilities|side_effects|required_tool_slots|language|runtime"
 
 
 def _clean_concrete_field_name(raw_item: str) -> tuple[str | None, bool]:
@@ -1207,6 +1215,8 @@ def _parse_explicit_list_field(field_name: str, *, file_path: str, purpose: str 
     raw = match.group(1)
     raw = re.split(rf"\s+(?:{_FIELD_LIST_NAMES_RE})\s*[：:=]", raw, maxsplit=1, flags=re.I)[0]
     values = [item.strip().strip("'\"") for item in re.split(r"[,，、]\s*", raw) if item.strip()]
+    if field_name in {"must_do", "must_not_do"}:
+        return values, []
     cleaned: list[str] = []
     warnings: list[str] = []
     ambiguous_seen = False
@@ -1462,6 +1472,13 @@ def build_skill_plan_entry(
             blueprint_summary=blueprint_summary,
         )
     )
+
+    explicit_must_do = _explicit_list_field(
+        "must_do", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary
+    ) or []
+    explicit_must_not_do = _explicit_list_field(
+        "must_not_do", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary
+    ) or []
 
     explicit_optional_capabilities = (
         _explicit_list_field(
@@ -1811,6 +1828,8 @@ def build_skill_plan_entry(
         file_type=file_type,
         role=role,
         purpose=purpose,
+        must_do=explicit_must_do,
+        must_not_do=explicit_must_not_do,
         file_kind=file_kind,
         component_hint=role,
         inputs=inputs,
@@ -2087,6 +2106,12 @@ def normalize_skill_plan(
     - authorize tools.
     """
 
+    structured_items_by_target = {
+        str(item.get("target_file") or ""): item
+        for item in (plan.function_items or [])
+        if isinstance(item, dict)
+    }
+
     entries: list[
         SkillPlanEntry
     ] = []
@@ -2282,6 +2307,16 @@ def normalize_skill_plan(
             entry,
 
             path=path,
+
+            must_do=list(
+                structured_items_by_target.get(path, {}).get("must_do", entry.must_do)
+                or []
+            ),
+
+            must_not_do=list(
+                structured_items_by_target.get(path, {}).get("must_not_do", entry.must_not_do)
+                or []
+            ),
 
             file_kind=(
                 file_kind_for_path(

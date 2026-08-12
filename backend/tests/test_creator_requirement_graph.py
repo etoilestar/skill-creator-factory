@@ -2150,6 +2150,8 @@ def test_responsibility_graph_uses_structured_function_items_directly():
         'outputs': ['semantic_result'],
         'required_capabilities': ['semantic_capability'],
         'constraints': [],
+        'must_do': ['Perform only the confirmed worker_a action.'],
+        'must_not_do': ['Do not perform worker_b action.'],
     }]
     graph = build_default_requirement_graph([_script_spec(path='scripts/a.py', purpose='file purpose')], responsibility_edges=[], function_items=structured)
     item = graph.function_items[0]
@@ -2157,6 +2159,24 @@ def test_responsibility_graph_uses_structured_function_items_directly():
     assert item.inputs == ['semantic_input']
     assert item.outputs == ['semantic_result']
     assert item.required_tools == ['semantic_capability']
+    assert item.must_do == structured[0]['must_do']
+    assert item.must_not_do == structured[0]['must_not_do']
+
+
+def test_structured_function_item_missing_boundaries_keeps_legacy_fallback():
+    structured = [{
+        'target_file': 'scripts/worker_a.py', 'role': 'worker',
+        'purpose': 'Perform the confirmed worker action.', 'inputs': [], 'outputs': [],
+        'required_capabilities': [], 'constraints': [],
+    }]
+    graph = build_default_requirement_graph([], responsibility_edges=[], function_items=structured)
+    item = graph.function_items[0]
+    assert item.must_do == ['Perform the confirmed worker action.']
+    assert item.must_not_do == [
+        'Do not add unrelated responsibilities to this file.',
+        'Do not replace or reimplement core responsibilities assigned to another script.',
+    ]
+    assert graph.dataflow_edges == []
 
 
 def test_graph_scope_signature_includes_excluded_function_item_fields():

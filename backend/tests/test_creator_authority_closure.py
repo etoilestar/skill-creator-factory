@@ -215,6 +215,8 @@ def test_blueprint_freeze_preserves_typed_structured_defaults():
 - path: `scripts/a.py`
   role: worker
   purpose: run
+  must_do: [Perform the confirmed worker_a action]
+  must_not_do: [Do not perform worker_b action]
   inputs: [arg_A, count, enabled, title]
   outputs: [result]
   default_values: [count=3, enabled=true, title="demo"]
@@ -236,6 +238,8 @@ def test_blueprint_freeze_preserves_typed_structured_defaults():
     )
     assert items[0]["inputs"] == ["arg_A", "count", "enabled", "title"]
     assert items[0]["default_values"] == {"count": 3, "enabled": True, "title": "demo"}
+    assert items[0]["must_do"] == ["Perform the confirmed worker_a action"]
+    assert items[0]["must_not_do"] == ["Do not perform worker_b action"]
     edges = [_edge("platform_input_node", "user_request", "scripts/a.py", "arg_A")]
     assert structured_responsibility_graph_input_provenance_gaps(items, edges) == []
 

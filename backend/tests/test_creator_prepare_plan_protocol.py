@@ -2540,6 +2540,20 @@ def test_structured_function_items_reject_unknown_fields():
         normalize_structured_function_items([item], source='planner')
 
 
+def test_structured_function_items_transport_optional_responsibility_boundaries_verbatim():
+    from backend.services.skill_plan import normalize_structured_function_items
+    item = _abstract_function_item('scripts/worker_a.py')
+    item['must_do'] = ['Preserve the confirmed transformation exactly.']
+    item['must_not_do'] = ['Do not perform worker_b responsibility.']
+    normalized = normalize_structured_function_items([item], source='planner')[0]
+    assert normalized['must_do'] == item['must_do']
+    assert normalized['must_not_do'] == item['must_not_do']
+
+    legacy = normalize_structured_function_items([_abstract_function_item('scripts/worker_b.py')], source='planner')[0]
+    assert legacy['must_do'] == []
+    assert legacy['must_not_do'] == []
+
+
 def test_structured_function_items_reject_duplicate_targets():
     from backend.services.skill_plan import normalize_structured_function_items
     with pytest.raises(ValueError, match='duplicate'):

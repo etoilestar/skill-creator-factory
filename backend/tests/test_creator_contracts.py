@@ -950,6 +950,48 @@ async def test_skill_md_reviewer_prompt_forbids_inventing_runtime_images_as_asse
     assert "不得把“Blueprint 未声明”解释为“SKILL.md 遗漏”" in prompt
 
 
+@pytest.mark.asyncio
+async def test_skill_md_reviewer_accepts_concise_authorized_resource_runtime_prose(monkeypatch):
+    from backend.services.creator import contracts
+
+    class Route:
+        model = "unit-test-model"
+
+    captured = {}
+    monkeypatch.setattr(contracts, "route_model", lambda *a, **k: Route())
+
+    async def fake_complete(messages, _role, fallback_model):
+        captured["prompt"] = "\n".join(message["content"] for message in messages)
+        captured["payload"] = messages[1]["content"]
+        return json.dumps({"passed": True, "issues": []})
+
+    monkeypatch.setattr(contracts, "complete_creator_role_once", fake_complete)
+    result = await contracts._review_skill_md_blueprint_intent_with_model(
+        skill_name="resource-consumer",
+        content=(
+            "assets/example.bin is used as a static resource by scripts/x.py.\n"
+            "scripts/x.py reads references/example.md as guidance."
+        ),
+        blueprint_text=(
+            "SkillPlan declares assets/example.bin with source=user_upload and "
+            "references/example.md for scripts/x.py."
+        ),
+        skill_plan_entry={"files": [
+            {"path": "scripts/x.py", "file_type": "script"},
+            {"path": "assets/example.bin", "file_type": "asset", "source": "user_upload"},
+            {"path": "references/example.md", "file_type": "reference"},
+        ]},
+    )
+
+    assert result["passed"] is True
+    assert result["issues"] == []
+    assert "source=user_upload is Creation-stage materialization metadata" in captured["prompt"]
+    assert "Do not interpret ‘not a runtime input’ as ‘the script may not read it’" in captured["prompt"]
+    assert "Missing internal lifecycle prose is not an unsupported resource claim" in captured["prompt"]
+    assert "assets/example.bin" in captured["payload"]
+    assert "references/example.md" in captured["payload"]
+
+
 async def _run_skill_md_resource_review(monkeypatch, payload, *, content="candidate", skill_plan_entry=None):
     from backend.services.creator import contracts
 

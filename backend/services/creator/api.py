@@ -7496,6 +7496,8 @@ allocation object and one channel entry for every requirement you derive.
             {
                 "target_file": str(item.get("target_file") or "").strip(),
                 "purpose": item.get("purpose", ""),
+                "must_do": item.get("must_do") or [],
+                "must_not_do": item.get("must_not_do") or [],
                 "inputs": item.get("inputs") or [],
                 "outputs": item.get("outputs") or [],
             }

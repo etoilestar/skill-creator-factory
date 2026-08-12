@@ -2309,12 +2309,14 @@ def normalize_skill_plan(
             path=path,
 
             must_do=list(
-                structured_items_by_target.get(path, {}).get("must_do", entry.must_do)
+                structured_items_by_target.get(path, {}).get("must_do")
+                or entry.must_do
                 or []
             ),
 
             must_not_do=list(
-                structured_items_by_target.get(path, {}).get("must_not_do", entry.must_not_do)
+                structured_items_by_target.get(path, {}).get("must_not_do")
+                or entry.must_not_do
                 or []
             ),
 

@@ -658,8 +658,6 @@ def build_default_responsibility_graph(
                     except Exception:
                         constraints.append(RequirementConstraint(name=str(raw_constraint.get("name") or "constraint"), kind=str(raw_constraint.get("kind") or "constraint"), value=raw_constraint.get("value"), comparator=str(raw_constraint.get("comparator") or "describes"), source=str(raw_constraint.get("source") or "planner"), required=bool(raw_constraint.get("required", True))))
             purpose = str(raw_item.get("purpose") or "").strip()
-            planned_must_do = raw_item.get("must_do") or []
-            planned_must_not_do = raw_item.get("must_not_do") or []
             items.append(FunctionItem(
                 target_file=str(raw_item.get("target_file") or "").strip(),
                 role=str(raw_item.get("role") or "").strip(),
@@ -669,11 +667,11 @@ def build_default_responsibility_graph(
                 outputs=[str(value) for value in raw_item.get("outputs") or []],
                 required_tools=[str(value) for value in raw_item.get("required_capabilities") or []],
                 optional_tools=[],
-                must_do=(planned_must_do if planned_must_do else ([purpose] if purpose else [])),
-                must_not_do=(planned_must_not_do if planned_must_not_do else [
-                    "Do not add unrelated responsibilities to this file.",
-                    "Do not replace or reimplement core responsibilities assigned to another script.",
-                ]),
+                must_do=[purpose] if purpose else [],
+                must_not_do=[
+                     "Do not add unrelated responsibilities to this file.",
+                     "Do not replace or reimplement core responsibilities assigned to another script.",
+                ],
                 constraints=constraints,
                 evidence_policy={
                     "first_round": "Review compact responsibility evidence in the target file.",
@@ -755,8 +753,6 @@ def build_default_responsibility_graph(
             if str(value).strip()
         ]
 
-        planned_must_do = getattr(file_spec, "must_do", None) or []
-        planned_must_not_do = getattr(file_spec, "must_not_do", None) or []
         must_do = planned_must_do if planned_must_do else ([purpose] if purpose else [])
 
         constraints: list[RequirementConstraint] = []
@@ -856,16 +852,16 @@ def build_default_responsibility_graph(
 
                 must_do=must_do,
 
-                must_not_do=(planned_must_not_do if planned_must_not_do else [
-                    (
-                        "Do not add unrelated "
-                        "responsibilities to this file."
-                    ),
-                    (
-                        "Do not replace or reimplement core "
-                        "responsibilities assigned to another script."
-                    ),
-                ]),
+                must_not_do=[
+                   (
+                       "Do not add unrelated "
+                       "responsibilities to this file."
+                   ),
+                   (
+                       "Do not replace or reimplement core "
+                       "responsibilities assigned to another script."
+                   ),
+                ],
 
                 constraints=constraints,
 

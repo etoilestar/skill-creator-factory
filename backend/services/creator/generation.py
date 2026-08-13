@@ -1076,6 +1076,14 @@ def _script_local_contract_payload(
             requirements=requirements,
         )
     )
+    planned_must_do = list(plan_entry.must_do or [])
+    planned_must_not_do = list(plan_entry.must_not_do or [])
+
+    for item in responsibility_requirements:
+        if planned_must_do:
+            item["must_do"] = planned_must_do
+        if planned_must_not_do:
+            item["must_not_do"] = planned_must_not_do
     implementation_resolution = (
         resolve_implementation(
             plan_entry,

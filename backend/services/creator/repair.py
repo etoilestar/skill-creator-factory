@@ -4963,8 +4963,96 @@ async def _run_script_responsibility_review(
     workflow_allocation_summary = str(review_context.get("workflow_allocation_summary") or "").strip()
     trial_stdout = review_context.get("trial_stdout_json", review_context.get("trial_stdout", ""))
     artifact_info = review_context.get("artifact_info", review_context.get("artifact_paths", []))
-    graph_context = function_execution_context
-    req_payload = [graph_context.get("function_item") or function_item_prompt_payload(item) for item in req_items]
+    graph_context = dict(
+        function_execution_context
+        if isinstance(function_execution_context, dict)
+        else {}
+    )
+
+    raw_graph_function_item = graph_context.get(
+        "function_item"
+    )
+
+    if isinstance(raw_graph_function_item, dict):
+        local_function_item = dict(
+             raw_graph_function_item
+        )
+    elif req_items:
+        local_function_item = (
+            function_item_prompt_payload(
+                req_items[0]
+            )
+        )
+    else:
+        local_function_item = {}
+
+    if isinstance(skill_plan_entry, dict):
+        planned_must_do = list(
+            skill_plan_entry.get("must_do") or []
+        )
+        planned_must_not_do = list(
+            skill_plan_entry.get("must_not_do") or []
+        )
+    else:
+        planned_must_do = list(
+            getattr(
+                skill_plan_entry,
+                "must_do",
+                None,
+            )
+            or []
+        )
+        planned_must_not_do = list(
+            getattr(
+                skill_plan_entry,
+                "must_not_do",
+                None,
+            )
+            or []
+        )
+
+    if planned_must_do:
+        local_function_item[
+            "must_do"
+        ] = planned_must_do
+
+    if planned_must_not_do:
+        local_function_item[
+            "must_not_do"
+        ] = planned_must_not_do
+
+    if local_function_item:
+        graph_context[
+             "function_item"
+        ] = local_function_item
+
+    req_payload = (
+        [local_function_item]
+        if local_function_item
+        else [
+            function_item_prompt_payload(item)
+            for item in req_items
+        ]
+    )
+
+    logger.info(
+        "[Creator][script_responsibility][local_contract] %s",
+        json.dumps(
+            {
+                "file_path": file_path,
+                "must_do": local_function_item.get(
+                    "must_do",
+                    [],
+                ),
+                "must_not_do": local_function_item.get(
+                    "must_not_do",
+                    [],
+                ),
+            },
+            ensure_ascii=False,
+            default=str,
+       ),
+    )
 
     messages = [
         {
@@ -5053,7 +5141,7 @@ async def _run_script_responsibility_review(
                 f"{workflow_allocation_summary[:4000]}\n\n"
 
                 "SkillPlanEntry：\n"
-                f"{json.dumps({k: getattr(skill_plan_entry, k, '') for k in ('path', 'purpose', 'role', 'component_hint')}, ensure_ascii=False, default=str)[:8000]}\n\n"
+                f"{json.dumps({k: getattr(skill_plan_entry, k, '') for k in ('path', 'purpose', 'role', 'component_hint', 'must_do', 'must_not_do')}, ensure_ascii=False, default=str)[:8000]}\n\n"
 
                 "当前文件 FunctionItem graph context（Producer/Judge shared payload）：\n"
                 f"{json.dumps(graph_context, ensure_ascii=False, default=str)[:8000]}\n\n"

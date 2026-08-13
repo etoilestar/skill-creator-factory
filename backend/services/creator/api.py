@@ -6217,8 +6217,6 @@ def _render_structured_responsibility_view(blueprint_text: str, function_items: 
     function_item_owned_fields = (
         "role",
         "purpose",
-        "must_do",
-        "must_not_do",
         "inputs",
         "outputs",
         "required_capabilities",
@@ -6226,7 +6224,7 @@ def _render_structured_responsibility_view(blueprint_text: str, function_items: 
     )
 
     def render_owned_field(field: str, item: dict[str, Any]) -> str:
-        if field in {"inputs", "outputs", "required_capabilities", "must_do", "must_not_do"}:
+        if field in {"inputs", "outputs", "required_capabilities"}:
             value = json.dumps(item.get(field) or [], ensure_ascii=False)
         elif field == "constraints":
             value = json.dumps(item.get(field) or [], ensure_ascii=False, default=str)
@@ -6815,8 +6813,6 @@ def _frozen_function_items_from_blueprint(
             "target_file": entry.path,
             "role": str(entry.role),
             "purpose": entry.purpose,
-            "must_do": list(entry.must_do or []),
-            "must_not_do": list(entry.must_not_do or []),
             "inputs": list(entry.inputs),
             "outputs": list(entry.outputs),
             "required_capabilities": list(entry.required_capabilities),
@@ -7496,8 +7492,6 @@ allocation object and one channel entry for every requirement you derive.
             {
                 "target_file": str(item.get("target_file") or "").strip(),
                 "purpose": item.get("purpose", ""),
-                "must_do": item.get("must_do") or [],
-                "must_not_do": item.get("must_not_do") or [],
                 "inputs": item.get("inputs") or [],
                 "outputs": item.get("outputs") or [],
             }

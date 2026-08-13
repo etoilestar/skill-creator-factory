@@ -753,7 +753,7 @@ def build_default_responsibility_graph(
             if str(value).strip()
         ]
 
-        must_do = planned_must_do if planned_must_do else ([purpose] if purpose else [])
+        must_do = [purpose] if purpose else []
 
         constraints: list[RequirementConstraint] = []
         raw_constraints = getattr(file_spec, "constraints", None) or []

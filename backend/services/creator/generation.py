@@ -1139,6 +1139,30 @@ def _script_local_contract_payload(
     else:
         function_execution_context = dict(function_execution_context)
 
+    local_function_item = function_execution_context.get(
+        "function_item"
+    )
+
+    if isinstance(local_function_item, dict):
+        local_function_item = dict(local_function_item)
+    else:
+        local_function_item = {}
+
+    if planned_must_do:
+        local_function_item["must_do"] = list(
+            planned_must_do
+        )
+
+    if planned_must_not_do:
+        local_function_item["must_not_do"] = list(
+            planned_must_not_do
+        )
+
+    if local_function_item:
+        function_execution_context[
+            "function_item"
+        ] = local_function_item
+
     projection_gaps = (
         _bound_callable_tool_contract_projection_gaps(
             tool_binding_summary

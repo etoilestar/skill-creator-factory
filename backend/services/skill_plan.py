@@ -450,8 +450,6 @@ def normalize_structured_function_items(raw_items: object, *, source: str = "pla
             inputs = _normalize_port_array(item.get("inputs"), source=source, index=index, field="inputs")
             outputs = _normalize_port_array(item.get("outputs"), source=source, index=index, field="outputs")
             required_capabilities = _normalize_string_array(item.get("required_capabilities"), source=source, index=index, field="required_capabilities")
-            must_do = _normalize_string_array(item.get("must_do", []), source=source, index=index, field="must_do")
-            must_not_do = _normalize_string_array(item.get("must_not_do", []), source=source, index=index, field="must_not_do")
         except ValueError as exc:
             invalid.append({"index": index, "error": str(exc)})
             continue
@@ -485,8 +483,6 @@ def normalize_structured_function_items(raw_items: object, *, source: str = "pla
             "target_file": target,
             "role": role,
             "purpose": purpose.strip(),
-            "must_do": must_do,
-            "must_not_do": must_not_do,
             "inputs": inputs,
             "outputs": outputs,
             "required_capabilities": required_capabilities,
@@ -2106,12 +2102,6 @@ def normalize_skill_plan(
     - authorize tools.
     """
 
-    structured_items_by_target = {
-        str(item.get("target_file") or ""): item
-        for item in (plan.function_items or [])
-        if isinstance(item, dict)
-    }
-
     entries: list[
         SkillPlanEntry
     ] = []
@@ -2309,14 +2299,12 @@ def normalize_skill_plan(
             path=path,
 
             must_do=list(
-                structured_items_by_target.get(path, {}).get("must_do")
-                or entry.must_do
+                entry.must_do
                 or []
             ),
 
             must_not_do=list(
-                structured_items_by_target.get(path, {}).get("must_not_do")
-                or entry.must_not_do
+                entry.must_not_do
                 or []
             ),
 

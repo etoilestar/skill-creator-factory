@@ -5142,6 +5142,61 @@ def _preflight_prepare_blueprint_text(
 
     return issues
 
+def _collect_prepare_blueprint_protocol_issues(
+    blueprint_text: str,
+    allowed_resource_paths: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Collect all repairable Blueprint protocol issues at one boundary."""
+
+    issues: list[dict[str, Any]] = []
+
+    try:
+        validate_blueprint_shape_for_creator(
+            blueprint_text
+        )
+    except BlueprintShapeError as exc:
+        issues.append(
+            _prepare_protocol_issue(
+                "invalid_strict_blueprint_shape",
+                str(exc),
+                field="internal_blueprint_text",
+            )
+        )
+
+    issues.extend(
+        _preflight_prepare_blueprint_text(
+            blueprint_text,
+            allowed_resource_paths,
+        )
+        if allowed_resource_paths is not None
+        else _preflight_prepare_blueprint_text(
+            blueprint_text
+        )
+    )
+
+    # Generic deduplication only.
+    deduplicated: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+
+        identity = (
+            str(issue.get("code") or ""),
+            str(issue.get("path") or ""),
+            str(issue.get("field") or ""),
+            str(issue.get("message") or ""),
+        )
+
+        if identity in seen:
+            continue
+
+        seen.add(identity)
+        deduplicated.append(issue)
+
+    return deduplicated
+
 
 def _prepare_blueprint_has_required_protocol_shape(blueprint_text: str) -> bool:
     text = str(blueprint_text or "")
@@ -5348,9 +5403,9 @@ async def _repair_prepare_blueprint_protocol(
             code == "unjustified_resource_reference" for code in issue_codes
         )
         original_non_resource_paths = (
-            _extract_prepare_non_resource_paths(repaired)
-            if is_resource_authority_repair
-            else []
+            _extract_prepare_non_resource_paths(
+                repaired
+            )
         )
         logger.info(
             "[Creator][blueprint_repair] attempt=%d issue_codes=%s issue_paths=%s",
@@ -5379,16 +5434,34 @@ async def _repair_prepare_blueprint_protocol(
 
 修复要求：
 
-- 只根据 protocol_errors 修复对应协议问题。
-- protocol_errors 中的 code、path、message、actual 是本轮必须直接消除的 validator 反馈。
-- 保留已经正确的业务目标。
-- 保留已经正确的文件职责。
-- 保留已经正确的脚本文件拓扑。
-- 不新增与 protocol_errors 无关的业务流程。
+你执行的是 incremental protocol repair，不是重新生成 Blueprint。
 
-这是 Blueprint 返修，不是重新规划 Skill。必须保持已经正确的用户核心需求、Script 划分、
-Script responsibility、inputs/outputs、workflow 主线和 FilePlan。优先只修 validator 指出的
-问题及必要关联内容；不得因局部格式错误重命名所有字段、重新拆 Script、新增 resources 或改变核心 workflow。
+唯一目标：
+消除 protocol_errors 中明确指出的协议错误。
+
+严格遵守：
+
+1. 已经存在且没有被 protocol_errors 指出的内容必须原样保留。
+2. 缺少字段时，只在对应的现有 `- path:` entry 中追加缺失字段。
+3. 缺少固定协议章节时，只追加该缺失章节。
+4. 如果字段已经存在，不得为了“优化”而改写它。
+5. 不得新增、删除、重命名或拆分任何已有 `SKILL.md` / `scripts/*` path。
+6. 不得改变 script topology。
+7. 不得改变已有 workflow 主线。
+8. 不得改变已有 role、purpose、must_do、must_not_do、required_capabilities、
+   forbidden_capabilities，除非 protocol_errors 明确指出该字段本身有错误。
+9. 不得因为补充 inputs / outputs 而决定 source、binding、placeholder、
+   endpoint、exact provenance 或最终 command；这些属于后续 InterfacePlan /
+   ResponsibilityGraph。
+10. dependencies / references 缺失时，如果当前 Blueprint 没有已经声明且合法的
+    静态资源依赖，可以补为空数组 `[]`；不得为了填字段而创建新的 reference 或 asset。
+11. 不得增加 confirmed_user_context 中不存在的新业务要求、数字限制、
+    输出格式、质量条件或禁止项。
+12. 修复前后，除 protocol_errors 所涉及的最小字段/章节外，其余 Blueprint
+    语义和文件身份应保持不变。
+
+返回的 internal_blueprint_text 仍然必须是完整 Blueprint，
+但它应当等于“原 Blueprint + 最小必要修复”，而不是重新规划后的新 Blueprint。
 
 Creator 协议边界：
 
@@ -5498,10 +5571,20 @@ Creator 协议边界：
         # protocol repairs can correct an invalid script path reported by their
         # validator feedback.
         if (
-            is_resource_authority_repair
-            and _extract_prepare_non_resource_paths(candidate)
-            != original_non_resource_paths
+                _extract_prepare_non_resource_paths(
+                    candidate
+                )
+                != original_non_resource_paths
         ):
+            logger.warning(
+                "[Creator][blueprint_repair]"
+                "[rejected_topology_change] "
+                "before=%s after=%s",
+                original_non_resource_paths,
+                _extract_prepare_non_resource_paths(
+                    candidate
+                ),
+            )
             continue
 
         candidate_errors = (
@@ -8985,15 +9068,10 @@ Return the complete corrected Blueprint only.
     if cleaned.startswith("```"):
         cleaned = re.sub(r"^```(?:markdown|md)?\s*", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\s*```$", "", cleaned).strip()
-    cleaned = _normalize_prepare_blueprint_references(cleaned)
-    validate_blueprint_shape_for_creator(cleaned)
-    parse_blueprint([{"role": "assistant", "content": cleaned}], strict=True)
-    preflight_issues = _preflight_prepare_blueprint_text(cleaned)
-    if preflight_issues:
-        raise PreparePlanProtocolError(
-            "Final Blueprint Cleanup failed strict FilePlan validation: "
-            f"{preflight_issues}"
-        )
+    cleaned = _normalize_prepare_blueprint_references(
+        cleaned
+    )
+
     return cleaned
 
 
@@ -9908,21 +9986,8 @@ Blueprint Planner 只规划业务责任。
             "function_items": [],
             "responsibility_edges": [],
         }
-        protocol_errors = []
-        try:
-            validate_blueprint_shape_for_creator(
-                frozen_blueprint_text
-            )
-        except BlueprintShapeError as exc:
-            protocol_errors.append(
-                _prepare_protocol_issue(
-                    "invalid_strict_blueprint_shape",
-                    str(exc),
-                    field="internal_blueprint_text",
-                )
-            )
-        protocol_errors.extend(
-            _preflight_prepare_blueprint_text(
+        protocol_errors = (
+            _collect_prepare_blueprint_protocol_issues(
                 frozen_blueprint_text,
                 allowed_resource_paths,
             )
@@ -9945,18 +10010,12 @@ Blueprint Planner 只规划业务责任。
                     f"repair_index={repair_index}; error={type(exc).__name__}: {exc}"
                 ) from exc
 
-            protocol_errors = []
-            try:
-                validate_blueprint_shape_for_creator(frozen_blueprint_text)
-            except BlueprintShapeError as exc:
-                protocol_errors.append(_prepare_protocol_issue(
-                    "invalid_strict_blueprint_shape", str(exc),
-                    field="internal_blueprint_text",
-                ))
-            protocol_errors.extend(_preflight_prepare_blueprint_text(
-                frozen_blueprint_text,
-                allowed_resource_paths,
-            ))
+            protocol_errors = (
+                _collect_prepare_blueprint_protocol_issues(
+                    frozen_blueprint_text,
+                    allowed_resource_paths,
+                )
+            )
         if protocol_errors:
             raise PreparePlanProtocolError(
                 "Planner ready Blueprint failed strict FilePlan preflight "

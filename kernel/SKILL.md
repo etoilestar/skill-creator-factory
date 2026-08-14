@@ -178,7 +178,11 @@ the protocol permits omission.
 > 每一个将被 Creator 创建的文件都必须在这里显式声明职责合同；scripts/ 文件必须选择一个 role，不要留空。
 > `required_capabilities` / `forbidden_capabilities` 必须由模型基于当前文件的真实运行需求显式声明；不要因为相邻概念、全局描述、文件名或业务描述自动扩展能力。后端只校验显式能力是否在当前 role 边界内，不会用业务词补 capability；资源文件（`SKILL.md`、`references/*.md`、`assets/*`）不声明 runtime capabilities。helper_required 能力必须调用平台 runtime helper；helper_preferred/self_implementation_allowed 能力可按 Tool Registry 指引使用 helper 或自实现。
 > 文件计划只包含 Creator 需要创建或上传的源文件：`SKILL.md`、`scripts/*`、`references/*`、`assets/*` 静态素材。目录结构只展示目录级结构，不要列具体 `scripts/*`、`references/*`、`assets/*` 文件名；具体文件只能出现在 SkillPlan / 文件职责计划中。如果目录结构中列出了具体文件，则必须与 SkillPlan path 完全一致，否则视为 invalid blueprint。`assets/*` 必须显式声明 `source: user_upload` 或 `source: bundled`；如不需要 assets，不要输出任何 assets path。用户运行 Skill 时上传或粘贴的输入文件不属于 Creator assets，应写入 I/O 契约和脚本 inputs。脚本运行后生成的 PDF/DOCX/PPTX/图片/JSON/中间文件/最终结果不得写入目录结构或 `assets/*` 文件计划；它们只能写在对应脚本的 `outputs`、stdout JSON schema、`file_paths` / `file_outputs` 中。`dependencies` 只能表示运行前要读取的输入依赖，不得填写输出目录、最终产物目录、动态文件名或脚本运行后才生成的文件。最终文件产物应由脚本运行时写入 `OUTPUT_DIR` 并通过 stdout JSON 返回路径。
-> `inputs` / `outputs` 必须是确定字段名列表，不要写候选字段、别名字段或组合表达；若存在多种可能，请先选定一个字段名。蓝图第一轮只检查文件边界、role/capability、安全边界、命令块基础格式和 JSON argv 可解析性，不在蓝图阶段要求脚本 output 必须被后续 input 静态同名消费；内部字段流转由第二轮 E2E 真实执行验证。
+`inputs` / `outputs` 只声明当前 script 的逻辑接收端口与逻辑输出端口，必须使用确定字段名，不要写候选字段、别名字段或组合表达。
+Blueprint 只负责确定 script topology、职责边界以及逻辑 inputs / outputs，不负责决定这些端口的最终运行时来源、source_path、placeholder、endpoint、argv value binding 或跨节点接口绑定。
+同一逻辑输入最终来自 platform input、另一个 FunctionItem output，还是其他合法运行时来源，由后续 Interface Planner 决定并由 ResponsibilityGraph 冻结。
+Blueprint 中不得为了描述执行方式而新增不属于当前 SkillPlan inputs 的 argv 字段，也不得提前猜测跨节点数据如何绑定。
+当 Blueprint 中的接口性描述与后续冻结的 InterfacePlan / ResponsibilityGraph 冲突时，以冻结后的 InterfacePlan / ResponsibilityGraph 为唯一运行时接口事实。
 > 下方 `scripts/<name>.py` 只表示一个 script responsibility entry 的字段结构，不表示默认只创建一个脚本。必须先根据任务复杂度和责任边界确定 script topology，再为每个独立脚本职责重复声明完整 entry。简单任务可以只有 1 个 script；中等或复杂任务通常形成 2～3 个清晰责任 script；不得为了套用单个示例而把多个独立责任压缩进一个文件，也不得为了模块化而机械拆分。
 
 - path: `SKILL.md`
@@ -238,9 +242,36 @@ the protocol permits omission.
 
 ### 宿主执行方式
 - **直接回答**: [哪些请求由模型直接生成文本/Markdown]
-- **需要脚本/命令**: assistant 必须在 Sandbox 当轮回复中输出标准 Markdown fenced code block（如 ```bash ... ```），宿主只执行当轮回复中出现的 block。脚本命令必须使用标准 JSON object argv，不要生成位置参数命令说明；JSON argv 值中不得写 `{{input_files[0]}}`、`{{references/...}}`、`{{assets/...}}` 等复杂模板表达式。运行时输入文件使用 `__RUNTIME_INPUT_FILE__` / `__RUNTIME_INPUT_FILE_0__` 等安全占位符；reference/assets 文件使用普通相对路径字符串（如 `references/parse_rules.md`）；模型名称使用 `TEXT_MODEL`。每个核心命令附近必须写 **argv JSON contract**，声明每个 argv 字段的 type、source、placeholder/path、required。
+- **需要脚本/命令**: Blueprint 阶段只描述需要执行哪些 substantive scripts 以及它们的逻辑执行顺序，不生成最终 bash command，不生成具体 JSON argv value，不声明 source_kind、source_path、placeholder、exact provenance 或 endpoint mapping。
+  Blueprint 中 script 的 `inputs` / `outputs` 是后续 Interface Planner 的逻辑端口候选，不是最终运行时绑定。
+  最终 script command、JSON argv、placeholder 和字段来源必须在 ResponsibilityGraph 冻结后，根据当前 script 的 canonical argv contract 与 Graph exact_target_provenance 生成。
+  Blueprint 中不得通过示例命令新增、补充或猜测 SkillPlan.inputs 中不存在的参数。
 - **禁止隐式执行**: 不要把行内脚本路径或“立即调用脚本”的自然语言当成执行触发器；脚本存在只代表可用资源和安全校验条件。只有在运行时当轮回复中输出标准 ```bash fenced code block，宿主才会解析并执行命令。
 - **执行后回答**: assistant 必须等待宿主返回 stdout/stderr/observation 后，再基于 observation 生成最终回答。最终 SKILL.md 只描述运行时触发、命令、observation 消费和结果返回，不得包含“输出蓝图等待确认”“用户确认后开始创建文件”等 Creator 创建阶段动作。
+
+### Blueprint 接口 authority
+
+Blueprint 是接口规划的上游语义草案，不是最终 runtime interface authority。
+
+Blueprint 权威字段仅包括：
+- script identity
+- responsibility boundary
+- logical inputs
+- logical outputs
+- dependencies/resources
+- capabilities
+
+以下事实不属于 Blueprint authority：
+- 某个 input 的最终 source
+- platform_to_member / member_to_member / member_to_platform 选择
+- source_path
+- endpoint identity
+- placeholder
+- JSON argv value
+- exact_target_provenance
+- 最终 command block
+
+这些事实由后续 InterfacePlan / ResponsibilityGraph 确定。Graph 冻结后，下游 Generation、SKILL.md 与 E2E 均不得使用 Blueprint 中冲突的接口性描述覆盖 Graph。
 
 ### 资源清单
 - [ ] [仅列静态 references 和 Creator 创建阶段静态 assets；不要列运行时输入、运行时中间数据或最终生成产物]

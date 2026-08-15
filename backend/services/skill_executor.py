@@ -353,6 +353,27 @@ def build_skill_runtime_env(
 
     # Resolve directories
     cwd = execution_root or skill_dir
+
+    output_dir = (
+        cwd / "outputs"
+        if cwd is not None
+        else None
+    )
+
+    # OUTPUT_DIR is a host-owned runtime directory.
+    # Materialize it before generated scripts execute so scripts can
+    # directly create OUTPUT_DIR/<artifact> without depending on
+    # pre-existing workspace layout.
+    if (
+            output_dir is not None
+            and cwd is not None
+            and cwd.is_dir()
+    ):
+        output_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
     api_key = (
         settings.llm_api_key
         or settings.openai_api_key

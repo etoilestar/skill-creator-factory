@@ -7434,42 +7434,68 @@ Before emitting every R*, silently answer: “Which confirmed user statement
 establishes this requirement?” If no confirmed user statement establishes it,
 do not emit that requirement.
 
-Channel rules:
+Channel rules classify requirements by FULFILLMENT MECHANISM,
+not by grammatical form or whether the requirement is positive,
+negative, structural, or restrictive.
+
 executable:
-A frozen FunctionItem performs a runtime action that directly fulfills the
-requirement. At least one owner is required. Every executable requirement must
-have at least one owner.
+One or more frozen FunctionItems must perform or actively enforce
+runtime behavior that directly fulfills the requirement.
+
+This includes requirements that constrain the runtime behavior or
+runtime output of a FunctionItem. A prohibition, quality condition,
+format condition, or behavioral constraint may therefore be executable
+when a FunctionItem must actively satisfy it at runtime.
+
+Every executable requirement must have at least one truthful frozen
+FunctionItem owner.
 
 resource:
-A structural rule, prohibition, static resource condition, architecture
-constraint, capability boundary, file-topology condition, or non-runtime-script
-obligation. owners must be empty.
+The requirement is fulfilled by the existence, content, availability,
+or frozen state of a non-executable resource or non-runtime structural fact,
+rather than by runtime behavior performed by a FunctionItem.
+
+resource requirements must have owners=[].
+
+Do NOT classify a requirement as resource merely because it is:
+- a prohibition;
+- a constraint;
+- a quality condition;
+- a formatting condition;
+- a capability restriction;
+- phrased as "must not";
+- globally applicable.
+
+If satisfying the requirement requires a frozen FunctionItem to behave
+in a particular way at runtime, classify by that runtime responsibility
+rather than by the requirement's wording.
 
 direct:
-The host platform or assistant directly handles the final responsibility rather
-than a frozen FunctionItem. owners must be empty.
+The host platform or assistant directly fulfills the responsibility
+without a frozen FunctionItem performing the substantive runtime action.
 
-A requirement is not executable merely because it is important, enforceable, or
-must eventually be validated. Validation stage and execution ownership are
-different concepts.
+direct requirements must have owners=[].
 
 CHANNEL SELF-CHECK
 
-For every requirement, ask:
+For every requirement, decide in this order:
 
-1. Is the requirement fulfilled by a runtime action performed by one or more
-   frozen FunctionItems? If yes, executable may be appropriate.
-2. Does the requirement instead constrain structure, topology, protocol,
-   permissions, prohibited behavior, file production, capability boundaries, or
-   how runtime actions must behave? If yes, resource is normally appropriate.
-3. Is the host platform or assistant directly responsible for the final action?
-   If yes, direct may be appropriate.
+1. Must one or more frozen FunctionItems actively perform or enforce
+   runtime behavior to fulfill this requirement?
+   If yes, use executable and assign only truthful owners.
 
-Do not classify a requirement as executable merely because every FunctionItem
-must comply with it, violating it would cause runtime failure, it is important,
-it must be validated later, it affects output behavior, it defines an execution
-protocol, or it restricts capabilities. Do not assign every FunctionItem as
-owner merely because every FunctionItem is governed by the same rule.
+2. Is the requirement fulfilled solely by a static/non-runtime resource
+   or frozen structural fact, with no FunctionItem runtime action owning
+   its fulfillment?
+   If yes, use resource and owners=[].
+
+3. Is the substantive responsibility fulfilled directly by the host
+   platform or assistant?
+   If yes, use direct and owners=[].
+
+Never choose a channel merely to make owner validation pass.
+Never remove a truthful runtime owner merely to justify a resource channel.
+Never invent an owner merely to justify an executable channel.
 
 3. INVARIANTS
 Never assign all FunctionItems merely to satisfy the non-empty owner rule. For
@@ -7605,21 +7631,52 @@ allocation object and one channel entry for every requirement you derive.
     }
 
 
-def _validate_requirement_projection_protocol(text: str) -> dict[str, Any]:
+def _validate_requirement_projection_protocol(
+    text: str,
+) -> dict[str, Any]:
     """Validate transport/schema only; ownership semantics are a later stage."""
+
     data = _parse_prepare_plan_json(text)
-    if set(data) != {"requirement_allocations", "requirement_channels"}:
+
+    if set(data) != {
+        "requirement_allocations",
+        "requirement_channels",
+    }:
         raise PreparePlanProtocolError(
-            "Requirement Projection must contain exactly requirement_allocations and requirement_channels"
+            "Requirement Projection must contain exactly "
+            "requirement_allocations and requirement_channels"
         )
-    allocations = _validate_requirement_allocations_for_ownership(
-        data["requirement_allocations"]
+
+    allocations = (
+        _validate_requirement_allocations_for_ownership(
+            data["requirement_allocations"]
+        )
     )
-    channels = _validate_requirement_channels_for_ownership(
-        data["requirement_channels"]
+
+    channels = (
+        _validate_requirement_channels_for_ownership(
+            data["requirement_channels"]
+        )
     )
-    _validate_requirement_channels(channels, allocations)
-    return {"requirement_allocations": allocations, "requirement_channels": channels}
+
+    # Transport layer validates identity closure only.
+    # Owner/channel semantic legality belongs to the
+    # dedicated ownership validation/repair stage.
+    allocation_ids = [
+        item["requirement_id"]
+        for item in allocations
+    ]
+
+    if set(channels) != set(allocation_ids):
+        raise PreparePlanProtocolError(
+            "Requirement Projection channel IDs must exactly "
+            "match requirement allocation IDs"
+        )
+
+    return {
+        "requirement_allocations": allocations,
+        "requirement_channels": channels,
+    }
 
 
 async def _reformat_requirement_projection_response(
@@ -7821,11 +7878,26 @@ The Blueprint and all FunctionItems are frozen. Do not create, delete, merge,
 split, rename, or rewrite FunctionItems. Do not modify target_file values. Do
 not modify requirement IDs or requirement text.
 
-For each affected requirement choose only one semantic repair:
-A. Keep the executable channel and assign one or more frozen FunctionItem
-   target_file values that truthfully own the runtime responsibility.
-B. Change the requirement to the appropriate non-executable channel when no
-   frozen FunctionItem truthfully owns its runtime fulfillment.
+For each affected requirement, choose channel and owners from the
+requirement's actual fulfillment mechanism.
+
+- If one or more frozen FunctionItems must actively perform or enforce
+  runtime behavior that fulfills the requirement, use executable and
+  assign only those truthful owners.
+
+- Use resource only when fulfillment depends on a non-executable
+  static resource or frozen non-runtime structural fact and no
+  FunctionItem runtime action owns fulfillment.
+
+- Use direct only when the host platform or assistant directly fulfills
+  the substantive responsibility.
+
+A prohibition, constraint, quality condition, formatting condition,
+or "must not" wording is NOT by itself a reason to use resource.
+
+Do not change channel merely because the current owners list is empty.
+Do not empty owners merely to make a resource/direct channel valid.
+Do not invent owners merely to make executable valid.
 
 Every existing requirement allocation must remain present exactly once and in
 its current array position. Do not add or remove requirement allocations. For
@@ -16390,7 +16462,50 @@ async def generate_file(request: GenerateFileRequest):
                             request.file_path,
                             json.dumps(_tool_binding_log_summary(repair_current_file_binding), ensure_ascii=False),
                         )
+                    repair_failed_checks_text = failed_checks_text
 
+                    if isinstance(original_exc, ContractValidationError):
+                        structured_failures = []
+
+                        for result in original_exc.results or []:
+                            if result.passed:
+                                continue
+
+                            details = (
+                                result.details
+                                if isinstance(result.details, dict)
+                                else {}
+                            )
+
+                            issue = (
+                                details.get("issue")
+                                if isinstance(details.get("issue"), dict)
+                                else {}
+                            )
+
+                            repair_ops = issue.get("repair_ops")
+
+                            if not isinstance(repair_ops, list) or not repair_ops:
+                                repair_ops = details.get("repair_ops")
+
+                            if isinstance(repair_ops, list) and repair_ops:
+                                structured_failures.append({
+                                    "id": result.id,
+                                    "target": result.target,
+                                    "message": result.message,
+                                    "expected": result.expected,
+                                    "minimal_edit": result.minimal_edit,
+                                    "repair_ops": repair_ops,
+                                })
+
+                        if structured_failures:
+                            repair_failed_checks_text = json.dumps(
+                                {
+                                    "failures": structured_failures,
+                                },
+                                ensure_ascii=False,
+                                default=str,
+                            )
                     if single_block_locator is None:
                         repaired_candidate = await _repair_generated_file_with_feedback(
                             prompt_messages=prompt_messages,
@@ -16401,7 +16516,7 @@ async def generate_file(request: GenerateFileRequest):
                             targeted_repair=targeted_repair,
                             contract_text=contract_text,
                             passed_checks_text=passed_checks_text,
-                            failed_checks_text=failed_checks_text,
+                            failed_checks_text=repair_failed_checks_text,
                             repair_mode=repair_mode,
                             skill_plan_entry=effective_skill_plan_entry,
                             import_guard_result=repair_import_guard_result,

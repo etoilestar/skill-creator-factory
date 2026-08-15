@@ -1665,12 +1665,88 @@ def _deterministic_skill_md_blueprint_alignment_checks(
     blueprint_text: str,
     skill_plan_entry: dict[str, Any] | None = None,
 ) -> list[ContractCheckResult]:
-    """Do not use regex to judge SKILL.md blueprint semantic alignment.
+    """Validate concrete resource identity closure only.
 
-    SKILL.md 是否覆盖蓝图规划任务、是否误把示例路径当真实文件、
-    capability 是否越界、workflow 是否完整，全部由模型审查。
+    Semantic alignment remains model-owned.
+    Concrete references/assets identity is protocol-owned and deterministic.
     """
-    return []
+
+    constraints = _collect_blueprint_skillplan_constraints(
+        blueprint_text=blueprint_text,
+        skill_plan_entry=skill_plan_entry,
+    )
+
+    authoritative_resources = (
+        set(constraints["declared_references"])
+        | set(constraints["declared_assets"])
+    )
+
+    mentioned_resources = {
+        path
+        for path in _extract_declared_skill_paths(
+            content
+        )
+        if (
+            (
+                path.startswith("references/")
+                and path != "references/"
+            )
+            or (
+                path.startswith("assets/")
+                and path != "assets/"
+            )
+        )
+    }
+
+    unauthorized_resources = sorted(
+        mentioned_resources
+        - authoritative_resources
+    )
+
+    if not unauthorized_resources:
+        return []
+
+    return [
+        ContractCheckResult(
+            id="skill_md.resource.authority_closure",
+            passed=False,
+            target="SKILL.md",
+            message=(
+                "SKILL.md 引用了 authoritative FilePlan "
+                "之外的本地静态资源："
+                + ", ".join(
+                    unauthorized_resources
+                )
+            ),
+            expected=(
+                "SKILL.md 中具体 references/** 和 "
+                "assets/** 文件 identity 必须来自 "
+                "authoritative / declared SkillPlan paths。"
+            ),
+            minimal_edit=(
+                "只从 SKILL.md 删除这些未授权资源引用；"
+                "不得修改 Blueprint/FilePlan，"
+                "也不得创建新资源来迁就 SKILL.md。"
+            ),
+            matched_paths=unauthorized_resources,
+            details={
+                "unauthorized_resource_paths": (
+                    unauthorized_resources
+                ),
+                "authoritative_references": sorted(
+                    constraints[
+                        "declared_references"
+                    ]
+                ),
+                "authoritative_assets": sorted(
+                    constraints[
+                        "declared_assets"
+                    ]
+                ),
+            },
+            layer="skill_md_intent_alignment",
+        )
+    ]
 
 
 def _compact_requirement_graph_for_skill_md_review(raw_graph: Any) -> dict[str, Any]:

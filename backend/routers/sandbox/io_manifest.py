@@ -58,7 +58,8 @@ def build_input_envelope(request: SandboxChatRequest, execution_root: Path | Non
             "mime_type": mime,
             "media_family": mime.partition("/")[0] + "/*",
             "model_access": "inline_image" if mime.startswith("image/") and safe else ("text_preview" if preview is not None else "path_only"),
-            "relative_to_input_dir": "/".join(Path(rel).parts[2:]) if len(Path(rel).parts) > 2 else filename,
+            "relative_to_input_dir": "/".join(Path(rel).parts[1:]) if len(Path(rel).parts) > 1 else filename,
+            "relative_to_input_session_dir": "/".join(Path(rel).parts[2:]) if len(Path(rel).parts) > 2 else filename,
             **({"text_preview": preview} if preview is not None else {}),
         })
     return {

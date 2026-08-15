@@ -241,7 +241,7 @@
 <script setup>
 import { ref, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { fetchSkills } from '../composables/useSkills.js'
-import { streamChat, confirmPlan, streamConfirmResponse } from '../composables/useChat.js'
+import { clearSandboxRoundResult, streamChat, confirmPlan, streamConfirmResponse } from '../composables/useSandboxChat.js'
 import ChatBubble from '../components/ChatBubble.vue'
 import ThinkingPanel from '../components/ThinkingPanel.vue'
 import TaskPlanPanel from '../components/TaskPlanPanel.vue'
@@ -377,8 +377,7 @@ function resetChat() {
   uploadError.value = ''
   sessionId.value = newSessionId()
   roundOutputFiles.value = []
-  resultManifest.value = null
-  resultManifest.value = null
+  clearSandboxRoundResult(resultManifest)
   thoughts.value = []
   skippedSteps.value = []
   currentPlanPreview.value = null
@@ -465,6 +464,7 @@ async function send() {
   streamBuffer.value = ''
   currentStatus.value = null
   roundOutputFiles.value = []
+  clearSandboxRoundResult(resultManifest)
   thoughts.value = []           // clear previous round's thoughts
   skippedSteps.value = []       // clear previous round's skipped steps
   currentPlanPreview.value = null
@@ -583,6 +583,7 @@ async function confirmCurrentPlan() {
   streamBuffer.value = ''
   thoughts.value = []
   roundOutputFiles.value = []
+  clearSandboxRoundResult(resultManifest)
   executingIndex.value = -1
   completedIndices.value = []
 

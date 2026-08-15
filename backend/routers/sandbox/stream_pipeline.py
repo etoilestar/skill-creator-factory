@@ -22,6 +22,7 @@ from ...services.kernel_loader import (
 from ...services.llm_proxy import complete_chat_once, stream_chat
 from ...services.model_router import (
     TEXT_TASK,
+    VISION_TASK,
     infer_sandbox_response_task,
     route_model,
 )
@@ -435,8 +436,7 @@ def _make_stream(skill_context: dict, request: SandboxChatRequest):
                         session_state.augmented_body_prompt = body_prompt
                         session_state.cache_artifact(StepName.RESOURCES, resource_decision)
 
-            if getattr(request, "input_files", None):
-                body_prompt += "\n\n## Sandbox Input Envelope\n" + json.dumps(input_envelope, ensure_ascii=False)
+            body_prompt += "\n\n## Sandbox Input Envelope\n" + json.dumps(input_envelope, ensure_ascii=False)
 
             if enable_action_execution:
                 # --- Instruction Analysis Round ---
@@ -445,6 +445,7 @@ def _make_stream(skill_context: dict, request: SandboxChatRequest):
                     body_prompt=body_prompt,
                     request=request,
                     model=model,
+                    input_envelope=input_envelope,
                 )
                 yield _thought(
                     "instruction_analysis",
@@ -466,8 +467,9 @@ def _make_stream(skill_context: dict, request: SandboxChatRequest):
                         failed_paths=failed_resource_paths,
                     )
 
+                    _has_image_input = any(item.get("media_family") == "image/*" for item in input_envelope["input_files"])
                     response_route = route_model(
-                        infer_sandbox_response_task(
+                        VISION_TASK if _has_image_input else infer_sandbox_response_task(
                             body_prompt=body_prompt,
                             user_text=_last_user_text(request),
                             plan=runtime_plan,
@@ -1217,8 +1219,9 @@ def _make_stream(skill_context: dict, request: SandboxChatRequest):
                     yield "data: [DONE]\n\n"
                     return
 
+            _has_image_input = any(item.get("media_family") == "image/*" for item in input_envelope["input_files"])
             response_route = route_model(
-                infer_sandbox_response_task(
+                VISION_TASK if _has_image_input else infer_sandbox_response_task(
                     body_prompt=body_prompt,
                     user_text=_last_user_text(request),
                     plan=locals().get("runtime_plan") if isinstance(locals().get("runtime_plan"), dict) else None,

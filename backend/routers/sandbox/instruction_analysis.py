@@ -48,6 +48,7 @@ async def _run_instruction_analysis_round(
     body_prompt: str,
     request: "ChatRequest",
     model: str,
+    input_envelope: dict | None = None,
 ) -> dict:
     """Analyze user instruction semantics and return structured understanding."""
     user_text = _last_user_text(request)
@@ -55,7 +56,8 @@ async def _run_instruction_analysis_round(
         {"role": "system", "content": _compose_instruction_analysis_prompt()},
         {"role": "user", "content": (
             f"## Skill 上下文摘要\n{body_prompt[:2000]}\n\n"
-            f"## 用户指令\n{user_text}"
+            f"## 用户指令\n{user_text}\n\n"
+            f"## Input Envelope\n{json.dumps(input_envelope or {}, ensure_ascii=False)}"
         )},
     ]
 

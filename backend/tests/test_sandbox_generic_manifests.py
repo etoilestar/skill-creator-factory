@@ -74,3 +74,65 @@ def test_result_manifest_preserves_stdout_and_artifact_mime(tmp_path):
     }, tmp_path)
     assert manifest["structured_outputs"][0]["data"]["unrestricted_business_field"]["value"] == 1
     assert manifest["artifacts"][0]["mime_type"] == "application/json"
+
+
+@pytest.mark.asyncio
+async def test_frontloaded_decisions_receive_structured_envelope(monkeypatch):
+    from backend.routers.sandbox.metadata_decisions import (
+        _run_child_skill_selection_round, _run_metadata_round,
+    )
+    from backend.routers.sandbox.resource_catalog import _run_resource_selection_round
+
+    calls = []
+
+    async def complete(messages, _model):
+        calls.append(messages)
+        content = messages[-1]["content"]
+        if "valid_child_refs" in content:
+            return '{"need_child":false,"child_ref":"","reason":"ok"}'
+        if "resource_catalog" in content:
+            return '{"need_resources":false,"resource_handles":[],"reason":"ok"}'
+        return '{"need_body":true}'
+
+    monkeypatch.setattr("backend.routers.sandbox.metadata_decisions.complete_chat_once", complete)
+    monkeypatch.setattr("backend.routers.sandbox.resource_catalog.complete_chat_once", complete)
+    request = SandboxChatRequest(messages=[], fields={"field": "value"})
+    envelope = build_input_envelope(request, None)
+    envelope["options"] = {"mode": "value"}
+    envelope["resources"] = [{"handle": "provided"}]
+
+    assert await _run_metadata_round(
+        metadata_prompt="metadata", request=request, model="model", input_envelope=envelope,
+    )
+    await _run_child_skill_selection_round(
+        parent_metadata_prompt="## Child Skills Manifest\n- ref: `child`",
+        request=request, model="model", input_envelope=envelope,
+    )
+    await _run_resource_selection_round(
+        body_prompt="skill", request=request, model="model",
+        resource_catalog=[{
+            "resource_handle": "resource:0", "path": "references/item", "kind": "reference",
+            "allowed_actions": ["read_resource"],
+        }],
+        input_envelope=envelope,
+    )
+    serialized = "\n".join(message["content"] for messages in calls for message in messages)
+    assert '"fields": {"field": "value"}' in serialized
+    assert '"options": {"mode": "value"}' in serialized
+    assert '"resources": [{"handle": "provided"}]' in serialized
+
+
+@pytest.mark.asyncio
+async def test_cleanup_removes_input_and_output_session(monkeypatch, tmp_path):
+    from backend.routers.sandbox.stream_pipeline import delete_sandbox_inputs
+
+    for area in ("inputs", "outputs"):
+        directory = tmp_path / area / "session"
+        directory.mkdir(parents=True)
+        (directory / "item").write_text("data", encoding="utf-8")
+    monkeypatch.setattr("backend.routers.sandbox.stream_pipeline._skill_root_for_name", lambda _name: tmp_path)
+
+    assert await delete_sandbox_inputs("skill", "session") == {"deleted": True}
+    assert not (tmp_path / "inputs" / "session").exists()
+    assert not (tmp_path / "outputs" / "session").exists()
+    assert await delete_sandbox_inputs("skill", "session") == {"deleted": True}

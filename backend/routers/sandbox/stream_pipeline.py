@@ -199,8 +199,10 @@ def _make_stream(skill_context: dict, request: SandboxChatRequest):
                 )
 
                 # If new files were uploaded, invalidate cached resource/body state
-                if getattr(request, "input_files", None):
-                    logger.debug("sandbox step-skip: input_files detected, invalidating cache")
+                if any((input_envelope.get("payload") is not None, input_envelope.get("fields"),
+                        input_envelope.get("options"), input_envelope.get("resources"),
+                        input_envelope.get("input_files"))):
+                    logger.debug("sandbox step-skip: structured input detected, invalidating cache")
                     session_state.invalidate()
                     intent = DialogIntent.NEW_TASK
 
@@ -226,6 +228,7 @@ def _make_stream(skill_context: dict, request: SandboxChatRequest):
                     metadata_prompt=skill_context["metadata_prompt"],
                     request=request,
                     model=model,
+                    input_envelope=input_envelope,
                 )
                 yield _thought(
                     "metadata_decision",
@@ -317,6 +320,7 @@ def _make_stream(skill_context: dict, request: SandboxChatRequest):
                         parent_metadata_prompt=skill_context["metadata_prompt"],
                         request=request,
                         model=model,
+                        input_envelope=input_envelope,
                     )
                     yield _thought(
                         "child_decision",
@@ -397,6 +401,7 @@ def _make_stream(skill_context: dict, request: SandboxChatRequest):
                         request=request,
                         model=model,
                         resource_catalog=resource_catalog,
+                        input_envelope=input_envelope,
                     )
                     yield _thought(
                         "resource_selection",
@@ -1439,11 +1444,13 @@ async def upload_sandbox_input(
 async def delete_sandbox_inputs(skill_name: str, session_id: str):
     import shutil
     root = _skill_root_for_name(skill_name).resolve()
-    target = (root / "inputs" / session_id).resolve()
-    if Path(session_id).name != session_id or not _is_within_sandbox(target, root):
+    targets = [(root / area / session_id).resolve() for area in ("inputs", "outputs")]
+    if (Path(session_id).name != session_id or session_id in {"", ".", ".."}
+            or not all(_is_within_sandbox(target, root) for target in targets)):
         raise HTTPException(status_code=400, detail="不安全的会话路径")
-    if target.is_dir():
-        shutil.rmtree(target)
+    for target in targets:
+        if target.is_dir():
+            shutil.rmtree(target)
     return {"deleted": True}
 
 

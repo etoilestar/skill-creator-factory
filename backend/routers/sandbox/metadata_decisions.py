@@ -128,6 +128,7 @@ async def _run_metadata_round(
     metadata_prompt: str,
     request: ChatRequest,
     model: str,
+    input_envelope: dict | None = None,
 ) -> bool:
     """First internal model round.
 
@@ -135,6 +136,7 @@ async def _run_metadata_round(
     不向前端流式输出，只用于决定是否进入正文阶段。
     """
     messages = [{"role": "system", "content": metadata_prompt}]
+    messages.append({"role": "user", "content": "Sandbox Input Envelope:\n" + json.dumps(input_envelope or {}, ensure_ascii=False)})
     messages.extend(_request_messages_with_files(request))
 
     decision_text = await complete_chat_once(messages, model)
@@ -174,6 +176,7 @@ async def _run_child_skill_selection_round(
     parent_metadata_prompt: str,
     request: ChatRequest,
     model: str,
+    input_envelope: dict | None = None,
 ) -> dict:
     """Decide whether a child Skill body should be loaded.
 
@@ -198,6 +201,7 @@ async def _run_child_skill_selection_round(
                     "valid_child_refs": sorted(valid_child_refs),
                     "parent_metadata_prompt": parent_metadata_prompt,
                     "user_messages": _request_messages_with_files(request),
+                    "input_envelope": input_envelope or {},
                 },
                 ensure_ascii=False,
             ),

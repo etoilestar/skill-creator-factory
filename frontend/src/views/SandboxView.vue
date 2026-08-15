@@ -148,25 +148,11 @@
                 class="round-file-link"
               >📄 {{ fileBasename(f) }}</a>
             </div>
+            <SandboxResultRenderer :manifest="resultManifest" />
             <div v-if="error" class="error">{{ error }}</div>
             <div v-if="uploadError" class="error">{{ uploadError }}</div>
             <!-- Uploaded files chips -->
-            <div v-if="uploadedFiles.length" class="upload-chips">
-              <span
-                v-for="(f, idx) in uploadedFiles"
-                :key="f.path"
-                class="upload-chip"
-              >
-                <span class="chip-icon">📄</span>
-                <span class="chip-name">{{ f.filename }}</span>
-                <button
-                  class="chip-remove"
-                  :disabled="streaming"
-                  @click="removeUploadedFile(idx)"
-                  :title="`移除 ${f.filename}`"
-                >✕</button>
-              </span>
-            </div>
+            <SandboxAttachmentList :files="uploadedFiles" :disabled="streaming" @remove="removeUploadedFile" />
             <div class="row">
               <textarea
                 v-model="input"
@@ -193,7 +179,7 @@
                   <span v-if="uploading">⏳</span>
                   <span v-else>📎</span>
                 </button>
-                <button class="btn-primary" @click="send" :disabled="streaming || !input.trim()">
+                <button class="btn-primary" @click="send" :disabled="streaming || (!input.trim() && !uploadedFiles.length)">
                   {{ streaming ? '生成中…' : '发送' }}
                 </button>
               </div>
@@ -261,6 +247,8 @@ import ThinkingPanel from '../components/ThinkingPanel.vue'
 import TaskPlanPanel from '../components/TaskPlanPanel.vue'
 import SOPPanel from '../components/SOPPanel.vue'
 import InlineTaskList from '../components/InlineTaskList.vue'
+import SandboxResultRenderer from '../components/sandbox/SandboxResultRenderer.vue'
+import SandboxAttachmentList from '../components/sandbox/SandboxAttachmentList.vue'
 
 const ACTION_LABELS = {
   run_script: '运行脚本',
@@ -330,6 +318,7 @@ const fileInputEl = ref(null)
 
 // Persistent file download bar — collects output_files from the current round
 const roundOutputFiles = ref([])  // [{ path, url, name? }]
+const resultManifest = ref(null)
 
 // Step-skipping state
 const skippedSteps = ref([])  // [{ step, reason, ts }] for the current round
@@ -352,7 +341,7 @@ onBeforeUnmount(() => {
 /** Synchronous cleanup handler for beforeunload (uses sendBeacon for reliability) */
 function _beforeUnloadHandler() {
   if (!selectedSkill.value || !sessionId.value) return
-  const url = `/api/skills/${encodeURIComponent(selectedSkill.value)}/sandbox-inputs/${encodeURIComponent(sessionId.value)}`
+  const url = `/api/chat/sandbox/${encodeURIComponent(selectedSkill.value)}/inputs/${encodeURIComponent(sessionId.value)}`
   // sendBeacon doesn't support DELETE, so we use a synchronous XMLHttpRequest as fallback
   try {
     const xhr = new XMLHttpRequest()
@@ -368,7 +357,7 @@ async function cleanupSession() {
   if (!selectedSkill.value || !sessionId.value) return
   try {
     await fetch(
-      `/api/skills/${encodeURIComponent(selectedSkill.value)}/sandbox-inputs/${encodeURIComponent(sessionId.value)}`,
+      `/api/chat/sandbox/${encodeURIComponent(selectedSkill.value)}/inputs/${encodeURIComponent(sessionId.value)}`,
       { method: 'DELETE' },
     )
   } catch {
@@ -388,6 +377,8 @@ function resetChat() {
   uploadError.value = ''
   sessionId.value = newSessionId()
   roundOutputFiles.value = []
+  resultManifest.value = null
+  resultManifest.value = null
   thoughts.value = []
   skippedSteps.value = []
   currentPlanPreview.value = null
@@ -433,7 +424,7 @@ async function onFileSelected(event) {
     fd.append('session_id', sessionId.value)
     try {
       const res = await fetch(
-        `/api/skills/${encodeURIComponent(selectedSkill.value)}/sandbox-inputs`,
+        `/api/chat/sandbox/${encodeURIComponent(selectedSkill.value)}/inputs`,
         { method: 'POST', body: fd }
       )
       if (!res.ok) {
@@ -460,7 +451,7 @@ async function scrollBottom() {
 
 async function send() {
   const text = input.value.trim()
-  if (!text || streaming.value || !selectedSkill.value) return
+  if ((!text && !uploadedFiles.value.length) || streaming.value || !selectedSkill.value) return
 
   error.value = ''
   const fileAttachments = uploadedFiles.value.length
@@ -482,7 +473,9 @@ async function send() {
   completedIndices.value = []
 
   // Snapshot the uploaded files for this message, then keep them until reset
-  const inputFilesSnapshot = uploadedFiles.value.map(f => ({ path: f.path, filename: f.filename }))
+  const inputFilesSnapshot = uploadedFiles.value.map(f => ({
+    path: f.path, filename: f.filename, size: f.size, mime_type: f.mime_type,
+  }))
 
   try {
     const url = `/api/chat/sandbox/${encodeURIComponent(selectedSkill.value)}`
@@ -502,6 +495,8 @@ async function send() {
         thoughts.value.push(chunk.data)
         // Auto-show the panel when thoughts start arriving
         if (!showThoughts.value) showThoughts.value = true
+      } else if (chunk.type === 'result_manifest') {
+        resultManifest.value = chunk.data
       } else if (chunk.type === 'action_result') {
         const r = chunk.data
         messages.value.push({
@@ -606,6 +601,8 @@ async function confirmCurrentPlan() {
         } else if (chunk.type === 'thought') {
           thoughts.value.push(chunk.data)
           if (!showThoughts.value) showThoughts.value = true
+        } else if (chunk.type === 'result_manifest') {
+          resultManifest.value = chunk.data
         } else if (chunk.type === 'action_result') {
           const r = chunk.data
           messages.value.push({

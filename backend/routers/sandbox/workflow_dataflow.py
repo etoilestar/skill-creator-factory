@@ -54,6 +54,12 @@ def _workflow_context_from_request_text(user_text: str, first_entry: dict) -> di
     return context
 
 
+def _workflow_context_from_input_envelope(envelope: dict, first_entry: dict | None = None) -> dict:
+    """Copy legitimate Platform input sources without business inference."""
+    allowed = ("user_request", "input", "text", "payload", "fields", "options", "input_files", "files", "resources")
+    return {key: envelope.get(key) for key in allowed if key in envelope}
+
+
 # ---------------------------------------------------------------------------
 #  Planner：生成简化的步骤列表
 # ---------------------------------------------------------------------------

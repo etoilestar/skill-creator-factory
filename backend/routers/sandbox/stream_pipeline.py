@@ -8,7 +8,7 @@ import logging
 import time as _time_module
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, File, Form, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -49,6 +49,8 @@ from ..chat_utils import (
     _validate_skill_md,
 )
 from ..chat_models import ChatRequest
+from .io_manifest import SandboxChatRequest, build_input_envelope
+from .result_manifest import build_result_manifest
 from .path_resolution import (
     _skill_root_for_name,
     _available_scripts_for_root,
@@ -95,7 +97,7 @@ from .stdout_render import (
 from .legacy_fallback import _plan_and_execute_generated_output
 from .workflow_dataflow import (
     _execute_skill_workflow,
-    _workflow_context_from_request_text,
+    _workflow_context_from_input_envelope,
 )
 from .error_correction import (
     _MAX_SANDBOX_RETRY,
@@ -145,7 +147,7 @@ async def _await_with_keepalive(coro, *, yield_func):
         raise
 
 
-def _make_stream(skill_context: dict, request: ChatRequest):
+def _make_stream(skill_context: dict, request: SandboxChatRequest):
     """Staged Skill execution with shared runtime planning and action execution."""
     requested_model = request.model or settings.default_model
     model = route_model(TEXT_TASK, requested_model=requested_model, reason="sandbox default response").model
@@ -175,6 +177,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
 
     async def generate():
         try:
+            input_envelope = build_input_envelope(request, execution_root)
             # Track resource loading status across rounds
             loaded_resource_paths: list[str] = []
             failed_resource_paths: list[dict] = []
@@ -432,85 +435,8 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                         session_state.augmented_body_prompt = body_prompt
                         session_state.cache_artifact(StepName.RESOURCES, resource_decision)
 
-            # Append uploaded input-file context to the body prompt so the LLM
-            # knows which files are available. For small text files the content is
-            # embedded directly so the LLM can reason about the data without running
-            # a script first. Binary or large files are described by path only.
             if getattr(request, "input_files", None):
-                _TEXT_CONTENT_SUFFIXES = frozenset({
-                    ".txt", ".md", ".csv", ".tsv", ".json", ".jsonl",
-                    ".yaml", ".yml", ".xml", ".html", ".htm", ".log",
-                })
-                _MAX_INLINE_BYTES = 100 * 1024  # 100 KB
-
-                file_sections: list[str] = []
-                for f in request.input_files:
-                    rel_path = f.get("path", "")
-                    filename = f.get("filename", rel_path.split("/")[-1] if rel_path else "")
-                    suffix = Path(filename).suffix.lower() if filename else ""
-
-                    # Try to read text content for embedding
-                    content_block = ""
-                    if rel_path and parent_skill_name and suffix in _TEXT_CONTENT_SUFFIXES:
-                        try:
-                            abs_path = (settings.skills_path / parent_skill_name / rel_path).resolve()
-                            # Ensure path stays inside the skill directory
-                            skill_dir_check = (settings.skills_path / parent_skill_name).resolve()
-                            abs_path.relative_to(skill_dir_check)
-                            if abs_path.is_file():
-                                raw = abs_path.read_bytes()
-                                if len(raw) <= _MAX_INLINE_BYTES:
-                                    text = raw.decode("utf-8", errors="replace")
-                                    # Choose a fence that doesn't appear in the content.
-                                    # Prefer ``` but fall back to a tilde fence when the
-                                    # file itself contains triple-backtick sequences.
-                                    if "```" not in text:
-                                        fence, content_text = "```", text
-                                    else:
-                                        fence = "~~~~"
-                                        content_text = text.replace("~~~~", "~ ~ ~ ~")
-                                    content_block = (
-                                        f"\n\n  文件内容如下：\n\n  {fence}\n{content_text}\n  {fence}"
-                                    )
-                        except Exception:
-                            pass  # fall back to path-only if read fails
-
-                    if content_block:
-                        file_sections.append(
-                            f"- `{rel_path}`（文件名：`{filename}`）{content_block}"
-                        )
-                    else:
-                        # Strip the leading "inputs/" component so the script only needs
-                        # os.path.join(INPUT_DIR, remaining) — INPUT_DIR points to inputs/.
-                        try:
-                            _rel_path_obj = Path(rel_path)
-                            # Use parts[0] to avoid Windows backslash ambiguity.
-                            if _rel_path_obj.parts and _rel_path_obj.parts[0] == "inputs":
-                                rel_to_input_dir = Path(*_rel_path_obj.parts[1:]).as_posix()
-                            else:
-                                rel_to_input_dir = rel_path
-                        except (ValueError, IndexError):
-                            rel_to_input_dir = rel_path
-                        file_sections.append(
-                            f"- `{rel_path}`（文件名：`{filename}`）"
-                            f"脚本可通过 `os.path.join(os.environ['INPUT_DIR'], '{rel_to_input_dir}')` 读取，"
-                            "或直接用 `os.environ['INPUT_SESSION_DIR']` 目录（该目录下包含本次会话所有上传文件）"
-                            "。"
-                        )
-
-                if file_sections:
-                    sections_text = "\n".join(file_sections)
-                    body_prompt = (
-                        body_prompt
-                        + "\n\n---\n\n"
-                        "## 当前对话已上传文件\n\n"
-                        "用户在本次对话中上传了以下文件，你必须以这些文件为输入进行分析或处理。\n"
-                        "- 对于文本/数据文件，内容已直接展示在下方，请直接阅读并回答。\n"
-                        "- 需要执行计算、统计、转换等操作时，可生成 Python 脚本并运行，"
-                        "脚本中使用 `os.environ['INPUT_SESSION_DIR']` 获取上传文件目录，"
-                        "使用 `os.environ['OUTPUT_DIR']` 输出结果文件。\n\n"
-                        f"{sections_text}\n"
-                    )
+                body_prompt += "\n\n## Sandbox Input Envelope\n" + json.dumps(input_envelope, ensure_ascii=False)
 
             if enable_action_execution:
                 # --- Instruction Analysis Round ---
@@ -686,8 +612,8 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                             if action_schema.get("errors"):
                                 raise ValueError("Skill Action schema 校验失败: " + json.dumps(action_schema["errors"], ensure_ascii=False))
 
-                            user_context = _workflow_context_from_request_text(
-                                _last_user_text(request),
+                            user_context = _workflow_context_from_input_envelope(
+                                input_envelope,
                                 first_entry=(action_schema.get("entries") or [{}])[0] if action_schema.get("entries") else {},
                             )
 
@@ -784,6 +710,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                                     }
                                 })
 
+                            yield _sse({"result_manifest": build_result_manifest(workflow_result, execution_root)})
                             yield _sse({"content": final_answer})
                             yield "data: [DONE]\n\n"
                             return
@@ -1249,6 +1176,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                                 }
                             })
 
+                        yield _sse({"result_manifest": build_result_manifest(exec_result, execution_root)})
                         yield _sse({"content": final_answer})
                         yield "data: [DONE]\n\n"
                         return
@@ -1454,7 +1382,7 @@ def build_skill_context(skill_name: str) -> dict:
 
 
 @router.post("/sandbox/{skill_name}")
-async def chat_in_sandbox(skill_name: str, request: ChatRequest):
+async def chat_in_sandbox(skill_name: str, request: SandboxChatRequest):
     """Multi-turn chat with a specific skill loaded in sandbox mode."""
     try:
         skill_context = build_skill_context(skill_name)
@@ -1462,6 +1390,58 @@ async def chat_in_sandbox(skill_name: str, request: ChatRequest):
         raise HTTPException(status_code=404, detail=str(exc))
 
     return _make_stream(skill_context, request)
+
+
+_MAX_INPUT_BYTES = 25 * 1024 * 1024
+
+
+@router.post("/sandbox/{skill_name}/inputs")
+async def upload_sandbox_input(
+    skill_name: str, session_id: str = Form(...), file: UploadFile = File(...),
+):
+    root = _skill_root_for_name(skill_name).resolve()
+    if not session_id or Path(session_id).name != session_id or session_id in {".", ".."}:
+        raise HTTPException(status_code=400, detail="无效的会话标识")
+    filename = Path(file.filename or "upload").name
+    if not filename or filename in {".", ".."}:
+        raise HTTPException(status_code=400, detail="无效的文件名")
+    target_dir = (root / "inputs" / session_id).resolve()
+    if not _is_within_sandbox(target_dir, root):
+        raise HTTPException(status_code=400, detail="不安全的上传路径")
+    target_dir.mkdir(parents=True, exist_ok=True)
+    stem, suffix = Path(filename).stem, Path(filename).suffix
+    target = target_dir / filename
+    counter = 1
+    while target.exists():
+        target = target_dir / f"{stem}-{counter}{suffix}"
+        counter += 1
+    size = 0
+    try:
+        with target.open("xb") as output:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > _MAX_INPUT_BYTES:
+                    raise HTTPException(status_code=413, detail="文件超过大小限制")
+                output.write(chunk)
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+    import mimetypes
+    mime = file.content_type or mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+    rel = target.relative_to(root).as_posix()
+    return {"path": rel, "url": f"/api/skills/{skill_name}/files/{rel}", "filename": target.name, "size": size, "mime_type": mime}
+
+
+@router.delete("/sandbox/{skill_name}/inputs/{session_id}")
+async def delete_sandbox_inputs(skill_name: str, session_id: str):
+    import shutil
+    root = _skill_root_for_name(skill_name).resolve()
+    target = (root / "inputs" / session_id).resolve()
+    if Path(session_id).name != session_id or not _is_within_sandbox(target, root):
+        raise HTTPException(status_code=400, detail="不安全的会话路径")
+    if target.is_dir():
+        shutil.rmtree(target)
+    return {"deleted": True}
 
 
 class PlanConfirmRequest(BaseModel):

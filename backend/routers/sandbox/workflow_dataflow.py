@@ -61,7 +61,7 @@ def _workflow_context_from_input_envelope(envelope: dict, first_entry: dict | No
 
 
 # ---------------------------------------------------------------------------
-#  Planner：生成简化的步骤列表
+#  Runtime Execution Planner
 # ---------------------------------------------------------------------------
 
 def _workflow_step_planner_prompt() -> str:
@@ -91,6 +91,7 @@ async def _plan_workflow_steps_with_model(
     skill_name: str = "",
     model: str | None = None,
     reference_texts: dict[str, str] | None = None,
+    resource_catalog: list[dict] | None = None,
 ) -> dict:
     """让 LLM 生成简化的步骤列表（不含 input_mapping/outputs/loop）。"""
     entries = [entry for entry in (action_schema.get("entries") or []) if isinstance(entry, dict)]
@@ -107,6 +108,7 @@ async def _plan_workflow_steps_with_model(
         {"role": "user", "content": "## 完整 input_envelope\n" + json.dumps(user_context or {}, ensure_ascii=False)},
         {"role": "user", "content": "## SKILL.md\n" + skill_md},
         {"role": "user", "content": "## Action schema\n" + json.dumps(action_schema, ensure_ascii=False)},
+        {"role": "user", "content": "## Resource catalog\n" + json.dumps(resource_catalog or [], ensure_ascii=False)},
     ]
     if reference_texts:
         messages.append({"role": "user", "content": "## 语义参考资料\n" + "\n\n".join(
@@ -120,12 +122,12 @@ async def _plan_workflow_steps_with_model(
     except Exception as exc:
         logger.warning("runtime planner service unavailable: %s", exc)
         return validate_runtime_execution_plan(
-            _build_fallback_step_plan(entries, user_context), action_schema, user_context
+            _build_fallback_step_plan(entries, user_context), action_schema, user_context, resource_catalog
         )
 
     try:
         raw_plan = json.loads(_strip_markdown_json_fence(planner_text))
-        return validate_runtime_execution_plan(raw_plan, action_schema, user_context)
+        return validate_runtime_execution_plan(raw_plan, action_schema, user_context, resource_catalog)
     except (json.JSONDecodeError, RuntimePlanError) as first_error:
         repair_messages = [*messages, {"role": "assistant", "content": planner_text}, {
             "role": "user",
@@ -140,7 +142,7 @@ async def _plan_workflow_steps_with_model(
             repaired = json.loads(_strip_markdown_json_fence(repaired_text))
         except json.JSONDecodeError as exc:
             raise RuntimePlanError("runtime_plan_invalid_protocol", "repair returned invalid JSON") from exc
-        return validate_runtime_execution_plan(repaired, action_schema, user_context)
+        return validate_runtime_execution_plan(repaired, action_schema, user_context, resource_catalog)
 
 
 def _build_fallback_step_plan(entries: list[dict], user_context: dict) -> dict:
@@ -168,46 +170,6 @@ def _build_fallback_step_plan(entries: list[dict], user_context: dict) -> dict:
         "warnings": ["planner unavailable; only the unambiguous single script was selected"],
     }
 
-
-def _validate_step_plan(plan: dict, entries: list[dict]) -> dict:
-    """基本校验：确保 plan 有 steps 且 script_path 与 entries 对应。"""
-    if not isinstance(plan, dict):
-        raise ValueError("workflow step plan 必须是 JSON object")
-
-    initial_context = plan.get("initial_context") or {}
-    if not isinstance(initial_context, dict):
-        initial_context = {}
-
-    raw_steps = plan.get("steps") or []
-    if not isinstance(raw_steps, list) or not raw_steps:
-        raise ValueError("workflow step plan 必须包含非空 steps 列表")
-
-    # 校验每个 step 的 script_path
-    entry_paths = [str(e.get("script_path") or "") for e in entries if str(e.get("script_path") or "").startswith("scripts/")]
-    validated_steps = []
-    for step in raw_steps:
-        if not isinstance(step, dict):
-            continue
-        sp = str(step.get("script_path") or "")
-        if not sp:
-            continue
-        # 如果 script_path 不在 entries 中但格式正确，仍保留（宽松）
-        validated_steps.append({
-            "script_path": sp,
-            "description": str(step.get("description") or f"执行 {sp}"),
-        })
-
-    if not validated_steps:
-        # 如果 LLM 没有输出有效 steps，用 entries 兜底
-        validated_steps = [
-            {"script_path": sp, "description": f"执行 {sp}"}
-            for sp in entry_paths
-        ]
-
-    return {
-        "initial_context": initial_context,
-        "steps": validated_steps,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -424,7 +386,8 @@ _MAX_TOOL_CALLS_PER_STEP = 20
 def _runtime_plan_preview(plan: dict) -> dict:
     """Expose provenance without repeating potentially large binding values."""
     return {"version": plan["version"], "steps": [{
-        "step_id": step["step_id"], "description": step["description"],
+        "step_id": step["step_id"], "script_path": step["script_path"],
+        "description": step["description"],
         "bindings": {name: (
             f"{binding.get('step_id')}.{binding.get('output')}"
             if binding["source_type"] == "step_output"
@@ -474,10 +437,23 @@ async def _execute_runtime_plan(
             results.append(result); touched.extend(task_touched)
             output_files.extend(result.get("output_files") or [])
             stdout = str(result.get("stdout") or "")
-            try:
-                observation = parse_stdout_context(stdout) if stdout.strip() else {}
-            except ValueError:
-                observation = {}
+            observation = {}
+            if result.get("success", True):
+                if stdout.strip():
+                    try:
+                        observation = parse_stdout_context(stdout)
+                    except ValueError as exc:
+                        raise RuntimePlanError(
+                            "runtime_plan_output_contract_mismatch",
+                            f"{step['step_id']} stdout is not a JSON object",
+                        ) from exc
+                missing_outputs = [name for name in step["expected_outputs"] if name not in observation]
+                if missing_outputs:
+                    raise RuntimePlanError(
+                        "runtime_plan_output_contract_mismatch",
+                        f"{step['step_id']} missing output: {', '.join(missing_outputs)}",
+                        details={"step_id": step["step_id"], "missing_outputs": missing_outputs},
+                    )
             instance = {"step_id": step["step_id"], "instance_index": instance_index,
                         "success": bool(result.get("success", True)), "output": observation}
             instances.append(instance)
@@ -642,6 +618,21 @@ async def _execute_workflow_with_react_loop(
             if tool_script != script_path:
                 raise ValueError(
                     f"ReAct cannot switch planned script {script_path} to {tool_script}"
+                )
+            planned_entry = next(
+                (entry for entry in entries if str(entry.get("script_path") or "") == script_path),
+                None,
+            )
+            allowed_params = set(
+                [*((planned_entry or {}).get("inputs") or []),
+                 *((planned_entry or {}).get("optional_inputs") or []),
+                 *((planned_entry or {}).get("command_keys") or [])]
+            )
+            unknown_params = set(tool_params) - allowed_params
+            if unknown_params:
+                raise RuntimePlanError(
+                    "runtime_plan_unknown_parameter",
+                    f"ReAct invented parameters for {script_path}: {sorted(unknown_params)}",
                 )
 
             if yield_func:
@@ -834,6 +825,7 @@ async def _execute_skill_workflow(
     dataflow_plan: dict | None = None,
     model: str | None = None,
     yield_func=None,
+    resource_catalog: list[dict] | None = None,
 ) -> dict:
     """规划步骤列表，然后通过 ReAct 多轮 LLM 交互执行。"""
     # 1. 规划步骤
@@ -848,6 +840,7 @@ async def _execute_skill_workflow(
             skill_name=skill_name,
             model=model,
             reference_texts=reference_texts,
+            resource_catalog=resource_catalog,
         )
 
     # 2. A complete runtime plan is deterministic. ReAct remains only as a
@@ -858,7 +851,8 @@ async def _execute_skill_workflow(
         return await _execute_runtime_plan(
             execution_root=execution_root, action_schema=action_schema,
             runtime_plan=dataflow_plan, input_envelope=user_context,
-            request=request, skill_name=skill_name, yield_func=yield_func,
+            request=request, skill_name=skill_name, resource_catalog=resource_catalog,
+            yield_func=yield_func,
         )
 
     return await _execute_workflow_with_react_loop(

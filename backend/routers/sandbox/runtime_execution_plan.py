@@ -41,9 +41,19 @@ def _required(entry: dict) -> set[str]:
 def _lookup(value: Any, path: str) -> Any:
     current = value
     for part in path.split(".") if path else []:
-        if not isinstance(current, dict) or part not in current:
+        if isinstance(current, dict):
+            if part not in current:
+                raise KeyError(path)
+            current = current[part]
+        elif isinstance(current, list):
+            if not part.isdigit():
+                raise KeyError(path)
+            index = int(part)
+            if index >= len(current):
+                raise KeyError(path)
+            current = current[index]
+        else:
             raise KeyError(path)
-        current = current[part]
     return current
 
 

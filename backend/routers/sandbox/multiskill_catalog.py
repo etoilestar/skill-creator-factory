@@ -17,7 +17,7 @@ from ...services.llm_proxy import complete_chat_once
 from ...services.markdown_metadata import parse_frontmatter
 from ...services.skill_governance import list_skills_for_mode, resolve_skill_record
 from ..chat_utils import _strip_markdown_json_fence
-from .action_schema import _extract_action_schemas_from_text
+from .action_schema import _build_runtime_action_schema
 
 DISCOVERY_CARD_VERSION = "sandbox-skill-discovery-card/v1"
 ACTIVATION_CARD_VERSION = "sandbox-skill-activation-card/v1"
@@ -58,9 +58,11 @@ def retrieve_skill_candidates(
 ) -> list[dict]:
     """Replaceable large-catalog retrieval seam.
 
-    V1 intentionally preserves the governance-resolved catalog unchanged.  A
-    future lexical, embedding, or hybrid implementation can replace this
-    function without introducing filename/suffix/business-keyword routing.
+    V1 large-catalog retrieval is not implemented: this seam intentionally
+    preserves the governance-resolved catalog unchanged.  The threshold only
+    selects this replaceable seam; it does not imply candidate reduction.  A
+    future lexical, embedding, or hybrid implementation can replace it without
+    introducing filename/suffix/business-keyword routing.
     """
     del user_request, input_envelope_summary
     return list(discovery_cards)
@@ -89,21 +91,12 @@ _UNSAFE_SUMMARY_LINE_RE = re.compile(
 )
 
 
-def _execution_summary(body: str) -> str:
-    """Confirm contract loading without forwarding its untrusted instructions."""
-    # The full body is read only during activation.  It is deliberately not
-    # copied into a planner-facing card because arbitrary prose can itself be a
-    # command or prompt injection, even when fenced shell blocks are removed.
-    return (
-        "The shortlisted skill's SKILL.md runtime guidance is available to the "
-        "host runtime. It is not reproduced in the planner-facing card."
-        if body.strip() else "The shortlisted skill has no SKILL.md body guidance."
-    )
-
-
-def _declared_runtime_ports(skill_text: str) -> list[dict]:
+def _declared_runtime_ports(action_schema: dict) -> list[dict]:
+    """Project only safe ports from the Single-Skill runtime's canonical schema."""
     ports = []
-    for entry in _extract_action_schemas_from_text(skill_text, source_path="SKILL.md"):
+    for entry in action_schema.get("entries") or []:
+        if not isinstance(entry, dict):
+            continue
         ports.append({
             "role": str(entry.get("role") or "generic_script"),
             "inputs": [str(value) for value in entry.get("inputs") or []],
@@ -128,6 +121,7 @@ def build_multiskill_activation_card(skill_name: str) -> dict:
         raise FileNotFoundError(f"Skill '{skill_name}' has no runtime contract")
     text = skill_file.read_text(encoding="utf-8", errors="replace")
     _frontmatter, body, _had_frontmatter = parse_frontmatter(text)
+    action_schema = _build_runtime_action_schema(text, execution_root=root)
 
     resources = {}
     for resource_type in ("scripts", "references", "assets"):
@@ -146,10 +140,14 @@ def build_multiskill_activation_card(skill_name: str) -> dict:
         "description": str(record.get("description") or ""),
         "scope": str(record["resolved_scope"]),
         "version": str(record.get("version") or ""),
-        "execution_summary": _execution_summary(body),
-        "declared_runtime_ports": _declared_runtime_ports(text),
+        "runtime_guidance_available": bool(body.strip()),
+        "declared_runtime_ports": _declared_runtime_ports(action_schema),
         "resource_availability": resources,
-        "output_channels": ["text", "structured_outputs", "artifacts", "output_files"],
+        "result_manifest_channels": ["text", "structured_outputs", "artifacts", "output_files"],
+        "result_manifest_note": (
+            "These are Host-supported Child Result Manifest boundary channels, "
+            "not skill-specific output capabilities or skill-selection signals."
+        ),
         "contract_note": (
             "declared_runtime_ports describe internal runtime ports, not public inputs or outputs; "
             "child invocation uses the Platform Input Envelope and results cross the Result Manifest boundary"

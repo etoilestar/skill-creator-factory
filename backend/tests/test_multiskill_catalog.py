@@ -35,6 +35,19 @@ def test_multiskill_catalog_uses_name_and_description(monkeypatch):
     assert card["description"] == "Creates concise reports"
 
 
+def test_multiskill_large_catalog_uses_retrieval_seam(monkeypatch):
+    monkeypatch.setattr(subject, "list_skills_for_mode", lambda mode: [_record("one"), _record("two")])
+    monkeypatch.setattr(subject.settings, "multiskill_direct_catalog_threshold", 1)
+    calls = []
+    def retrieve(cards, **kwargs):
+        calls.append((cards, kwargs))
+        return cards
+    monkeypatch.setattr(subject, "retrieve_skill_candidates", retrieve)
+    cards = subject.build_multiskill_catalog(user_request="request", input_envelope_summary={"text": True})
+    assert [card["name"] for card in cards] == ["one", "two"]
+    assert calls[0][1] == {"user_request": "request", "input_envelope_summary": {"text": True}}
+
+
 def test_multiskill_catalog_exposes_no_runtime_or_creator_state(monkeypatch):
     monkeypatch.setattr(subject, "list_skills_for_mode", lambda mode: [_record(
         scripts=["bad.py"], command="python bad.py", metadata={"creator": {"graph": "secret"}}
@@ -100,6 +113,54 @@ python scripts/run.py '{"topic":"{{topic}}"}'
     assert card["declared_runtime_ports"][0]["inputs"] == ["topic"]
     assert "python" not in str(card).lower()
     assert str(tmp_path) not in str(card)
+    assert card["runtime_guidance_available"] is True
+    assert "output_channels" not in card
+    assert card["result_manifest_channels"] == ["text", "structured_outputs", "artifacts", "output_files"]
+
+
+def test_multiskill_activation_uses_same_action_schema_sources_as_runtime(monkeypatch, tmp_path):
+    (tmp_path / "SKILL.md").write_text(
+        "---\nname: reporter\ndescription: Makes reports\n---\nRuntime guidance.\n", encoding="utf-8"
+    )
+    (tmp_path / "references").mkdir()
+    (tmp_path / "references" / "runtime.md").write_text(
+        """role: text_generator
+inputs: [document]
+outputs: [summary]
+```bash
+python scripts/summarize.py '{"document":"{{document}}"}'
+```
+""", encoding="utf-8")
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "summarize.py").write_text("", encoding="utf-8")
+    monkeypatch.setattr(subject, "resolve_skill_record", lambda *a, **k: _record(root_path=str(tmp_path)))
+    card = subject.build_multiskill_activation_card("reporter")
+    assert card["declared_runtime_ports"] == [{
+        "role": "text_generator", "inputs": ["document"],
+        "optional_inputs": [], "outputs": ["summary"],
+    }]
+
+
+def test_multiskill_activation_projects_canonical_action_schema(monkeypatch, tmp_path):
+    (tmp_path / "SKILL.md").write_text(
+        "---\nname: reporter\ndescription: Makes reports\n---\nRuntime guidance.\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(subject, "resolve_skill_record", lambda *a, **k: _record(root_path=str(tmp_path)))
+    monkeypatch.setattr(subject, "_build_runtime_action_schema", lambda text, execution_root: {
+        "entries": [{
+            "role": "text_generator", "inputs": ["canonical_input"],
+            "optional_inputs": ["optional"], "outputs": ["canonical_output"],
+            "script_path": "scripts/private.py", "command": "python scripts/private.py",
+            "source_path": "/host/private", "placeholder_keys": ["secret"], "command_keys": ["secret"],
+        }]
+    })
+    card = subject.build_multiskill_activation_card("reporter")
+    assert card["declared_runtime_ports"] == [{
+        "role": "text_generator", "inputs": ["canonical_input"],
+        "optional_inputs": ["optional"], "outputs": ["canonical_output"],
+    }]
+    rendered = str(card)
+    assert "private.py" not in rendered and "/host/private" not in rendered
 
 
 @pytest.mark.asyncio

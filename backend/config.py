@@ -104,6 +104,16 @@ class Settings(BaseSettings):
     # Resource reading limit per file (characters) used by read_skill_resource_text.
     skill_resource_max_chars: int = Field(20000, validation_alias=AliasChoices("SKILL_RESOURCE_MAX_CHARS", "skill_resource_max_chars"))
 
+    # Discovery is deliberately independent from business-domain routing.  Above
+    # this size the catalog goes through the replaceable candidate retriever.
+    multiskill_direct_catalog_threshold: int = Field(
+        50,
+        validation_alias=AliasChoices(
+            "MULTISKILL_DIRECT_CATALOG_THRESHOLD",
+            "multiskill_direct_catalog_threshold",
+        ),
+    )
+
     # Maximum wall-clock seconds allowed for a single run_command subprocess.
     skill_command_timeout: int = Field(300, validation_alias=AliasChoices("SKILL_COMMAND_TIMEOUT", "skill_command_timeout"))
 

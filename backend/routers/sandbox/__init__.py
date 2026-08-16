@@ -60,3 +60,10 @@ from .error_correction import (
 from .workflow_dataflow import execute_skill_workflow
 from .action_schema import validate_stdout_against_action_entry
 from .stream_pipeline import build_skill_context
+from .multiskill_catalog import (
+    build_multiskill_catalog,
+    build_multiskill_activation_card,
+    build_multiskill_activation_cards,
+    retrieve_skill_candidates,
+    _plan_skill_candidates_with_model,
+)

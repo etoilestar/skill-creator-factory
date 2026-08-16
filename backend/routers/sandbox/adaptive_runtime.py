@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from ...services.llm_proxy import complete_chat_once
@@ -18,6 +19,12 @@ ADAPTIVE_ACTIONS = {
     "continue", "replan_remaining", "retry_current", "ask_user",
     "stop_success", "stop_failure",
 }
+logger = logging.getLogger(__name__)
+
+
+def empty_adaptive_policy() -> dict:
+    """Return the inert companion policy used for graceful degradation."""
+    return {"version": POLICY_VERSION, "checkpoints": []}
 
 
 def validate_adaptive_policy(policy: dict, runtime_plan: dict) -> dict:
@@ -99,8 +106,12 @@ async def _plan_adaptive_policy_with_model(*, user_request: str, runtime_plan: d
         "skill_md": skill_md, "references": references or {},
         "resource_catalog": _resource_catalog_for_planner(resource_catalog or []),
     }, ensure_ascii=False)}]
-    raw = await complete_chat_once(messages, _planner_model_name(model))
-    return validate_adaptive_policy(json.loads(_strip_markdown_json_fence(raw)), runtime_plan)
+    try:
+        raw = await complete_chat_once(messages, _planner_model_name(model))
+        return validate_adaptive_policy(json.loads(_strip_markdown_json_fence(raw)), runtime_plan)
+    except Exception as exc:
+        logger.warning("adaptive policy planner unavailable; continuing deterministically: %s", exc)
+        return empty_adaptive_policy()
 
 
 async def _decide_after_observation(*, user_request: str, runtime_plan: dict,

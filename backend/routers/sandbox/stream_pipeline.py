@@ -568,16 +568,6 @@ def _make_stream(skill_context: dict, request: SandboxChatRequest):
                                 reference_texts=_reference_contract_texts(execution_root),
                                 resource_catalog=_plan_resource_catalog,
                             )
-                            _skill_path = execution_root / "SKILL.md"
-                            _adaptive_policy = await _plan_adaptive_policy_with_model(
-                                user_request=str(input_envelope.get("user_request") or ""),
-                                runtime_plan=_runtime_execution_plan, action_schema=_plan_action_schema,
-                                skill_md=_skill_path.read_text(encoding="utf-8", errors="replace")[:settings.skill_resource_max_chars]
-                                    if _skill_path.is_file() else "",
-                                references=_reference_contract_texts(execution_root),
-                                resource_catalog=_plan_resource_catalog, model=model,
-                            )
-
                             if _runtime_execution_plan["missing_required_inputs"]:
                                 missing = _runtime_execution_plan["missing_required_inputs"]
                                 names = [str(item.get("input") or item) for item in missing]
@@ -590,6 +580,16 @@ def _make_stream(skill_context: dict, request: SandboxChatRequest):
                                 )})
                                 yield "data: [DONE]\n\n"
                                 return
+
+                            _skill_path = execution_root / "SKILL.md"
+                            _adaptive_policy = await _plan_adaptive_policy_with_model(
+                                user_request=str(input_envelope.get("user_request") or ""),
+                                runtime_plan=_runtime_execution_plan, action_schema=_plan_action_schema,
+                                skill_md=_skill_path.read_text(encoding="utf-8", errors="replace")[:settings.skill_resource_max_chars]
+                                    if _skill_path.is_file() else "",
+                                references=_reference_contract_texts(execution_root),
+                                resource_catalog=_plan_resource_catalog, model=model,
+                            )
 
                         _cleanup_expired_plans()
                         _pending_plans[plan_id] = {

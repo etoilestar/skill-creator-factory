@@ -411,7 +411,7 @@ async def _execute_runtime_plan(
     skill_name: str = "", resource_catalog=None, yield_func=None,
     adaptive_policy: dict | None = None, model: str | None = None,
 ) -> dict:
-    """Execute canonical steps; only namespaced real stdout enters dataflow."""
+    """Execute canonical steps and adapt only at checkpoints or runtime errors."""
     plan = validate_runtime_execution_plan(runtime_plan, action_schema, input_envelope, resource_catalog)
     if plan["missing_required_inputs"]:
         raise RuntimePlanError("runtime_plan_missing_input", "required inputs are unresolved", details=plan["missing_required_inputs"])
@@ -422,16 +422,31 @@ async def _execute_runtime_plan(
     checkpoints = {item["after_step_id"]: item["reason"] for item in (policy or {}).get("checkpoints", [])}
     context: dict[str, Any] = {"steps": {}}
     results, output_files, touched, logs, instances = [], [], [], [], []
+    attempt_results, attempt_output_files = [], []
     completed_step_ids: list[str] = []
     adaptive_trace: list[dict] = []
     retry_counts: dict[str, int] = {}
+    retry_steps: dict[str, dict] = {}
     revision_count = 0
+    adaptive_decision_count = 0
+    stopped_early = False
     if yield_func:
         await yield_func(_sse_react_event("plan", "结构化运行时执行计划已校验", {"runtime_plan": _runtime_plan_preview(plan)}))
 
+    def common_result() -> dict:
+        return {
+            "runtime_plan": plan, "results": results, "context": context,
+            "runtime_instances": instances, "output_files": output_files,
+            "accepted_output_files": output_files, "attempt_results": attempt_results,
+            "attempt_output_files": attempt_output_files,
+            "touched_paths": [str(path) for path in touched], "logs": logs,
+            "adaptive_trace": adaptive_trace,
+        }
+
     cursor = 0
     while cursor < len(plan["steps"]):
-        step = plan["steps"][cursor]
+        planned_step = plan["steps"][cursor]
+        step = retry_steps.pop(planned_step["step_id"], planned_step)
         if step["step_id"] in completed_step_ids:
             cursor += 1
             continue
@@ -439,37 +454,44 @@ async def _execute_runtime_plan(
             await yield_func(_sse_react_event("step_start", step["description"] or step["script_path"], {
                 "step_id": step["step_id"], "description": step["description"],
             }))
+        attempt_number = retry_counts.get(step["step_id"], 0) + 1
         items = [None]
-        if step["foreach"]:
-            collection = resolve_binding(step["foreach"], input_envelope, context, resource_catalog)
-            if not isinstance(collection, list):
-                raise RuntimePlanError("runtime_plan_invalid_binding", f"foreach for {step['step_id']} did not resolve to a list")
-            items = collection
-        observations = []
         failure_result = None
-        for instance_index, item in enumerate(items):
-            try:
-                params = resolve_step_bindings(step, input_envelope, context, resource_catalog, item=item)
-            except (RuntimePlanError, KeyError) as exc:
-                failure_result = {"success": False, "returncode": None, "stderr": str(exc), "stdout": "", "output_files": []}
-                trigger = "binding_failure"
-                break
-            command = _build_command_from_tool_call(step["script_path"], params, action_schema)
-            result, task_touched = await asyncio.to_thread(functools.partial(
-                _execute_single_task,
-                {"action": "run_command", "command": command, "reason": f"runtime plan {step['step_id']}"},
-                [], req, execution_root=root, inferred_skill_root=root,
-                skill_name=skill_name or root.name, session_input_dir=session_input_dir,
-            ))
-            results.append(result)
-            touched.extend(task_touched)
-            output_files.extend(result.get("output_files") or [])
-            stdout = str(result.get("stdout") or "")
-            observation = {}
-            if result.get("success", True):
-                if stdout.strip():
+        trigger = "checkpoint"
+        try:
+            if step["foreach"]:
+                collection = resolve_binding(step["foreach"], input_envelope, context, resource_catalog)
+                if not isinstance(collection, list):
+                    raise RuntimePlanError("runtime_plan_invalid_binding", f"foreach for {step['step_id']} did not resolve to a list")
+                items = collection
+        except (RuntimePlanError, KeyError) as exc:
+            failure_result = {"success": False, "returncode": None, "stderr": str(exc), "stdout": "", "output_files": []}
+            trigger = "binding_failure"
+
+        observations, current_results, current_files, current_touched, current_instances = [], [], [], [], []
+        if failure_result is None:
+            for instance_index, item in enumerate(items):
+                try:
+                    params = resolve_step_bindings(step, input_envelope, context, resource_catalog, item=item)
+                except (RuntimePlanError, KeyError) as exc:
+                    failure_result = {"success": False, "returncode": None, "stderr": str(exc), "stdout": "", "output_files": []}
+                    trigger = "binding_failure"
+                    break
+                command = _build_command_from_tool_call(step["script_path"], params, action_schema)
+                result, task_touched = await asyncio.to_thread(functools.partial(
+                    _execute_single_task,
+                    {"action": "run_command", "command": command, "reason": f"runtime plan {step['step_id']}"},
+                    [], req, execution_root=root, inferred_skill_root=root,
+                    skill_name=skill_name or root.name, session_input_dir=session_input_dir,
+                ))
+                current_results.append(result)
+                current_touched.extend(task_touched)
+                current_files.extend(result.get("output_files") or [])
+                stdout = str(result.get("stdout") or "")
+                observation = {}
+                if result.get("success", True):
                     try:
-                        observation = parse_stdout_context(stdout)
+                        observation = parse_stdout_context(stdout) if stdout.strip() else {}
                     except ValueError as exc:
                         if policy is None:
                             raise RuntimePlanError(
@@ -479,96 +501,160 @@ async def _execute_runtime_plan(
                         failure_result = {**result, "success": False,
                             "stderr": f"runtime_plan_output_contract_mismatch: {step['step_id']} stdout is not a JSON object"}
                         trigger = "output_contract_mismatch"
-                missing_outputs = [name for name in step["expected_outputs"] if name not in observation]
-                if missing_outputs and failure_result is None:
-                    if policy is not None:
+                    missing_outputs = [name for name in step["expected_outputs"] if name not in observation]
+                    if missing_outputs and failure_result is None:
+                        if policy is None:
+                            raise RuntimePlanError(
+                                "runtime_plan_output_contract_mismatch",
+                                f"{step['step_id']} missing output: {', '.join(missing_outputs)}",
+                                details={"step_id": step["step_id"], "missing_outputs": missing_outputs},
+                            )
                         failure_result = {**result, "success": False,
                             "stderr": f"runtime_plan_output_contract_mismatch: missing output: {', '.join(missing_outputs)}"}
                         trigger = "output_contract_mismatch"
-                    else:
-                        raise RuntimePlanError(
-                            "runtime_plan_output_contract_mismatch",
-                            f"{step['step_id']} missing output: {', '.join(missing_outputs)}",
-                            details={"step_id": step["step_id"], "missing_outputs": missing_outputs},
-                        )
+                else:
+                    failure_result = result
+                    trigger = "execution_failure"
+                instance = {"step_id": step["step_id"], "instance_index": instance_index,
+                            "attempt": attempt_number, "accepted": False,
+                            "success": bool(result.get("success", True)) and failure_result is None,
+                            "output": observation}
+                current_instances.append(instance)
                 if failure_result is not None:
                     break
-            instance = {"step_id": step["step_id"], "instance_index": instance_index,
-                        "success": bool(result.get("success", True)), "output": observation}
-            instances.append(instance)
-            if not result.get("success", True):
-                failure_result = result
-                trigger = "execution_failure"
-                break
-            observations.append(observation)
-        successful = failure_result is None
-        if successful:
-            context["steps"][step["step_id"]] = observations if step["foreach"] else observations[0]
-            completed_step_ids.append(step["step_id"])
-            logs.append(f"{step['step_id']} executed {step['script_path']}")
-            trigger = "checkpoint"
-            reason = checkpoints.get(step["step_id"])
-        else:
-            reason = "runtime exception requires a model decision"
+                observations.append(observation)
 
+        attempt_results.extend(current_results)
+        attempt_output_files.extend(current_files)
+        touched.extend(current_touched)
+        instances.extend(current_instances)
+        successful = failure_result is None
+        reason = checkpoints.get(step["step_id"]) if successful else "runtime exception requires a model decision"
         should_decide = policy is not None and ((successful and reason is not None) or not successful)
-        if should_decide and len(adaptive_trace) < MAX_ADAPTIVE_DECISIONS:
-            observation = (context["steps"].get(step["step_id"], {}) if successful else {
+        decision = {"action": "continue", "reason": "deterministic continuation"}
+
+        if should_decide and adaptive_decision_count < MAX_ADAPTIVE_DECISIONS:
+            observation = ((observations if step["foreach"] else observations[0]) if successful else {
                 "success": False, "stderr": str(failure_result.get("stderr") or "")[:2000],
                 "returncode": failure_result.get("returncode"), "failed_step_id": step["step_id"],
             })
             if yield_func:
                 await yield_func(_sse_react_event("adaptive_checkpoint", reason, {"step_id": step["step_id"], "trigger": trigger}))
             safe = _safe_observation_for_agent(step=step, observation=observation, context=context,
-                remaining_steps=plan["steps"][cursor + 1:], output_files=output_files)
-            decision = await _decide_after_observation(user_request=str(input_envelope.get("user_request") or ""),
-                runtime_plan=plan, completed_step_ids=completed_step_ids, safe_observation=safe,
-                action_schema=action_schema, adaptive_reason=reason, trigger=trigger, model=model)
+                remaining_steps=plan["steps"][cursor + 1:], output_files=[*output_files, *current_files])
+            adaptive_decision_count += 1
+            try:
+                decision = await _decide_after_observation(
+                    user_request=str(input_envelope.get("user_request") or ""), runtime_plan=plan,
+                    completed_step_ids=[*completed_step_ids, *([step["step_id"]] if successful else [])],
+                    safe_observation=safe, action_schema=action_schema, adaptive_reason=reason,
+                    trigger=trigger, model=model,
+                )
+            except Exception as exc:
+                logger.warning("adaptive decision unavailable at %s: %s", step["step_id"], exc)
+                decision = {"action": "continue" if successful else "stop_failure",
+                            "reason": "adaptive model unavailable", "fallback": True}
             action = decision["action"]
-            trace = {"round": len(adaptive_trace) + 1, "after_step_id": step["step_id"], "trigger": trigger,
-                     "decision": action, "reason": decision.get("reason", ""), "plan_revision": revision_count}
-            adaptive_trace.append(trace)
+            trace_decision = (("fallback_continue" if successful else "fallback_stop_failure")
+                              if decision.get("fallback") else action)
+            adaptive_trace.append({
+                "round": adaptive_decision_count, "after_step_id": step["step_id"], "trigger": trigger,
+                "decision": trace_decision, "reason": decision.get("reason", ""),
+                "plan_revision": revision_count, "retry_attempt": retry_counts.get(step["step_id"], 0),
+            })
             if yield_func:
-                await yield_func(_sse_react_event("adaptive_decision", decision.get("reason", ""), {"step_id": step["step_id"], "action": action}))
-            if action == "retry_current" and retry_counts.get(step["step_id"], 0) < MAX_RETRY_PER_STEP:
-                retry_counts[step["step_id"]] = retry_counts.get(step["step_id"], 0) + 1
-                if successful:
-                    completed_step_ids.remove(step["step_id"])
-                    context["steps"].pop(step["step_id"], None)
-                if yield_func:
-                    await yield_func(_sse_react_event("adaptive_retry", "重试当前步骤", {"step_id": step["step_id"]}))
-                continue
-            if action == "replan_remaining" and revision_count < MAX_PLAN_REVISIONS:
-                plan = validate_runtime_plan_revision(plan, decision["revised_plan"], completed_step_ids,
-                    action_schema, input_envelope, resource_catalog)
-                revision_count += 1
-                adaptive_trace[-1]["plan_revision"] = revision_count
-                if yield_func:
-                    await yield_func(_sse_react_event("runtime_plan_revised", "剩余计划已重新校验", {"revision": revision_count}))
-                cursor = len(completed_step_ids)
-                continue
-            if action == "replan_remaining":
-                return {"executed": False, "success": False, "adaptive_limit_reached": "plan_revisions",
-                    "runtime_plan": plan, "results": results, "context": context, "runtime_instances": instances,
-                    "output_files": output_files, "touched_paths": [str(p) for p in touched], "logs": logs,
-                    "failed_step_id": None if successful else step["step_id"], "adaptive_trace": adaptive_trace,
+                await yield_func(_sse_react_event("adaptive_decision", decision.get("reason", ""), {
+                    "step_id": step["step_id"], "action": trace_decision,
+                }))
+        elif not successful:
+            decision = {"action": "stop_failure", "reason": "adaptive decision budget exhausted"}
+
+        action = decision["action"]
+        if action == "retry_current" and retry_counts.get(step["step_id"], 0) < MAX_RETRY_PER_STEP:
+            bindings = decision.get("bindings")
+            retry_step = step
+            if bindings is not None:
+                if not isinstance(bindings, dict):
+                    raise RuntimePlanError("adaptive_decision_invalid", "retry bindings must be an object")
+                raw_retry_plan = {**plan, "steps": [
+                    {**item, "bindings": {**item["bindings"], **bindings}}
+                    if item["step_id"] == step["step_id"] else item
+                    for item in plan["steps"]
+                ]}
+                retry_plan = validate_runtime_execution_plan(raw_retry_plan, action_schema, input_envelope, resource_catalog)
+                if retry_plan["missing_required_inputs"]:
+                    raise RuntimePlanError("runtime_plan_missing_input", "retry bindings are unresolved",
+                                           details=retry_plan["missing_required_inputs"])
+                retry_step = next(item for item in retry_plan["steps"] if item["step_id"] == step["step_id"])
+            retry_counts[step["step_id"]] = retry_counts.get(step["step_id"], 0) + 1
+            retry_steps[step["step_id"]] = retry_step
+            if yield_func:
+                await yield_func(_sse_react_event("adaptive_retry", "重试当前步骤", {
+                    "step_id": step["step_id"], "attempt": retry_counts[step["step_id"]] + 1,
+                }))
+            continue
+
+        if successful:
+            for instance in current_instances:
+                instance["accepted"] = True
+            results.extend(current_results)
+            output_files.extend(current_files)
+            context["steps"][step["step_id"]] = observations if step["foreach"] else observations[0]
+            completed_step_ids.append(step["step_id"])
+            logs.append(f"{step['step_id']} executed {step['script_path']}")
+
+        if action == "replan_remaining" and revision_count < MAX_PLAN_REVISIONS:
+            plan = validate_runtime_plan_revision(plan, decision["revised_plan"], completed_step_ids,
+                                                  action_schema, input_envelope, resource_catalog)
+            revision_count += 1
+            adaptive_trace[-1]["plan_revision"] = revision_count
+            if plan["missing_required_inputs"]:
+                return {**common_result(), "executed": True, "success": None, "completed": False,
+                        "paused_for_user": True, "mode": "ask_user",
+                        "reason": "revised plan requires additional input",
+                        "missing": plan["missing_required_inputs"]}
+            from .action_schema import _reference_contract_texts
+            skill_path = root / "SKILL.md"
+            policy = await _plan_adaptive_policy_with_model(
+                user_request=str(input_envelope.get("user_request") or ""), runtime_plan=plan,
+                action_schema=action_schema,
+                skill_md=skill_path.read_text(encoding="utf-8", errors="replace")[:settings.skill_resource_max_chars]
+                    if skill_path.is_file() else "",
+                references=_reference_contract_texts(root), resource_catalog=resource_catalog, model=model,
+            )
+            policy = validate_adaptive_policy(policy, plan)
+            checkpoints = {item["after_step_id"]: item["reason"] for item in policy["checkpoints"]
+                           if item["after_step_id"] not in completed_step_ids}
+            if yield_func:
+                await yield_func(_sse_react_event("runtime_plan_revised", "剩余计划已重新校验", {
+                    "revision": revision_count,
+                    "remaining_step_count": len(plan["steps"]) - len(completed_step_ids),
+                    "adaptive_checkpoint_count": len(checkpoints),
+                }))
+            cursor = len(completed_step_ids)
+            continue
+        if action == "replan_remaining":
+            return {**common_result(), "executed": False, "success": False,
+                    "adaptive_limit_reached": "plan_revisions",
+                    "failed_step_id": None if successful else step["step_id"],
                     "stderr": "adaptive plan revision limit reached"}
-            if action == "ask_user":
-                return {"executed": True, "success": True, "mode": "ask_user", "reason": decision.get("reason", ""),
-                    "missing": decision.get("missing") or [], "runtime_plan": plan, "results": results, "context": context,
-                    "runtime_instances": instances, "output_files": output_files, "touched_paths": [str(p) for p in touched],
-                    "logs": logs, "adaptive_trace": adaptive_trace}
-            if action == "stop_success":
-                break
-            if action == "stop_failure" or (not successful and action not in {"retry_current", "replan_remaining"}):
-                should_decide = False
+        if action == "ask_user":
+            return {**common_result(), "executed": True, "success": None, "completed": False,
+                    "paused_for_user": True, "mode": "ask_user", "reason": decision.get("reason", ""),
+                    "missing": decision.get("missing") or []}
+        if action == "stop_success":
+            stopped_early = True
+            break
         if not successful:
-            failure = {"executed": False, "success": False, "runtime_plan": plan, "results": results,
-                "context": context, "runtime_instances": instances, "output_files": output_files,
-                "touched_paths": [str(path) for path in touched], "logs": logs, "failed_step_id": step["step_id"],
-                "failed_instance_index": instance_index, "completed_instance_count": len(observations),
-                "stderr": str(failure_result.get("stderr") or ""), "returncode": failure_result.get("returncode"),
-                "adaptive_trace": adaptive_trace}
+            if policy is None:
+                output_files.extend(current_files)
+            failure = {**common_result(), "executed": False, "success": False,
+                       "failed_step_id": step["step_id"],
+                       "failed_instance_index": len(observations),
+                       "completed_instance_count": len(observations),
+                       "stderr": str(failure_result.get("stderr") or ""),
+                       "returncode": failure_result.get("returncode"),
+                       "partial_artifacts": current_files}
             if yield_func:
                 await yield_func(_sse_react_event("step_failed", f"{step['step_id']} 执行失败", {"step_id": step["step_id"]}))
                 await yield_func(None)
@@ -576,12 +662,12 @@ async def _execute_runtime_plan(
         if yield_func:
             await yield_func(_sse_react_event("step_complete", f"{step['step_id']} 完成", {"step_id": step["step_id"]}))
         cursor += 1
+
     if yield_func:
-        await yield_func(_sse_react_event("workflow_complete", "工作流执行完成", {"step_count": len(plan["steps"])}))
+        await yield_func(_sse_react_event("workflow_complete", "工作流执行完成", {"step_count": len(completed_step_ids)}))
         await yield_func(None)
-    return {"executed": True, "success": True, "runtime_plan": plan, "results": results, "context": context,
-            "runtime_instances": instances, "output_files": output_files,
-            "touched_paths": [str(path) for path in touched], "logs": logs, "adaptive_trace": adaptive_trace}
+    return {**common_result(), "executed": True, "success": True,
+            "stopped_early": stopped_early, "stop_reason": "adaptive" if stopped_early else None}
 
 
 async def _execute_workflow_with_react_loop(
@@ -943,14 +1029,15 @@ async def _execute_skill_workflow(
             reference_texts=reference_texts,
             resource_catalog=resource_catalog,
         )
-        skill_path = execution_root / "SKILL.md"
-        adaptive_policy = await _plan_adaptive_policy_with_model(
-            user_request=str(user_context.get("user_request") or ""), runtime_plan=dataflow_plan,
-            action_schema=action_schema,
-            skill_md=skill_path.read_text(encoding="utf-8", errors="replace")[:settings.skill_resource_max_chars]
-                if skill_path.is_file() else "",
-            references=reference_texts, resource_catalog=resource_catalog, model=model,
-        )
+        if not dataflow_plan.get("missing_required_inputs"):
+            skill_path = execution_root / "SKILL.md"
+            adaptive_policy = await _plan_adaptive_policy_with_model(
+                user_request=str(user_context.get("user_request") or ""), runtime_plan=dataflow_plan,
+                action_schema=action_schema,
+                skill_md=skill_path.read_text(encoding="utf-8", errors="replace")[:settings.skill_resource_max_chars]
+                    if skill_path.is_file() else "",
+                references=reference_texts, resource_catalog=resource_catalog, model=model,
+            )
 
     # 2. A complete runtime plan is deterministic. ReAct remains only as a
     # bounded compatibility/failure-repair mechanism for legacy plans.

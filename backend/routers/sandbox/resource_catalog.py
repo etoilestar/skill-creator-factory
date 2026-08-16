@@ -242,6 +242,7 @@ async def _run_resource_selection_round(
     request: ChatRequest,
     model: str,
     resource_catalog: list[dict],
+    input_envelope: dict | None = None,
 ) -> dict:
     if not resource_catalog:
         return {"need_resources": False, "resource_handles": [], "reason": "无可用资源"}
@@ -256,6 +257,7 @@ async def _run_resource_selection_round(
                     "resource_catalog": _resource_catalog_for_planner(resource_catalog),
                     "user_messages": _request_messages_with_files(request),
                     "last_user_text": _last_user_text(request),
+                    "input_envelope": input_envelope or {},
                 },
                 ensure_ascii=False,
             ),

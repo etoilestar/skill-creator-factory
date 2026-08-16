@@ -10,9 +10,6 @@ from ..chat_models import ChatRequest
 logger = __import__("logging").getLogger(__name__)
 
 
-_VISION_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
-
-
 def _request_messages_with_inline_images(request: ChatRequest, execution_root: Path | None) -> list[dict]:
     """Build OpenAI-compatible multimodal user messages for VL models."""
     messages = _request_messages_with_files(request)
@@ -24,11 +21,11 @@ def _request_messages_with_inline_images(request: ChatRequest, execution_root: P
     for item in request.input_files:
         rel = str(item.get("path") or "")
         path = (root / rel).resolve()
-        if path.suffix.lower() not in _VISION_IMAGE_EXTS:
+        mime = str(item.get("mime_type") or mimetypes.guess_type(path.name)[0] or "")
+        if not mime.startswith("image/"):
             continue
         if not _is_within_sandbox(path, root) or not path.is_file():
             continue
-        mime = mimetypes.guess_type(path.name)[0] or "image/png"
         encoded = base64.b64encode(path.read_bytes()).decode("ascii")
         image_parts.append({
             "type": "image_url",

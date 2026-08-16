@@ -36,65 +36,20 @@ logger = logging.getLogger(__name__)
 
 def _compose_skill_runtime_planner_prompt() -> str:
     return (
-        "你是 Skill Agent 运行时动作意图判断器。\n\n"
-        "【重要】你只能输出一个严格的 JSON 对象，绝对不能输出任何自然语言、解释、思考过程或 Markdown 文本。"
-        "你的全部输出必须是可直接被 json.loads() 解析的 JSON，不得有任何前缀或后缀。\n\n"
-        "你的任务不是回答用户问题，也不是凭空创建命令；你的任务是根据 Loaded SKILL.md、"
-        "resource_catalog、available_scripts 和用户请求判断本轮应直接回答、读取资源，还是进入后端 deterministic workflow。\n\n"
-        "核心原则：\n"
-        "1. Loaded SKILL.md 是当前 Skill 的执行规范。\n"
-        "2. resource_catalog 和 available_scripts 只包含当前业务 Skill 目录内真实存在的 skill-local resources；kernel references 不会暴露给运行时，不能读取或引用。\n"
-        "不能用它们推导、补全或发明命令参数。\n"
-        "3. 是否执行命令，必须由 SKILL.md/references Action schema 中的显式 shell fenced 命令示例触发；"
-        "不要因为磁盘上存在脚本就直接规划 run_command，也不要临时拼接 Skill.md 中没有声明的命令。\n"
-        "4. 你可以规划 read_resource，因为读取 reference/asset 是宿主受控动作；"
-        "单步脚本可把替换真实参数后的完整命令放入 final_instruction 的 shell fenced block；"
-        "复合脚本 Skill 必须使用 mode=execute_workflow，让后端根据 Action schema 顺序执行；"
-        "不要在 actions 中规划 run_command、write_file 或 create_directory。\n"
-        "5. 如果任务需要运行多个 scripts、生成 PPT/Excel/Word/PDF/图片等文件，或 Loaded SKILL.md 明确要求多个脚本步骤，"
-        "必须使用 mode=execute_workflow；不要让主模型重新输出多条 bash 命令。单步命令才可使用 direct_answer/final_instruction 兜底。\n"
-        "6. 如果 Skill.md/reference 只写了 `scripts/...` 行内路径、'调用脚本'等自然语言，但没有具体 fenced 命令示例，"
-        "必须使用 mode=ask_user，说明该 Skill 缺少可执行命令 block 示例，不能让主模型临时拼命令。\n"
-        "7. 如果 available_scripts 和 resource_catalog 中没有对应脚本，而任务必须依赖脚本，应使用 mode=ask_user 并说明缺少脚本。\n"
-        "8. 你不能把函数名、伪代码函数、Python 函数、自然语言动作当成系统命令。\n"
-        "9. 如果当前 Skill 是写作、故事生成、公文生成、报告生成、总结、翻译、润色、分析、咨询等语言生成类任务，"
-        "且最终产物是纯文本或 Markdown（不是 .pptx/.xlsx/.docx 等格式文件），"
-        "应使用 mode=direct_answer，并让主模型按 Loaded SKILL.md 直接回答，不输出可执行块。\n"
-        "10. read_resource 只能使用 resource_handle，禁止输出 path。\n"
-        "11. resource_handle 必须来自 resource_catalog。\n"
-        "12. 如果任务需要 references/assets 的知识、示例、模板或配置，应优先规划 read_resource。\n"
-        "13. 不要假装读取、假装执行、假装写入。\n"
-        "14. 只输出严格 JSON，不要 Markdown，不要解释。\n\n"
-        "允许的 action：\n"
-        "- read_resource：读取 resource_catalog 中的资源，只能传 resource_handle。\n"
-        "- display / ignore：展示或忽略。\n"
-        "禁止的 action：run_command、write_file、create_directory；这些只能由后续主模型显式 fenced block 触发。\n\n"
-        "显式可执行 fenced code block 触发规则（给 final_instruction 使用）：\n"
-        "- 需要执行命令时，只能要求主模型复用 Action schema 中来自 SKILL.md/references 的具体 shell fenced 命令示例，"
-        "替换用户真实参数后输出；禁止从 available_scripts 或脚本文件名临时发明 CLI 参数。\n"
-        "- 需要写文件时，要求主模型在代码块前写 `写入文件：<path>` 或 `保存到：<path>`，"
-        "文件内容必须放在紧随其后的 fenced code block 内。\n"
-        "- 后端只执行 final_instruction 或主模型回复中已经出现、且通过 available_scripts 与 Action schema 校验的命令；资源存在性只做安全校验，不做触发条件。\n\n"
-        "mode 选择规则：\n"
-        "- direct_answer：主模型继续生成最终回复；仅适用于无需脚本或单步脚本兜底。\n"
-        "- execute_workflow：用于包含多个 scripts/*.py 命令、章节循环或文件产物链路的复合 Skill；后端将按 Action schema 顺序执行，不依赖主模型输出 bash。\n"
-        "- execute：用于 read_resource/display/ignore 这类宿主受控动作；若 final_instruction 含合法单步命令，宿主会在前置动作后执行该命令。\n"
-        "- ask_user：缺少必要输入，或 SKILL.md 要求的脚本/资源不存在，无法安全继续。\n"
-        "- not_applicable：用户请求与当前 Skill 明显不匹配。\n\n"
-        "输出格式：\n"
-        "{\n"
-        "  \"mode\": \"execute_workflow | execute | direct_answer | ask_user | not_applicable\",\n"
-        "  \"actions\": [\n"
-        "    {\n"
-        "      \"action\": \"read_resource | display | ignore\",\n"
-        "      \"resource_handle\": \"resource:0\",\n"
-        "      \"reason\": \"为什么需要该动作\"\n"
-        "    }\n"
-        "  ],\n"
-        "  \"missing\": [],\n"
-        "  \"errors\": [],\n"
-        "  \"final_instruction\": \"需要执行脚本时放入替换真实参数后的 shell fenced 命令；只能引用 SKILL.md/references 中已有命令示例\"\n"
-        "}\n"
+        "你是 Skill Agent 的合同驱动运行时规划器。只输出可被 json.loads 解析的 JSON object。\n"
+        "根据 loaded_skill_prompt、input_envelope、resource_catalog、available_scripts、"
+        "action_schema、execution_root、loaded_resources、failed_resources 和当前用户要求规划。\n"
+        "不得根据文件名、扩展名或业务关键词推断 workflow；只依据 Skill 合同、Action schema、"
+        "输入可访问性和步骤数据依赖。不得假装读取或执行。\n"
+        "mode 规则：direct_answer 仅当合同允许模型完成、必要输入可访问且无需宿主动作；"
+        "execute 用于 read_resource/display/ignore 或现有单阶段宿主动作；"
+        "execute_workflow 用于 Action schema 的执行责任、步骤数据依赖或必须由 executable workflow 产生结果；"
+        "ask_user 仅当执行必需输入无法从 envelope、resources、默认值或前序结果获得；"
+        "not_applicable 表示合同确实不适用。\n"
+        "read_resource 只能使用 resource_catalog 内的 resource_handle。不得发明命令或路径。\n"
+        "输出：{\"mode\":\"execute_workflow|execute|direct_answer|ask_user|not_applicable\","
+        "\"actions\":[{\"action\":\"read_resource|display|ignore\",\"resource_handle\":\"resource:0\",\"reason\":\"...\"}],"
+        "\"missing\":[],\"errors\":[],\"final_instruction\":\"...\"}"
     )
 
 
@@ -373,6 +328,8 @@ async def _run_skill_runtime_planner_round(
     resource_catalog = _extract_runtime_resource_catalog(body_prompt, execution_root=execution_root)
     planner_body_prompt = _strip_runtime_resource_manifest(body_prompt)
     command_contract = _extract_skill_command_contract(planner_body_prompt, execution_root=execution_root)
+    from .io_manifest import build_input_envelope
+    input_envelope = build_input_envelope(request, execution_root)
 
     # Deterministically scan only the current business Skill root. Never scan kernel.
     available_scripts = _available_scripts_for_root(execution_root)
@@ -385,14 +342,16 @@ async def _run_skill_runtime_planner_round(
 
     planner_payload = {
         "loaded_skill_prompt": planner_body_prompt,
+        "input_envelope": input_envelope,
         "resource_catalog": _resource_catalog_for_planner(resource_catalog),
         "available_scripts": available_scripts,
+        "action_schema": command_contract,
         "user_messages": _request_messages_with_files(request),
         "last_user_text": _last_user_text(request),
         "execution_root": str(execution_root) if execution_root else "",
         "skill_name": skill_name,
-        "loaded_paths": list(loaded_paths or []),
-        "failed_paths": list(failed_paths or []),
+        "loaded_resources": list(loaded_paths or []),
+        "failed_resources": list(failed_paths or []),
         "runtime_contract": {
             "skill_md_is_markdown": True,
             "skill_md_code_blocks_have_no_action_tag": True,
@@ -415,7 +374,7 @@ async def _run_skill_runtime_planner_round(
         {"role": "user", "content": f"## Skill 执行规范\n{planner_body_prompt}"},
         {"role": "user", "content": f"## 可用脚本\n{json.dumps(available_scripts, ensure_ascii=False)}"},
         {"role": "user", "content": f"## SKILL.md / references Action schema\n{json.dumps(command_contract, ensure_ascii=False)}"},
-        {"role": "user", "content": f"## 用户请求\n{_last_user_text(request)}"},
+        {"role": "user", "content": f"## Input Envelope\n{json.dumps(input_envelope, ensure_ascii=False)}"},
         {"role": "user", "content": f"## 执行根目录\n{str(execution_root) if execution_root else ''}"},
         {"role": "user", "content": f"## 技能名称\n{skill_name}"},
         {"role": "user", "content": "## 已加载/加载失败资源\n" + json.dumps({"loaded_paths": list(loaded_paths or []), "failed_paths": list(failed_paths or [])}, ensure_ascii=False)},

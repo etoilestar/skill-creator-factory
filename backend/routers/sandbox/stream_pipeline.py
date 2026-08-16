@@ -76,7 +76,7 @@ from .sop_planner import (
     _pending_plans,
     _format_task_checklist_markdown,
 )
-from .action_schema import _build_runtime_action_schema
+from .action_schema import _build_runtime_action_schema, _reference_contract_texts
 from .runtime_planner import _run_skill_runtime_planner_round, _run_supplementary_plan_round
 from .final_answer import (
     _generate_final_answer_from_observation,
@@ -98,8 +98,11 @@ from .stdout_render import (
 from .legacy_fallback import _plan_and_execute_generated_output
 from .workflow_dataflow import (
     _execute_skill_workflow,
+    _plan_workflow_steps_with_model,
+    _runtime_plan_preview,
     _workflow_context_from_input_envelope,
 )
+from .runtime_execution_plan import RuntimePlanError, validate_runtime_execution_plan
 from .error_correction import (
     _MAX_SANDBOX_RETRY,
     _get_llm_error_correction,
@@ -161,6 +164,8 @@ def _make_stream(skill_context: dict, request: SandboxChatRequest):
     child_body_loader = skill_context.get("child_body_loader")
     parent_skill_name = skill_context.get("skill_name", "")
     enable_resource_preload = bool(skill_context.get("enable_resource_preload", False))
+    confirmed_runtime_plan = skill_context.get("confirmed_runtime_plan")
+    confirmed_resource_catalog = skill_context.get("confirmed_resource_catalog")
 
     # Dual execution mode: "plan" (规划模式，预览后确认再执行) or "execute" (执行模式，直接执行)
     # Backward compatible: "craft" is mapped to "execute" via effective_execution_mode()
@@ -462,15 +467,24 @@ def _make_stream(skill_context: dict, request: SandboxChatRequest):
                 # --- Runtime Planner Round ---
                 try:
                     yield _sse({"status": {"phase": "planning", "message": "规划执行方案…"}})
-                    runtime_plan = await _run_skill_runtime_planner_round(
-                        body_prompt=body_prompt,
-                        request=request,
-                        model=model,
-                        execution_root=execution_root,
-                        skill_name=parent_skill_name,
-                        loaded_paths=loaded_resource_paths,
-                        failed_paths=failed_resource_paths,
-                    )
+                    if confirmed_runtime_plan is not None:
+                        # Confirmation fixes the execution route. Only the
+                        # deterministic validator/executor may inspect the
+                        # already-confirmed plan from this point onward.
+                        runtime_plan = {
+                            "mode": "execute_workflow", "tasks": [],
+                            "errors": [], "missing": [],
+                        }
+                    else:
+                        runtime_plan = await _run_skill_runtime_planner_round(
+                            body_prompt=body_prompt,
+                            request=request,
+                            model=model,
+                            execution_root=execution_root,
+                            skill_name=parent_skill_name,
+                            loaded_paths=loaded_resource_paths,
+                            failed_paths=failed_resource_paths,
+                        )
 
                     _has_image_input = any(item.get("media_family") == "image/*" for item in input_envelope["input_files"])
                     response_route = route_model(
@@ -537,6 +551,34 @@ def _make_stream(skill_context: dict, request: SandboxChatRequest):
                         _plan_action_schema = None
                         if mode == "execute_workflow" and execution_root:
                             _plan_action_schema = _build_runtime_action_schema(body_prompt, execution_root=execution_root)
+                        _plan_resource_catalog = None
+                        _runtime_execution_plan = None
+                        if mode == "execute_workflow" and _plan_action_schema:
+                            _plan_resource_catalog = _extract_runtime_resource_catalog(
+                                body_prompt, execution_root=execution_root
+                            )
+                            _runtime_execution_plan = await _plan_workflow_steps_with_model(
+                                execution_root=execution_root,
+                                action_schema=_plan_action_schema,
+                                user_context=_workflow_context_from_input_envelope(input_envelope),
+                                request=request,
+                                skill_name=parent_skill_name,
+                                reference_texts=_reference_contract_texts(execution_root),
+                                resource_catalog=_plan_resource_catalog,
+                            )
+
+                            if _runtime_execution_plan["missing_required_inputs"]:
+                                missing = _runtime_execution_plan["missing_required_inputs"]
+                                names = [str(item.get("input") or item) for item in missing]
+                                yield _sse({"runtime_plan_status": {
+                                    "mode": "ask_user", "missing_required_inputs": missing,
+                                }})
+                                yield _sse({"status": None})
+                                yield _sse({"content": "缺少以下必要输入：\n" + "\n".join(
+                                    f"- {name}" for name in names
+                                )})
+                                yield "data: [DONE]\n\n"
+                                return
 
                         _cleanup_expired_plans()
                         _pending_plans[plan_id] = {
@@ -546,20 +588,29 @@ def _make_stream(skill_context: dict, request: SandboxChatRequest):
                             "skill_context": skill_context,
                             "request": request,
                             "action_schema": _plan_action_schema,
+                            "runtime_execution_plan": _runtime_execution_plan,
+                            "resource_catalog": _plan_resource_catalog,
                             "ts": _time_module.time(),
                         }
 
                         # Build task items for both plan_preview and task_checklist events
                         if mode == "execute_workflow" and _plan_action_schema:
-                            # Show workflow steps from action schema entries
+                            # Preview the exact canonical plan that confirmation executes.
+                            preview = _runtime_plan_preview(_runtime_execution_plan)
                             plan_tasks = [
                                 {
                                     "action": "run_command",
-                                    "command": (str(entry.get("command") or ""))[:200] or None,
-                                    "path": entry.get("script_path"),
-                                    "reason": str(entry.get("local_description") or "")[:300],
+                                    "command": None,
+                                    "path": step.get("script_path"),
+                                    "reason": "；".join(filter(None, [
+                                        step.get("description"),
+                                        "；".join(
+                                            f"{name} ← {source}"
+                                            for name, source in step.get("bindings", {}).items()
+                                        ),
+                                    ])),
                                 }
-                                for entry in (_plan_action_schema.get("entries") or [])
+                                for step in preview["steps"]
                             ]
                         else:
                             plan_tasks = [
@@ -571,6 +622,7 @@ def _make_stream(skill_context: dict, request: SandboxChatRequest):
                                 }
                                 for t in tasks
                             ]
+                        preview_tasks = plan_tasks if mode == "execute_workflow" else tasks
 
                         yield _sse({
                             "plan_preview": {
@@ -579,7 +631,7 @@ def _make_stream(skill_context: dict, request: SandboxChatRequest):
                                 "instruction_analysis": instruction_analysis,
                                 "sop": sop_document,
                                 "tasks": plan_tasks,
-                                "total_tasks": len(tasks),
+                                "total_tasks": len(preview_tasks),
                                 "awaiting_confirmation": True,
                             }
                         })
@@ -593,17 +645,17 @@ def _make_stream(skill_context: dict, request: SandboxChatRequest):
                                 "command": (str(t.get("command") or ""))[:200] or None,
                                 "path": t.get("path") or t.get("resource_handle") or None,
                             }
-                            for idx, t in enumerate(tasks)
+                            for idx, t in enumerate(preview_tasks)
                         ]
                         yield _task_checklist(checklist_tasks)
 
                         # Also push Markdown checklist as content for backward compatibility
                         checklist_md = _format_task_checklist_markdown(
-                            tasks, instruction_analysis=instruction_analysis
+                            preview_tasks, instruction_analysis=instruction_analysis
                         )
                         yield _sse({"status": None})
                         yield _sse({"content": (
-                            f"📋 **执行方案已生成**（共 {len(tasks)} 个步骤）\n\n"
+                            f"📋 **执行方案已生成**（共 {len(preview_tasks)} 个步骤）\n\n"
                             f"{checklist_md}\n\n"
                             "请在左侧面板查看详细方案，确认后将开始执行。\n"
                             f"（方案ID：`{plan_id}`）"
@@ -623,6 +675,13 @@ def _make_stream(skill_context: dict, request: SandboxChatRequest):
                                 input_envelope,
                                 first_entry=(action_schema.get("entries") or [{}])[0] if action_schema.get("entries") else {},
                             )
+                            workflow_resource_catalog = (
+                                confirmed_resource_catalog
+                                if confirmed_resource_catalog is not None
+                                else _extract_runtime_resource_catalog(
+                                    body_prompt, execution_root=execution_root
+                                )
+                            )
 
                             # 使用 asyncio.Queue 桥接 ReAct 事件到 SSE 流
                             _react_event_queue: asyncio.Queue[str | None] = asyncio.Queue()
@@ -638,6 +697,8 @@ def _make_stream(skill_context: dict, request: SandboxChatRequest):
                                 user_context=user_context,
                                 request=request,
                                 skill_name=parent_skill_name,
+                                dataflow_plan=confirmed_runtime_plan,
+                                resource_catalog=workflow_resource_catalog,
                                 yield_func=_react_yield,
                             ))
 
@@ -663,6 +724,23 @@ def _make_stream(skill_context: dict, request: SandboxChatRequest):
                             _loaded_resource_paths = workflow_result.get("loaded_resource_paths") or []
                             _failed_resource_paths = workflow_result.get("failed_resource_paths") or []
                             _planned_followup_commands = workflow_result.get("planned_followup_commands") or []
+
+                            if workflow_result.get("success") is False:
+                                yield _thought(
+                                    "workflow_failure", "脚本执行失败",
+                                    f"步骤 {workflow_result.get('failed_step_id') or '?'} 执行失败",
+                                    {
+                                        "failed_step_id": workflow_result.get("failed_step_id"),
+                                        "failed_instance_index": workflow_result.get("failed_instance_index"),
+                                        "completed_instance_count": workflow_result.get("completed_instance_count", 0),
+                                        "output_file_count": len(_exec_all_output_files),
+                                    },
+                                )
+                                yield _sse({"result_manifest": build_result_manifest(workflow_result, execution_root)})
+                                yield _sse({"status": None})
+                                yield _sse({"error": "错误：脚本执行失败"})
+                                yield "data: [DONE]\n\n"
+                                return
 
                             yield _thought(
                                 "workflow_result",
@@ -722,6 +800,21 @@ def _make_stream(skill_context: dict, request: SandboxChatRequest):
                             yield "data: [DONE]\n\n"
                             return
 
+                        except RuntimePlanError as exc:
+                            logger.warning("runtime plan rejected: code=%s details=%r", exc.code, exc.details)
+                            yield _sse({"status": None})
+                            if exc.code == "runtime_plan_missing_input":
+                                missing = exc.details or []
+                                names = [str(item.get("input") or item) for item in missing]
+                                yield _sse({"runtime_plan_status": {
+                                    "mode": "ask_user", "missing_required_inputs": missing,
+                                }})
+                                yield _sse({"content": "缺少以下必要输入：\n" + "\n".join(f"- {name}" for name in names)})
+                            else:
+                                yield _sse({"runtime_plan_status": {"mode": "protocol_error", "code": exc.code}})
+                                yield _sse({"error": f"运行计划生成失败：{exc.code}"})
+                            yield "data: [DONE]\n\n"
+                            return
                         except Exception as exc:
                             logger.exception("workflow execution failed: %s", exc)
                             yield _sse({"status": None})
@@ -1492,12 +1585,34 @@ async def confirm_plan_execution(skill_name: str, request: PlanConfirmRequest):
                         status_code=400,
                         detail=f"方案已失效：脚本 {script_path} 不存在",
                     )
+            current_resource_catalog = [
+                item for item in (pending.get("resource_catalog") or [])
+                if isinstance(item, dict)
+                and (execution_root / str(item.get("path") or "")).is_file()
+            ]
+            canonical_plan = validate_runtime_execution_plan(
+                pending.get("runtime_execution_plan"), action_schema,
+                build_input_envelope(pending["request"], execution_root),
+                current_resource_catalog,
+            )
+            if canonical_plan["missing_required_inputs"]:
+                missing_names = [
+                    str(item.get("input") or item)
+                    for item in canonical_plan["missing_required_inputs"]
+                ]
+                raise HTTPException(
+                    status_code=400,
+                    detail="方案当前缺少必要输入：" + "、".join(missing_names),
+                )
         except HTTPException:
             raise
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"方案校验失败：{exc}")
 
     # Re-execute the plan by building a new stream with execute mode
+    skill_context = dict(skill_context)
+    skill_context["confirmed_runtime_plan"] = canonical_plan if execution_root else pending.get("runtime_execution_plan")
+    skill_context["confirmed_resource_catalog"] = current_resource_catalog if execution_root else pending.get("resource_catalog")
     original_request = pending["request"]
     # Override to execute mode for actual execution
     original_request.execution_mode = "execute"

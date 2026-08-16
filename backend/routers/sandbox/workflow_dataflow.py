@@ -1,11 +1,4 @@
-"""工作流 ReAct 规划与执行。
-
-架构：规划步骤列表 → ReAct 多轮 LLM 交互执行
-- Planner 只输出步骤列表（script_path + description），不指定 input_mapping/outputs/loop
-- 执行时每步由 LLM 决定调用哪个工具、传什么参数
-- 工具执行结果追加到对话历史，LLM 观察后决定下一步
-- 循环由 LLM 自行判断（看到上游输出后决定是否重复调用）
-"""
+"""Sandbox runtime planning and execution (deterministic first, ReAct fallback)."""
 
 import asyncio
 import functools
@@ -36,6 +29,12 @@ from .path_resolution import (
 )
 from .action_schema import _extract_script_path_from_command
 from .task_executor import _execute_single_task
+from .runtime_execution_plan import (
+    VERSION as RUNTIME_PLAN_VERSION,
+    resolve_binding,
+    resolve_step_bindings,
+    validate_runtime_execution_plan,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,21 +64,18 @@ def _workflow_context_from_input_envelope(envelope: dict, first_entry: dict | No
 # ---------------------------------------------------------------------------
 
 def _workflow_step_planner_prompt() -> str:
-    """Planner system prompt — 只输出步骤列表和初始上下文，不指定参数映射。"""
+    """Describe the complete, portable Sandbox runtime plan protocol."""
     return (
-        "你是 workflow step planner，负责根据用户请求和可用工具规划执行步骤。\n"
-        "必须只输出 JSON object，不要 Markdown 代码块。\n"
-        "\n"
-        "输出格式：\n"
-        "{\"initial_context\":{...},\"steps\":[{\"script_path\":\"scripts/x.py\",\"description\":\"该步骤的目的\"}]}\n"
-        "\n"
-        "规则：\n"
-        "1) initial_context：从用户请求中提取的关键变量（如 animal_name、style 等），以及 schema 默认值。用户输入覆盖默认值。\n"
-        "2) steps：按执行顺序列出每个脚本步骤，script_path 必须与 Action schema entries 一致。\n"
-        "3) description：简要说明该步骤的目的，帮助后续执行模型理解该步骤需要做什么。\n"
-        "4) 不要输出 input_mapping、outputs、loop、collections 等字段，执行时由模型自行决定参数。\n"
-        "5) 不要输出 bash 命令，不要宣称执行成功。\n"
-        "6) 如果参考资料中定义了与 Action schema inputs 默认值不同的规范，initial_context 应优先使用参考资料中的值。"
+        "你是 Sandbox Runtime Planner。只输出 JSON object。把本轮完整 input_envelope 实例化为 "
+        "sandbox-runtime-plan/v1。steps 每项必须包含 step_id、script_path、description、bindings、"
+        "expected_outputs、depends_on、foreach。bindings 的 key 只能来自对应 Action Schema；source_type "
+        "只能是 envelope、user_input、derived_from_user_input、default、step_output、resource。自然语言的"
+        "语义参数映射由你完成，后端不会按业务关键词猜测。step_output 只保存引用 "
+        "{source_type:'step_output',step_id:'step_1',output:'name'}，不得提前生成上游结果。"
+        "envelope source 使用 fields.x、options.x 等真实路径；显式结构化输入优先于自然语言值，"
+        "自然语言值优先于前序输出，前序输出优先于默认值。foreach 只能引用产生 list 的通用来源。"
+        "不得输出 bash、任意路径、schema 外脚本/参数/输出。无法闭合的必填输入不要猜值，写入 "
+        "missing_required_inputs。"
     )
 
 
@@ -131,8 +127,7 @@ async def _plan_workflow_steps_with_model(
 
     messages = [
         {"role": "system", "content": _workflow_step_planner_prompt()},
-        {"role": "user", "content": "## 用户请求\n" + user_text},
-        {"role": "user", "content": "## 已知用户上下文\n" + json.dumps(user_context or {}, ensure_ascii=False)},
+        {"role": "user", "content": "## 完整 input_envelope\n" + json.dumps(user_context or {}, ensure_ascii=False)},
         {"role": "user", "content": "## SKILL.md\n" + skill_md},
         {"role": "user", "content": "## 可用工具\n" + "\n".join(tool_descriptions)},
         {"role": "user", "content": "## Action schema\n" + json.dumps(action_schema, ensure_ascii=False)},
@@ -154,23 +149,36 @@ async def _plan_workflow_steps_with_model(
         raw_plan = _build_fallback_step_plan(entries, user_context)
 
     # 基本校验
-    return _validate_step_plan(raw_plan, entries)
+    return validate_runtime_execution_plan(raw_plan, action_schema)
 
 
 def _build_fallback_step_plan(entries: list[dict], user_context: dict) -> dict:
-    """当 LLM planner 不可用时，从 Action schema 构建简单步骤列表。"""
+    """Build a conservative plan without semantic guessing."""
     steps = []
-    for entry in entries:
+    structured = {**(user_context.get("fields") or {}), **(user_context.get("options") or {})}
+    for index, entry in enumerate(entries):
         sp = str(entry.get("script_path") or "")
         if not sp.startswith("scripts/"):
             continue
+        bindings = {}
+        for name in entry.get("inputs") or []:
+            if name in structured:
+                parent = "options" if name in (user_context.get("options") or {}) else "fields"
+                bindings[name] = {"source_type": "envelope", "source": f"{parent}.{name}"}
+            elif name in (entry.get("default_values") or {}):
+                bindings[name] = {"source_type": "default", "source": name, "value": entry["default_values"][name]}
         steps.append({
+            "step_id": f"step_{index + 1}",
             "script_path": sp,
             "description": f"执行 {sp}",
+            "bindings": bindings,
+            "expected_outputs": list(entry.get("outputs") or []),
+            "depends_on": [], "foreach": None,
         })
     return {
-        "initial_context": dict(user_context),
+        "version": RUNTIME_PLAN_VERSION,
         "steps": steps,
+        "missing_required_inputs": [], "warnings": ["planner unavailable; semantic values were not guessed"],
     }
 
 
@@ -426,6 +434,66 @@ def _render_command_with_params(command_template: str, script_path: str, params:
 _MAX_TOOL_CALLS_PER_STEP = 20
 
 
+async def _execute_runtime_plan(
+    *, execution_root: Path, action_schema: dict, runtime_plan: dict,
+    input_envelope: dict, request: ChatRequest | None = None,
+    skill_name: str = "", resource_catalog=None, yield_func=None,
+) -> dict:
+    """Resolve each binding against real observations and execute the fixed script."""
+    plan = validate_runtime_execution_plan(runtime_plan, action_schema)
+    if plan["missing_required_inputs"]:
+        raise ValueError("missing_required_inputs: " + json.dumps(plan["missing_required_inputs"], ensure_ascii=False))
+    root = execution_root.resolve()
+    req = request or ChatRequest(messages=[])
+    session_input_dir = _extract_input_session_dir(getattr(req, "input_files", []) or [], root)
+    context: dict[str, Any] = {"steps": {}}
+    results, output_files, touched, logs = [], [], [], []
+    if yield_func:
+        await yield_func(_sse_react_event("plan", "结构化运行时执行计划已校验", {"runtime_plan": plan}))
+
+    for index, step in enumerate(plan["steps"]):
+        if yield_func:
+            await yield_func(_sse_react_event("step_start", step["description"] or step["script_path"], {"step": step}))
+        items = [None]
+        if step.get("foreach"):
+            collection = resolve_binding(step["foreach"], input_envelope, context, resource_catalog)
+            if not isinstance(collection, list):
+                raise ValueError(f"foreach source for {step['step_id']} must resolve to a list")
+            items = collection
+        observations = []
+        for item in items:
+            params = resolve_step_bindings(step, input_envelope, context, resource_catalog, item=item)
+            # The command is always taken from the matched schema entry; the model cannot switch it.
+            command = _build_command_from_tool_call(step["script_path"], params, action_schema)
+            result, task_touched = await asyncio.to_thread(
+                functools.partial(
+                    _execute_single_task,
+                    {"action": "run_command", "command": command, "reason": f"runtime plan {step['step_id']}"},
+                    [], req, execution_root=root, inferred_skill_root=root,
+                    skill_name=skill_name or root.name, session_input_dir=session_input_dir,
+                )
+            )
+            results.append(result); touched.extend(task_touched)
+            output_files.extend(result.get("output_files") or [])
+            stdout = str(result.get("stdout") or "")
+            observation = parse_stdout_context(stdout) if stdout.strip() else {}
+            observations.append(observation)
+            if not result.get("success", True):
+                raise RuntimeError(f"runtime step failed: {step['step_id']}")
+        step_output = observations if step.get("foreach") else observations[0]
+        context["steps"][step["step_id"]] = step_output
+        if isinstance(step_output, dict):
+            context.update(step_output)
+        logs.append(f"{step['step_id']} executed {step['script_path']}")
+        if yield_func:
+            await yield_func(_sse_react_event("step_complete", f"{step['step_id']} 完成", {"output": step_output}))
+    if yield_func:
+        await yield_func(_sse_react_event("workflow_complete", "工作流执行完成", {"step_count": len(plan["steps"])}))
+        await yield_func(None)
+    return {"executed": True, "runtime_plan": plan, "results": results, "context": context,
+            "output_files": output_files, "touched_paths": [str(path) for path in touched], "logs": logs}
+
+
 async def _execute_workflow_with_react_loop(
     *,
     execution_root: Path,
@@ -553,6 +621,13 @@ async def _execute_workflow_with_react_loop(
             # 需要调用工具
             tool_script = parsed["script"]
             tool_params = parsed["params"]
+
+            # Even the bounded ReAct compatibility path cannot escape the
+            # script selected by the runtime/legacy step plan.
+            if tool_script != script_path:
+                raise ValueError(
+                    f"ReAct cannot switch planned script {script_path} to {tool_script}"
+                )
 
             if yield_func:
                 await yield_func(_sse_react_event(
@@ -765,7 +840,17 @@ async def _execute_skill_workflow(
             entries = [e for e in (action_schema.get("entries") or []) if isinstance(e, dict)]
             dataflow_plan = _build_fallback_step_plan(entries, user_context)
 
-    # 2. ReAct 执行
+    # 2. A complete runtime plan is deterministic. ReAct remains only as a
+    # bounded compatibility/failure-repair mechanism for legacy plans.
+    if dataflow_plan.get("version") == RUNTIME_PLAN_VERSION or any(
+        isinstance(step, dict) and "bindings" in step for step in dataflow_plan.get("steps") or []
+    ):
+        return await _execute_runtime_plan(
+            execution_root=execution_root, action_schema=action_schema,
+            runtime_plan=dataflow_plan, input_envelope=user_context,
+            request=request, skill_name=skill_name, yield_func=yield_func,
+        )
+
     return await _execute_workflow_with_react_loop(
         execution_root=execution_root,
         action_schema=action_schema,

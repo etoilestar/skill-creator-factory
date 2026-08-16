@@ -75,7 +75,7 @@ def _execution_requires_run_command_observation(runtime_plan: dict) -> bool:
 
 
 def _should_force_skill_workflow(*, command_contract: dict, user_text: str = "") -> str:
-    """Return a reason when a declared multi-script Skill must run deterministically."""
+    """Use executable responsibility and declared dataflow, never user keywords."""
     action_schema = (command_contract or {}).get("action_schema") or {}
     entries = [entry for entry in (action_schema.get("entries") or []) if isinstance(entry, dict)]
     script_entries = [
@@ -85,37 +85,8 @@ def _should_force_skill_workflow(*, command_contract: dict, user_text: str = "")
     if not script_entries:
         return ""
 
-    roles = {str(entry.get("role") or "") for entry in script_entries}
-    commands_text = "\n".join(str(entry.get("command") or "") for entry in script_entries)
-    output_text = " ".join(
-        " ".join(str(item) for item in (entry.get("outputs") or []))
-        for entry in script_entries
-    )
-    artifact_requested = bool(re.search(
-        r"(?i)(生成|创建|导出|制作|文件|图片|插图|PDF|Word|PPT|docx|pptx|pdf|image|illustration|file)",
-        user_text or "",
-    ))
-    artifact_roles = {
-        "image_generator",
-        "pdf_builder",
-        "docx_builder",
-        "pptx_builder",
-        "html_asset_builder",
-        "asset_builder",
-        "composite_generator",
-    }
-    artifact_declared = bool(
-        roles & artifact_roles
-        or re.search(
-            r"(?i)(\.pdf|\.png|\.jpe?g|\.gif|\.webp|\.docx|\.pptx|\.xlsx|\.html?)",
-            output_text + "\n" + commands_text,
-        )
-    )
-
     if len(script_entries) >= 2:
-        if artifact_requested or artifact_declared:
-            return "Action schema 声明了多个 scripts/*.py 执行入口，且任务/输出涉及文件类产物，必须由后端按 schema 顺序执行 workflow"
-        return "Action schema 声明了多个 scripts/*.py 执行入口，属于复合 Skill，必须由后端按 schema 顺序执行 workflow"
+        return "Action schema 声明多个宿主执行入口，需要 Sandbox Runtime Planner 实例化步骤和数据依赖"
     return ""
 
 

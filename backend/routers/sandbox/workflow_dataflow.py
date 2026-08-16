@@ -40,7 +40,8 @@ from .runtime_execution_plan import (
 from .adaptive_runtime import (
     MAX_ADAPTIVE_DECISIONS, MAX_PLAN_REVISIONS, MAX_RETRY_PER_STEP,
     _decide_after_observation, _safe_observation_for_agent,
-    _plan_adaptive_policy_with_model, validate_adaptive_policy, validate_runtime_plan_revision,
+    _plan_adaptive_policy_with_model, empty_adaptive_policy,
+    validate_adaptive_policy, validate_runtime_plan_revision,
 )
 
 logger = logging.getLogger(__name__)
@@ -418,7 +419,13 @@ async def _execute_runtime_plan(
     root = execution_root.resolve()
     req = request or ChatRequest(messages=[])
     session_input_dir = _extract_input_session_dir(getattr(req, "input_files", []) or [], root)
-    policy = validate_adaptive_policy(adaptive_policy, plan) if adaptive_policy else None
+    policy = None
+    if adaptive_policy:
+        try:
+            policy = validate_adaptive_policy(adaptive_policy, plan)
+        except RuntimePlanError as exc:
+            logger.warning("invalid adaptive policy; continuing deterministically: %s", exc)
+            policy = empty_adaptive_policy()
     checkpoints = {item["after_step_id"]: item["reason"] for item in (policy or {}).get("checkpoints", [])}
     context: dict[str, Any] = {"steps": {}}
     results, output_files, touched, logs, instances = [], [], [], [], []
@@ -615,14 +622,18 @@ async def _execute_runtime_plan(
                         "missing": plan["missing_required_inputs"]}
             from .action_schema import _reference_contract_texts
             skill_path = root / "SKILL.md"
-            policy = await _plan_adaptive_policy_with_model(
-                user_request=str(input_envelope.get("user_request") or ""), runtime_plan=plan,
-                action_schema=action_schema,
-                skill_md=skill_path.read_text(encoding="utf-8", errors="replace")[:settings.skill_resource_max_chars]
-                    if skill_path.is_file() else "",
-                references=_reference_contract_texts(root), resource_catalog=resource_catalog, model=model,
-            )
-            policy = validate_adaptive_policy(policy, plan)
+            try:
+                policy = await _plan_adaptive_policy_with_model(
+                    user_request=str(input_envelope.get("user_request") or ""), runtime_plan=plan,
+                    action_schema=action_schema,
+                    skill_md=skill_path.read_text(encoding="utf-8", errors="replace")[:settings.skill_resource_max_chars]
+                        if skill_path.is_file() else "",
+                    references=_reference_contract_texts(root), resource_catalog=resource_catalog, model=model,
+                )
+                policy = validate_adaptive_policy(policy, plan)
+            except Exception as exc:
+                logger.warning("revised adaptive policy unavailable; continuing deterministically: %s", exc)
+                policy = empty_adaptive_policy()
             checkpoints = {item["after_step_id"]: item["reason"] for item in policy["checkpoints"]
                            if item["after_step_id"] not in completed_step_ids}
             if yield_func:

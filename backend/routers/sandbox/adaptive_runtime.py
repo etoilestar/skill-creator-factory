@@ -131,9 +131,19 @@ async def _decide_after_observation(*, user_request: str, runtime_plan: dict,
         await complete_chat_once(messages, _planner_model_name(model))))
     if not isinstance(raw, dict) or raw.get("action") not in ADAPTIVE_ACTIONS:
         raise RuntimePlanError("adaptive_decision_invalid", "invalid adaptive action")
-    allowed = {"action", "reason", "revised_plan", "bindings", "missing"}
+    allowed = {"action", "reason"}
+    if raw.get("action") == "replan_remaining":
+        allowed.add("revised_plan")
+    elif raw.get("action") == "retry_current":
+        allowed.add("bindings")
+    elif raw.get("action") == "ask_user":
+        allowed.add("missing")
     if set(raw) - allowed or not isinstance(raw.get("reason", ""), str):
         raise RuntimePlanError("adaptive_decision_invalid", "decision contains forbidden fields")
     if raw["action"] == "replan_remaining" and not isinstance(raw.get("revised_plan"), dict):
         raise RuntimePlanError("adaptive_decision_invalid", "replan requires revised_plan")
+    if "bindings" in raw and not isinstance(raw["bindings"], dict):
+        raise RuntimePlanError("adaptive_decision_invalid", "retry bindings must be an object")
+    if "missing" in raw and not isinstance(raw["missing"], list):
+        raise RuntimePlanError("adaptive_decision_invalid", "ask_user missing must be a list")
     return raw

@@ -103,7 +103,11 @@ from .workflow_dataflow import (
     _workflow_context_from_input_envelope,
 )
 from .runtime_execution_plan import RuntimePlanError, validate_runtime_execution_plan
-from .adaptive_runtime import _plan_adaptive_policy_with_model, validate_adaptive_policy
+from .adaptive_runtime import (
+    _plan_adaptive_policy_with_model,
+    empty_adaptive_policy,
+    validate_adaptive_policy,
+)
 from .error_correction import (
     _MAX_SANDBOX_RETRY,
     _get_llm_error_correction,
@@ -1619,10 +1623,13 @@ async def confirm_plan_execution(skill_name: str, request: PlanConfirmRequest):
                 build_input_envelope(pending["request"], execution_root),
                 current_resource_catalog,
             )
-            canonical_adaptive_policy = validate_adaptive_policy(
-                pending.get("adaptive_policy") or {"version": "adaptive-runtime-policy/v1", "checkpoints": []},
-                canonical_plan,
-            )
+            try:
+                canonical_adaptive_policy = validate_adaptive_policy(
+                    pending.get("adaptive_policy") or empty_adaptive_policy(), canonical_plan,
+                )
+            except RuntimePlanError as exc:
+                logger.warning("confirmed adaptive policy is invalid; using empty policy: %s", exc)
+                canonical_adaptive_policy = empty_adaptive_policy()
             if canonical_plan["missing_required_inputs"]:
                 missing_names = [
                     str(item.get("input") or item)

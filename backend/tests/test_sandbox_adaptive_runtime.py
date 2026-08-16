@@ -147,7 +147,7 @@ def test_adaptive_policy_invalid_json_does_not_break_deterministic_execution(mon
     assert result["success"] and calls == [] and executed == ["a", "b", "c"]
 
 
-def test_missing_runtime_inputs_skip_adaptive_planner(monkeypatch, tmp_path):
+def test_missing_runtime_inputs_skip_adaptive_policy_planner(monkeypatch, tmp_path):
     missing_plan = plan(("a",))
     missing_plan["steps"][0]["bindings"] = {}
     async def planner(**kwargs):
@@ -190,7 +190,7 @@ def test_adaptive_replan_policy_failure_falls_back_to_empty_policy(monkeypatch, 
     assert result["success"] and len(calls) == 1 and executed == ["a", "b", "e", "d"]
 
 
-def test_adaptive_replan_missing_input_asks_user(monkeypatch, tmp_path):
+def test_adaptive_replan_missing_input_routes_to_ask_user(monkeypatch, tmp_path):
     revised = plan(("a", "b", "e"))
     revised["steps"][2]["bindings"] = {}
     result, _, executed = asyncio.run(run(
@@ -248,6 +248,24 @@ def test_adaptive_retry_does_not_accept_superseded_artifacts(monkeypatch, tmp_pa
     assert result["output_files"] == [{"path": "attempt-2.txt"}]
     assert result["attempt_output_files"] == [{"path": "attempt-1.txt"}, {"path": "attempt-2.txt"}]
     assert [item["accepted"] for item in result["runtime_instances"]] == [False, True]
+
+
+def test_adaptive_retry_records_attempt_history(monkeypatch, tmp_path):
+    attempts = 0
+    def executor(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        return {"success": attempts > 1, "stderr": "transient", "returncode": 1,
+                "stdout": '{"result":"accepted"}' if attempts > 1 else "",
+                "output_files": [{"path": f"attempt-{attempts}.txt"}]}, []
+    result, _, _ = asyncio.run(run(
+        monkeypatch, tmp_path, runtime_plan=plan(("a",)), adaptive_policy=policy(), executor=executor,
+        decisions=[{"action": "retry_current", "reason": "retry transient failure"}],
+    ))
+    assert len(result["attempt_results"]) == 2
+    assert [(item["attempt"], item["accepted"]) for item in result["runtime_instances"]] == [
+        (1, False), (2, True),
+    ]
 
 
 def test_checkpoint_decision_failure_falls_back_to_continue(monkeypatch, tmp_path):

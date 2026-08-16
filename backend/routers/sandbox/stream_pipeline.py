@@ -103,6 +103,7 @@ from .workflow_dataflow import (
     _workflow_context_from_input_envelope,
 )
 from .runtime_execution_plan import RuntimePlanError, validate_runtime_execution_plan
+from .adaptive_runtime import _plan_adaptive_policy_with_model, validate_adaptive_policy
 from .error_correction import (
     _MAX_SANDBOX_RETRY,
     _get_llm_error_correction,
@@ -553,6 +554,7 @@ def _make_stream(skill_context: dict, request: SandboxChatRequest):
                             _plan_action_schema = _build_runtime_action_schema(body_prompt, execution_root=execution_root)
                         _plan_resource_catalog = None
                         _runtime_execution_plan = None
+                        _adaptive_policy = None
                         if mode == "execute_workflow" and _plan_action_schema:
                             _plan_resource_catalog = _extract_runtime_resource_catalog(
                                 body_prompt, execution_root=execution_root
@@ -565,6 +567,15 @@ def _make_stream(skill_context: dict, request: SandboxChatRequest):
                                 skill_name=parent_skill_name,
                                 reference_texts=_reference_contract_texts(execution_root),
                                 resource_catalog=_plan_resource_catalog,
+                            )
+                            _skill_path = execution_root / "SKILL.md"
+                            _adaptive_policy = await _plan_adaptive_policy_with_model(
+                                user_request=str(input_envelope.get("user_request") or ""),
+                                runtime_plan=_runtime_execution_plan, action_schema=_plan_action_schema,
+                                skill_md=_skill_path.read_text(encoding="utf-8", errors="replace")[:settings.skill_resource_max_chars]
+                                    if _skill_path.is_file() else "",
+                                references=_reference_contract_texts(execution_root),
+                                resource_catalog=_plan_resource_catalog, model=model,
                             )
 
                             if _runtime_execution_plan["missing_required_inputs"]:
@@ -590,6 +601,7 @@ def _make_stream(skill_context: dict, request: SandboxChatRequest):
                             "action_schema": _plan_action_schema,
                             "runtime_execution_plan": _runtime_execution_plan,
                             "resource_catalog": _plan_resource_catalog,
+                            "adaptive_policy": _adaptive_policy,
                             "ts": _time_module.time(),
                         }
 
@@ -699,6 +711,7 @@ def _make_stream(skill_context: dict, request: SandboxChatRequest):
                                 skill_name=parent_skill_name,
                                 dataflow_plan=confirmed_runtime_plan,
                                 resource_catalog=workflow_resource_catalog,
+                                adaptive_policy=skill_context.get("confirmed_adaptive_policy"),
                                 yield_func=_react_yield,
                             ))
 
@@ -724,6 +737,17 @@ def _make_stream(skill_context: dict, request: SandboxChatRequest):
                             _loaded_resource_paths = workflow_result.get("loaded_resource_paths") or []
                             _failed_resource_paths = workflow_result.get("failed_resource_paths") or []
                             _planned_followup_commands = workflow_result.get("planned_followup_commands") or []
+
+                            if workflow_result.get("mode") == "ask_user":
+                                yield _sse({"runtime_plan_status": {
+                                    "mode": "ask_user", "reason": workflow_result.get("reason", ""),
+                                    "missing": workflow_result.get("missing") or [],
+                                }})
+                                yield _sse({"result_manifest": build_result_manifest(workflow_result, execution_root)})
+                                yield _sse({"status": None})
+                                yield _sse({"content": workflow_result.get("reason") or "需要补充信息后继续执行。"})
+                                yield "data: [DONE]\n\n"
+                                return
 
                             if workflow_result.get("success") is False:
                                 yield _thought(
@@ -1595,6 +1619,10 @@ async def confirm_plan_execution(skill_name: str, request: PlanConfirmRequest):
                 build_input_envelope(pending["request"], execution_root),
                 current_resource_catalog,
             )
+            canonical_adaptive_policy = validate_adaptive_policy(
+                pending.get("adaptive_policy") or {"version": "adaptive-runtime-policy/v1", "checkpoints": []},
+                canonical_plan,
+            )
             if canonical_plan["missing_required_inputs"]:
                 missing_names = [
                     str(item.get("input") or item)
@@ -1613,6 +1641,7 @@ async def confirm_plan_execution(skill_name: str, request: PlanConfirmRequest):
     skill_context = dict(skill_context)
     skill_context["confirmed_runtime_plan"] = canonical_plan if execution_root else pending.get("runtime_execution_plan")
     skill_context["confirmed_resource_catalog"] = current_resource_catalog if execution_root else pending.get("resource_catalog")
+    skill_context["confirmed_adaptive_policy"] = canonical_adaptive_policy if execution_root else pending.get("adaptive_policy")
     original_request = pending["request"]
     # Override to execute mode for actual execution
     original_request.execution_mode = "execute"

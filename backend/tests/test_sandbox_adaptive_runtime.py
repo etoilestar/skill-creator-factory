@@ -310,3 +310,99 @@ def test_adaptive_stop_success_records_early_stop(monkeypatch, tmp_path):
     ))
     assert result["success"] and executed == ["a"]
     assert result["stopped_early"] is True and result["stop_reason"] == "adaptive"
+
+
+def test_adaptive_stop_success_after_success(monkeypatch, tmp_path):
+    result, _, executed = asyncio.run(run(
+        monkeypatch, tmp_path, runtime_plan=plan(("a", "b")), adaptive_policy=policy("a"),
+        decisions=[{"action": "stop_success", "reason": "complete"}],
+    ))
+    assert result["success"] is True and executed == ["a"]
+    assert result["stopped_early"] is True
+
+
+def test_adaptive_stop_success_cannot_mask_execution_failure(monkeypatch, tmp_path):
+    def executor(*args, **kwargs):
+        return {"success": False, "stderr": "real failure", "returncode": 7,
+                "output_files": [{"path": "partial.txt"}]}, []
+    result, _, _ = asyncio.run(run(
+        monkeypatch, tmp_path, runtime_plan=plan(("a",)), adaptive_policy=policy(), executor=executor,
+        decisions=[{"action": "stop_success", "reason": "incorrect success"}],
+    ))
+    assert result["success"] is False
+    assert result["stderr"] == "real failure" and result["returncode"] == 7
+    assert result["failed_step_id"] == "a"
+    assert result["adaptive_trace"][0]["decision"] == "invalid_stop_success_on_failure"
+    assert result["adaptive_trace"][0]["fallback_decision"] == "stop_failure"
+
+
+def test_adaptive_stop_failure_after_successful_checkpoint(monkeypatch, tmp_path):
+    result, _, executed = asyncio.run(run(
+        monkeypatch, tmp_path, runtime_plan=plan(("a", "b")), adaptive_policy=policy("a"),
+        decisions=[{"action": "stop_failure", "reason": "task cannot be completed"}],
+    ))
+    assert result["success"] is False and executed == ["a"]
+    assert len(result["results"]) == 1 and result["runtime_instances"][0]["accepted"] is True
+    assert result["stopped_early"] is True and result["failed_step_id"] is None
+    assert result["adaptive_stop_step_id"] == "a" and "stderr" not in result
+
+
+def test_adaptive_stop_failure_preserves_real_execution_failure(monkeypatch, tmp_path):
+    def executor(*args, **kwargs):
+        return {"success": False, "stderr": "executor failed", "returncode": 11,
+                "output_files": [{"path": "partial.txt"}]}, []
+    result, _, _ = asyncio.run(run(
+        monkeypatch, tmp_path, runtime_plan=plan(("a",)), adaptive_policy=policy(), executor=executor,
+        decisions=[{"action": "stop_failure", "reason": "cannot recover"}],
+    ))
+    assert result["success"] is False and result["stopped_early"] is True
+    assert result["stderr"] == "executor failed" and result["returncode"] == 11
+    assert result["partial_artifacts"] == [{"path": "partial.txt"}]
+
+
+def test_adaptive_retry_override_updates_effective_runtime_plan(monkeypatch, tmp_path):
+    attempts = 0
+    def executor(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        return {"success": attempts > 1, "stderr": "retry", "returncode": 1,
+                "stdout": '{"result":"ok"}' if attempts > 1 else "", "output_files": []}, []
+    result, _, _ = asyncio.run(run(
+        monkeypatch, tmp_path, runtime_plan=plan(("a",)), adaptive_policy=policy(), executor=executor,
+        decisions=[{"action": "retry_current", "reason": "fix binding",
+                    "bindings": {"value": {"source_type": "user_input", "value": "fixed"}}}],
+    ))
+    binding = result["runtime_plan"]["steps"][0]["bindings"]["value"]
+    assert binding["value"] == "fixed"
+    assert result["adaptive_trace"][0]["binding_override_keys"] == ["value"]
+
+
+def test_adaptive_replan_after_retry_uses_effective_completed_prefix(monkeypatch, tmp_path):
+    calls = 0
+    executed_values = []
+    def executor(task, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        value = json.loads(shlex.split(task["command"])[2])["value"]
+        executed_values.append(value)
+        if calls == 1:
+            return {"success": False, "stderr": "retry", "returncode": 1, "output_files": []}, []
+        return {"success": True, "stdout": '{"result":"ok"}', "output_files": []}, []
+    revised = plan(("a", "b", "e"))
+    revised["steps"][0]["bindings"]["value"]["value"] = "fixed"
+    async def refresh(**kwargs):
+        return policy()
+    monkeypatch.setattr(workflow_dataflow, "_plan_adaptive_policy_with_model", refresh)
+    result, _, _ = asyncio.run(run(
+        monkeypatch, tmp_path, runtime_plan=plan(("a", "b", "c")),
+        adaptive_policy=policy("a", "b"), executor=executor,
+        decisions=[
+            {"action": "retry_current", "reason": "fix A",
+             "bindings": {"value": {"source_type": "user_input", "value": "fixed"}}},
+            {"action": "continue", "reason": "accept retried A"},
+            {"action": "replan_remaining", "reason": "replace suffix", "revised_plan": revised},
+        ],
+    ))
+    assert result["success"] is True
+    assert result["runtime_plan"]["steps"][0]["bindings"]["value"]["value"] == "fixed"
+    assert executed_values[:2] == ["a", "fixed"]

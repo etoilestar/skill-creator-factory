@@ -433,7 +433,6 @@ async def _execute_runtime_plan(
     completed_step_ids: list[str] = []
     adaptive_trace: list[dict] = []
     retry_counts: dict[str, int] = {}
-    retry_steps: dict[str, dict] = {}
     revision_count = 0
     adaptive_decision_count = 0
     stopped_early = False
@@ -452,8 +451,7 @@ async def _execute_runtime_plan(
 
     cursor = 0
     while cursor < len(plan["steps"]):
-        planned_step = plan["steps"][cursor]
-        step = retry_steps.pop(planned_step["step_id"], planned_step)
+        step = plan["steps"][cursor]
         if step["step_id"] in completed_step_ids:
             cursor += 1
             continue
@@ -594,7 +592,9 @@ async def _execute_runtime_plan(
                                            details=retry_plan["missing_required_inputs"])
                 retry_step = next(item for item in retry_plan["steps"] if item["step_id"] == step["step_id"])
             retry_counts[step["step_id"]] = retry_counts.get(step["step_id"], 0) + 1
-            retry_steps[step["step_id"]] = retry_step
+            plan["steps"][cursor] = retry_step
+            adaptive_trace[-1]["retry_attempt"] = retry_counts[step["step_id"]]
+            adaptive_trace[-1]["binding_override_keys"] = sorted(bindings) if bindings else []
             if yield_func:
                 await yield_func(_sse_react_event("adaptive_retry", "重试当前步骤", {
                     "step_id": step["step_id"], "attempt": retry_counts[step["step_id"]] + 1,
@@ -653,7 +653,16 @@ async def _execute_runtime_plan(
             return {**common_result(), "executed": True, "success": None, "completed": False,
                     "paused_for_user": True, "mode": "ask_user", "reason": decision.get("reason", ""),
                     "missing": decision.get("missing") or []}
-        if action == "stop_success":
+        if action == "stop_success" and not successful:
+            action = "stop_failure"
+            adaptive_trace[-1]["decision"] = "invalid_stop_success_on_failure"
+            adaptive_trace[-1]["fallback_decision"] = "stop_failure"
+        if action == "stop_failure" and successful:
+            return {**common_result(), "executed": True, "success": False,
+                    "stopped_early": True, "stop_reason": "adaptive",
+                    "adaptive_stop_reason": decision.get("reason", ""),
+                    "adaptive_stop_step_id": step["step_id"], "failed_step_id": None}
+        if action == "stop_success" and successful:
             stopped_early = True
             break
         if not successful:
@@ -665,7 +674,10 @@ async def _execute_runtime_plan(
                        "completed_instance_count": len(observations),
                        "stderr": str(failure_result.get("stderr") or ""),
                        "returncode": failure_result.get("returncode"),
-                       "partial_artifacts": current_files}
+                       "partial_artifacts": current_files,
+                       "stopped_early": action == "stop_failure",
+                       "stop_reason": "adaptive" if action == "stop_failure" else None,
+                       "adaptive_stop_reason": decision.get("reason", "") if action == "stop_failure" else None}
             if yield_func:
                 await yield_func(_sse_react_event("step_failed", f"{step['step_id']} 执行失败", {"step_id": step["step_id"]}))
                 await yield_func(None)

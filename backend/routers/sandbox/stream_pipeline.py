@@ -467,15 +467,24 @@ def _make_stream(skill_context: dict, request: SandboxChatRequest):
                 # --- Runtime Planner Round ---
                 try:
                     yield _sse({"status": {"phase": "planning", "message": "规划执行方案…"}})
-                    runtime_plan = await _run_skill_runtime_planner_round(
-                        body_prompt=body_prompt,
-                        request=request,
-                        model=model,
-                        execution_root=execution_root,
-                        skill_name=parent_skill_name,
-                        loaded_paths=loaded_resource_paths,
-                        failed_paths=failed_resource_paths,
-                    )
+                    if confirmed_runtime_plan is not None:
+                        # Confirmation fixes the execution route. Only the
+                        # deterministic validator/executor may inspect the
+                        # already-confirmed plan from this point onward.
+                        runtime_plan = {
+                            "mode": "execute_workflow", "tasks": [],
+                            "errors": [], "missing": [],
+                        }
+                    else:
+                        runtime_plan = await _run_skill_runtime_planner_round(
+                            body_prompt=body_prompt,
+                            request=request,
+                            model=model,
+                            execution_root=execution_root,
+                            skill_name=parent_skill_name,
+                            loaded_paths=loaded_resource_paths,
+                            failed_paths=failed_resource_paths,
+                        )
 
                     _has_image_input = any(item.get("media_family") == "image/*" for item in input_envelope["input_files"])
                     response_route = route_model(
@@ -593,9 +602,13 @@ def _make_stream(skill_context: dict, request: SandboxChatRequest):
                                     "action": "run_command",
                                     "command": None,
                                     "path": step.get("script_path"),
-                                    "reason": step.get("description") or "；".join(
-                                        f"{name} ← {source}" for name, source in step.get("bindings", {}).items()
-                                    ),
+                                    "reason": "；".join(filter(None, [
+                                        step.get("description"),
+                                        "；".join(
+                                            f"{name} ← {source}"
+                                            for name, source in step.get("bindings", {}).items()
+                                        ),
+                                    ])),
                                 }
                                 for step in preview["steps"]
                             ]

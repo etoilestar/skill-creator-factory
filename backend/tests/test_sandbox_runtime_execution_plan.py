@@ -296,3 +296,55 @@ def test_confirm_rejects_plan_with_missing_inputs(monkeypatch, tmp_path):
             "skill", stream_pipeline.PlanConfirmRequest(plan_id="confirm-missing")
         ))
     assert caught.value.status_code == 400
+
+
+def test_confirmed_runtime_plan_skips_high_level_planner_and_executes_same_plan(monkeypatch, tmp_path):
+    from backend.routers.chat_models import Message
+    from backend.routers.sandbox.io_manifest import SandboxChatRequest
+    from backend.routers.sandbox import stream_pipeline
+
+    confirmed = validate_runtime_execution_plan(
+        plan({"source_type": "user_input", "value": 1}), schema(), {}
+    )
+    captured = {}
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("confirmed runtime plan must not re-run high-level planner")
+
+    async def instruction(*args, **kwargs):
+        return {"intent": "execute", "complexity": "simple"}
+
+    async def execute_workflow(*args, **kwargs):
+        captured["dataflow_plan"] = kwargs.get("dataflow_plan")
+        yield_func = kwargs.get("yield_func")
+        if yield_func:
+            await yield_func(None)
+        return {"success": True, "results": [], "output_files": [], "context": {"steps": {}}}
+
+    async def final_answer(**kwargs):
+        return "done"
+
+    monkeypatch.setattr(stream_pipeline, "_allowed_skill_roots", lambda: [tmp_path])
+    monkeypatch.setattr(stream_pipeline, "_run_skill_runtime_planner_round", forbidden)
+    monkeypatch.setattr(stream_pipeline, "_run_instruction_analysis_round", instruction)
+    monkeypatch.setattr(stream_pipeline, "_build_runtime_action_schema", lambda *a, **k: schema())
+    monkeypatch.setattr(stream_pipeline, "_extract_runtime_resource_catalog", lambda *a, **k: [])
+    monkeypatch.setattr(stream_pipeline, "_execute_skill_workflow", execute_workflow)
+    monkeypatch.setattr(stream_pipeline, "_generate_final_answer_from_observation", final_answer)
+
+    context = {
+        "skill_name": "skill", "metadata_prompt": "meta", "force_body": True,
+        "body_loader": lambda: "body", "enable_action_execution": True,
+        "execution_root": tmp_path, "confirmed_runtime_plan": confirmed,
+        "confirmed_resource_catalog": [],
+    }
+    request = SandboxChatRequest(
+        messages=[Message(role="user", content="go")], execution_mode="execute"
+    )
+    response = stream_pipeline._make_stream(context, request)
+
+    async def consume():
+        return [chunk async for chunk in response.body_iterator]
+
+    asyncio.run(consume())
+    assert captured["dataflow_plan"] is confirmed

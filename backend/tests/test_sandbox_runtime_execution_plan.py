@@ -216,3 +216,83 @@ def test_runtime_plan_foreach_partial_failure_is_failure(monkeypatch, tmp_path):
     assert not result["success"]
     assert result["failed_instance_index"] == 1
     assert result["output_files"] == [{"path": "partial"}]
+
+
+def test_runtime_planner_receives_safe_resource_catalog(monkeypatch, tmp_path):
+    captured = {}
+    async def fake(messages, model):
+        captured["messages"] = messages
+        return '{"version":"sandbox-runtime-plan/v1","steps":[{"step_id":"step_1","script_path":"scripts/run.py","bindings":{"value":{"source_type":"user_input","value":1}}}]}'
+    monkeypatch.setattr(workflow_dataflow, "complete_chat_once", fake)
+    catalog = [{
+        "resource_handle": "resource:0", "path": "references/host-only.txt",
+        "kind": "references", "title": "safe", "allowed_actions": ["read_resource"],
+        "usage_hint": "use it", "host_secret": "must-not-leak",
+    }]
+    asyncio.run(workflow_dataflow._plan_workflow_steps_with_model(
+        execution_root=tmp_path, action_schema=schema(), user_context={}, resource_catalog=catalog,
+        reference_texts={"references/semantic.md": "semantic guidance"},
+    ))
+    prompt = "\n".join(str(message["content"]) for message in captured["messages"])
+    assert "display_path" in prompt and "references/host-only.txt" in prompt
+    assert "host_secret" not in prompt and "semantic guidance" in prompt
+
+
+def test_runtime_plan_preview_count_and_checklist_source_are_runtime_steps():
+    runtime_plan = validate_runtime_execution_plan({"version": VERSION, "steps": [
+        {"step_id": "one", "script_path": "scripts/run.py", "description": "first",
+         "bindings": {"value": {"source_type": "user_input", "value": 1}}},
+        {"step_id": "two", "script_path": "scripts/run.py", "description": "second",
+         "bindings": {"value": {"source_type": "step_output", "step_id": "one", "output": "result"}}},
+    ]}, schema())
+    preview = workflow_dataflow._runtime_plan_preview(runtime_plan)
+    assert len(preview["steps"]) == 2
+    assert [step["script_path"] for step in preview["steps"]] == ["scripts/run.py", "scripts/run.py"]
+    assert preview["steps"][1]["bindings"]["value"] == "one.result"
+
+
+def test_confirm_uses_revalidated_canonical_plan_without_replanning(monkeypatch, tmp_path):
+    import time
+    from backend.routers.chat_models import Message
+    from backend.routers.sandbox.io_manifest import SandboxChatRequest
+    from backend.routers.sandbox import stream_pipeline
+
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "run.py").write_text("", encoding="utf-8")
+    request = SandboxChatRequest(messages=[Message(role="user", content="go")])
+    pending_plan = plan({"source_type": "default", "value": 99})
+    action_schema = schema(defaults={"value": 3})
+    stream_pipeline._pending_plans["confirm-canonical"] = {
+        "skill_context": {"execution_root": tmp_path}, "request": request,
+        "runtime_execution_plan": pending_plan, "resource_catalog": [], "ts": time.time(),
+    }
+    captured = {}
+    monkeypatch.setattr(stream_pipeline, "_build_runtime_action_schema", lambda *a, **k: action_schema)
+    monkeypatch.setattr(stream_pipeline, "_make_stream", lambda context, req: captured.update(context) or "stream")
+    result = asyncio.run(stream_pipeline.confirm_plan_execution(
+        "skill", stream_pipeline.PlanConfirmRequest(plan_id="confirm-canonical")
+    ))
+    assert result == "stream"
+    assert captured["confirmed_runtime_plan"]["steps"][0]["bindings"]["value"]["value"] == 3
+
+
+def test_confirm_rejects_plan_with_missing_inputs(monkeypatch, tmp_path):
+    import time
+    from fastapi import HTTPException
+    from backend.routers.chat_models import Message
+    from backend.routers.sandbox.io_manifest import SandboxChatRequest
+    from backend.routers.sandbox import stream_pipeline
+
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "run.py").write_text("", encoding="utf-8")
+    stream_pipeline._pending_plans["confirm-missing"] = {
+        "skill_context": {"execution_root": tmp_path},
+        "request": SandboxChatRequest(messages=[Message(role="user", content="go")]),
+        "runtime_execution_plan": plan(), "resource_catalog": [], "ts": time.time(),
+    }
+    monkeypatch.setattr(stream_pipeline, "_build_runtime_action_schema", lambda *a, **k: schema())
+    with pytest.raises(HTTPException, match="缺少必要输入") as caught:
+        asyncio.run(stream_pipeline.confirm_plan_execution(
+            "skill", stream_pipeline.PlanConfirmRequest(plan_id="confirm-missing")
+        ))
+    assert caught.value.status_code == 400

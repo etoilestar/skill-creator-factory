@@ -29,6 +29,7 @@ from .path_resolution import (
 )
 from .action_schema import _extract_script_path_from_command
 from .task_executor import _execute_single_task
+from .resource_catalog import _resource_catalog_for_planner
 from .runtime_execution_plan import (
     VERSION as RUNTIME_PLAN_VERSION,
     RuntimePlanError,
@@ -93,7 +94,7 @@ async def _plan_workflow_steps_with_model(
     reference_texts: dict[str, str] | None = None,
     resource_catalog: list[dict] | None = None,
 ) -> dict:
-    """让 LLM 生成简化的步骤列表（不含 input_mapping/outputs/loop）。"""
+    """根据当前 Skill 契约和 Input Envelope 生成并校验 Runtime Execution Plan。"""
     entries = [entry for entry in (action_schema.get("entries") or []) if isinstance(entry, dict)]
     req = request or ChatRequest(messages=[])
     user_text = str((user_context or {}).get("user_request") or _last_user_text(req) or "")
@@ -108,7 +109,9 @@ async def _plan_workflow_steps_with_model(
         {"role": "user", "content": "## 完整 input_envelope\n" + json.dumps(user_context or {}, ensure_ascii=False)},
         {"role": "user", "content": "## SKILL.md\n" + skill_md},
         {"role": "user", "content": "## Action schema\n" + json.dumps(action_schema, ensure_ascii=False)},
-        {"role": "user", "content": "## Resource catalog\n" + json.dumps(resource_catalog or [], ensure_ascii=False)},
+        {"role": "user", "content": "## Resource catalog\n" + json.dumps(
+            _resource_catalog_for_planner(resource_catalog or []), ensure_ascii=False
+        )},
     ]
     if reference_texts:
         messages.append({"role": "user", "content": "## 语义参考资料\n" + "\n\n".join(

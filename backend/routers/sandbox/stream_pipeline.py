@@ -76,7 +76,7 @@ from .sop_planner import (
     _pending_plans,
     _format_task_checklist_markdown,
 )
-from .action_schema import _build_runtime_action_schema
+from .action_schema import _build_runtime_action_schema, _reference_contract_texts
 from .runtime_planner import _run_skill_runtime_planner_round, _run_supplementary_plan_round
 from .final_answer import (
     _generate_final_answer_from_observation,
@@ -554,8 +554,22 @@ def _make_stream(skill_context: dict, request: SandboxChatRequest):
                                 user_context=_workflow_context_from_input_envelope(input_envelope),
                                 request=request,
                                 skill_name=parent_skill_name,
+                                reference_texts=_reference_contract_texts(execution_root),
                                 resource_catalog=_plan_resource_catalog,
                             )
+
+                            if _runtime_execution_plan["missing_required_inputs"]:
+                                missing = _runtime_execution_plan["missing_required_inputs"]
+                                names = [str(item.get("input") or item) for item in missing]
+                                yield _sse({"runtime_plan_status": {
+                                    "mode": "ask_user", "missing_required_inputs": missing,
+                                }})
+                                yield _sse({"status": None})
+                                yield _sse({"content": "缺少以下必要输入：\n" + "\n".join(
+                                    f"- {name}" for name in names
+                                )})
+                                yield "data: [DONE]\n\n"
+                                return
 
                         _cleanup_expired_plans()
                         _pending_plans[plan_id] = {
@@ -595,6 +609,7 @@ def _make_stream(skill_context: dict, request: SandboxChatRequest):
                                 }
                                 for t in tasks
                             ]
+                        preview_tasks = plan_tasks if mode == "execute_workflow" else tasks
 
                         yield _sse({
                             "plan_preview": {
@@ -603,7 +618,7 @@ def _make_stream(skill_context: dict, request: SandboxChatRequest):
                                 "instruction_analysis": instruction_analysis,
                                 "sop": sop_document,
                                 "tasks": plan_tasks,
-                                "total_tasks": len(tasks),
+                                "total_tasks": len(preview_tasks),
                                 "awaiting_confirmation": True,
                             }
                         })
@@ -617,17 +632,17 @@ def _make_stream(skill_context: dict, request: SandboxChatRequest):
                                 "command": (str(t.get("command") or ""))[:200] or None,
                                 "path": t.get("path") or t.get("resource_handle") or None,
                             }
-                            for idx, t in enumerate(tasks)
+                            for idx, t in enumerate(preview_tasks)
                         ]
                         yield _task_checklist(checklist_tasks)
 
                         # Also push Markdown checklist as content for backward compatibility
                         checklist_md = _format_task_checklist_markdown(
-                            tasks, instruction_analysis=instruction_analysis
+                            preview_tasks, instruction_analysis=instruction_analysis
                         )
                         yield _sse({"status": None})
                         yield _sse({"content": (
-                            f"📋 **执行方案已生成**（共 {len(tasks)} 个步骤）\n\n"
+                            f"📋 **执行方案已生成**（共 {len(preview_tasks)} 个步骤）\n\n"
                             f"{checklist_md}\n\n"
                             "请在左侧面板查看详细方案，确认后将开始执行。\n"
                             f"（方案ID：`{plan_id}`）"
@@ -1562,11 +1577,20 @@ async def confirm_plan_execution(skill_name: str, request: PlanConfirmRequest):
                 if isinstance(item, dict)
                 and (execution_root / str(item.get("path") or "")).is_file()
             ]
-            validate_runtime_execution_plan(
+            canonical_plan = validate_runtime_execution_plan(
                 pending.get("runtime_execution_plan"), action_schema,
                 build_input_envelope(pending["request"], execution_root),
                 current_resource_catalog,
             )
+            if canonical_plan["missing_required_inputs"]:
+                missing_names = [
+                    str(item.get("input") or item)
+                    for item in canonical_plan["missing_required_inputs"]
+                ]
+                raise HTTPException(
+                    status_code=400,
+                    detail="方案当前缺少必要输入：" + "、".join(missing_names),
+                )
         except HTTPException:
             raise
         except Exception as exc:
@@ -1574,7 +1598,7 @@ async def confirm_plan_execution(skill_name: str, request: PlanConfirmRequest):
 
     # Re-execute the plan by building a new stream with execute mode
     skill_context = dict(skill_context)
-    skill_context["confirmed_runtime_plan"] = pending.get("runtime_execution_plan")
+    skill_context["confirmed_runtime_plan"] = canonical_plan if execution_root else pending.get("runtime_execution_plan")
     skill_context["confirmed_resource_catalog"] = current_resource_catalog if execution_root else pending.get("resource_catalog")
     original_request = pending["request"]
     # Override to execute mode for actual execution

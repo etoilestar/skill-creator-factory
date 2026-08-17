@@ -69,6 +69,11 @@ from .metadata_decisions import (
     _run_child_skill_selection_round,
 )
 from .multimodal import _request_messages_with_inline_images
+from .multiskill_manager import (
+    PendingMultiSkillPlanError,
+    confirm_multiskill_plan,
+    run_multiskill_orchestration,
+)
 from .instruction_analysis import _run_instruction_analysis_round
 from .sop_planner import (
     _generate_sop_from_plan,
@@ -1508,6 +1513,90 @@ def build_skill_context(skill_name: str) -> dict:
         "strict_skill_execution": True,
         "enable_resource_preload": True,
     }
+
+
+@router.post("/sandbox")
+async def chat_in_multiskill_sandbox(request: SandboxChatRequest):
+    """Stream opt-in Skill Pool orchestration; explicit single-Skill routes stay unchanged."""
+    upload_root = settings.multiskill_uploads_path.resolve()
+    envelope = build_input_envelope(request, upload_root)
+    envelope["_platform_input_root"] = str(upload_root)
+
+    async def generate():
+        queue: asyncio.Queue = asyncio.Queue()
+        async def event_sink(event):
+            await queue.put(event)
+        async def run():
+            try:
+                if request.multiskill_plan_id:
+                    return await confirm_multiskill_plan(request.multiskill_plan_id, event_sink=event_sink)
+                return await run_multiskill_orchestration(
+                    user_request=str(envelope.get("user_request") or ""), parent_envelope=envelope,
+                    execution_mode=request.effective_execution_mode(), model=request.model,
+                    event_sink=event_sink,
+                )
+            except PendingMultiSkillPlanError as exc:
+                return {"success": False, "completed": False, "mode": "error", "error": str(exc)}
+            except PermissionError:
+                return {"success": False, "completed": False, "mode": "error",
+                        "error": "skill_not_executable"}
+        task = asyncio.create_task(run())
+        while not task.done() or not queue.empty():
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=_SSE_KEEPALIVE_INTERVAL)
+                yield _sse(event)
+            except asyncio.TimeoutError:
+                yield ": keepalive\n\n"
+        result = await task
+        structured_outputs = [item for child in (result.get("skill_results") or {}).values()
+                              for item in (child.get("structured_outputs") or [])]
+        yield _sse({"multi_skill_trace": result.get("multi_skill_trace") or []})
+        yield _sse({"result_manifest": {
+            "version": "sandbox-result-v1",
+            "structured_outputs": structured_outputs,
+            "artifacts": result.get("artifacts") or [],
+        }})
+        if result.get("text"):
+            yield _sse({"answer": result["text"]})
+        yield _sse({"multiskill_result": result})
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+@router.post("/sandbox/inputs")
+async def upload_multiskill_input(session_id: str = Form(...), file: UploadFile = File(...)):
+    """Upload into a Host-owned Platform boundary, never into a guessed Child root."""
+    root = settings.multiskill_uploads_path.resolve()
+    if not session_id or Path(session_id).name != session_id or session_id in {".", ".."}:
+        raise HTTPException(status_code=400, detail="无效的会话标识")
+    filename = Path(file.filename or "upload").name
+    if not filename or filename in {".", ".."}:
+        raise HTTPException(status_code=400, detail="无效的文件名")
+    target_dir = (root / "inputs" / session_id).resolve()
+    if not _is_within_sandbox(target_dir, root):
+        raise HTTPException(status_code=400, detail="不安全的上传路径")
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / filename
+    stem, suffix, counter = target.stem, target.suffix, 1
+    while target.exists():
+        target = target_dir / f"{stem}-{counter}{suffix}"
+        counter += 1
+    size = 0
+    try:
+        with target.open("xb") as output:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > _MAX_INPUT_BYTES:
+                    raise HTTPException(status_code=413, detail="文件超过大小限制")
+                output.write(chunk)
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+    import mimetypes
+    mime = file.content_type or mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+    return {"path": target.relative_to(root).as_posix(), "filename": target.name,
+            "size": size, "mime_type": mime}
 
 
 @router.post("/sandbox/{skill_name}")

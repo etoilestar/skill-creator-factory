@@ -21,6 +21,7 @@ class SandboxChatRequest(ChatRequest):
     fields: dict[str, Any] = Field(default_factory=dict)
     options: dict[str, Any] = Field(default_factory=dict)
     resources: list[Any] = Field(default_factory=list)
+    multiskill_plan_id: str | None = None
 
 
 def _safe_text_preview(path: Path, limit: int = MAX_PREVIEW_BYTES) -> str | None:

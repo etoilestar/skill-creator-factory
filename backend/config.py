@@ -95,6 +95,7 @@ class Settings(BaseSettings):
     bundled_skills_path: Path = PROJECT_ROOT / "bundled-skills"
     governance_path: Path = PROJECT_ROOT / ".skill-governance"
     exports_path: Path = Field(PROJECT_ROOT / "backend" / "data" / "exports", validation_alias=AliasChoices("EXPORTS_PATH", "exports_path"))
+    multiskill_uploads_path: Path = Field(PROJECT_ROOT / "backend" / "data" / "multiskill-inputs", validation_alias=AliasChoices("MULTISKILL_UPLOADS_PATH", "multiskill_uploads_path"))
 
     # Publish module settings
     publish_config_path: Path = PROJECT_ROOT / ".skill-governance" / "publish"
@@ -134,6 +135,7 @@ class Settings(BaseSettings):
         self.bundled_skills_path.mkdir(parents=True, exist_ok=True)
         self.governance_path.mkdir(parents=True, exist_ok=True)
         self.exports_path.mkdir(parents=True, exist_ok=True)
+        self.multiskill_uploads_path.mkdir(parents=True, exist_ok=True)
         self.skills_path = self.managed_skills_path
         if not self.kernel_path.exists():
             raise ValueError(

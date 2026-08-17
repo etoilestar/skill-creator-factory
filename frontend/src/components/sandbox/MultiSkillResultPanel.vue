@@ -10,7 +10,10 @@
       <h5>Skill 结果</h5>
       <div v-for="(item, id) in result.skill_results || {}" :key="id" class="summary"><code>{{ id }}</code><span>{{ item.skill_name || item.status || item.mode || '已返回' }}</span></div>
       <h5 v-if="result.artifacts?.length || result.output_files?.length">产物</h5>
-      <div v-for="file in [...(result.artifacts || []), ...(result.output_files || [])]" :key="file.url || file.path" class="summary">{{ file.name || file.filename || file.path }}</div>
+      <div v-for="file in [...(result.artifacts || []), ...(result.output_files || [])]" :key="file.url || file.path" class="summary">
+        <a v-if="file.url" :href="file.url" :download="file.name || file.filename">{{ file.name || file.filename || '下载产物' }}</a>
+        <span v-else>{{ file.name || file.filename || file.path }}</span>
+      </div>
       <details v-if="debug"><summary>调试事件（已过滤）</summary><pre>{{ safeDebug }}</pre></details>
     </template>
   </section>

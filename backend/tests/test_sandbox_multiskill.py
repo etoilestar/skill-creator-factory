@@ -8,6 +8,7 @@ import pytest
 from backend.routers.sandbox import multiskill_executor as executor
 from backend.routers.sandbox import multiskill_plan as plans
 from backend.routers.sandbox import multiskill_manager as manager
+from backend.routers.sandbox import stream_pipeline
 
 
 def plan(*steps):
@@ -41,6 +42,22 @@ def test_multiskill_does_not_import_creator_tool_registry():
         tree = ast.parse((Path(executor.__file__).parent / filename).read_text())
         imported = [node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)]
         assert not any("creator" in name or "tool_registry" in name for name in imported)
+
+
+@pytest.mark.asyncio
+async def test_multiskill_upload_session_cleanup_is_host_bounded(tmp_path, monkeypatch):
+    monkeypatch.setattr(stream_pipeline.settings, "multiskill_uploads_path", tmp_path)
+    session = tmp_path / "inputs" / "session-1"
+    session.mkdir(parents=True)
+    (session / "input.txt").write_text("temporary")
+
+    assert await stream_pipeline.cleanup_multiskill_inputs("session-1") == {"success": True}
+    assert not session.exists()
+
+    for unsafe in (".", "..", "../escape", "nested/session"):
+        with pytest.raises(stream_pipeline.HTTPException) as exc:
+            await stream_pipeline.cleanup_multiskill_inputs(unsafe)
+        assert exc.value.status_code == 400
 
 
 def test_multiskill_rejects_unknown_non_executable_future_channel_and_cycle():

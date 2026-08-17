@@ -268,7 +268,7 @@
 <script setup>
 import { ref, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { fetchSkills } from '../composables/useSkills.js'
-import { clearSandboxRoundResult, streamChat, confirmPlan, streamConfirmResponse, applyMultiSkillEvent } from '../composables/useSandboxChat.js'
+import { clearSandboxRoundResult, streamChat, confirmPlan, streamConfirmResponse, applyMultiSkillEvent, buildSandboxRequestBody, canUseSandboxMode, sandboxChatUrl, sandboxUploadUrl } from '../composables/useSandboxChat.js'
 import ChatBubble from '../components/ChatBubble.vue'
 import ThinkingPanel from '../components/ThinkingPanel.vue'
 import TaskPlanPanel from '../components/TaskPlanPanel.vue'
@@ -320,7 +320,7 @@ const streamBuffer = ref('')
 const error = ref('')
 const messagesEl = ref(null)
 const currentStatus = ref(null)  // { phase, message } | null
-const canUseSandbox = computed(() => sandboxMode.value === 'skill_pool' || Boolean(selectedSkill.value))
+const canUseSandbox = computed(() => canUseSandboxMode(sandboxMode.value, selectedSkill.value))
 
 // Parent orchestration state. Child events are intentionally keyed by child_run_id.
 const multiSkillPlan = ref(null)
@@ -383,8 +383,9 @@ onBeforeUnmount(() => {
 
 /** Synchronous cleanup handler for beforeunload (uses sendBeacon for reliability) */
 function _beforeUnloadHandler() {
-  if (sandboxMode.value === 'skill_pool' || !selectedSkill.value || !sessionId.value) return
-  const url = `/api/chat/sandbox/${encodeURIComponent(selectedSkill.value)}/inputs/${encodeURIComponent(sessionId.value)}`
+  if (!sessionId.value || (sandboxMode.value === 'single_skill' && !selectedSkill.value)) return
+  const base = sandboxUploadUrl(sandboxMode.value, selectedSkill.value)
+  const url = `${base}/${encodeURIComponent(sessionId.value)}`
   // sendBeacon doesn't support DELETE, so we use a synchronous XMLHttpRequest as fallback
   try {
     const xhr = new XMLHttpRequest()
@@ -397,13 +398,11 @@ function _beforeUnloadHandler() {
 
 /** Clean up the current session's files on the backend (inputs + outputs). */
 async function cleanupSession() {
-  // The current Host-owned Skill Pool upload API intentionally has no DELETE route.
-  if (sandboxMode.value === 'skill_pool' || !selectedSkill.value || !sessionId.value) return
+  if (!sessionId.value || (sandboxMode.value === 'single_skill' && !selectedSkill.value)) return
+  // Resolve before awaiting so mode switches always clean the old mode's session.
+  const url = `${sandboxUploadUrl(sandboxMode.value, selectedSkill.value)}/${encodeURIComponent(sessionId.value)}`
   try {
-    await fetch(
-      `/api/chat/sandbox/${encodeURIComponent(selectedSkill.value)}/inputs/${encodeURIComponent(sessionId.value)}`,
-      { method: 'DELETE' },
-    )
+    await fetch(url, { method: 'DELETE' })
   } catch {
     // Best-effort cleanup; ignore network errors
   }
@@ -518,9 +517,7 @@ async function onFileSelected(event) {
     fd.append('file', file)
     fd.append('session_id', sessionId.value)
     try {
-      const uploadUrl = sandboxMode.value === 'skill_pool'
-        ? '/api/chat/sandbox/inputs'
-        : `/api/chat/sandbox/${encodeURIComponent(selectedSkill.value)}/inputs`
+      const uploadUrl = sandboxUploadUrl(sandboxMode.value, selectedSkill.value)
       const res = await fetch(
         uploadUrl,
         { method: 'POST', body: fd }
@@ -587,19 +584,9 @@ async function send() {
   }))
 
   try {
-    const url = sandboxMode.value === 'skill_pool'
-      ? '/api/chat/sandbox'
-      : `/api/chat/sandbox/${encodeURIComponent(selectedSkill.value)}`
-    const body = {
-      messages: chatHistory.value,
-      model: null,
-      execution_mode: executionMode.value,
-      sandbox_session_id: sessionId.value,
-      input_files: inputFilesSnapshot,
-      fields: {},
-      options: {},
-      resources: [],
-    }
+    const url = sandboxChatUrl(sandboxMode.value, selectedSkill.value)
+    const body = buildSandboxRequestBody({ messages: chatHistory.value, executionMode: executionMode.value,
+      sessionId: sessionId.value, inputFiles: inputFilesSnapshot })
     for await (const chunk of streamChat(url, body)) {
       if (typeof chunk === 'string') {
         streamBuffer.value += chunk
@@ -701,13 +688,9 @@ async function confirmCurrentPlan() {
     multiSkillTab.value = 'children'
     multiSkillResult.value = null
     try {
-      const body = {
-        messages: [], model: null, execution_mode: 'execute', input_files: [],
-        fields: {}, options: {}, resources: [],
-        sandbox_session_id: sessionId.value,
-        multiskill_plan_id: pendingMultiSkillPlanId.value,
-      }
-      for await (const chunk of streamChat('/api/chat/sandbox', body)) {
+      const body = buildSandboxRequestBody({ sessionId: sessionId.value,
+        multiskillPlanId: pendingMultiSkillPlanId.value })
+      for await (const chunk of streamChat(sandboxChatUrl('skill_pool'), body)) {
         if (typeof chunk === 'string') streamBuffer.value += chunk
         else if (chunk.type === 'result_manifest') resultManifest.value = chunk.data
         else if (chunk.type === 'status') currentStatus.value = chunk.data

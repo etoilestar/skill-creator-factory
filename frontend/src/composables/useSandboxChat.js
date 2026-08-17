@@ -27,19 +27,46 @@ export function parseSandboxSSEPayload(payload) {
 }
 
 /** Keep parent Skill state separate from each Child Runtime's private event list. */
+export function normalizeMultiSkillStepForUI(step = {}, index = 0) {
+  const rawSources = step.input_sources ?? step.input_bindings ?? step.bindings ?? {}
+  const inputSources = []
+  if (Array.isArray(rawSources)) {
+    for (const item of rawSources) {
+      if (typeof item === 'string') inputSources.push(item)
+      else if (item && typeof item === 'object') {
+        inputSources.push(`${item.target || '?'} ← ${item.source || '?'}`)
+      }
+    }
+  } else if (rawSources && typeof rawSources === 'object') {
+    for (const [target, source] of Object.entries(rawSources)) {
+      if (typeof source === 'string') inputSources.push(`${target} ← ${source}`)
+      else if (source && typeof source === 'object') {
+        if (source.source_type === 'skill_result') {
+          const path = source.path || ''
+          inputSources.push(`${target} ← ${source.step_id || '?'}.${source.channel || '?'}${path}`)
+        } else {
+          inputSources.push(`${target} ← ${source.source_type || source.source || '?'}`)
+        }
+      }
+    }
+  }
+  return {
+    stepId: step.step_id || `step_${index + 1}`,
+    skillName: step.skill_name || '',
+    task: step.task || '',
+    dependsOn: Array.isArray(step.depends_on) ? [...step.depends_on] : [],
+    inputSources,
+    childRunId: null,
+    status: 'pending',
+  }
+}
+
 export function applyMultiSkillEvent(state, event) {
   const data = event.data || {}
   if (event.type === 'multiskill_plan') {
     state.plan = data
-    state.steps = (data.steps || data.preview || []).map((step, index) => ({
-      stepId: step.step_id || `step_${index + 1}`,
-      skillName: step.skill_name || '',
-      task: step.task || '',
-      dependsOn: step.depends_on || [],
-      inputSources: step.input_sources || step.input_bindings || {},
-      childRunId: null,
-      status: 'pending',
-    }))
+    const displaySteps = data.preview?.length ? data.preview : data.steps || []
+    state.steps = displaySteps.map(normalizeMultiSkillStepForUI)
     return
   }
   if (event.type === 'child_runtime_event') {
@@ -64,11 +91,32 @@ export function applyMultiSkillEvent(state, event) {
   if (!status) return
   let step = state.steps.find(item => item.stepId === data.step_id)
   if (!step) {
-    step = { stepId: data.step_id, skillName: data.skill_name || '', task: '', dependsOn: [], inputSources: {}, childRunId: null, status: 'pending' }
+    step = { stepId: data.step_id, skillName: data.skill_name || '', task: '', dependsOn: [], inputSources: [], childRunId: null, status: 'pending' }
     state.steps.push(step)
   }
   step.status = status
   if (data.child_run_id) step.childRunId = data.child_run_id
+}
+
+export function canUseSandboxMode(mode, skillName) {
+  return mode === 'skill_pool' || Boolean(skillName)
+}
+
+export function sandboxChatUrl(mode, skillName = '') {
+  return mode === 'skill_pool' ? '/api/chat/sandbox' : `/api/chat/sandbox/${encodeURIComponent(skillName)}`
+}
+
+export function sandboxUploadUrl(mode, skillName = '') {
+  return mode === 'skill_pool' ? '/api/chat/sandbox/inputs' : `${sandboxChatUrl(mode, skillName)}/inputs`
+}
+
+export function buildSandboxRequestBody({ messages = [], model = null, executionMode = 'execute',
+  sessionId, inputFiles = [], fields = {}, options = {}, resources = [], multiskillPlanId } = {}) {
+  return {
+    messages, model, execution_mode: executionMode, sandbox_session_id: sessionId,
+    input_files: inputFiles, fields, options, resources,
+    ...(multiskillPlanId ? { multiskill_plan_id: multiskillPlanId } : {}),
+  }
 }
 
 export function clearSandboxRoundResult(resultManifest) {

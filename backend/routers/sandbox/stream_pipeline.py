@@ -5,6 +5,7 @@ import functools
 import hashlib
 import json
 import logging
+import shutil
 import time as _time_module
 from pathlib import Path
 
@@ -1597,6 +1598,20 @@ async def upload_multiskill_input(session_id: str = Form(...), file: UploadFile 
     mime = file.content_type or mimetypes.guess_type(target.name)[0] or "application/octet-stream"
     return {"path": target.relative_to(root).as_posix(), "filename": target.name,
             "size": size, "mime_type": mime}
+
+
+@router.delete("/sandbox/inputs/{session_id}")
+async def cleanup_multiskill_inputs(session_id: str):
+    """Delete one Host-owned upload session without crossing its input boundary."""
+    root = settings.multiskill_uploads_path.resolve()
+    inputs_root = (root / "inputs").resolve()
+    if not session_id or Path(session_id).name != session_id or session_id in {".", ".."}:
+        raise HTTPException(status_code=400, detail="无效的会话标识")
+    target_dir = (inputs_root / session_id).resolve()
+    if not _is_within_sandbox(target_dir, inputs_root):
+        raise HTTPException(status_code=400, detail="不安全的上传路径")
+    shutil.rmtree(target_dir, ignore_errors=True)
+    return {"success": True}
 
 
 @router.post("/sandbox/{skill_name}")

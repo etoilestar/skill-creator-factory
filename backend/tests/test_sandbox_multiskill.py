@@ -88,14 +88,13 @@ async def test_multiskill_invokes_runtime_and_passes_manifest_channels_serially(
     async def runtime(**kwargs):
         calls.append(kwargs)
         if kwargs["skill_name"] == "one":
-            return {"success": True, "text": "analysis", "structured_outputs": {"summary": "short"},
-                    "artifacts": [{"artifact_id": "a1"}], "output_files": [{"resource_id": "f1"}],
+            return {"success": True, "text": "analysis", "structured_outputs": [{"source": "stdout", "data": {"summary": "short"}}],
+                    "artifacts": [{"artifact_id": "a1"}], "output_files": [],
                     "runtime_plan": {"must": "not leak"}}
-        return {"success": True, "text": "done", "structured_outputs": {}, "artifacts": [], "output_files": []}
+        return {"success": True, "text": "done", "structured_outputs": [], "artifacts": [], "output_files": []}
     bindings = {
-        "payload": {"source_type": "skill_result", "step_id": "s1", "channel": "structured_outputs", "path": "summary"},
+        "payload": {"source_type": "skill_result", "step_id": "s1", "channel": "structured_outputs", "path": "[0].data.summary"},
         "resources": {"source_type": "skill_result", "step_id": "s1", "channel": "artifacts"},
-        "input_files": {"source_type": "skill_result", "step_id": "s1", "channel": "output_files"},
     }
     result = await executor.execute_multiskill_plan(plan=plan(step(), step("s2", "two", "make slides", bindings, ["s1"])),
         activated_skill_names=["one", "two"], parent_envelope={"user_request": "original", "fields": {"x": 1}},
@@ -105,7 +104,7 @@ async def test_multiskill_invokes_runtime_and_passes_manifest_channels_serially(
     assert calls[1]["input_envelope"]["user_request"] == "make slides"
     assert calls[1]["input_envelope"]["payload"] == "short"
     assert calls[1]["input_envelope"]["resources"] == [{"artifact_id": "a1"}]
-    assert calls[1]["input_envelope"]["input_files"] == [{"resource_id": "f1"}]
+    assert calls[1]["input_envelope"]["input_files"] == []
     assert "runtime_plan" not in str(result)
     assert result["skills"]["s1"]["child_run_id"].startswith("child_")
 
@@ -137,7 +136,8 @@ async def test_confirmed_multiskill_plan_executes_same_plan_without_planner():
         return {"success": True, "text": "ok"}
     result = await manager.run_multiskill_manager(user_request="original", parent_envelope={},
         activation_cards=[{"skill_name": "one"}], single_skill_runtime=runtime,
-        confirmed_plan=canonical, model_call=lambda *_: pytest.fail("planner must not run"))
+        confirmed_plan=canonical, model_call=lambda *_: pytest.fail("planner must not run"),
+        final_synthesizer=lambda **_: "final")
     assert result["success"] is True
     assert calls[0]["input_envelope"]["user_request"] == "confirmed task"
 

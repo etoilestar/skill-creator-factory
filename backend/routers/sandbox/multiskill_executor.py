@@ -3,15 +3,22 @@
 from __future__ import annotations
 
 import inspect
+import mimetypes
 import re
+import shutil
 import uuid
 from copy import deepcopy
+from pathlib import Path
 from typing import Awaitable, Callable
 
 from ...services.skill_governance import resolve_skill_record
+from ..chat_utils import _is_within_sandbox
+from .child_skill_runtime import execute_child_skill_runtime
 from .multiskill_plan import RESULT_CHANNELS, validate_multiskill_plan
 
-PUBLIC_RESULT_FIELDS = {"status", "mode", "text", "structured_outputs", "artifacts", "output_files"}
+CONTROL_FIELDS = {"status", "mode", "success", "completed", "paused_for_user", "reason", "missing"}
+DATA_FIELDS = {"text", "structured_outputs", "artifacts", "output_files"}
+PUBLIC_RESULT_FIELDS = CONTROL_FIELDS | DATA_FIELDS
 ENVELOPE_FIELDS = {"user_request", "input", "text", "payload", "fields", "options", "input_files", "files", "resources"}
 
 
@@ -26,11 +33,17 @@ def normalize_child_skill_result(raw: dict, *, child_run_id: str, skill_name: st
     result.update({"child_run_id": child_run_id, "skill_name": skill_name})
     result["status"] = str(result.get("status") or ("completed" if raw.get("success", True) else "failed"))
     result["mode"] = str(result.get("mode") or "execute")
+    paused = bool(result.get("paused_for_user") or result["mode"] == "ask_user")
+    result["success"] = None if paused else bool(raw.get("success", result["status"] == "completed"))
+    result["completed"] = False if paused else bool(raw.get("completed", result["success"] is True))
+    result["paused_for_user"] = paused
+    result["reason"] = str(result.get("reason") or "")
+    result["missing"] = list(result.get("missing") or [])
     result["text"] = str(result.get("text") or "")
     for key in ("artifacts", "output_files"):
         result[key] = result.get(key) if isinstance(result.get(key), list) else []
-    if result.get("structured_outputs") is None:
-        result["structured_outputs"] = {}
+    if not isinstance(result.get("structured_outputs"), list):
+        result["structured_outputs"] = []
     return result
 
 
@@ -48,7 +61,9 @@ def _resolve(binding: dict, parent: dict, results: dict):
     source = binding["source_type"]
     if source == "default":
         return deepcopy(binding.get("value"))
-    if source in {"envelope", "user_input", "derived_from_user_input"}:
+    if source == "derived_from_user_input":
+        return deepcopy(binding.get("value"))
+    if source in {"envelope", "user_input"}:
         if source == "user_input":
             return parent.get("user_request", parent.get("text", ""))
         path = binding.get("path")
@@ -62,14 +77,53 @@ def _resolve(binding: dict, parent: dict, results: dict):
     return _json_path(value, binding["path"]) if binding.get("path") else deepcopy(value)
 
 
-def build_child_input_envelope(step: dict, parent_envelope: dict, skill_results: dict) -> dict:
+def materialize_child_artifacts_for_input(*, items: list[dict], source_skill_name: str,
+                                          target_skill_name: str, child_run_id: str) -> list[dict]:
+    """Host-validate executor artifacts and copy them into the target input boundary."""
+    source_record = resolve_skill_record(source_skill_name, mode="sandbox", require_visible=True, require_executable=True)
+    target_record = resolve_skill_record(target_skill_name, mode="sandbox", require_visible=True, require_executable=True)
+    source_root, target_root = Path(source_record["root_path"]).resolve(), Path(target_record["root_path"]).resolve()
+    input_dir = (target_root / "inputs" / child_run_id).resolve()
+    if not _is_within_sandbox(input_dir, target_root):
+        raise MultiSkillBindingError("invalid target input boundary")
+    input_dir.mkdir(parents=True, exist_ok=True)
+    manifests = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise MultiSkillBindingError("artifact entry must be an object")
+        relative = str(item.get("path") or "")
+        source = (source_root / relative).resolve()
+        if not relative or not _is_within_sandbox(source, source_root) or not source.is_file():
+            raise MultiSkillBindingError("artifact is not an executor-confirmed local file")
+        filename = Path(str(item.get("name") or item.get("filename") or source.name)).name
+        target = input_dir / f"{index}-{filename}"
+        shutil.copy2(source, target)
+        mime = str(item.get("mime_type") or mimetypes.guess_type(filename)[0] or "application/octet-stream")
+        relative_path = target.relative_to(target_root).as_posix()
+        manifests.append({
+            "path": relative_path, "filename": filename, "size": target.stat().st_size,
+            "mime_type": mime, "media_family": mime.partition("/")[0] + "/*",
+            "model_access": "path_only", "relative_to_input_dir": target.name,
+            "relative_to_input_session_dir": target.name,
+        })
+    return manifests
+
+
+def build_child_input_envelope(step: dict, parent_envelope: dict, skill_results: dict,
+                               *, child_run_id: str) -> dict:
     child = {key: deepcopy(parent_envelope.get(key)) for key in ENVELOPE_FIELDS if key in parent_envelope}
     child["user_request"] = step["task"]
     child["input"] = child["text"] = step["task"]
     for target, binding in step.get("bindings", {}).items():
         if target not in ENVELOPE_FIELDS:
             raise MultiSkillBindingError(f"binding target is not an Input Envelope field: {target}")
-        child[target] = _resolve(binding, parent_envelope, skill_results)
+        value = _resolve(binding, parent_envelope, skill_results)
+        if target in {"input_files", "files"} and binding.get("source_type") == "skill_result" and binding.get("channel") in {"artifacts", "output_files"}:
+            source_result = skill_results[binding["step_id"]]
+            value = materialize_child_artifacts_for_input(items=value,
+                source_skill_name=source_result["skill_name"], target_skill_name=step["skill_name"],
+                child_run_id=child_run_id)
+        child[target] = value
     child.setdefault("payload", None)
     for key, default in (("fields", {}), ("options", {}), ("input_files", []), ("files", []), ("resources", [])):
         child.setdefault(key, deepcopy(default))
@@ -77,21 +131,21 @@ def build_child_input_envelope(step: dict, parent_envelope: dict, skill_results:
 
 
 async def invoke_child_skill(*, step: dict, parent_envelope: dict, skill_results: dict,
-                             single_skill_runtime: Callable[..., Awaitable[dict] | dict],
+                             single_skill_runtime: Callable[..., Awaitable[dict] | dict] | None = None,
                              child_run_id: str | None = None) -> dict:
     """Revalidate governance, then invoke the existing complete Single-Skill Runtime."""
-    record = resolve_skill_record(step["skill_name"], mode="sandbox", require_visible=True, require_executable=True)
+    resolve_skill_record(step["skill_name"], mode="sandbox", require_visible=True, require_executable=True)
     run_id = child_run_id or f"child_{uuid.uuid4().hex}"
-    envelope = build_child_input_envelope(step, parent_envelope, skill_results)
-    raw = single_skill_runtime(skill_name=step["skill_name"], skill_root=record["root_path"],
-                               input_envelope=envelope, child_run_id=run_id)
+    envelope = build_child_input_envelope(step, parent_envelope, skill_results, child_run_id=run_id)
+    runtime = single_skill_runtime or execute_child_skill_runtime
+    raw = runtime(skill_name=step["skill_name"], input_envelope=envelope, child_run_id=run_id)
     if inspect.isawaitable(raw):
         raw = await raw
     return normalize_child_skill_result(raw, child_run_id=run_id, skill_name=step["skill_name"])
 
 
 async def execute_multiskill_plan(*, plan: dict, activated_skill_names, parent_envelope: dict,
-                                  single_skill_runtime: Callable[..., Awaitable[dict] | dict],
+                                  single_skill_runtime: Callable[..., Awaitable[dict] | dict] | None = None,
                                   event_sink: Callable[[dict], object] | None = None) -> dict:
     """Execute validated nodes serially; no fan-out, retry, replacement, or parent replan."""
     canonical = validate_multiskill_plan(plan, activated_skill_names)
@@ -114,9 +168,10 @@ async def execute_multiskill_plan(*, plan: dict, activated_skill_names, parent_e
         if result["mode"] == "ask_user":
             trace.append({"step_id": step["step_id"], "skill_name": step["skill_name"], "child_run_id": run_id, "status": "ask_user"})
             await emit({"skill_ask_user": deepcopy(trace[-1])})
-            return {"success": True, "mode": "ask_user", "paused_at_step_id": step["step_id"],
+            return {"success": None, "completed": False, "paused_for_user": True,
+                    "mode": "ask_user", "paused_at_step_id": step["step_id"],
                     "child_run_id": run_id, "skill_name": step["skill_name"],
-                    "reason": result.get("text", ""), "missing": result.get("structured_outputs", {}).get("missing", []),
+                    "reason": result.get("reason") or result.get("text", ""), "missing": result.get("missing") or [],
                     "skill_results": results, "skills": skills, "artifacts": artifacts,
                     "output_files": output_files, "multi_skill_trace": trace}
         if result["status"] in {"failed", "error"}:
@@ -127,5 +182,6 @@ async def execute_multiskill_plan(*, plan: dict, activated_skill_names, parent_e
                     "artifacts": artifacts, "output_files": output_files, "multi_skill_trace": trace}
         trace.append({"step_id": step["step_id"], "skill_name": step["skill_name"], "child_run_id": run_id, "status": "completed"})
         await emit({"skill_completed": deepcopy(trace[-1])})
-    return {"success": True, "mode": "multi_skill", "skill_results": results, "skills": skills,
+    return {"success": True, "completed": True, "paused_for_user": False,
+            "mode": "multi_skill", "skill_results": results, "skills": skills,
             "artifacts": artifacts, "output_files": output_files, "multi_skill_trace": trace}

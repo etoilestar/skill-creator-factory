@@ -69,6 +69,7 @@ from .metadata_decisions import (
     _run_child_skill_selection_round,
 )
 from .multimodal import _request_messages_with_inline_images
+from .multiskill_manager import run_multiskill_orchestration
 from .instruction_analysis import _run_instruction_analysis_round
 from .sop_planner import (
     _generate_sop_from_plan,
@@ -1508,6 +1509,16 @@ def build_skill_context(skill_name: str) -> dict:
         "strict_skill_execution": True,
         "enable_resource_preload": True,
     }
+
+
+@router.post("/sandbox")
+async def chat_in_multiskill_sandbox(request: SandboxChatRequest):
+    """Opt-in Skill Pool route; explicitly selected `/sandbox/{skill}` stays unchanged."""
+    envelope = build_input_envelope(request, None)
+    return await run_multiskill_orchestration(
+        user_request=str(envelope.get("user_request") or ""), parent_envelope=envelope,
+        execution_mode=request.effective_execution_mode(), model=request.model,
+    )
 
 
 @router.post("/sandbox/{skill_name}")

@@ -20,7 +20,18 @@ VERSION = "sandbox-multiskill-plan/v1"
 SOURCE_TYPES = {"envelope", "user_input", "derived_from_user_input", "skill_result", "default"}
 RESULT_CHANNELS = {"text", "structured_outputs", "artifacts", "output_files"}
 FORBIDDEN_FIELDS = {"tool_name", "function_name", "script_path", "command", "shell", "action_schema_entry"}
-_PATH = re.compile(r"^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+|\[[0-9]+\])*$")
+TOP_LEVEL_FIELDS = {"version", "steps", "missing_required_inputs", "warnings"}
+STEP_FIELDS = {"step_id", "skill_name", "task", "description", "bindings", "depends_on"}
+BINDING_FIELDS = {
+    "default": {"source_type", "value"},
+    "skill_result": {"source_type", "step_id", "channel", "path"},
+    "envelope": {"source_type", "path"},
+    "user_input": {"source_type"},
+    # A planner-derived value is an explicit literal, never a backend inference.
+    "derived_from_user_input": {"source_type", "value"},
+}
+BINDING_TARGETS = {"user_request", "input", "text", "payload", "fields", "options", "input_files", "files", "resources"}
+_PATH = re.compile(r"^(?:[A-Za-z0-9_-]+|\[[0-9]+\])(?:\.[A-Za-z0-9_-]+|\[[0-9]+\])*$")
 
 
 class MultiSkillPlanError(ValueError):
@@ -45,17 +56,25 @@ def validate_multiskill_plan(payload: dict, activated_skill_names, *, revalidate
     if not isinstance(payload, dict):
         raise MultiSkillPlanError("multiskill_plan_invalid", "plan must be an object")
     _reject_forbidden(payload)
+    unknown = set(payload) - TOP_LEVEL_FIELDS
+    if unknown:
+        raise MultiSkillPlanError("multiskill_unknown_field", f"plan.{sorted(unknown)[0]}")
     if payload.get("version") != VERSION:
         raise MultiSkillPlanError("multiskill_plan_version")
     steps = payload.get("steps")
     if not isinstance(steps, list) or not steps:
         raise MultiSkillPlanError("multiskill_plan_steps")
+    if not isinstance(payload.get("missing_required_inputs", []), list) or not isinstance(payload.get("warnings", []), list):
+        raise MultiSkillPlanError("multiskill_plan_metadata")
     allowed = set(activated_skill_names)
     seen: set[str] = set()
     canonical = []
     for raw in steps:
         if not isinstance(raw, dict):
             raise MultiSkillPlanError("multiskill_step_invalid")
+        unknown = set(raw) - STEP_FIELDS
+        if unknown:
+            raise MultiSkillPlanError("multiskill_unknown_field", f"step.{sorted(unknown)[0]}")
         step_id = raw.get("step_id")
         name = raw.get("skill_name")
         task = raw.get("task")
@@ -77,11 +96,25 @@ def validate_multiskill_plan(payload: dict, activated_skill_names, *, revalidate
         if not isinstance(bindings, dict):
             raise MultiSkillPlanError("multiskill_bindings")
         for target, binding in bindings.items():
-            if not isinstance(target, str) or not isinstance(binding, dict):
+            if target not in BINDING_TARGETS or not isinstance(binding, dict):
                 raise MultiSkillPlanError("multiskill_binding_invalid")
             source_type = binding.get("source_type")
             if source_type not in SOURCE_TYPES:
                 raise MultiSkillPlanError("multiskill_binding_source", str(source_type))
+            unknown = set(binding) - BINDING_FIELDS[source_type]
+            required = {
+                "default": {"source_type", "value"},
+                "skill_result": {"source_type", "step_id", "channel"},
+                "envelope": {"source_type"},
+                "user_input": {"source_type"},
+                "derived_from_user_input": {"source_type", "value"},
+            }[source_type]
+            if unknown or not required.issubset(binding):
+                raise MultiSkillPlanError("multiskill_binding_shape", str(target))
+            if source_type == "envelope" and binding.get("path") is not None and (
+                not isinstance(binding["path"], str) or not _PATH.fullmatch(binding["path"])
+            ):
+                raise MultiSkillPlanError("multiskill_binding_path", str(binding.get("path")))
             if source_type == "skill_result":
                 source_step = binding.get("step_id")
                 if source_step not in seen:

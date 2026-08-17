@@ -268,7 +268,7 @@
 <script setup>
 import { ref, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { fetchSkills } from '../composables/useSkills.js'
-import { clearSandboxRoundResult, streamChat, confirmPlan, streamConfirmResponse, applyMultiSkillEvent, buildSandboxRequestBody, canUseSandboxMode, sandboxChatUrl, sandboxUploadUrl } from '../composables/useSandboxChat.js'
+import { clearSandboxRoundResult, streamChat, confirmPlan, streamConfirmResponse, applyMultiSkillEvent, buildSandboxRequestBody, canUseSandboxMode, mapSandboxError, sandboxChatUrl, sandboxUploadUrl } from '../composables/useSandboxChat.js'
 import ChatBubble from '../components/ChatBubble.vue'
 import ThinkingPanel from '../components/ThinkingPanel.vue'
 import TaskPlanPanel from '../components/TaskPlanPanel.vue'
@@ -473,6 +473,9 @@ function handleMultiSkillChunk(chunk) {
   applyMultiSkillEvent(state, chunk)
   if (chunk.type === 'multiskill_result') {
     const result = chunk.data || {}
+    if (result.mode === 'error' || (result.success === false && result.error)) {
+      error.value = mapSandboxError(result.error)
+    }
     if (result.mode === 'plan' && result.plan_id) {
       pendingMultiSkillPlanId.value = result.plan_id
       multiSkillPlan.value = { ...(result.plan || {}), preview: result.preview, selection_mode: result.selection_mode }
@@ -489,15 +492,7 @@ function handleMultiSkillChunk(chunk) {
 }
 
 function userFacingError(value) {
-  const message = String(value || '')
-  const known = {
-    no_skill: '没有发现可执行的 Skill，请调整需求或检查技能是否已启用。',
-    skill_not_executable: '选中的 Skill 当前不可执行，请检查技能状态。',
-    multiskill_plan_not_found: '多技能方案不存在，请重新生成方案。',
-    multiskill_plan_expired: '多技能方案已过期，请重新生成方案。',
-  }
-  const code = Object.keys(known).find(key => message.includes(key))
-  return code ? known[code] : message.split('\n')[0]
+  return mapSandboxError(value)
 }
 
 function removeUploadedFile(idx) {

@@ -42,8 +42,8 @@ export function normalizeMultiSkillStepForUI(step = {}, index = 0) {
       if (typeof source === 'string') inputSources.push(`${target} ← ${source}`)
       else if (source && typeof source === 'object') {
         if (source.source_type === 'skill_result') {
-          const path = source.path || ''
-          inputSources.push(`${target} ← ${source.step_id || '?'}.${source.channel || '?'}${path}`)
+          const base = `${source.step_id || '?'}.${source.channel || '?'}`
+          inputSources.push(`${target} ← ${appendJsonPath(base, source.path || '')}`)
         } else {
           inputSources.push(`${target} ← ${source.source_type || source.source || '?'}`)
         }
@@ -59,6 +59,23 @@ export function normalizeMultiSkillStepForUI(step = {}, index = 0) {
     childRunId: null,
     status: 'pending',
   }
+}
+
+export function appendJsonPath(base, path) {
+  if (!path) return base
+  return path.startsWith('[') ? `${base}${path}` : `${base}.${path}`
+}
+
+export function mapSandboxError(value) {
+  const message = String(value || '')
+  const known = {
+    no_skill: '没有发现可执行的 Skill，请调整需求或检查技能是否已启用。',
+    skill_not_executable: '选中的 Skill 当前不可执行，请检查技能状态。',
+    multiskill_plan_not_found: '多技能方案不存在，请重新生成方案。',
+    multiskill_plan_expired: '多技能方案已过期，请重新生成方案。',
+  }
+  const code = Object.keys(known).find(key => message.includes(key))
+  return code ? known[code] : message.split('\n')[0]
 }
 
 export function applyMultiSkillEvent(state, event) {

@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { applyMultiSkillEvent, buildSandboxRequestBody, canUseSandboxMode,
-  normalizeMultiSkillStepForUI, parseSandboxSSEPayload, sandboxChatUrl, sandboxUploadUrl } from './useSandboxChat.js'
+import { appendJsonPath, applyMultiSkillEvent, buildSandboxRequestBody, canUseSandboxMode,
+  mapSandboxError, normalizeMultiSkillStepForUI, parseSandboxSSEPayload, sandboxChatUrl, sandboxUploadUrl } from './useSandboxChat.js'
 
 test('parses every Multi-Skill SSE envelope without changing its data', () => {
   for (const type of ['multiskill_plan', 'skill_started', 'child_runtime_event', 'skill_completed', 'skill_failed', 'skill_ask_user', 'multi_skill_trace', 'multiskill_result']) {
@@ -25,6 +25,16 @@ test('normalizes canonical bindings without mutating protocol data', () => {
   const step = normalizeMultiSkillStepForUI(canonical)
   assert.deepEqual(step.inputSources, ['payload ← s1.structured_outputs[0].data.summary'])
   assert.deepEqual(canonical.bindings.payload, binding)
+})
+
+test('appends bracket and property JSON paths correctly', () => {
+  assert.equal(appendJsonPath('s1.structured_outputs', '[0].data.summary'), 's1.structured_outputs[0].data.summary')
+  assert.equal(appendJsonPath('s1.structured_outputs', 'summary'), 's1.structured_outputs.summary')
+})
+
+test('maps Multi-Skill SSE error codes to safe user messages', () => {
+  assert.equal(mapSandboxError('multiskill_plan_expired'), '多技能方案已过期，请重新生成方案。')
+  assert.equal(mapSandboxError('skill_not_executable'), '选中的 Skill 当前不可执行，请检查技能状态。')
 })
 
 test('builds mode-specific URLs and allows Skill Pool without selectedSkill', () => {

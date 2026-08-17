@@ -4,6 +4,7 @@
     <template v-else>
       <h4>{{ modeLabel }}</h4>
       <div v-if="result.reason" class="notice">{{ result.reason }}</div>
+      <div v-if="result.error" class="failure">{{ mapSandboxError(result.error) }}</div>
       <div v-if="result.missing?.length" class="notice">需要补充：{{ result.missing.join('、') }}</div>
       <div v-if="result.failed_skill_step_id" class="failure">失败步骤：{{ result.failed_skill_step_id }}</div>
       <div v-if="result.paused_at_step_id" class="notice">暂停步骤：{{ result.paused_at_step_id }}</div>
@@ -20,6 +21,7 @@
 </template>
 <script setup>
 import { computed } from 'vue'
+import { mapSandboxError } from '../../composables/useSandboxChat.js'
 const props = defineProps({ result: { type: Object, default: null }, trace: { type: Array, default: () => [] }, debug: Boolean })
 const modeLabel = computed(() => props.result?.mode === 'ask_user' ? '⚠️ 等待用户输入' : props.result?.success === false ? '❌ 多技能执行失败' : '✅ 多技能执行结果')
 const safeDebug = computed(() => JSON.stringify({ mode: props.result?.mode, success: props.result?.success, failed_skill_step_id: props.result?.failed_skill_step_id, paused_at_step_id: props.result?.paused_at_step_id, multi_skill_trace: props.trace }, null, 2))

@@ -4,6 +4,13 @@ export function parseSandboxSSEPayload(payload) {
   if (payload.error) throw new Error(payload.error)
   if (payload.type === 'error') throw new Error(payload.message || '执行失败')
   if (payload.result_manifest) return { type: 'result_manifest', data: payload.result_manifest }
+  const multiSkillEvents = [
+    'multiskill_plan', 'skill_started', 'child_runtime_event', 'skill_completed',
+    'skill_failed', 'skill_ask_user', 'multi_skill_trace', 'multiskill_result',
+  ]
+  for (const type of multiSkillEvents) {
+    if (payload[type]) return { type, data: payload[type] }
+  }
   if (payload.action_result) return { type: 'action_result', data: payload.action_result }
   if (payload.thought) return { type: 'thought', data: payload.thought }
   if ('status' in payload) return { type: 'status', data: payload.status }
@@ -14,8 +21,119 @@ export function parseSandboxSSEPayload(payload) {
   if (payload.sandbox_retry) return { type: 'sandbox_retry', data: payload.sandbox_retry }
   if (payload.type === 'step_skipped') return { type: 'step_skipped', data: payload.data }
   if (payload.model_ack) return { type: 'model_ack', data: payload.model_ack }
+  if (payload.answer) return payload.answer
   if (payload.content) return payload.content
   return null
+}
+
+/** Keep parent Skill state separate from each Child Runtime's private event list. */
+export function normalizeMultiSkillStepForUI(step = {}, index = 0) {
+  const rawSources = step.input_sources ?? step.input_bindings ?? step.bindings ?? {}
+  const inputSources = []
+  if (Array.isArray(rawSources)) {
+    for (const item of rawSources) {
+      if (typeof item === 'string') inputSources.push(item)
+      else if (item && typeof item === 'object') {
+        inputSources.push(`${item.target || '?'} ← ${item.source || '?'}`)
+      }
+    }
+  } else if (rawSources && typeof rawSources === 'object') {
+    for (const [target, source] of Object.entries(rawSources)) {
+      if (typeof source === 'string') inputSources.push(`${target} ← ${source}`)
+      else if (source && typeof source === 'object') {
+        if (source.source_type === 'skill_result') {
+          const base = `${source.step_id || '?'}.${source.channel || '?'}`
+          inputSources.push(`${target} ← ${appendJsonPath(base, source.path || '')}`)
+        } else {
+          inputSources.push(`${target} ← ${source.source_type || source.source || '?'}`)
+        }
+      }
+    }
+  }
+  return {
+    stepId: step.step_id || `step_${index + 1}`,
+    skillName: step.skill_name || '',
+    task: step.task || '',
+    dependsOn: Array.isArray(step.depends_on) ? [...step.depends_on] : [],
+    inputSources,
+    childRunId: null,
+    status: 'pending',
+  }
+}
+
+export function appendJsonPath(base, path) {
+  if (!path) return base
+  return path.startsWith('[') ? `${base}${path}` : `${base}.${path}`
+}
+
+export function mapSandboxError(value) {
+  const message = String(value || '')
+  const known = {
+    no_skill: '没有发现可执行的 Skill，请调整需求或检查技能是否已启用。',
+    skill_not_executable: '选中的 Skill 当前不可执行，请检查技能状态。',
+    multiskill_plan_not_found: '多技能方案不存在，请重新生成方案。',
+    multiskill_plan_expired: '多技能方案已过期，请重新生成方案。',
+  }
+  const code = Object.keys(known).find(key => message.includes(key))
+  return code ? known[code] : message.split('\n')[0]
+}
+
+export function applyMultiSkillEvent(state, event) {
+  const data = event.data || {}
+  if (event.type === 'multiskill_plan') {
+    state.plan = data
+    const displaySteps = data.preview?.length ? data.preview : data.steps || []
+    state.steps = displaySteps.map(normalizeMultiSkillStepForUI)
+    return
+  }
+  if (event.type === 'child_runtime_event') {
+    if (!data.child_run_id) return
+    ;(state.childEvents[data.child_run_id] ||= []).push(data.event)
+    return
+  }
+  if (event.type === 'multi_skill_trace') {
+    state.trace = Array.isArray(data) ? data : []
+    return
+  }
+  if (event.type === 'multiskill_result') {
+    state.result = data
+    if (Array.isArray(data.multi_skill_trace)) state.trace = data.multi_skill_trace
+    return
+  }
+  const statuses = {
+    skill_started: 'running', skill_completed: 'completed',
+    skill_failed: 'failed', skill_ask_user: 'ask_user',
+  }
+  const status = statuses[event.type]
+  if (!status) return
+  let step = state.steps.find(item => item.stepId === data.step_id)
+  if (!step) {
+    step = { stepId: data.step_id, skillName: data.skill_name || '', task: '', dependsOn: [], inputSources: [], childRunId: null, status: 'pending' }
+    state.steps.push(step)
+  }
+  step.status = status
+  if (data.child_run_id) step.childRunId = data.child_run_id
+}
+
+export function canUseSandboxMode(mode, skillName) {
+  return mode === 'skill_pool' || Boolean(skillName)
+}
+
+export function sandboxChatUrl(mode, skillName = '') {
+  return mode === 'skill_pool' ? '/api/chat/sandbox' : `/api/chat/sandbox/${encodeURIComponent(skillName)}`
+}
+
+export function sandboxUploadUrl(mode, skillName = '') {
+  return mode === 'skill_pool' ? '/api/chat/sandbox/inputs' : `${sandboxChatUrl(mode, skillName)}/inputs`
+}
+
+export function buildSandboxRequestBody({ messages = [], model = null, executionMode = 'execute',
+  sessionId, inputFiles = [], fields = {}, options = {}, resources = [], multiskillPlanId } = {}) {
+  return {
+    messages, model, execution_mode: executionMode, sandbox_session_id: sessionId,
+    input_files: inputFiles, fields, options, resources,
+    ...(multiskillPlanId ? { multiskill_plan_id: multiskillPlanId } : {}),
+  }
 }
 
 export function clearSandboxRoundResult(resultManifest) {

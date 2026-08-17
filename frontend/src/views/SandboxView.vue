@@ -2,11 +2,16 @@
   <div class="sandbox">
     <div class="header">
       <h2>沙盒测试</h2>
-      <p class="muted">选择一个技能，模拟它被加载后的对话效果</p>
+      <p class="muted">{{ sandboxMode === 'skill_pool' ? '系统将从可执行 Skill 中自动选择并组合能力。' : '选择一个技能，模拟它被加载后的对话效果' }}</p>
     </div>
 
     <div class="toolbar">
-      <select v-model="selectedSkill" @change="resetChat" :disabled="streaming">
+      <div class="sandbox-mode" aria-label="运行方式">
+        <span>运行方式</span>
+        <button class="mode-btn" :class="{ active: sandboxMode === 'single_skill' }" :disabled="streaming" @click="switchSandboxMode('single_skill')">单 Skill</button>
+        <button class="mode-btn" :class="{ active: sandboxMode === 'skill_pool' }" :disabled="streaming" @click="switchSandboxMode('skill_pool')">Skill Pool</button>
+      </div>
+      <select v-if="sandboxMode === 'single_skill'" v-model="selectedSkill" @change="resetChat" :disabled="streaming">
         <option value="">-- 选择技能 --</option>
         <option v-for="sk in skills" :key="sk.name" :value="sk.name">
           {{ sk.display_name || sk.name }} · {{ sk.scope }} · {{ sk.status }}
@@ -14,7 +19,7 @@
       </select>
 
       <!-- Execution Mode Switch -->
-      <div v-if="selectedSkill" class="mode-switch">
+      <div v-if="canUseSandbox" class="mode-switch">
         <button
           class="mode-btn"
           :class="{ active: executionMode === 'plan' }"
@@ -31,11 +36,11 @@
         >⚡ 执行模式</button>
       </div>
 
-      <button class="btn-ghost" @click="resetChat" :disabled="streaming || !selectedSkill">
+      <button class="btn-ghost" @click="resetChat" :disabled="streaming || !canUseSandbox">
         重置对话
       </button>
       <button
-        v-if="selectedSkill"
+        v-if="sandboxMode === 'single_skill' && selectedSkill"
         class="btn-ghost btn-thoughts"
         :class="{ active: showThoughts }"
         @click="showThoughts = !showThoughts"
@@ -44,7 +49,7 @@
         🔍 执行过程{{ thoughts.length ? ` (${thoughts.length})` : '' }}
       </button>
       <button
-        v-if="selectedSkill && (currentPlanPreview || currentSOP)"
+        v-if="sandboxMode === 'single_skill' && selectedSkill && (currentPlanPreview || currentSOP)"
         class="btn-ghost btn-plan-panel"
         :class="{ active: showPlanPanel }"
         @click="showPlanPanel = !showPlanPanel"
@@ -52,9 +57,10 @@
       >
         📋 方案{{ currentPlanPreview ? ' (待确认)' : '' }}
       </button>
+      <button v-if="sandboxMode === 'skill_pool'" class="btn-ghost btn-thoughts" :class="{ active: showMultiSkillPanel }" @click="showMultiSkillPanel = !showMultiSkillPanel">🧠 多技能调度</button>
     </div>
 
-    <div v-if="!selectedSkill" class="empty muted">
+    <div v-if="!canUseSandbox" class="empty muted">
       请先选择一个 Skill 开始测试。
     </div>
 
@@ -64,8 +70,12 @@
         <div class="messages-column">
           <div class="messages" ref="messagesEl">
             <div v-if="messages.length === 0" class="empty muted">
-              <p>Skill <strong>{{ selectedSkill }}</strong> 已加载为 system prompt。</p>
-              <p>向它发送消息，测试它的行为。</p>
+              <template v-if="sandboxMode === 'skill_pool'">
+                <p class="pool-title">🧠 <strong>Skill Pool</strong></p>
+                <p>由系统根据请求自动发现、选择并组合可执行 Skill。</p>
+                <p>直接输入需求或上传文件，无需手动选择 Child Skills。</p>
+              </template>
+              <template v-else><p>Skill <strong>{{ selectedSkill }}</strong> 已加载为 system prompt。</p><p>向它发送消息，测试它的行为。</p></template>
               <p class="mode-hint" v-if="executionMode === 'plan'">
                 📋 当前为 <strong>规划模式</strong>：AI 会先生成任务清单供你确认后再执行。
               </p>
@@ -157,7 +167,7 @@
               <textarea
                 v-model="input"
                 rows="3"
-                placeholder="向已加载的 Skill 发送测试消息…"
+                :placeholder="sandboxMode === 'skill_pool' ? '描述需要技能池完成的任务…' : '向已加载的 Skill 发送测试消息…'"
                 @keydown.enter.exact.prevent="send"
                 :disabled="streaming"
               />
@@ -196,6 +206,23 @@
               <button class="btn-ghost btn-close-panel" @click="showThoughts = false">✕</button>
             </div>
             <ThinkingPanel :thoughts="thoughts" />
+          </div>
+        </transition>
+
+        <transition name="panel-slide">
+          <div v-if="sandboxMode === 'skill_pool' && showMultiSkillPanel" class="thinking-sidebar multi-skill-sidebar">
+            <div class="thinking-sidebar-header">
+              <div class="plan-tabs">
+                <button class="plan-tab" :class="{ active: multiSkillTab === 'schedule' }" @click="multiSkillTab = 'schedule'">Skill 调度</button>
+                <button class="plan-tab" :class="{ active: multiSkillTab === 'children' }" @click="multiSkillTab = 'children'">Child 执行</button>
+                <button class="plan-tab" :class="{ active: multiSkillTab === 'result' }" @click="multiSkillTab = 'result'">结果</button>
+              </div>
+              <button class="btn-ghost btn-close-panel" @click="showMultiSkillPanel = false">✕</button>
+            </div>
+            <MultiSkillPlanPanel v-if="multiSkillTab === 'schedule'" :plan="multiSkillPlan" :confirmable="Boolean(pendingMultiSkillPlanId)" :confirming="confirming" @confirm="confirmCurrentPlan" @cancel="cancelCurrentPlan" />
+            <MultiSkillExecutionPanel v-if="multiSkillTab === 'children'" :steps="multiSkillSteps" :child-events="childEventCache" />
+            <MultiSkillResultPanel v-if="multiSkillTab === 'result'" :result="multiSkillResult" :trace="multiSkillTrace" :debug="showMultiSkillDebug" />
+            <label class="debug-toggle"><input v-model="showMultiSkillDebug" type="checkbox"> 显示安全调试摘要</label>
           </div>
         </transition>
 
@@ -241,7 +268,7 @@
 <script setup>
 import { ref, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { fetchSkills } from '../composables/useSkills.js'
-import { clearSandboxRoundResult, streamChat, confirmPlan, streamConfirmResponse } from '../composables/useSandboxChat.js'
+import { clearSandboxRoundResult, streamChat, confirmPlan, streamConfirmResponse, applyMultiSkillEvent, buildSandboxRequestBody, canUseSandboxMode, mapSandboxError, sandboxChatUrl, sandboxUploadUrl } from '../composables/useSandboxChat.js'
 import ChatBubble from '../components/ChatBubble.vue'
 import ThinkingPanel from '../components/ThinkingPanel.vue'
 import TaskPlanPanel from '../components/TaskPlanPanel.vue'
@@ -249,6 +276,9 @@ import SOPPanel from '../components/SOPPanel.vue'
 import InlineTaskList from '../components/InlineTaskList.vue'
 import SandboxResultRenderer from '../components/sandbox/SandboxResultRenderer.vue'
 import SandboxAttachmentList from '../components/sandbox/SandboxAttachmentList.vue'
+import MultiSkillPlanPanel from '../components/sandbox/MultiSkillPlanPanel.vue'
+import MultiSkillExecutionPanel from '../components/sandbox/MultiSkillExecutionPanel.vue'
+import MultiSkillResultPanel from '../components/sandbox/MultiSkillResultPanel.vue'
 
 const ACTION_LABELS = {
   run_script: '运行脚本',
@@ -281,6 +311,7 @@ function newSessionId() {
 }
 
 const skills = ref([])
+const sandboxMode = ref('single_skill')
 const selectedSkill = ref('')
 const messages = ref([])
 const input = ref('')
@@ -289,6 +320,18 @@ const streamBuffer = ref('')
 const error = ref('')
 const messagesEl = ref(null)
 const currentStatus = ref(null)  // { phase, message } | null
+const canUseSandbox = computed(() => canUseSandboxMode(sandboxMode.value, selectedSkill.value))
+
+// Parent orchestration state. Child events are intentionally keyed by child_run_id.
+const multiSkillPlan = ref(null)
+const multiSkillTrace = ref([])
+const multiSkillResult = ref(null)
+const multiSkillSteps = ref([])
+const pendingMultiSkillPlanId = ref(null)
+const childEventCache = ref({})
+const showMultiSkillPanel = ref(true)
+const multiSkillTab = ref('schedule')
+const showMultiSkillDebug = ref(false)
 
 // Execution mode: "plan" or "execute"
 const executionMode = ref('execute')
@@ -340,8 +383,9 @@ onBeforeUnmount(() => {
 
 /** Synchronous cleanup handler for beforeunload (uses sendBeacon for reliability) */
 function _beforeUnloadHandler() {
-  if (!selectedSkill.value || !sessionId.value) return
-  const url = `/api/chat/sandbox/${encodeURIComponent(selectedSkill.value)}/inputs/${encodeURIComponent(sessionId.value)}`
+  if (!sessionId.value || (sandboxMode.value === 'single_skill' && !selectedSkill.value)) return
+  const base = sandboxUploadUrl(sandboxMode.value, selectedSkill.value)
+  const url = `${base}/${encodeURIComponent(sessionId.value)}`
   // sendBeacon doesn't support DELETE, so we use a synchronous XMLHttpRequest as fallback
   try {
     const xhr = new XMLHttpRequest()
@@ -354,12 +398,11 @@ function _beforeUnloadHandler() {
 
 /** Clean up the current session's files on the backend (inputs + outputs). */
 async function cleanupSession() {
-  if (!selectedSkill.value || !sessionId.value) return
+  if (!sessionId.value || (sandboxMode.value === 'single_skill' && !selectedSkill.value)) return
+  // Resolve before awaiting so mode switches always clean the old mode's session.
+  const url = `${sandboxUploadUrl(sandboxMode.value, selectedSkill.value)}/${encodeURIComponent(sessionId.value)}`
   try {
-    await fetch(
-      `/api/chat/sandbox/${encodeURIComponent(selectedSkill.value)}/inputs/${encodeURIComponent(sessionId.value)}`,
-      { method: 'DELETE' },
-    )
+    await fetch(url, { method: 'DELETE' })
   } catch {
     // Best-effort cleanup; ignore network errors
   }
@@ -387,6 +430,20 @@ function resetChat() {
   executingIndex.value = -1
   completedIndices.value = []
   pendingChecklist.value = null
+  multiSkillPlan.value = null
+  multiSkillTrace.value = []
+  multiSkillResult.value = null
+  multiSkillSteps.value = []
+  pendingMultiSkillPlanId.value = null
+  childEventCache.value = {}
+  multiSkillTab.value = 'schedule'
+}
+
+function switchSandboxMode(mode) {
+  if (mode === sandboxMode.value) return
+  resetChat()
+  sandboxMode.value = mode
+  showMultiSkillPanel.value = mode === 'skill_pool'
 }
 
 /** Update inline task checklist in the last assistant message when task_progress arrives */
@@ -405,6 +462,39 @@ function updateInlineChecklist(execIdx, completedIdxs) {
   }
 }
 
+function handleMultiSkillChunk(chunk) {
+  const state = {
+    get plan() { return multiSkillPlan.value }, set plan(value) { multiSkillPlan.value = value },
+    get trace() { return multiSkillTrace.value }, set trace(value) { multiSkillTrace.value = value },
+    get result() { return multiSkillResult.value }, set result(value) { multiSkillResult.value = value },
+    get steps() { return multiSkillSteps.value }, set steps(value) { multiSkillSteps.value = value },
+    childEvents: childEventCache.value,
+  }
+  applyMultiSkillEvent(state, chunk)
+  if (chunk.type === 'multiskill_result') {
+    const result = chunk.data || {}
+    if (result.mode === 'error' || (result.success === false && result.error)) {
+      error.value = mapSandboxError(result.error)
+    }
+    if (result.mode === 'plan' && result.plan_id) {
+      pendingMultiSkillPlanId.value = result.plan_id
+      multiSkillPlan.value = { ...(result.plan || {}), preview: result.preview, selection_mode: result.selection_mode }
+      applyMultiSkillEvent(state, { type: 'multiskill_plan', data: multiSkillPlan.value })
+      multiSkillTab.value = 'schedule'
+    } else {
+      pendingMultiSkillPlanId.value = null
+      multiSkillTab.value = 'result'
+    }
+  } else if (chunk.type === 'skill_started') {
+    multiSkillTab.value = 'children'
+  }
+  showMultiSkillPanel.value = true
+}
+
+function userFacingError(value) {
+  return mapSandboxError(value)
+}
+
 function removeUploadedFile(idx) {
   uploadedFiles.value.splice(idx, 1)
 }
@@ -412,7 +502,7 @@ function removeUploadedFile(idx) {
 async function onFileSelected(event) {
   const files = Array.from(event.target.files || [])
   event.target.value = ''  // reset so same file can be re-selected
-  if (!files.length || !selectedSkill.value) return
+  if (!files.length || !canUseSandbox.value) return
 
   uploading.value = true
   uploadError.value = ''
@@ -422,8 +512,9 @@ async function onFileSelected(event) {
     fd.append('file', file)
     fd.append('session_id', sessionId.value)
     try {
+      const uploadUrl = sandboxUploadUrl(sandboxMode.value, selectedSkill.value)
       const res = await fetch(
-        `/api/chat/sandbox/${encodeURIComponent(selectedSkill.value)}/inputs`,
+        uploadUrl,
         { method: 'POST', body: fd }
       )
       if (!res.ok) {
@@ -450,7 +541,7 @@ async function scrollBottom() {
 
 async function send() {
   const text = input.value.trim()
-  if ((!text && !uploadedFiles.value.length) || streaming.value || !selectedSkill.value) return
+  if ((!text && !uploadedFiles.value.length) || streaming.value || !canUseSandbox.value) return
 
   error.value = ''
   const fileAttachments = uploadedFiles.value.length
@@ -471,6 +562,16 @@ async function send() {
   currentSOP.value = null
   executingIndex.value = -1
   completedIndices.value = []
+  if (sandboxMode.value === 'skill_pool') {
+    multiSkillPlan.value = null
+    multiSkillTrace.value = []
+    multiSkillResult.value = null
+    multiSkillSteps.value = []
+    pendingMultiSkillPlanId.value = null
+    childEventCache.value = {}
+    showMultiSkillPanel.value = true
+    multiSkillTab.value = 'schedule'
+  }
 
   // Snapshot the uploaded files for this message, then keep them until reset
   const inputFilesSnapshot = uploadedFiles.value.map(f => ({
@@ -478,13 +579,9 @@ async function send() {
   }))
 
   try {
-    const url = `/api/chat/sandbox/${encodeURIComponent(selectedSkill.value)}`
-    const body = {
-      messages: chatHistory.value,
-      execution_mode: executionMode.value,
-      sandbox_session_id: sessionId.value,
-    }
-    if (inputFilesSnapshot.length) body.input_files = inputFilesSnapshot
+    const url = sandboxChatUrl(sandboxMode.value, selectedSkill.value)
+    const body = buildSandboxRequestBody({ messages: chatHistory.value, executionMode: executionMode.value,
+      sessionId: sessionId.value, inputFiles: inputFilesSnapshot })
     for await (const chunk of streamChat(url, body)) {
       if (typeof chunk === 'string') {
         streamBuffer.value += chunk
@@ -552,6 +649,8 @@ async function send() {
           ts: chunk.data.ts,
         })
         if (!showThoughts.value) showThoughts.value = true
+      } else if (chunk.type.startsWith('skill_') || ['multiskill_plan', 'child_runtime_event', 'multi_skill_trace', 'multiskill_result'].includes(chunk.type)) {
+        handleMultiSkillChunk(chunk)
       }
     }
     if (streamBuffer.value) {
@@ -565,7 +664,7 @@ async function send() {
       streamBuffer.value = ''
     }
   } catch (e) {
-    error.value = e.message
+    error.value = userFacingError(e.message)
   } finally {
     streaming.value = false
     currentStatus.value = null
@@ -575,7 +674,39 @@ async function send() {
 
 /** Confirm a pending plan in Plan mode */
 async function confirmCurrentPlan() {
-  if (!currentPlanPreview.value || confirming.value) return
+  if (confirming.value) return
+
+  if (sandboxMode.value === 'skill_pool') {
+    if (!pendingMultiSkillPlanId.value) return
+    confirming.value = true
+    streaming.value = true
+    multiSkillTab.value = 'children'
+    multiSkillResult.value = null
+    try {
+      const body = buildSandboxRequestBody({ sessionId: sessionId.value,
+        multiskillPlanId: pendingMultiSkillPlanId.value })
+      for await (const chunk of streamChat(sandboxChatUrl('skill_pool'), body)) {
+        if (typeof chunk === 'string') streamBuffer.value += chunk
+        else if (chunk.type === 'result_manifest') resultManifest.value = chunk.data
+        else if (chunk.type === 'status') currentStatus.value = chunk.data
+        else handleMultiSkillChunk(chunk)
+      }
+      if (streamBuffer.value) {
+        messages.value.push({ role: 'assistant', content: streamBuffer.value })
+        streamBuffer.value = ''
+      }
+    } catch (e) {
+      error.value = userFacingError(e.message)
+    } finally {
+      confirming.value = false
+      streaming.value = false
+      currentStatus.value = null
+      await scrollBottom()
+    }
+    return
+  }
+
+  if (!currentPlanPreview.value) return
 
   const planId = currentPlanPreview.value.plan_id
   confirming.value = true
@@ -639,7 +770,7 @@ async function confirmCurrentPlan() {
 
     currentPlanPreview.value = null
   } catch (e) {
-    error.value = e.message
+    error.value = userFacingError(e.message)
   } finally {
     confirming.value = false
     streaming.value = false
@@ -652,6 +783,12 @@ async function confirmCurrentPlan() {
 
 /** Cancel a pending plan */
 async function cancelCurrentPlan() {
+  if (sandboxMode.value === 'skill_pool') {
+    if (!pendingMultiSkillPlanId.value) return
+    pendingMultiSkillPlanId.value = null
+    messages.value.push({ role: 'assistant', content: '❌ 多技能执行方案已取消。' })
+    return
+  }
   if (!currentPlanPreview.value) return
 
   const planId = currentPlanPreview.value.plan_id
@@ -753,6 +890,9 @@ async function exportSOP(format) {
   flex-shrink: 0;
 }
 .toolbar select { max-width: 280px; }
+.sandbox-mode { display:flex; align-items:center; gap:6px; font-size:12px; color:var(--text-muted); }
+.sandbox-mode .mode-btn { white-space:nowrap; }
+.pool-title { font-size:18px; }
 
 .btn-thoughts {
   margin-left: auto;
@@ -814,6 +954,9 @@ async function exportSOP(format) {
   flex-shrink: 0;
   color: var(--text);
 }
+.multi-skill-sidebar { width: 380px; }
+.multi-skill-sidebar > :not(.thinking-sidebar-header):not(.debug-toggle) { flex:1; min-height:0; }
+.debug-toggle { padding:8px 14px; border-top:1px solid var(--border); font-size:11px; color:var(--text-muted); }
 
 .btn-close-panel {
   font-size: 12px;

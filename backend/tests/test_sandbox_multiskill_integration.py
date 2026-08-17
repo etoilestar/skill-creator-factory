@@ -211,9 +211,41 @@ async def test_real_single_skill_fast_path(real_skills, monkeypatch):
     monkeypatch.setattr(multiskill_manager, "build_multiskill_activation_cards", lambda _: [{"skill_name": "one"}])
     result = await multiskill_manager.run_multiskill_orchestration(user_request="analyze",
         parent_envelope={"user_request": "analyze", "text": "input"}, single_skill_runtime=None,
-        planner_model_call=lambda *_: json.dumps({"mode": "single_skill", "skill_name": "one"}))
-    assert result["mode"] == "single_skill" and result["result"]["structured_outputs"][0]["data"]["summary"] == "hello"
+        planner_model_call=lambda *_: json.dumps({"mode": "single_skill", "skill_name": "one"}),
+        final_synthesizer=lambda **_: "final answer")
+    assert result["mode"] == "single_skill" and result["skill_results"]["skill_1"]["structured_outputs"][0]["data"]["summary"] == "hello"
+    assert result["text"] == "final answer"
     assert result["child_run_id"].startswith("child_")
+
+
+@pytest.mark.asyncio
+async def test_real_single_skill_fast_path_with_uploaded_file(real_skills, monkeypatch, tmp_path):
+    _install_runtime_planners(monkeypatch)
+    upload_root = tmp_path / "pool-uploads"
+    source = upload_root / "inputs" / "session" / "test.txt"
+    source.parent.mkdir(parents=True)
+    source.write_text("single upload", encoding="utf-8")
+    monkeypatch.setattr(multiskill_manager, "build_multiskill_catalog", lambda **_: [{"name": "files"}])
+    async def shortlist(**kwargs): return {"candidates": [{"skill_name": "files"}]}
+    monkeypatch.setattr(multiskill_manager, "_plan_skill_candidates_with_model", shortlist)
+    monkeypatch.setattr(multiskill_manager, "build_multiskill_activation_cards",
+        lambda _: [{"skill_name": "files"}])
+    parent = {
+        "user_request": "read upload", "input": "read upload", "text": "read upload",
+        "payload": None, "fields": {}, "options": {}, "resources": [],
+        "input_files": [{"path": "inputs/session/test.txt", "filename": "test.txt"}],
+        "files": [{"path": "inputs/session/test.txt", "filename": "test.txt"}],
+        "_platform_input_root": str(upload_root),
+    }
+    result = await multiskill_manager.run_multiskill_orchestration(user_request="read upload",
+        parent_envelope=parent,
+        planner_model_call=lambda *_: json.dumps({"mode": "single_skill", "skill_name": "files"}),
+        final_synthesizer=lambda **_: "read complete")
+    child = result["skill_results"]["skill_1"]
+    assert child["structured_outputs"][0]["data"]["result"] == "single upload"
+    assert result["text"] == "read complete"
+    assert next((real_skills["files"] / "inputs").rglob("*-test.txt")).read_text() == "single upload"
+    assert str(upload_root.resolve()) not in str(result)
 
 
 @pytest.mark.parametrize("location,payload", [

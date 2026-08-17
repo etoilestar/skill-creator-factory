@@ -1555,7 +1555,6 @@ async def chat_in_multiskill_sandbox(request: SandboxChatRequest):
             "version": "sandbox-result-v1",
             "structured_outputs": structured_outputs,
             "artifacts": result.get("artifacts") or [],
-            "output_files": result.get("output_files") or [],
         }})
         if result.get("text"):
             yield _sse({"answer": result["text"]})

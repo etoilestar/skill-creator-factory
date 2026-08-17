@@ -133,9 +133,13 @@ def materialize_parent_files_for_child(*, items: list[dict], source_root: Path,
 
 def build_child_input_envelope(step: dict, parent_envelope: dict, skill_results: dict,
                                *, child_run_id: str) -> dict:
-    child = {key: deepcopy(parent_envelope.get(key)) for key in ENVELOPE_FIELDS if key in parent_envelope}
-    child["user_request"] = step["task"]
-    child["input"] = child["text"] = step["task"]
+    # task is the only implicit Parent -> Child value. Every business input is
+    # admitted solely through an explicit, validated binding below.
+    child = {
+        "user_request": step["task"], "input": step["task"], "text": step["task"],
+        "payload": None, "fields": {}, "options": {},
+        "input_files": [], "files": [], "resources": [],
+    }
     for target, binding in step.get("bindings", {}).items():
         if target not in ENVELOPE_FIELDS:
             raise MultiSkillBindingError(f"binding target is not an Input Envelope field: {target}")
@@ -152,9 +156,31 @@ def build_child_input_envelope(step: dict, parent_envelope: dict, skill_results:
                 source_skill_name=source_result["skill_name"], target_skill_name=step["skill_name"],
                 child_run_id=child_run_id)
         child[target] = value
-    child.setdefault("payload", None)
-    for key, default in (("fields", {}), ("options", {}), ("input_files", []), ("files", []), ("resources", [])):
-        child.setdefault(key, deepcopy(default))
+    return child
+
+
+def build_single_skill_input_envelope(parent_envelope: dict, *, skill_name: str,
+                                      child_run_id: str) -> dict:
+    """Build the full-task fast-path envelope while keeping Host metadata private."""
+    child = {
+        "user_request": str(parent_envelope.get("user_request") or ""),
+        "input": deepcopy(parent_envelope.get("input", parent_envelope.get("user_request", ""))),
+        "text": str(parent_envelope.get("text", parent_envelope.get("user_request", "")) or ""),
+        "payload": deepcopy(parent_envelope.get("payload")),
+        "fields": deepcopy(parent_envelope.get("fields") or {}),
+        "options": deepcopy(parent_envelope.get("options") or {}),
+        "input_files": [], "files": [],
+        "resources": deepcopy(parent_envelope.get("resources") or []),
+    }
+    parent_files = parent_envelope.get("input_files") or parent_envelope.get("files") or []
+    if parent_files:
+        source_root = parent_envelope.get("_platform_input_root")
+        if not source_root:
+            raise MultiSkillBindingError("platform input boundary is unavailable")
+        manifests = materialize_parent_files_for_child(items=parent_files, source_root=Path(source_root),
+            target_skill_name=skill_name, child_run_id=child_run_id)
+        child["input_files"] = manifests
+        child["files"] = deepcopy(manifests)
     return child
 
 

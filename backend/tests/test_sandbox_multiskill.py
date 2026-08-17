@@ -1,5 +1,6 @@
 import asyncio
 import ast
+import json
 from pathlib import Path
 
 import pytest
@@ -80,6 +81,24 @@ def test_child_result_only_exposes_public_manifest():
         "context": {"steps": []}, "stdout": "private", "host_path": "/tmp/x"}, child_run_id="r", skill_name="one")
     assert set(result) == executor.PUBLIC_RESULT_FIELDS | {"child_run_id", "skill_name"}
     assert "private" not in str(result) and "secret" not in str(result)
+
+
+def test_child_does_not_inherit_unbound_parent_fields():
+    envelope = executor.build_child_input_envelope(step(), {
+        "payload": {"secret": "x"}, "fields": {"secret": "x"},
+        "options": {"foo": "bar"}, "resources": [{"secret": True}],
+    }, {}, child_run_id="child-1")
+    assert envelope["payload"] is None
+    assert envelope["fields"] == {} and envelope["options"] == {} and envelope["resources"] == []
+    assert envelope["user_request"] == envelope["input"] == envelope["text"] == "do one"
+
+
+def test_child_does_not_receive_unbound_parent_files():
+    envelope = executor.build_child_input_envelope(step(), {
+        "input_files": [{"path": "inputs/private"}], "files": [{"path": "inputs/private"}],
+        "_platform_input_root": "/private/host/root",
+    }, {}, child_run_id="child-1")
+    assert envelope["input_files"] == [] and envelope["files"] == []
 
 
 @pytest.mark.asyncio
@@ -175,6 +194,55 @@ async def test_multiskill_plan_mode_returns_plan_id_and_confirmation_uses_same_p
     assert counters == {"catalog": 1, "shortlist": 1, "planner": 1}
 
 
+@pytest.mark.asyncio
+async def test_single_skill_plan_mode_does_not_execute_and_confirmation_is_stable(monkeypatch):
+    manager._pending_multiskill_plans.clear()
+    counters = {"catalog": 0, "shortlist": 0, "planner": 0}
+    monkeypatch.setattr(manager, "build_multiskill_catalog",
+        lambda **_: (counters.__setitem__("catalog", counters["catalog"] + 1) or [{"name": "one"}]))
+    async def shortlist(**kwargs):
+        counters["shortlist"] += 1
+        return {"candidates": [{"skill_name": "one"}]}
+    monkeypatch.setattr(manager, "_plan_skill_candidates_with_model", shortlist)
+    monkeypatch.setattr(manager, "build_multiskill_activation_cards",
+        lambda names: [{"skill_name": name} for name in names])
+    async def planner(*_):
+        counters["planner"] += 1
+        return '{"mode":"single_skill","skill_name":"one"}'
+    calls = []
+    async def runtime(**kwargs):
+        calls.append(kwargs)
+        return {"success": True, "structured_outputs": [], "artifacts": [], "output_files": []}
+    preview = await manager.run_multiskill_orchestration(user_request="original", parent_envelope={
+        "user_request": "original", "text": "original"}, execution_mode="plan",
+        single_skill_runtime=runtime, planner_model_call=planner)
+    assert calls == []
+    assert preview["mode"] == "plan" and preview["selection_mode"] == "single_skill"
+    assert preview["plan_id"].startswith("multiskill_") and preview["skill_name"] == "one"
+    result = await manager.confirm_multiskill_plan(preview["plan_id"], single_skill_runtime=runtime,
+        final_synthesizer=lambda **_: "final")
+    assert len(calls) == 1 and result["skill_name"] == "one" and result["text"] == "final"
+    assert counters == {"catalog": 1, "shortlist": 1, "planner": 1}
+    assert set(result) >= {"skill_results", "skills", "artifacts", "output_files", "multi_skill_trace", "text"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw", [
+    {"success": None, "mode": "ask_user", "paused_for_user": True,
+     "completed": False, "reason": "need file", "missing": ["file"]},
+    {"success": False, "status": "failed", "reason": "script failed"},
+])
+async def test_single_skill_ask_user_or_failure_does_not_synthesize(raw):
+    async def runtime(**kwargs): return raw
+    result = await manager.run_multiskill_manager(user_request="run", parent_envelope={
+        "user_request": "run", "input": "run", "text": "run"},
+        activation_cards=[{"skill_name": "one"}], confirmed_skill_name="one",
+        single_skill_runtime=runtime,
+        final_synthesizer=lambda **_: pytest.fail("non-success must not synthesize"))
+    assert result["text"] == ""
+    assert result["success"] is raw["success"]
+
+
 def test_expired_multiskill_plan_is_rejected(monkeypatch):
     manager._pending_multiskill_plans.clear()
     manager._pending_multiskill_plans["old"] = {"created_at": 1}
@@ -215,6 +283,10 @@ async def test_multiskill_sse_bridges_parent_child_result_and_done(monkeypatch, 
     assert "skill_started" in body and "child_runtime_event" in body
     assert "multi_skill_trace" in body and "result_manifest" in body and '"answer": "final"' in body
     assert ": keepalive" in body and body.endswith("data: [DONE]\n\n")
+    events = [json.loads(line.removeprefix("data: ")) for line in body.splitlines()
+              if line.startswith("data: {")]
+    manifest = next(event["result_manifest"] for event in events if "result_manifest" in event)
+    assert set(manifest) == {"version", "structured_outputs", "artifacts"}
 
 
 @pytest.mark.asyncio

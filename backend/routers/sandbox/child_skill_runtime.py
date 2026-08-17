@@ -55,7 +55,7 @@ async def execute_child_skill_runtime(*, skill_name: str, input_envelope: dict, 
 
     async def yield_func(event):
         if event_sink is not None:
-            value = event_sink({"child_run_id": child_run_id, "event": event})
+            value = event_sink(event)
             if hasattr(value, "__await__"):
                 await value
 

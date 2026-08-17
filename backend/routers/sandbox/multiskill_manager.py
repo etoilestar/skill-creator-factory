@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import time
 import uuid
 from copy import deepcopy
 from typing import Callable
@@ -18,6 +19,43 @@ from .multiskill_catalog import (
 )
 from .multiskill_executor import execute_multiskill_plan, normalize_child_skill_result
 from .multiskill_plan import plan_multiskill, validate_multiskill_plan
+
+_pending_multiskill_plans: dict[str, dict] = {}
+_MULTISKILL_PLAN_EXPIRY_SECONDS = 600
+
+
+class PendingMultiSkillPlanError(ValueError):
+    pass
+
+
+def _cleanup_expired_multiskill_plans(*, now: float | None = None) -> None:
+    current = time.time() if now is None else now
+    for plan_id in [key for key, value in _pending_multiskill_plans.items()
+                    if current - float(value.get("created_at", 0)) > _MULTISKILL_PLAN_EXPIRY_SECONDS]:
+        del _pending_multiskill_plans[plan_id]
+
+
+def _store_multiskill_plan(*, plan: dict, user_request: str, parent_envelope: dict,
+                           model: str | None) -> str:
+    _cleanup_expired_multiskill_plans()
+    plan_id = f"multiskill_{uuid.uuid4().hex}"
+    _pending_multiskill_plans[plan_id] = {
+        "plan": deepcopy(plan), "user_request": user_request,
+        "parent_envelope": deepcopy(parent_envelope), "model": model,
+        "created_at": time.time(),
+    }
+    return plan_id
+
+
+def _take_multiskill_plan(plan_id: str) -> dict:
+    existed = plan_id in _pending_multiskill_plans
+    _cleanup_expired_multiskill_plans()
+    value = _pending_multiskill_plans.pop(plan_id, None)
+    if value is None:
+        raise PendingMultiSkillPlanError(
+            "multiskill_plan_expired" if existed else "multiskill_plan_not_found"
+        )
+    return value
 
 
 def preview_multiskill_plan(plan: dict) -> list[dict]:
@@ -52,7 +90,13 @@ async def run_multiskill_manager(*, user_request: str, parent_envelope: dict, ac
         name = decision["skill_name"]
         run_id = f"child_{uuid.uuid4().hex}"
         runtime = single_skill_runtime or execute_child_skill_runtime
-        raw = runtime(skill_name=name, input_envelope=deepcopy(parent_envelope), child_run_id=run_id)
+        async def child_sink(event):
+            if event_sink:
+                value = event_sink({"child_runtime_event": {"child_run_id": run_id, "event": event}})
+                if inspect.isawaitable(value):
+                    await value
+        raw = runtime(skill_name=name, input_envelope=deepcopy(parent_envelope), child_run_id=run_id,
+                      model=model, event_sink=child_sink)
         if inspect.isawaitable(raw):
             raw = await raw
         result = normalize_child_skill_result(raw, child_run_id=run_id, skill_name=name)
@@ -61,11 +105,16 @@ async def run_multiskill_manager(*, user_request: str, parent_envelope: dict, ac
                 "skill_name": name, "child_run_id": run_id, "reason": result["reason"],
                 "missing": result["missing"], "result": result}
     canonical = decision["plan"]
+    if canonical["missing_required_inputs"]:
+        return {"success": None, "completed": False, "paused_for_user": True,
+                "mode": "ask_user", "reason": "Multi-Skill plan requires additional input.",
+                "missing": deepcopy(canonical["missing_required_inputs"]), "plan": canonical}
     if execution_mode == "plan":
         return {"success": True, "mode": "plan", "plan": canonical,
                 "preview": preview_multiskill_plan(canonical)}
     result = await execute_multiskill_plan(plan=canonical, activated_skill_names=names,
-        parent_envelope=parent_envelope, single_skill_runtime=single_skill_runtime, event_sink=event_sink)
+        parent_envelope=parent_envelope, single_skill_runtime=single_skill_runtime,
+        event_sink=event_sink, model=model)
     if result.get("success") and result.get("mode") == "multi_skill":
         synthesizer = final_synthesizer or synthesize_multiskill_result
         synthesis_kwargs = dict(original_user_request=user_request,
@@ -99,7 +148,7 @@ async def run_multiskill_orchestration(*, user_request: str, parent_envelope: di
                                        planner_model_call=None, final_synthesizer=None,
                                        event_sink=None, model: str | None = None) -> dict:
     """Production #465 discovery/activation to #466 composition entry point."""
-    summary = {key: bool(value) for key, value in parent_envelope.items()}
+    summary = {key: bool(value) for key, value in parent_envelope.items() if not key.startswith("_")}
     if confirmed_plan is not None:
         # Confirmation executes the same canonical plan and only refreshes its
         # governance-backed activation records; no discovery/planner rerun.
@@ -117,7 +166,23 @@ async def run_multiskill_orchestration(*, user_request: str, parent_envelope: di
     if not activation_cards:
         return {"success": False, "completed": False, "mode": "no_skill",
                 "reason": "No executable skill was activated."}
-    return await run_multiskill_manager(user_request=user_request, parent_envelope=parent_envelope,
+    result = await run_multiskill_manager(user_request=user_request, parent_envelope=parent_envelope,
         activation_cards=activation_cards, single_skill_runtime=single_skill_runtime,
         execution_mode=execution_mode, confirmed_plan=confirmed_plan, model_call=planner_model_call,
         event_sink=event_sink, final_synthesizer=final_synthesizer, model=model)
+    if result.get("mode") == "plan":
+        result["plan_id"] = _store_multiskill_plan(plan=result["plan"], user_request=user_request,
+            parent_envelope=parent_envelope, model=model)
+    return result
+
+
+async def confirm_multiskill_plan(plan_id: str, *, single_skill_runtime=None,
+                                  event_sink=None, final_synthesizer=None) -> dict:
+    """Consume a pending plan and execute it without discovery or planning."""
+    pending = _take_multiskill_plan(plan_id)
+    return await run_multiskill_orchestration(
+        user_request=pending["user_request"], parent_envelope=pending["parent_envelope"],
+        execution_mode="execute", confirmed_plan=pending["plan"],
+        single_skill_runtime=single_skill_runtime, event_sink=event_sink,
+        final_synthesizer=final_synthesizer, model=pending.get("model"),
+    )

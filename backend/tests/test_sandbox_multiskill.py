@@ -128,6 +128,114 @@ async def test_child_pause_or_failure_stops_parent(kind):
 
 
 @pytest.mark.asyncio
+async def test_multiskill_missing_required_inputs_does_not_execute_children():
+    calls = []
+    missing_plan = plan(step())
+    missing_plan["missing_required_inputs"] = [{"input": "document", "reason": "required"}]
+    result = await executor.execute_multiskill_plan(plan=missing_plan,
+        activated_skill_names=["one"], parent_envelope={},
+        single_skill_runtime=lambda **kwargs: calls.append(kwargs))
+    assert calls == []
+    assert result["success"] is None and result["mode"] == "ask_user"
+    assert result["missing"] == [{"input": "document", "reason": "required"}]
+
+
+@pytest.mark.asyncio
+async def test_multiskill_missing_required_inputs_returns_ask_user():
+    missing_plan = plan(step())
+    missing_plan["missing_required_inputs"] = ["document"]
+    result = await manager.run_multiskill_manager(user_request="run", parent_envelope={},
+        activation_cards=[{"skill_name": "one"}], confirmed_plan=missing_plan)
+    assert result == {"success": None, "completed": False, "paused_for_user": True,
+        "mode": "ask_user", "reason": "Multi-Skill plan requires additional input.",
+        "missing": ["document"], "plan": plans.validate_multiskill_plan(missing_plan, ["one"])}
+
+
+@pytest.mark.asyncio
+async def test_multiskill_plan_mode_returns_plan_id_and_confirmation_uses_same_plan(monkeypatch):
+    manager._pending_multiskill_plans.clear()
+    counters = {"catalog": 0, "shortlist": 0, "planner": 0}
+    def catalog(**kwargs): counters["catalog"] += 1; return [{"name": "one"}]
+    async def shortlist(**kwargs): counters["shortlist"] += 1; return {"candidates": [{"skill_name": "one"}]}
+    def activate(names): return [{"skill_name": name} for name in names]
+    async def planner_call(*_):
+        counters["planner"] += 1
+        return '{"mode":"multi_skill","plan":{"version":"sandbox-multiskill-plan/v1","steps":[{"step_id":"s1","skill_name":"one","task":"same task","bindings":{},"depends_on":[]}]}}'
+    calls = []
+    async def runtime(**kwargs): calls.append(kwargs); return {"success": True, "text": "ok"}
+    monkeypatch.setattr(manager, "build_multiskill_catalog", catalog)
+    monkeypatch.setattr(manager, "_plan_skill_candidates_with_model", shortlist)
+    monkeypatch.setattr(manager, "build_multiskill_activation_cards", activate)
+    preview = await manager.run_multiskill_orchestration(user_request="run", parent_envelope={},
+        execution_mode="plan", planner_model_call=planner_call)
+    assert preview["mode"] == "plan" and preview["plan_id"].startswith("multiskill_")
+    result = await manager.confirm_multiskill_plan(preview["plan_id"], single_skill_runtime=runtime,
+        final_synthesizer=lambda **_: "done")
+    assert result["success"] is True and calls[0]["input_envelope"]["user_request"] == "same task"
+    assert counters == {"catalog": 1, "shortlist": 1, "planner": 1}
+
+
+def test_expired_multiskill_plan_is_rejected(monkeypatch):
+    manager._pending_multiskill_plans.clear()
+    manager._pending_multiskill_plans["old"] = {"created_at": 1}
+    monkeypatch.setattr(manager.time, "time", lambda: 1 + manager._MULTISKILL_PLAN_EXPIRY_SECONDS + 1)
+    with pytest.raises(manager.PendingMultiSkillPlanError, match="expired"):
+        manager._take_multiskill_plan("old")
+
+
+@pytest.mark.asyncio
+async def test_confirmed_multiskill_plan_revalidates_governance(monkeypatch):
+    manager._pending_multiskill_plans.clear()
+    manager._pending_multiskill_plans["disabled"] = {
+        "created_at": manager.time.time(), "plan": plan(step()),
+        "user_request": "run", "parent_envelope": {}, "model": None,
+    }
+    monkeypatch.setattr(manager, "build_multiskill_activation_cards",
+        lambda names: (_ for _ in ()).throw(PermissionError("skill_not_executable")))
+    with pytest.raises(PermissionError, match="skill_not_executable"):
+        await manager.confirm_multiskill_plan("disabled")
+
+
+@pytest.mark.asyncio
+async def test_multiskill_sse_bridges_parent_child_result_and_done(monkeypatch, tmp_path):
+    from backend.routers.sandbox import stream_pipeline
+    from backend.routers.sandbox.io_manifest import SandboxChatRequest
+    monkeypatch.setattr(stream_pipeline.settings, "multiskill_uploads_path", tmp_path)
+    monkeypatch.setattr(stream_pipeline, "_SSE_KEEPALIVE_INTERVAL", 0.001)
+    async def orchestration(**kwargs):
+        await kwargs["event_sink"]({"skill_started": {"step_id": "s1", "child_run_id": "c1"}})
+        await kwargs["event_sink"]({"child_runtime_event": {"child_run_id": "c1", "event": {"step": "inner"}}})
+        await asyncio.sleep(0.003)
+        return {"success": True, "mode": "multi_skill", "text": "final",
+                "multi_skill_trace": [{"step_id": "s1"}], "artifacts": [], "output_files": []}
+    monkeypatch.setattr(stream_pipeline, "run_multiskill_orchestration", orchestration)
+    response = await stream_pipeline.chat_in_multiskill_sandbox(
+        SandboxChatRequest(messages=[{"role": "user", "content": "run"}]))
+    body = "".join([chunk async for chunk in response.body_iterator])
+    assert "skill_started" in body and "child_runtime_event" in body
+    assert "multi_skill_trace" in body and "result_manifest" in body and '"answer": "final"' in body
+    assert ": keepalive" in body and body.endswith("data: [DONE]\n\n")
+
+
+@pytest.mark.asyncio
+async def test_multiskill_http_confirmation_uses_stored_plan_path(monkeypatch, tmp_path):
+    from backend.routers.sandbox import stream_pipeline
+    from backend.routers.sandbox.io_manifest import SandboxChatRequest
+    monkeypatch.setattr(stream_pipeline.settings, "multiskill_uploads_path", tmp_path)
+    seen = []
+    async def confirm(plan_id, **kwargs):
+        seen.append(plan_id)
+        return {"success": True, "mode": "multi_skill", "artifacts": [], "output_files": []}
+    monkeypatch.setattr(stream_pipeline, "confirm_multiskill_plan", confirm)
+    monkeypatch.setattr(stream_pipeline, "run_multiskill_orchestration",
+        lambda **_: pytest.fail("confirmation must not rediscover or replan"))
+    response = await stream_pipeline.chat_in_multiskill_sandbox(SandboxChatRequest(
+        messages=[{"role": "user", "content": "confirm"}], multiskill_plan_id="plan-1"))
+    body = "".join([chunk async for chunk in response.body_iterator])
+    assert seen == ["plan-1"] and "multiskill_result" in body and body.endswith("data: [DONE]\n\n")
+
+
+@pytest.mark.asyncio
 async def test_confirmed_multiskill_plan_executes_same_plan_without_planner():
     canonical = plan(step(task="confirmed task"))
     calls = []

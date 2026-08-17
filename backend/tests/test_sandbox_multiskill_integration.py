@@ -147,6 +147,37 @@ async def test_real_artifact_handoff(real_skills, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_real_parent_uploaded_file_to_first_child(real_skills, monkeypatch, tmp_path):
+    _install_runtime_planners(monkeypatch)
+    upload_root = tmp_path / "platform-uploads"
+    source = upload_root / "inputs" / "session" / "test.txt"
+    source.parent.mkdir(parents=True)
+    source.write_text("uploaded content", encoding="utf-8")
+    plan = {"version": multiskill_plan.VERSION, "steps": [{
+        "step_id": "s1", "skill_name": "files", "task": "read upload",
+        "bindings": {"input_files": {"source_type": "envelope", "path": "input_files"}},
+        "depends_on": [],
+    }]}
+    parent = {"text": "read", "_platform_input_root": str(upload_root), "input_files": [{
+        "path": "inputs/session/test.txt", "filename": "test.txt", "size": 999,
+        "mime_type": "text/plain",
+    }]}
+    result = await multiskill_executor.execute_multiskill_plan(plan=plan,
+        activated_skill_names=["files"], parent_envelope=parent)
+    assert result["skill_results"]["s1"]["structured_outputs"][0]["data"]["result"] == "uploaded content"
+    copied = next((real_skills["files"] / "inputs").rglob("*-test.txt"))
+    assert copied.read_text() == "uploaded content"
+    assert str(source.resolve()) not in str(result)
+
+
+def test_artifact_bridge_rejects_path_traversal(real_skills, tmp_path):
+    outside = tmp_path / "secret.txt"; outside.write_text("secret")
+    with pytest.raises(multiskill_executor.MultiSkillBindingError, match="confirmed"):
+        multiskill_executor.materialize_child_artifacts_for_input(items=[{"path": "../secret.txt"}],
+            source_skill_name="one", target_skill_name="two", child_run_id="safe")
+
+
+@pytest.mark.asyncio
 async def test_real_child_ask_user_pauses_parent(real_skills, monkeypatch):
     async def decide(**kwargs):
         return {"action": "ask_user", "reason": "need approval", "missing": ["approval"]}

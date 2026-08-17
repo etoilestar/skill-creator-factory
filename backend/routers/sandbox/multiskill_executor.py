@@ -82,7 +82,15 @@ def materialize_child_artifacts_for_input(*, items: list[dict], source_skill_nam
     """Host-validate executor artifacts and copy them into the target input boundary."""
     source_record = resolve_skill_record(source_skill_name, mode="sandbox", require_visible=True, require_executable=True)
     target_record = resolve_skill_record(target_skill_name, mode="sandbox", require_visible=True, require_executable=True)
-    source_root, target_root = Path(source_record["root_path"]).resolve(), Path(target_record["root_path"]).resolve()
+    source_root = Path(source_record["root_path"]).resolve()
+    return _materialize_files_for_child(items=items, source_root=source_root,
+        target_root=Path(target_record["root_path"]).resolve(), child_run_id=child_run_id)
+
+
+def _materialize_files_for_child(*, items: list[dict], source_root: Path,
+                                 target_root: Path, child_run_id: str) -> list[dict]:
+    """Common Host bridge for platform inputs and executor-confirmed artifacts."""
+    source_root, target_root = source_root.resolve(), target_root.resolve()
     input_dir = (target_root / "inputs" / child_run_id).resolve()
     if not _is_within_sandbox(input_dir, target_root):
         raise MultiSkillBindingError("invalid target input boundary")
@@ -97,6 +105,12 @@ def materialize_child_artifacts_for_input(*, items: list[dict], source_skill_nam
             raise MultiSkillBindingError("artifact is not an executor-confirmed local file")
         filename = Path(str(item.get("name") or item.get("filename") or source.name)).name
         target = input_dir / f"{index}-{filename}"
+        collision = 1
+        while target.exists():
+            target = input_dir / f"{index}-{collision}-{filename}"
+            collision += 1
+        if not _is_within_sandbox(target.resolve(), input_dir):
+            raise MultiSkillBindingError("materialized target escapes child input boundary")
         shutil.copy2(source, target)
         mime = str(item.get("mime_type") or mimetypes.guess_type(filename)[0] or "application/octet-stream")
         relative_path = target.relative_to(target_root).as_posix()
@@ -109,6 +123,14 @@ def materialize_child_artifacts_for_input(*, items: list[dict], source_skill_nam
     return manifests
 
 
+def materialize_parent_files_for_child(*, items: list[dict], source_root: Path,
+                                       target_skill_name: str, child_run_id: str) -> list[dict]:
+    """Validate Platform-upload descriptors and materialize them for one child."""
+    target_record = resolve_skill_record(target_skill_name, mode="sandbox", require_visible=True, require_executable=True)
+    return _materialize_files_for_child(items=items, source_root=Path(source_root),
+        target_root=Path(target_record["root_path"]), child_run_id=child_run_id)
+
+
 def build_child_input_envelope(step: dict, parent_envelope: dict, skill_results: dict,
                                *, child_run_id: str) -> dict:
     child = {key: deepcopy(parent_envelope.get(key)) for key in ENVELOPE_FIELDS if key in parent_envelope}
@@ -118,6 +140,12 @@ def build_child_input_envelope(step: dict, parent_envelope: dict, skill_results:
         if target not in ENVELOPE_FIELDS:
             raise MultiSkillBindingError(f"binding target is not an Input Envelope field: {target}")
         value = _resolve(binding, parent_envelope, skill_results)
+        if target in {"input_files", "files"} and binding.get("source_type") == "envelope" and binding.get("path") in {"input_files", "files"}:
+            source_root = parent_envelope.get("_platform_input_root")
+            if not source_root:
+                raise MultiSkillBindingError("platform input boundary is unavailable")
+            value = materialize_parent_files_for_child(items=value, source_root=Path(source_root),
+                target_skill_name=step["skill_name"], child_run_id=child_run_id)
         if target in {"input_files", "files"} and binding.get("source_type") == "skill_result" and binding.get("channel") in {"artifacts", "output_files"}:
             source_result = skill_results[binding["step_id"]]
             value = materialize_child_artifacts_for_input(items=value,
@@ -132,13 +160,15 @@ def build_child_input_envelope(step: dict, parent_envelope: dict, skill_results:
 
 async def invoke_child_skill(*, step: dict, parent_envelope: dict, skill_results: dict,
                              single_skill_runtime: Callable[..., Awaitable[dict] | dict] | None = None,
-                             child_run_id: str | None = None) -> dict:
+                             child_run_id: str | None = None, model: str | None = None,
+                             child_event_sink=None) -> dict:
     """Revalidate governance, then invoke the existing complete Single-Skill Runtime."""
     resolve_skill_record(step["skill_name"], mode="sandbox", require_visible=True, require_executable=True)
     run_id = child_run_id or f"child_{uuid.uuid4().hex}"
     envelope = build_child_input_envelope(step, parent_envelope, skill_results, child_run_id=run_id)
     runtime = single_skill_runtime or execute_child_skill_runtime
-    raw = runtime(skill_name=step["skill_name"], input_envelope=envelope, child_run_id=run_id)
+    raw = runtime(skill_name=step["skill_name"], input_envelope=envelope, child_run_id=run_id,
+                  model=model, event_sink=child_event_sink)
     if inspect.isawaitable(raw):
         raw = await raw
     return normalize_child_skill_result(raw, child_run_id=run_id, skill_name=step["skill_name"])
@@ -146,7 +176,8 @@ async def invoke_child_skill(*, step: dict, parent_envelope: dict, skill_results
 
 async def execute_multiskill_plan(*, plan: dict, activated_skill_names, parent_envelope: dict,
                                   single_skill_runtime: Callable[..., Awaitable[dict] | dict] | None = None,
-                                  event_sink: Callable[[dict], object] | None = None) -> dict:
+                                  event_sink: Callable[[dict], object] | None = None,
+                                  model: str | None = None) -> dict:
     """Execute validated nodes serially; no fan-out, retry, replacement, or parent replan."""
     canonical = validate_multiskill_plan(plan, activated_skill_names)
     results, skills, trace, artifacts, output_files = {}, {}, [], [], []
@@ -156,12 +187,20 @@ async def execute_multiskill_plan(*, plan: dict, activated_skill_names, parent_e
             if inspect.isawaitable(value):
                 await value
     await emit({"multiskill_plan": deepcopy(canonical)})
+    if canonical["missing_required_inputs"]:
+        return {"success": None, "completed": False, "paused_for_user": True,
+                "mode": "ask_user", "reason": "Multi-Skill plan requires additional input.",
+                "missing": deepcopy(canonical["missing_required_inputs"]), "skill_results": {},
+                "skills": {}, "artifacts": [], "output_files": [], "multi_skill_trace": []}
     for step in canonical["steps"]:
         run_id = f"child_{uuid.uuid4().hex}"
         skills[step["step_id"]] = {"child_run_id": run_id, "skill_name": step["skill_name"], "status": "running"}
         await emit({"skill_started": {"step_id": step["step_id"], "skill_name": step["skill_name"], "child_run_id": run_id}})
+        async def child_sink(event):
+            await emit({"child_runtime_event": {"child_run_id": run_id, "event": event}})
         result = await invoke_child_skill(step=step, parent_envelope=parent_envelope, skill_results=results,
-                                          single_skill_runtime=single_skill_runtime, child_run_id=run_id)
+                                          single_skill_runtime=single_skill_runtime, child_run_id=run_id,
+                                          model=model, child_event_sink=child_sink)
         results[step["step_id"]] = result
         skills[step["step_id"]].update(status=result["status"], result=result)
         artifacts.extend(result["artifacts"]); output_files.extend(result["output_files"])

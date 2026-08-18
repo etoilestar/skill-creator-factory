@@ -46,6 +46,65 @@ def _positioned_failure(*, step, target, layer, code, actual):
     )
 
 
+def _command_binding_to_script_exit_failures(*, after_boundary_invalid=False):
+    before = (
+        "E2E_REPAIR_TARGET=SKILL.md\n"
+        "E2E_LAYER=command_binding\n"
+        "E2E_STRUCTURED_FAILURE="
+        + __import__("json").dumps({
+            "failed_step_index": 1,
+            "target_file": "SKILL.md",
+            "layer": "command_binding",
+            "actual": "command binding invalid",
+            "details": {
+                "failure_code": "command_binding_invalid",
+                "argv_shape_valid": False,
+                "command_script_interface_aligned": False,
+            },
+        })
+    )
+    after_details = {"failure_code": "script_exit"}
+    if after_boundary_invalid:
+        after_details["argv_shape_valid"] = False
+    after = (
+        "E2E_REPAIR_TARGET=scripts/overview_generator.py\n"
+        "E2E_LAYER=script_exit\n"
+        "E2E_STRUCTURED_FAILURE="
+        + __import__("json").dumps({
+            "failed_step_index": 1,
+            "target_file": "scripts/overview_generator.py",
+            "layer": "script_exit",
+            "actual": "runtime failed",
+            "stderr": (
+                "Traceback (most recent call last):\n"
+                '  File "scripts/overview_generator.py", line 12, in run\n'
+                "    file_path = input_files[0]['path']\n"
+                "TypeError: string indices must be integers\n"
+            ),
+            "details": after_details,
+        })
+    )
+    return before, after
+
+
+def test_fixed_command_binding_advances_to_real_script_failure():
+    before, after = _command_binding_to_script_exit_failures()
+
+    assert _e2e_candidate_improved([before], [after], target_file="SKILL.md") is True
+
+
+def test_new_script_traceback_is_not_progress_when_after_boundary_is_invalid():
+    before, after = _command_binding_to_script_exit_failures(after_boundary_invalid=True)
+
+    assert _e2e_candidate_improved([before], [after], target_file="SKILL.md") is False
+
+
+def test_command_binding_layer_precedes_script_exit():
+    before, after = _command_binding_to_script_exit_failures()
+
+    assert _e2e_failure_position(before) < _e2e_failure_position(after)
+
+
 def test_collection_placeholder_boundary_rejects_double_wrap(tmp_path):
     source = tmp_path / "a.csv"
     source.write_text("name\nAda\n", encoding="utf-8")

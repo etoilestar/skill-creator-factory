@@ -2496,6 +2496,7 @@ _E2E_LAYER_RANK = {
     "placeholder_render": 1,
     "external_input_missing": 1,
     "e2e_dataflow_missing": 1,
+    "command_binding": 2,
     "argv_guard": 2,
     "argv_schema_error": 2,
     "script_execution": 3,
@@ -2607,12 +2608,11 @@ def _e2e_candidate_improved(original_errors: list[str], new_errors: list[str], *
     # A later exception is not progress while the input boundary which feeds it
     # remains invalid.  Otherwise AttributeError -> KeyError can retain a script
     # patch that merely moves past malformed argv.
-    for structured in (old_structured, new_structured):
-        facts = structured.get("details") or {}
-        if any(facts.get(flag) is False for flag in (
-            "fixture_valid", "placeholder_resolved", "argv_shape_valid", "command_script_interface_aligned",
-        )):
-            return False
+    facts = new_structured.get("details") or {}
+    if any(facts.get(flag) is False for flag in (
+        "fixture_valid", "placeholder_resolved", "argv_shape_valid", "command_script_interface_aligned",
+    )):
+        return False
     old_fs = ((old_structured.get("details") or {}).get("filesystem_trace") or {}) if old_structured else {}
     new_fs = ((new_structured.get("details") or {}).get("filesystem_trace") or {}) if new_structured else {}
     old_code, new_code = _failure_code_from_structured(old_structured), _failure_code_from_structured(new_structured)

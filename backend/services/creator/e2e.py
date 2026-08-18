@@ -4598,7 +4598,10 @@ def _called_registry_tool_context(source: str, context: dict[str, Any] | None) -
         "authorization_scope": context.get("authorization_scope", "skill"),
         "read_only": True,
         "binding_digest": context.get("binding_digest"),
-        "selected_tool_ids": context.get("selected_tool_ids") or [],
+        # Do not expose Skill-wide alternatives to localized repair.  The owner
+        # ids and resolved facts below describe only callables present in this
+        # exact source file.
+        "selected_tool_ids": sorted(used_tool_ids),
         "used_tool_ids": sorted(used_tool_ids),
         "resolved_tools": resolved,
     }
@@ -4749,6 +4752,14 @@ async def _diagnose_e2e_failure_for_repair(*, skill_name: str, skill_dir: Path, 
     prompt = {"structured_failure": failure, "symptom_file": symptom, "layer": failure.get("layer"), "filesystem_trace": details.get("filesystem_trace", {}), "runtime_filesystem_facts": runtime_filesystem_facts, "argv_interface_provenance_facts": argv_provenance_facts, "runtime_binding_trace": details.get("runtime_binding_trace", {}), "previous_step_traces": traces, "skill_files": related, "platform_io_facts": _platform_io_repair_summary(), "read_only_callable_context": read_only_callable_context or {}, "previous_debug_attempts": rejected, "retry_reason": retry_reason}
     logger.info("[Creator][e2e_diagnosis] source_digest=%s", _stable_json_hash(related))
     callable_boundary = (
+        " For the behavior of an already-called Registry callable, read_only_callable_context is authoritative. "
+        "Authority order: (1) actual runtime traceback and rendered runtime evidence; (2) the exact "
+        "read_only_callable_context of the already-called callable; (3) current source code; (4) model inference "
+        "only when the contract is silent. If output_schema, return_contract, or example_return explicitly states "
+        "a shape, do not infer a conflicting shape from general knowledge. Do not guess list versus object, field "
+        "names, parameter names, return fields, or nested item shape when the callable contract states them. If "
+        "actual runtime evidence conflicts with that contract, report an unresolved contract conflict; do not guess "
+        "which is correct, switch tools, or make a functionality judgment. "
         " When the failing script calls a Registry Tool, first locate the traceback/runtime line, read its signature, "
         "return_contract, and example_return, then compare arguments, return-field reads, and actual stdout/stderr. "
         "Tool usage is read-only evidence, not permission to add, remove, switch, or rediscover tools. If evidence "
@@ -4761,7 +4772,7 @@ async def _diagnose_e2e_failure_for_repair(*, skill_name: str, skill_dir: Path, 
         "tools are authorized in the Skill-wide ToolPool, E2E repair must not switch from one tool to another. Callable "
         "repair may only correct the invocation of the tool already represented by the failing source call."
     )
-    messages = [{"role": "system", "content": "You diagnose a Creator E2E breakpoint. Output only JSON. Select exactly one primary repair_target. It must be SKILL.md or an existing scripts/*.py in this Skill. Do not propose edits or backend/runtime/tool changes." + callable_boundary}, {"role": "user", "content": json.dumps(prompt, ensure_ascii=False, default=str) + "\nReturn {repair_target, root_cause_hypothesis, evidence, repair_instruction, confidence}. These are real Sandbox experiments with stable failure identities and patch digests. Do not re-propose the same target, breakpoint, and repair region merely by changing hypothesis wording." + callable_boundary}]
+    messages = [{"role": "system", "content": "You diagnose a Creator E2E breakpoint. Output only JSON. Select exactly one primary repair_target. It must be SKILL.md or an existing scripts/*.py in this Skill. Do not propose edits or backend/runtime/tool changes." + callable_boundary}, {"role": "user", "content": json.dumps(prompt, ensure_ascii=False, default=str) + "\nReturn {repair_target, root_cause_hypothesis, evidence, repair_instruction, confidence, callable_contract_evidence}. Include callable_contract_evidence only when read_only_callable_context is non-empty, and cite the exact callable facts that ground the diagnosis. These are real Sandbox experiments with stable failure identities and patch digests. Do not re-propose the same target, breakpoint, and repair region merely by changing hypothesis wording." + callable_boundary}]
     for proposal_attempt in range(3):
         try:
             text = _complete_chat_once_sync_for_e2e(messages, route.model)
@@ -4775,7 +4786,10 @@ async def _diagnose_e2e_failure_for_repair(*, skill_name: str, skill_dir: Path, 
         # Hypothesis wording is explanatory only. Actual experiment deduplication
         # happens after a patch digest exists, before Sandbox is invoked.
         if valid:
-            return {"repair_target": target, "symptom_file": symptom, "root_cause_hypothesis": hypothesis, "evidence": data.get("evidence") or [], "repair_instruction": str(data.get("repair_instruction") or ""), "confidence": data.get("confidence") or "", "hypothesis_key": key}
+            result = {"repair_target": target, "symptom_file": symptom, "root_cause_hypothesis": hypothesis, "evidence": data.get("evidence") or [], "repair_instruction": str(data.get("repair_instruction") or ""), "confidence": data.get("confidence") or "", "hypothesis_key": key}
+            if read_only_callable_context:
+                result["callable_contract_evidence"] = data.get("callable_contract_evidence") or []
+            return result
         messages.append({"role": "user", "content": "Your proposal was invalid. Return a different valid repair target JSON proposal."})
     return {"status": "diagnosis_exhausted", "symptom_file": symptom}
 
@@ -5394,7 +5408,12 @@ async def _repair_existing_file_for_e2e_failure(
 
     if target_path.startswith("scripts/") and read_only_callable_context:
         base_task_context += (
-            "\n\n只读 callable facts（read_only=true，仅用于修正真实 import/name/signature 错误；不是工具选择建议）：\n"
+            "\n\n只读 callable facts（read_only=true，仅用于当前 callable 的 import identity、arguments、return structure 和当前源码如何消费该返回值；不是工具选择或脚本功能评价建议）：\n"
+            "The readonly callable facts below are runtime interface authority for callable behavior. "
+            "When the failing expression consumes the callable return value, the patch must preserve the declared "
+            "return shape. Do not replace object field access with positional indexing, or vice versa, unless runtime "
+            "evidence or the exact callable contract requires it. Do not reinterpret an explicitly declared "
+            "array<object> as array<array>.\n"
             + json.dumps(
                 read_only_callable_context,
                 ensure_ascii=False,

@@ -1148,6 +1148,38 @@ def _callable_context(function_name: str = "real_callable_name"):
     }
 
 
+def test_called_registry_context_keeps_complete_facts_for_only_the_actual_call():
+    fields = {
+        "signature": "fn_alpha(path: str) -> dict",
+        "input_schema": {"type": "object"},
+        "output_schema": {"type": "object", "properties": {"records": {"type": "array", "items": {"type": "object"}}}},
+        "return_contract": "Returns records as an array of objects.",
+        "example_return": {"records": [{"name": "example"}]},
+        "common_mistakes": ["Do not use positional indexing."],
+        "trial_mode_behavior": "Returns deterministic fixture records.",
+    }
+    context = {
+        "selected_tool_ids": ["tool_alpha", "tool_beta"],
+        "resolved_tools": [
+            {"tool_id": "tool_alpha", "import_path": "module_x", "function_name": "fn_alpha", **fields},
+            {"tool_id": "tool_alpha", "import_path": "module_x", "function_name": "fn_alpha_v2"},
+            {"tool_id": "tool_beta", "import_path": "module_y", "function_name": "fn_beta"},
+        ],
+    }
+
+    projected = e2e._called_registry_tool_context(
+        "from module_x import fn_alpha\nresult = fn_alpha(path)\nrecords = result['records']\n",
+        context,
+    )
+
+    assert projected["selected_tool_ids"] == ["tool_alpha"]
+    assert projected["used_tool_ids"] == ["tool_alpha"]
+    assert len(projected["resolved_tools"]) == 1
+    assert projected["resolved_tools"][0] == {
+        "tool_id": "tool_alpha", "import_path": "module_x", "function_name": "fn_alpha", **fields,
+    }
+
+
 def test_e2e_missing_import_is_environment_prepare_failure_without_script_repair(tmp_path, monkeypatch):
     script = "from definitely_missing_creator_package import run\nrun()\n"
     skill_dir, _command, _skill_md, _payload = _write_trial_script(tmp_path, script)
@@ -1231,6 +1263,7 @@ async def test_value_error_repair_uses_workspace_current_called_tool_context(tmp
             "root_cause_hypothesis": "The script reads a field outside the helper return contract.",
             "evidence": ["ValueError: missing path"],
             "repair_instruction": "Use the declared path field.",
+            "callable_contract_evidence": ["real_callable_name return_contract.type=object"],
             "confidence": "high",
             "hypothesis_key": "scripts/one.py|return field",
         }
@@ -1280,6 +1313,10 @@ async def test_value_error_repair_uses_workspace_current_called_tool_context(tmp
     assert "real_callable_name(text: str) -> dict" in prompt
     assert "outputs/value.txt" in prompt
     assert "Do not read file_outputs." in prompt
+    assert "runtime interface authority" in prompt
+    assert "object field access with positional indexing" in prompt
+    assert "array<object> as array<array>" in prompt
+    assert "real_callable_name return_contract.type=object" in prompt
     assert "unused_callable() -> dict" not in prompt
     assert "stale_callable" not in prompt
     assert captured["diagnosis_context"]["resolved_tools"][0]["function_name"] == "real_callable_name"
@@ -1528,6 +1565,9 @@ async def test_diagnosis_receives_selected_callable_facts_and_forbids_traceback_
             "repair_target": "scripts/one.py",
             "root_cause_hypothesis": "Use the selected Registry callable.",
             "repair_instruction": "Use fn_alpha from module_x.",
+            "callable_contract_evidence": [
+                "module_x.fn_alpha output_schema.records.items.type=object",
+            ],
         })
 
     monkeypatch.setattr(e2e, "_complete_chat_once_sync_for_e2e", fake_complete)
@@ -1537,6 +1577,11 @@ async def test_diagnosis_receives_selected_callable_facts_and_forbids_traceback_
             "tool_id": "tool_alpha",
             "import_path": "module_x",
             "function_name": "fn_alpha",
+            "signature": "fn_alpha(path: str) -> dict",
+            "input_schema": {"type": "object", "required": ["path"]},
+            "output_schema": {"type": "object", "properties": {"records": {"type": "array", "items": {"type": "object"}}}},
+            "return_contract": "Returns records as an array of objects.",
+            "example_return": {"records": [{"name": "example"}]},
         }],
     }
 
@@ -1550,8 +1595,21 @@ async def test_diagnosis_receives_selected_callable_facts_and_forbids_traceback_
 
     prompt = "\n".join(message["content"] for message in captured["messages"])
     assert diagnosis["repair_instruction"] == "Use fn_alpha from module_x."
+    assert diagnosis["callable_contract_evidence"] == [
+        "module_x.fn_alpha output_schema.records.items.type=object",
+    ]
     assert '"selected_tool_ids": ["tool_alpha"]' in prompt
     assert '"function_name": "fn_alpha"' in prompt
+    assert "fn_alpha(path: str) -> dict" in prompt
+    assert '"output_schema"' in prompt
+    assert '"records"' in prompt
+    assert '"type": "array"' in prompt
+    assert '"type": "object"' in prompt
+    assert '"return_contract"' in prompt
+    assert '"example_return"' in prompt
+    assert "read_only_callable_context is authoritative" in prompt
+    assert "Authority order" in prompt
+    assert "unresolved contract conflict" in prompt
     assert "Did you mean" in prompt
     assert "exact import_path/function_name" in prompt
     assert "callable_repair_evidence_missing" in prompt

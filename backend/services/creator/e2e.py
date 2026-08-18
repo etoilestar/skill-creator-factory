@@ -477,8 +477,12 @@ def _e2e_runtime_boundary_facts(
         issues.append({"error_code": "command_argv_extra", "keys": unknown_keys})
 
     fixture_paths: list[str] = []
+    runtime_file_roots = _platform_runtime_file_input_names()
     for binding in runtime_binding_trace.values():
-        source = payload.get(str(binding.get("source_root") or ""))
+        source_root = str(binding.get("source_root") or "")
+        if source_root not in runtime_file_roots:
+            continue
+        source = payload.get(source_root)
         if isinstance(source, list) and source and all(isinstance(item, str) for item in source):
             fixture_paths.extend(item for item in source if Path(item).is_absolute())
     fixture_valid = all(Path(path).is_file() for path in fixture_paths)
@@ -1960,7 +1964,7 @@ def _seed_initial_e2e_payload(
             and input_name in command.argv_template
         ), None)
         path_parts = str(expr or "").split(".")
-        if len(path_parts) < 2:
+        if not path_parts or not path_parts[0]:
             continue
         container = payload
         for path_part in path_parts[:-1]:

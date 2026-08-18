@@ -333,6 +333,115 @@ def test_e2e_seed_preserves_external_value_over_skillplan_default(tmp_path):
     assert payload["fields"]["count"] == 8
 
 
+@pytest.mark.parametrize(("name", "default"), [("font_size", 12), ("foo_limit", 7)])
+def test_e2e_seed_uses_root_dynamic_placeholder_default(tmp_path, name, default):
+    skill_dir = tmp_path / name
+    skill_dir.mkdir()
+    template = "{{" + name + "}}"
+    (skill_dir / "SKILL.md").write_text(
+        f"# Dynamic input\ncommand: {template}\n",
+        encoding="utf-8",
+    )
+    command = E2EWorkflowCommand(
+        1, "SKILL.md", "scripts/x.py", "python scripts/x.py '{}'", "python",
+        {name: template},
+    )
+
+    payload = e2e._seed_initial_e2e_payload(
+        [command],
+        skill_dir=skill_dir,
+        requirements_by_file={
+            "scripts/x.py": [e2e.RequirementItem(target_file="scripts/x.py", inputs=[f"{name}: int"])]
+        },
+        skill_plan_entries={
+            "scripts/x.py": SimpleNamespace(
+                inputs=[f"{name}: int"], outputs=[], artifact_contract={},
+                default_values={name: default},
+            )
+        },
+    )
+
+    assert payload[name] == default
+    assert e2e._render_e2e_command_payload(command, payload=payload) == {name: default}
+    assert template in (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+
+
+def test_e2e_seed_preserves_root_external_value_over_default(tmp_path):
+    skill_dir = tmp_path / "external-root-default"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("# Dynamic input\n", encoding="utf-8")
+    command = E2EWorkflowCommand(
+        1, "SKILL.md", "scripts/x.py", "python scripts/x.py '{}'", "python",
+        {"font_size": "{{font_size}}"},
+    )
+
+    payload = e2e._seed_initial_e2e_payload(
+        [command],
+        external_context={"font_size": 18},
+        skill_dir=skill_dir,
+        skill_plan_entries={
+            "scripts/x.py": SimpleNamespace(
+                inputs=["font_size: int"], outputs=[], artifact_contract={},
+                default_values={"font_size": 12},
+            )
+        },
+    )
+
+    assert payload["font_size"] == 18
+
+
+def test_e2e_upstream_value_overrides_seeded_default(tmp_path):
+    skill_dir = tmp_path / "upstream-root-default"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("# Dynamic input\n", encoding="utf-8")
+    command = E2EWorkflowCommand(
+        2, "SKILL.md", "scripts/x.py", "python scripts/x.py '{}'", "python",
+        {"font_size": "{{font_size}}"},
+    )
+    payload = e2e._seed_initial_e2e_payload(
+        [command],
+        skill_dir=skill_dir,
+        skill_plan_entries={
+            "scripts/x.py": SimpleNamespace(
+                inputs=["font_size: int"], outputs=[], artifact_contract={},
+                default_values={"font_size": 12},
+            )
+        },
+    )
+
+    payload.update({"font_size": 16})  # The workflow applies prior-step stdout this way.
+
+    assert e2e._render_e2e_command_payload(command, payload=payload) == {"font_size": 16}
+
+
+def test_e2e_root_placeholder_without_default_keeps_typed_materialization(tmp_path):
+    skill_dir = tmp_path / "typed-root"
+    (skill_dir / "scripts").mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# Dynamic input\n", encoding="utf-8")
+    (skill_dir / "scripts" / "x.py").write_text(
+        "from backend.services.runtime_tools import strict_json_argv_guard\n"
+        "def parse(payload):\n"
+        "    return strict_json_argv_guard(payload, {'custom_value': {'type': 'integer', 'required': True}})\n",
+        encoding="utf-8",
+    )
+    command = E2EWorkflowCommand(
+        1, "SKILL.md", "scripts/x.py", "python scripts/x.py '{}'", "python",
+        {"custom_value": "{{fields.custom_value}}"},
+    )
+    payload = e2e._seed_initial_e2e_payload(
+        [command],
+        skill_dir=skill_dir,
+        requirements_by_file={
+            "scripts/x.py": [
+                e2e.RequirementItem(target_file="scripts/x.py", inputs=["custom_value: int"])
+            ]
+        },
+    )
+    rendered = e2e._render_e2e_command_payload(command, payload=payload)
+
+    assert isinstance(rendered["custom_value"], int)
+
+
 def test_checkpoint_saved_and_resume_from_changed_step(tmp_path, monkeypatch):
     skill_dir = _make_skill(tmp_path)
     _patch_fast_e2e(monkeypatch)

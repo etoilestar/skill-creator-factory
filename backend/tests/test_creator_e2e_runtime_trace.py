@@ -86,6 +86,46 @@ def test_whole_collection_placeholder_preserves_list_shape(tmp_path):
     assert not isinstance(rendered["input_files"][0], list)
 
 
+def test_runtime_file_fixture_check_accepts_existing_platform_file(tmp_path):
+    source = tmp_path / "input.csv"
+    source.write_text("name\nAda\n", encoding="utf-8")
+    command = E2EWorkflowCommand(
+        1, "SKILL.md", "scripts/run.py", "python scripts/run.py ...", "python",
+        {"input_files": "{{input_files}}"},
+    )
+    payload = {"input_files": [str(source)]}
+    rendered = e2e._render_e2e_command_payload(command, payload=payload)
+    trace = _runtime_binding_trace(
+        command=command, payload=payload, rendered_payload=rendered, value_provenance={},
+    )
+
+    facts = e2e._e2e_runtime_boundary_facts(
+        command=command, payload=payload, rendered_payload=rendered,
+        script_content="", runtime_binding_trace=trace,
+    )
+
+    assert facts["fixture_valid"] is True
+
+
+def test_non_runtime_file_absolute_strings_are_not_fixture_checked():
+    command = E2EWorkflowCommand(
+        1, "SKILL.md", "scripts/run.py", "python scripts/run.py ...", "python",
+        {"paths": "{{paths}}"},
+    )
+    payload = {"paths": ["/api/v1/a", "/api/v1/b"]}
+    rendered = e2e._render_e2e_command_payload(command, payload=payload)
+    trace = _runtime_binding_trace(
+        command=command, payload=payload, rendered_payload=rendered, value_provenance={},
+    )
+
+    facts = e2e._e2e_runtime_boundary_facts(
+        command=command, payload=payload, rendered_payload=rendered,
+        script_content="", runtime_binding_trace=trace,
+    )
+
+    assert facts["fixture_valid"] is True
+
+
 def test_platform_runtime_files_seed_is_real_file_collection(tmp_path):
     (tmp_path / "scripts").mkdir()
     (tmp_path / "SKILL.md").write_text("# CSV workflow\n", encoding="utf-8")

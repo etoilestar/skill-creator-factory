@@ -16865,7 +16865,8 @@ async def validate_skill(request: SkillActionRequest):
     while True:
         external_context = _external_context_from_skill_action_request(request)
         try:
-            e2e_errors = validate_workflow_e2e(
+            e2e_errors = await asyncio.to_thread(
+                validate_workflow_e2e,
                 skill_name,
                 external_context=external_context,
                 requested_model=request.model,

@@ -1,9 +1,12 @@
 from pathlib import Path
+import asyncio
 import inspect
 import json
 from types import SimpleNamespace
 import subprocess
 import sys
+import threading
+import time
 
 import pytest
 
@@ -488,6 +491,62 @@ def test_e2e_state_ignores_advisory_when_no_failed_checks():
     assert state["full_e2e_passed"] is True
     assert state["remaining_failed_checks"] == []
     assert state["current_target_file"] == "none"
+
+
+@pytest.mark.asyncio
+async def test_validate_skill_runs_e2e_outside_event_loop_thread(monkeypatch, tmp_path):
+    from backend.services.creator import api
+    from backend.services.creator.common import SkillActionRequest
+
+    skill_dir = tmp_path / "threaded-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("# Threaded skill\n", encoding="utf-8")
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    monkeypatch.setattr(api, "_create_e2e_session", lambda *_args, **_kwargs: SimpleNamespace(events=[]))
+
+    main_thread_id = threading.get_ident()
+    worker_thread_ids = []
+
+    def fake_validate_workflow_e2e(*_args, **_kwargs):
+        worker_thread_ids.append(threading.get_ident())
+        return []
+
+    monkeypatch.setattr(api, "validate_workflow_e2e", fake_validate_workflow_e2e)
+
+    response = await api.validate_skill(SkillActionRequest(skill_name="threaded-skill"))
+
+    assert response.success is True
+    assert worker_thread_ids
+    assert worker_thread_ids[0] != main_thread_id
+
+
+@pytest.mark.asyncio
+async def test_validate_skill_keeps_event_loop_schedulable_during_e2e(monkeypatch, tmp_path):
+    from backend.services.creator import api
+    from backend.services.creator.common import SkillActionRequest
+
+    skill_dir = tmp_path / "schedulable-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("# Schedulable skill\n", encoding="utf-8")
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    monkeypatch.setattr(api, "_create_e2e_session", lambda *_args, **_kwargs: SimpleNamespace(events=[]))
+    e2e_started = threading.Event()
+
+    def slow_validate_workflow_e2e(*_args, **_kwargs):
+        e2e_started.set()
+        time.sleep(0.1)
+        return []
+
+    monkeypatch.setattr(api, "validate_workflow_e2e", slow_validate_workflow_e2e)
+    validation_task = asyncio.create_task(
+        api.validate_skill(SkillActionRequest(skill_name="schedulable-skill"))
+    )
+
+    while not e2e_started.is_set():
+        await asyncio.sleep(0)
+    await asyncio.sleep(0.01)
+    assert validation_task.done() is False
+    assert (await validation_task).success is True
 
 
 def test_checkpoint_rejects_changed_script_hash(tmp_path, monkeypatch):

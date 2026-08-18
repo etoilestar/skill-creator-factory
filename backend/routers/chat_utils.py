@@ -365,12 +365,31 @@ def _get_skill_venv_python(skill_dir: Path) -> Path:
 def _install_python_import_dependency(import_name: str, venv_python: Path) -> dict[str, object]:
     """Install one import name, using the shared import-to-distribution mapping."""
     package = _IMPORT_TO_PACKAGE.get(import_name, import_name)
-    result = subprocess.run(
-        [str(venv_python), "-m", "pip", "install", "--quiet", package],
-        timeout=180,
-        capture_output=True,
-        text=True,
+    packages = [package]
+    logger.info(
+        "skill-env: dependency install started python=%s packages=%s",
+        venv_python,
+        packages,
     )
+    started_at = time.monotonic()
+    try:
+        result = subprocess.run(
+            [str(venv_python), "-m", "pip", "install", "--quiet", package],
+            timeout=180,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.TimeoutExpired:
+        duration_ms = round((time.monotonic() - started_at) * 1000)
+        logger.warning(
+            "skill-env: dependency install timed out python=%s packages=%s duration_ms=%s timeout_seconds=%s",
+            venv_python,
+            packages,
+            duration_ms,
+            180,
+        )
+        raise
+    duration_ms = round((time.monotonic() - started_at) * 1000)
     details: dict[str, object] = {
         "import_name": import_name,
         "package": package,
@@ -380,10 +399,23 @@ def _install_python_import_dependency(import_name: str, venv_python: Path) -> di
         "stderr": (result.stderr or "")[-2000:],
     }
     if result.returncode != 0:
+        logger.warning(
+            "skill-env: dependency install failed python=%s packages=%s duration_ms=%s returncode=%s",
+            venv_python,
+            packages,
+            duration_ms,
+            result.returncode,
+        )
         raise RuntimeError(
             "Python dependency install failed: "
             + json.dumps(details, ensure_ascii=False, default=str)
         )
+    logger.info(
+        "skill-env: dependency install completed python=%s packages=%s duration_ms=%s",
+        venv_python,
+        packages,
+        duration_ms,
+    )
     return details
 
 
@@ -437,13 +469,38 @@ def _scan_and_install_python_deps(script_path: Path, venv_python: Path) -> dict[
 
     if to_install:
         logger.info("skill-env: pip installing into venv: %s", to_install)
-        result = subprocess.run(
-            [str(venv_python), "-m", "pip", "install", "--quiet"] + to_install,
-            timeout=180,
-            capture_output=True,
-            text=True,
+        logger.info(
+            "skill-env: dependency install started python=%s packages=%s",
+            venv_python,
+            to_install,
         )
+        started_at = time.monotonic()
+        try:
+            result = subprocess.run(
+                [str(venv_python), "-m", "pip", "install", "--quiet"] + to_install,
+                timeout=180,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.TimeoutExpired:
+            duration_ms = round((time.monotonic() - started_at) * 1000)
+            logger.warning(
+                "skill-env: dependency install timed out python=%s packages=%s duration_ms=%s timeout_seconds=%s",
+                venv_python,
+                to_install,
+                duration_ms,
+                180,
+            )
+            raise
+        duration_ms = round((time.monotonic() - started_at) * 1000)
         if result.returncode != 0:
+            logger.warning(
+                "skill-env: dependency install failed python=%s packages=%s duration_ms=%s returncode=%s",
+                venv_python,
+                to_install,
+                duration_ms,
+                result.returncode,
+            )
             raise RuntimeError(
                 "Python dependency install failed: "
                 + json.dumps({
@@ -454,6 +511,12 @@ def _scan_and_install_python_deps(script_path: Path, venv_python: Path) -> dict[
                     "stderr": (result.stderr or "")[-2000:],
                 }, ensure_ascii=False, default=str)
             )
+        logger.info(
+            "skill-env: dependency install completed python=%s packages=%s duration_ms=%s",
+            venv_python,
+            to_install,
+            duration_ms,
+        )
     return {"script": str(script_path), "imports": sorted(seen), "installed": to_install}
 
 

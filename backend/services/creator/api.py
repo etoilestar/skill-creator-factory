@@ -16930,6 +16930,21 @@ async def validate_skill(request: SkillActionRequest):
         # This is the runtime symptom location, not a confirmed repair target.
         # _repair_existing_file_for_e2e_failure performs the diagnosis phase.
         target_path = _e2e_symptom_file_from_errors(blocking_errors)
+        if target_path == "runtime_environment":
+            return SkillActionResponse(
+                success=False,
+                path=None,
+                message=(
+                    "严格端到端工作流运行环境准备失败：\n"
+                    + "\n\n".join(blocking_errors)
+                ),
+                repair_events=repair_events or e2e_session.events,
+                deterministic_workflow_passed=False,
+                advisory_validator_status=_e2e_advisory_status_from_warnings(advisory_warnings),
+                blocking_errors=blocking_errors,
+                warnings=advisory_warnings,
+                missing_stdlib_requests=missing_stdlib_reqs,
+            )
         if target_path == "__validator__":
             return SkillActionResponse(
                 success=True,
@@ -17019,6 +17034,17 @@ async def validate_skill(request: SkillActionRequest):
                 repair_logs.append(f"第 {attempt} 轮：{repaired_target} 已推动 E2E 断点，保留补丁并重新诊断新失败")
                 continue
             if status == "debug_hypothesis_rejected":
+                rejection_reason = repair_result.get("rejection_reason")
+                if (
+                    rejection_reason in {
+                        "same_breakpoint_repeated",
+                        "repair_experiment_already_rejected",
+                        "duplicate_experiment",
+                    }
+                    and repair_result.get("next_target") is None
+                ):
+                    repair_logs.append(f"第 {attempt} 轮：当前 repair experiment 已确定性拒绝（{rejection_reason}），无新的 repair owner，停止重跑 baseline")
+                    return SkillActionResponse(success=False, path=None, message="严格端到端工作流校验未收敛：当前 repair experiment 已被拒绝，且没有新的确定性 repair layer。\n" + "\n\n".join(blocking_errors), repair_events=repair_events or e2e_session.events, missing_stdlib_requests=missing_stdlib_reqs)
                 repair_logs.append(f"第 {attempt} 轮：当前 hypothesis 经真实 E2E 实验未产生改善，已回滚并进入下一轮根因诊断")
                 continue
             if status == "patch_proposal_exhausted":

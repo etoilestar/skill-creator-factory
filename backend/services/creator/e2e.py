@@ -16,6 +16,10 @@ from ..platform_io_contract import (
     project_and_commit_platform_outputs,
     value_matches_platform_schema,
 )
+from backend.routers.chat_utils import (
+    _install_python_import_dependency,
+    _scan_and_install_python_deps,
+)
 
 
 
@@ -2105,6 +2109,7 @@ class CreatorE2ESession:
     # One entry per real hypothesis -> patch -> sandbox experiment.
     debug_attempts: list[dict[str, Any]] = field(default_factory=list)
     verified_bindings_by_script: dict[str, dict[str, str]] = field(default_factory=dict)
+    runtime_dependency_attempts: set[str] = field(default_factory=set)
 
     def to_event_base(self) -> dict[str, Any]:
         return {
@@ -2149,6 +2154,9 @@ def _deps_signature_for_commands(skill_dir: Path, skill_md: str, commands: list[
     for command in commands:
         if not command.script_path.endswith(".py"):
             continue
+        # Generated source is the final dependency truth.  Including its digest
+        # makes a newly added import invalidate dependency preparation.
+        deps.append(f"source:{command.script_path}:{_file_sha256(skill_dir / command.script_path)}")
         try:
             entry = _skill_plan_entry_for_file(file_path=command.script_path, blueprint_text=skill_md)
             deps.extend(str(item) for item in (entry.required_capabilities or []))
@@ -2158,6 +2166,17 @@ def _deps_signature_for_commands(skill_dir: Path, skill_md: str, commands: list[
         except Exception as exc:
             deps.append(f"unresolved:{command.script_path}:{type(exc).__name__}:{exc}")
     return _stable_json_hash(sorted(set(deps)))
+
+
+_MISSING_PYTHON_MODULE_RE = re.compile(
+    r"(?:ModuleNotFoundError|ImportError)[^\n]*No module named ['\"]?([A-Za-z0-9_.-]+)['\"]?",
+    re.IGNORECASE,
+)
+
+
+def _missing_python_module(text: str) -> str | None:
+    match = _MISSING_PYTHON_MODULE_RE.search(text or "")
+    return match.group(1).split(".")[0] if match else None
 
 
 def _create_e2e_session(skill_name: str, *, source_skill_dir: Path | None = None) -> CreatorE2ESession:
@@ -3411,6 +3430,7 @@ def _parse_e2e_stdout_json(
     if proc.returncode != 0:
         stderr_tail = (proc.stderr or "")[-4000:]
         stdout_tail = (proc.stdout or "")[-4000:]
+        missing_module = _missing_python_module(stderr_tail + "\n" + stdout_tail)
 
         argv_details = _classify_argv_schema_failure(
             command=command,
@@ -3425,7 +3445,13 @@ def _parse_e2e_stdout_json(
         failure_layer = (
             "argv_schema_error"
             if is_argv_schema_error
-            else "script_exit"
+            else (
+                "runtime_environment_error"
+                if missing_module and _is_python_stdlib_module(missing_module)
+                else "environment_dependency"
+                if missing_module
+                else "script_exit"
+            )
         )
 
         target_file = (
@@ -3434,7 +3460,7 @@ def _parse_e2e_stdout_json(
                 or command.script_path
             )
             if is_argv_schema_error
-            else command.script_path
+            else ("runtime_environment" if missing_module else command.script_path)
         )
 
         target_reason = str(
@@ -3452,12 +3478,19 @@ def _parse_e2e_stdout_json(
                 "真实 command argv 必须通过当前脚本 strict_json_argv_guard，"
                 "并保持 strict_json_argv_guard 与 run(args) 入口接口自洽。"
             )
+        elif missing_module:
+            repair_instruction = (
+                "Python module dependency is missing from the runtime environment. "
+                "Do not modify the script or remove/guard its import."
+            )
+            target_region = "python runtime environment"
+            expected = "The current skill venv must provide imports used by the final script."
         else:
             repair_instruction = (
                 f"根据 {command.script_path} 本次真实 subprocess "
                 "stderr traceback、return_code 和实际报错源码行进行最小修复。"
                 "只修改异常直接涉及的代码。"
-                "ImportError/ModuleNotFoundError 只修 traceback 直接相关 import；"
+                "ImportError: cannot import name 只能依据真实 callable identity 证据局部修复；"
                 "其它运行异常只修改 traceback 直接涉及的执行区域。"
                 "不要检查 ToolPool、allowed_helper_imports、tool binding、"
                 "required_capabilities、coverage_requirements 或工具权限。"
@@ -3499,6 +3532,14 @@ def _parse_e2e_stdout_json(
                         "filesystem_trace": filesystem_trace,
                         "runtime_binding_trace": runtime_binding_trace or {},
                         "failure_code": failure_layer,
+                        "missing_module": missing_module,
+                        "dependency_kind": (
+                            "stdlib_runtime_broken"
+                            if missing_module and _is_python_stdlib_module(missing_module)
+                            else "third_party_dependency_missing"
+                            if missing_module
+                            else None
+                        ),
                     },
                 )
             )
@@ -3970,17 +4011,28 @@ def _run_skill_workflow_e2e_once(
                             + list(resolution.declared_dependencies or []),
                             source_label="implementation_resolution",
                         )
+                        scan_result = _scan_and_install_python_deps(
+                            trial_skill_dir / command.script_path,
+                            venv_python,
+                        )
+                        if e2e_session is not None:
+                            e2e_session.events.append({
+                                **e2e_session.to_event_base(),
+                                "event": "runtime_dependencies_scanned",
+                                "script_path": command.script_path,
+                                "details": scan_result,
+                            })
                     if e2e_session is not None:
                         e2e_session.installed_deps_signature = deps_signature
                         e2e_session.events.append({**e2e_session.to_event_base(), "event": "dependencies_prepared", "reused_venv": False})
                 elif e2e_session is not None:
                     e2e_session.events.append({**e2e_session.to_event_base(), "event": "dependencies_reused", "reused_venv": True})
 
-            except RuntimeError as exc:
+            except (RuntimeError, subprocess.TimeoutExpired) as exc:
                 return [
                     _e2e_error(
-                        target="scripts",
-                        layer="venv_prepare",
+                        target="runtime_environment",
+                        layer="environment_dependency_prepare_failed",
                         message=f"端到端试运行环境准备失败：{exc}",
                     )
                 ]
@@ -4292,8 +4344,34 @@ def _run_skill_workflow_e2e_once(
 
             except ValueError as exc:
                 message = str(exc)
+                structured = _structured_failure_from_errors([message])
+                if (
+                    e2e_session is not None
+                    and venv_python is not None
+                    and structured.get("layer") == "environment_dependency"
+                ):
+                    package = str((structured.get("details") or {}).get("missing_module") or "")
+                    attempt_key = f"{venv_python.resolve()}::{package}"
+                    if package and attempt_key not in e2e_session.runtime_dependency_attempts:
+                        e2e_session.runtime_dependency_attempts.add(attempt_key)
+                        e2e_session.events.append({**e2e_session.to_event_base(), "event": "runtime_dependency_missing", "package": package, "step_index": command.ordinal})
+                        e2e_session.events.append({**e2e_session.to_event_base(), "event": "runtime_dependency_install_started", "package": package, "python": str(venv_python), "step_index": command.ordinal})
+                        try:
+                            install_result = _install_python_import_dependency(package, venv_python)
+                        except (RuntimeError, subprocess.TimeoutExpired) as install_exc:
+                            e2e_session.events.append({**e2e_session.to_event_base(), "event": "runtime_dependency_install_failed", "package": package, "python": str(venv_python), "error": str(install_exc)[-2000:]})
+                            errors.append(_e2e_error(target="runtime_environment", layer="environment_dependency_prepare_failed", message=f"package={package}\npython={venv_python}\ninstall_attempted=true\ninstall_result={install_exc}"))
+                            break
+                        e2e_session.events.append({**e2e_session.to_event_base(), "event": "runtime_dependency_installed", "package": package, "python": str(venv_python), "install_result": install_result, "resume_from_step": command.ordinal})
+                        return _run_skill_workflow_e2e_once(
+                            skill_name,
+                            external_context=external_context,
+                            source_skill_dir=trial_skill_dir,
+                            requested_model=requested_model,
+                            e2e_session=e2e_session,
+                            resume_from_step=command.ordinal,
+                        )
                 if e2e_session is not None:
-                    structured = _structured_failure_from_errors([message])
                     e2e_session.events.append({
                         **e2e_session.to_event_base(),
                         "event": "step_failed",
@@ -5210,7 +5288,8 @@ async def _repair_existing_file_for_e2e_failure(
             "strict_json_argv_guard schema 和 run(args) 实际读取关系。\n"
             "strict_json_argv_guard 是接口不对齐探针，不能通过删除参数降低功能覆盖面。\n"
             "如果是 script_exit，以 raw stderr traceback、异常类型和报错源码行为主；"
-            "ImportError 或 ModuleNotFoundError 可以修改直接相关 import，"
+            "ModuleNotFoundError / ImportError: No module named 属于 runtime environment，禁止修改或删除 import；"
+            "ImportError: cannot import name 仅可在有真实 callable identity 证据时修改直接相关 import，"
             "其它异常只做验证当前调试假设所需的最小局部修改。\n"
             "如果是 stdout_contract/stdout_json_parse，"
             "只修改当前 stdout 组织与返回逻辑。\n"

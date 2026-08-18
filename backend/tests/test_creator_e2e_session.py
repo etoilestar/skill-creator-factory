@@ -1941,3 +1941,58 @@ async def test_validate_skill_stops_after_terminal_duplicate_experiment(monkeypa
     response = await api.validate_skill(SkillActionRequest(skill_name="demo", auto_repair=True, max_e2e_repair_attempts=1))
     assert response.success is False
     assert "repair experiment" in response.message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_layer",
+    ["environment_dependency_prepare_failed", "runtime_environment_error"],
+)
+async def test_validate_skill_never_routes_runtime_environment_to_file_repair(
+    monkeypatch, tmp_path, failure_layer
+):
+    from backend.services.creator import api
+    from backend.services.creator.common import SkillActionRequest
+
+    skill_dir = tmp_path / "demo"
+    (skill_dir / "scripts").mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# Demo\n", encoding="utf-8")
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    monkeypatch.setattr(
+        api,
+        "_create_e2e_session",
+        lambda *_args, **_kwargs: SimpleNamespace(events=[]),
+    )
+    monkeypatch.setattr(
+        api,
+        "validate_workflow_e2e",
+        lambda *_args, **_kwargs: [
+            "E2E_REPAIR_TARGET=runtime_environment\n"
+            f"E2E_LAYER={failure_layer}\n"
+            "Python runtime dependency preparation failed"
+        ],
+    )
+    repair_calls = []
+
+    async def fail_if_file_repair_is_called(**kwargs):
+        repair_calls.append(kwargs)
+        pytest.fail("runtime_environment must not enter file repair")
+
+    monkeypatch.setattr(
+        api,
+        "_repair_existing_file_for_e2e_failure",
+        fail_if_file_repair_is_called,
+    )
+
+    response = await api.validate_skill(
+        SkillActionRequest(
+            skill_name="demo",
+            auto_repair=True,
+            max_e2e_repair_attempts=1,
+        )
+    )
+
+    assert response.success is False
+    assert response.deterministic_workflow_passed is False
+    assert failure_layer in "\n".join(response.blocking_errors)
+    assert repair_calls == []

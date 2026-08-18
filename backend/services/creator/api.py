@@ -16930,6 +16930,21 @@ async def validate_skill(request: SkillActionRequest):
         # This is the runtime symptom location, not a confirmed repair target.
         # _repair_existing_file_for_e2e_failure performs the diagnosis phase.
         target_path = _e2e_symptom_file_from_errors(blocking_errors)
+        if target_path == "runtime_environment":
+            return SkillActionResponse(
+                success=False,
+                path=None,
+                message=(
+                    "严格端到端工作流运行环境准备失败：\n"
+                    + "\n\n".join(blocking_errors)
+                ),
+                repair_events=repair_events or e2e_session.events,
+                deterministic_workflow_passed=False,
+                advisory_validator_status=_e2e_advisory_status_from_warnings(advisory_warnings),
+                blocking_errors=blocking_errors,
+                warnings=advisory_warnings,
+                missing_stdlib_requests=missing_stdlib_reqs,
+            )
         if target_path == "__validator__":
             return SkillActionResponse(
                 success=True,

@@ -426,6 +426,78 @@ def _runtime_binding_trace(
     return trace
 
 
+def _e2e_runtime_boundary_facts(
+    *,
+    command: E2EWorkflowCommand,
+    payload: dict[str, Any],
+    rendered_payload: dict[str, Any],
+    script_content: str,
+    runtime_binding_trace: dict[str, Any],
+) -> dict[str, Any]:
+    """Return deterministic facts which must hold before blaming a script.
+
+    In particular, JSON rendering deliberately preserves the value of a whole
+    placeholder.  Wrapping a collection placeholder in a JSON list is therefore
+    a command error, not an invitation to make the script accept ``list[list]``.
+    """
+    try:
+        schema = extract_python_strict_argv_schema(script_content) if command.script_path.endswith(".py") else {}
+    except Exception:
+        schema = {}
+    expected_types = schema.get("expected_types") if isinstance(schema, dict) else {}
+    expected_types = expected_types if isinstance(expected_types, dict) else {}
+    required_keys = set(schema.get("required_keys") or []) if isinstance(schema, dict) else set()
+    allowed_keys = set(schema.get("allowed_keys") or []) if isinstance(schema, dict) else set()
+
+    issues: list[dict[str, Any]] = []
+    for argv_key, template_value in (command.argv_template or {}).items():
+        key = str(argv_key)
+        expected = _canonical_e2e_shape(expected_types.get(key) or "")
+        # A one-element template list containing a whole collection placeholder
+        # is unambiguously a duplicate wrapper, regardless of business/file type.
+        if isinstance(template_value, list) and len(template_value) == 1:
+            expr = _whole_e2e_placeholder_expr(template_value[0])
+            source = _resolve_e2e_payload_expr(expr, payload=payload, missing=[]) if expr else None
+            if expr and isinstance(source, list) and (expected.startswith("list") or isinstance(rendered_payload.get(key), list)):
+                issues.append({
+                    "error_code": "collection_placeholder_double_wrapped",
+                    "argv_key": key,
+                    "placeholder_expression": expr,
+                    "placeholder_source_root": _placeholder_root(expr),
+                    "source_runtime_shape": _json_shape(source),
+                    "rendered_shape": _json_shape(rendered_payload.get(key)),
+                    "expected_shape": expected or "list",
+                })
+
+    missing_required = sorted(str(key) for key in required_keys - set(rendered_payload))
+    unknown_keys = sorted(str(key) for key in set(rendered_payload) - allowed_keys) if allowed_keys else []
+    if missing_required:
+        issues.append({"error_code": "command_argv_missing", "keys": missing_required})
+    if unknown_keys:
+        issues.append({"error_code": "command_argv_extra", "keys": unknown_keys})
+
+    fixture_paths: list[str] = []
+    for binding in runtime_binding_trace.values():
+        source = payload.get(str(binding.get("source_root") or ""))
+        if isinstance(source, list) and source and all(isinstance(item, str) for item in source):
+            fixture_paths.extend(item for item in source if Path(item).is_absolute())
+    fixture_valid = all(Path(path).is_file() for path in fixture_paths)
+    argv_shape_valid = not issues
+    return {
+        "fixture_valid": fixture_valid,
+        "placeholder_resolved": True,
+        "argv_shape_valid": argv_shape_valid,
+        "command_script_interface_aligned": not missing_required and not unknown_keys and argv_shape_valid,
+        "repair_layer": "script" if argv_shape_valid and not missing_required and not unknown_keys else "command",
+        "repair_target": command.script_path if argv_shape_valid and not missing_required and not unknown_keys else "SKILL.md",
+        "issues": issues,
+        "rendered_payload": rendered_payload,
+        "runtime_binding_trace": runtime_binding_trace,
+        "value_provenance_roots": sorted(str(binding.get("source_root") or "") for binding in runtime_binding_trace.values()),
+        "script_argv_schema": schema,
+    }
+
+
 def _verified_bindings_from_runtime_trace(
     *,
     runtime_binding_trace: dict[str, Any],
@@ -2528,6 +2600,15 @@ def _e2e_candidate_improved(original_errors: list[str], new_errors: list[str], *
         return True
     old_error, new_error = (original_errors or [""])[0], (new_errors or [""])[0]
     old_structured, new_structured = _structured_failure_from_errors([old_error]), _structured_failure_from_errors([new_error])
+    # A later exception is not progress while the input boundary which feeds it
+    # remains invalid.  Otherwise AttributeError -> KeyError can retain a script
+    # patch that merely moves past malformed argv.
+    for structured in (old_structured, new_structured):
+        facts = structured.get("details") or {}
+        if any(facts.get(flag) is False for flag in (
+            "fixture_valid", "placeholder_resolved", "argv_shape_valid", "command_script_interface_aligned",
+        )):
+            return False
     old_fs = ((old_structured.get("details") or {}).get("filesystem_trace") or {}) if old_structured else {}
     new_fs = ((new_structured.get("details") or {}).get("filesystem_trace") or {}) if new_structured else {}
     old_code, new_code = _failure_code_from_structured(old_structured), _failure_code_from_structured(new_structured)
@@ -4014,6 +4095,33 @@ def _run_skill_workflow_e2e_once(
                     value_provenance=value_provenance,
                 )
 
+                boundary_facts = _e2e_runtime_boundary_facts(
+                    command=command,
+                    payload=payload,
+                    rendered_payload=rendered_payload,
+                    script_content=content,
+                    runtime_binding_trace=runtime_binding_trace,
+                )
+                if not (
+                    boundary_facts["fixture_valid"]
+                    and boundary_facts["placeholder_resolved"]
+                    and boundary_facts["argv_shape_valid"]
+                    and boundary_facts["command_script_interface_aligned"]
+                ):
+                    raise ValueError(_format_e2e_failure(E2EFailure(
+                        failed_step_index=command.ordinal,
+                        target_file="SKILL.md",
+                        target_region=f"workflow command {command.ordinal}",
+                        failed_command=command.raw_command,
+                        input_payload=payload_before,
+                        rendered_payload=rendered_payload,
+                        expected="A command payload aligned with the existing script argv interface",
+                        actual="Deterministic command/binding boundary is invalid",
+                        repair_instruction="Only fix this failed SKILL.md command; pass a whole collection placeholder directly without wrapping it in another list.",
+                        layer="command_binding",
+                        details={"failure_code": "command_binding_invalid", **boundary_facts},
+                    )))
+
                 fs_before = snapshot_runtime_files(trial_skill_dir)
 
                 if entry.runtime == "python":
@@ -4632,6 +4740,24 @@ async def _repair_existing_file_for_e2e_failure(
     standalone_repair = e2e_session is None
     if e2e_session is None:
         e2e_session = _create_e2e_session(skill_name, source_skill_dir=skill_dir)
+    before_identity = _e2e_failure_identity((e2e_errors or [""])[0], target_file=target_path)
+    boundary_facts = structured_failure.get("details") or {}
+    boundary_invalid = any(boundary_facts.get(flag) is False for flag in (
+        "fixture_valid", "placeholder_resolved", "argv_shape_valid", "command_script_interface_aligned",
+    ))
+    deterministic_target = "SKILL.md" if boundary_invalid else ""
+    # A rejected failure/target experiment is terminal for that pair.  Do this
+    # before diagnosis so changing hypothesis prose cannot reopen it.
+    rejected_target = deterministic_target or target_path
+    if _count_matching_no_progress_attempts(
+        e2e_session, repair_target=rejected_target, before_failure_identity=before_identity,
+    ):
+        return {
+            "status": "debug_hypothesis_rejected", "rejection_reason": "repair_experiment_already_rejected",
+            "progress_reason": "same_breakpoint_repeated", "sandbox_executed": False,
+            "candidate_retained": False, "candidate_rolled_back": False,
+            "repaired_target": rejected_target, "next_target": None, "next_failure": e2e_errors,
+        }
     if target_path.startswith("scripts/") and read_only_callable_context:
         source_path = e2e_session.workspace_dir / target_path
         source = source_path.read_text(encoding="utf-8", errors="replace") if source_path.is_file() else ""
@@ -4647,12 +4773,17 @@ async def _repair_existing_file_for_e2e_failure(
             "error_type": "callable_repair_evidence_missing",
             "sandbox_executed": False,
         }
-    diagnosis = await _diagnose_e2e_failure_for_repair(
+    diagnosis = ({
+        "repair_target": "SKILL.md", "symptom_file": target_path,
+        "root_cause_hypothesis": "Deterministic command/binding boundary is invalid.",
+        "evidence": boundary_facts.get("issues") or [],
+        "repair_instruction": "Only repair the failed SKILL.md command boundary.",
+        "confidence": "deterministic", "hypothesis_key": "deterministic-command-boundary",
+    } if deterministic_target else await _diagnose_e2e_failure_for_repair(
         skill_name=skill_name, skill_dir=skill_dir, e2e_errors=e2e_errors,
-        e2e_session=e2e_session,
-        requested_model=requested_model,
+        e2e_session=e2e_session, requested_model=requested_model,
         read_only_callable_context=read_only_callable_context,
-    )
+    ))
     if diagnosis.get("status") == "diagnosis_exhausted":
         return {"status": "diagnosis_exhausted", "repaired_target": None, "next_target": None, "next_failure": e2e_errors}
     target_path = diagnosis["repair_target"]

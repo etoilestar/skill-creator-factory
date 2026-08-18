@@ -7,6 +7,7 @@ from backend.services.creator.e2e import (
     _verified_bindings_from_runtime_trace,
 )
 from backend.services.creator.common import E2EWorkflowCommand
+from backend.services.creator import e2e
 
 
 def _failure(filesystem_trace, *, code="artifact_not_created", layer=None, actual=""):
@@ -43,6 +44,78 @@ def _positioned_failure(*, step, target, layer, code, actual):
             "details": {"failure_code": code},
         })
     )
+
+
+def test_collection_placeholder_boundary_rejects_double_wrap(tmp_path):
+    source = tmp_path / "a.csv"
+    source.write_text("name\nAda\n", encoding="utf-8")
+    command = E2EWorkflowCommand(
+        1, "SKILL.md", "scripts/run.py", "python scripts/run.py ...", "python",
+        {"input_files": ["{{input_files}}"]},
+    )
+    payload = {"input_files": [str(source)]}
+    rendered = e2e._render_e2e_command_payload(command, payload=payload)
+    trace = _runtime_binding_trace(
+        command=command, payload=payload, rendered_payload=rendered, value_provenance={},
+    )
+    facts = e2e._e2e_runtime_boundary_facts(
+        command=command, payload=payload, rendered_payload=rendered,
+        script_content='EXPECTED_TYPES = {"input_files": "list[str]"}\n',
+        runtime_binding_trace=trace,
+    )
+
+    assert rendered == {"input_files": [[str(source)]]}
+    assert facts["argv_shape_valid"] is False
+    assert facts["command_script_interface_aligned"] is False
+    assert facts["repair_target"] == "SKILL.md"
+    assert facts["issues"][0]["error_code"] == "collection_placeholder_double_wrapped"
+
+
+def test_whole_collection_placeholder_preserves_list_shape(tmp_path):
+    source = tmp_path / "a.csv"
+    source.write_text("name\nAda\n", encoding="utf-8")
+    command = E2EWorkflowCommand(
+        1, "SKILL.md", "scripts/run.py", "python scripts/run.py ...", "python",
+        {"input_files": "{{input_files}}"},
+    )
+    payload = {"input_files": [str(source)]}
+    rendered = e2e._render_e2e_command_payload(command, payload=payload)
+
+    assert rendered == {"input_files": [str(source)]}
+    assert isinstance(rendered["input_files"], list)
+    assert not isinstance(rendered["input_files"][0], list)
+
+
+def test_platform_runtime_files_seed_is_real_file_collection(tmp_path):
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "SKILL.md").write_text("# CSV workflow\n", encoding="utf-8")
+    (tmp_path / "scripts" / "run.py").write_text("EXPECTED_TYPES = {'input_files': 'list[str]'}\n", encoding="utf-8")
+    command = E2EWorkflowCommand(
+        1, "SKILL.md", "scripts/run.py", "python scripts/run.py ...", "python",
+        {"input_files": "{{input_files}}"},
+    )
+
+    payload = e2e._seed_initial_e2e_payload([command], skill_dir=tmp_path)
+
+    assert isinstance(payload["input_files"], list)
+    assert payload["input_files"]
+    assert all(__import__("pathlib").Path(path).is_file() for path in payload["input_files"])
+    assert "sample value" not in payload["input_files"]
+
+
+def test_new_breakpoint_is_false_progress_when_boundary_remains_invalid():
+    before = _positioned_failure(step=1, target="scripts/x.py", layer="script_exit", code="script_exit", actual="AttributeError")
+    after = _positioned_failure(step=1, target="scripts/x.py", layer="script_exit", code="script_exit", actual="KeyError")
+    for name, value in (("before", before), ("after", after)):
+        marker, data = value.split("E2E_STRUCTURED_FAILURE=", 1)
+        parsed = __import__("json").loads(data)
+        parsed["details"]["argv_shape_valid"] = False
+        if name == "before":
+            before = marker + "E2E_STRUCTURED_FAILURE=" + __import__("json").dumps(parsed)
+        else:
+            after = marker + "E2E_STRUCTURED_FAILURE=" + __import__("json").dumps(parsed)
+
+    assert _e2e_candidate_improved([before], [after], target_file="scripts/x.py") is False
 
 
 def test_terminal_phase_after_argv_failure_is_progress_but_same_breakpoint_is_not():

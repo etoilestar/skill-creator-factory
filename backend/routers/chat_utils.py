@@ -362,7 +362,32 @@ def _get_skill_venv_python(skill_dir: Path) -> Path:
     return venv_python
 
 
-def _scan_and_install_python_deps(script_path: Path, venv_python: Path) -> None:
+def _install_python_import_dependency(import_name: str, venv_python: Path) -> dict[str, object]:
+    """Install one import name, using the shared import-to-distribution mapping."""
+    package = _IMPORT_TO_PACKAGE.get(import_name, import_name)
+    result = subprocess.run(
+        [str(venv_python), "-m", "pip", "install", "--quiet", package],
+        timeout=180,
+        capture_output=True,
+        text=True,
+    )
+    details: dict[str, object] = {
+        "import_name": import_name,
+        "package": package,
+        "python": str(venv_python),
+        "returncode": result.returncode,
+        "stdout": (result.stdout or "")[-2000:],
+        "stderr": (result.stderr or "")[-2000:],
+    }
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Python dependency install failed: "
+            + json.dumps(details, ensure_ascii=False, default=str)
+        )
+    return details
+
+
+def _scan_and_install_python_deps(script_path: Path, venv_python: Path) -> dict[str, object]:
     """Static-scan a .py script and pip-install any missing third-party imports
     into the per-skill venv before the script is executed.
     """
@@ -373,7 +398,7 @@ def _scan_and_install_python_deps(script_path: Path, venv_python: Path) -> None:
         source = script_path.read_text(encoding="utf-8", errors="replace")
         tree = ast.parse(source, filename=str(script_path))
     except SyntaxError:
-        return  # 语法错误留给执行时报告
+        return {"script": str(script_path), "imports": [], "installed": []}  # 语法错误留给执行时报告
 
     top_level_names: list[str] = []
     for node in ast.walk(tree):
@@ -412,12 +437,24 @@ def _scan_and_install_python_deps(script_path: Path, venv_python: Path) -> None:
 
     if to_install:
         logger.info("skill-env: pip installing into venv: %s", to_install)
-        subprocess.run(
+        result = subprocess.run(
             [str(venv_python), "-m", "pip", "install", "--quiet"] + to_install,
             timeout=180,
             capture_output=True,
             text=True,
         )
+        if result.returncode != 0:
+            raise RuntimeError(
+                "Python dependency install failed: "
+                + json.dumps({
+                    "packages": to_install,
+                    "python": str(venv_python),
+                    "returncode": result.returncode,
+                    "stdout": (result.stdout or "")[-2000:],
+                    "stderr": (result.stderr or "")[-2000:],
+                }, ensure_ascii=False, default=str)
+            )
+    return {"script": str(script_path), "imports": sorted(seen), "installed": to_install}
 
 
 def _scan_and_install_node_deps(script_path: Path, skill_dir: Path) -> None:

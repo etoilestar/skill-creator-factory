@@ -43,8 +43,9 @@ def test_e2e_uses_real_subprocess_traceback_instead_of_static_import_guard(tmp_p
     errors = e2e._run_skill_workflow_e2e_once("real-subprocess", source_skill_dir=skill_dir)
 
     joined = "\n".join(errors)
-    assert "ModuleNotFoundError" in joined
-    assert "script_exit" in joined or "return_code" in joined
+    assert "environment_dependency_prepare_failed" in joined
+    assert "definitely_missing_creator_package" in joined
+    assert "E2E_REPAIR_TARGET=runtime_environment" in joined
     assert "runtime_import_guard_failed" not in joined
 
 

@@ -1089,7 +1089,7 @@ def _callable_context(function_name: str = "real_callable_name"):
     }
 
 
-def test_e2e_missing_import_runs_real_subprocess_without_import_guard_failure(tmp_path, monkeypatch):
+def test_e2e_missing_import_is_environment_prepare_failure_without_script_repair(tmp_path, monkeypatch):
     script = "from definitely_missing_creator_package import run\nrun()\n"
     skill_dir, _command, _skill_md, _payload = _write_trial_script(tmp_path, script)
     monkeypatch.setattr(e2e, "_skill_plan_entry_for_file", _generic_python_entry)
@@ -1097,9 +1097,48 @@ def test_e2e_missing_import_runs_real_subprocess_without_import_guard_failure(tm
     errors = e2e._run_skill_workflow_e2e_once("trial-skill", source_skill_dir=skill_dir)
 
     joined = "\n".join(errors)
-    assert "ModuleNotFoundError" in joined
-    assert "script_exit" in joined or "return_code" in joined
+    assert "environment_dependency_prepare_failed" in joined
+    assert "definitely_missing_creator_package" in joined
+    assert "E2E_REPAIR_TARGET=runtime_environment" in joined
     assert "runtime_import_guard_failed" not in joined
+
+
+@pytest.mark.parametrize(
+    ("stderr", "expected_layer", "expected_target"),
+    [
+        ("ModuleNotFoundError: No module named 'foo'", "environment_dependency", "runtime_environment"),
+        ("ImportError: No module named foo", "environment_dependency", "runtime_environment"),
+        ("ModuleNotFoundError: No module named 'json'", "runtime_environment_error", "runtime_environment"),
+        ("ImportError: cannot import name 'foo' from 'bar'", "script_exit", "scripts/run.py"),
+    ],
+)
+def test_missing_module_classification_is_distinct_from_callable_import_error(
+    tmp_path, stderr, expected_layer, expected_target
+):
+    script = "print('{}')\n"
+    skill_dir, command, skill_md, payload = _write_trial_script(tmp_path, script)
+    entry = _generic_python_entry(file_path="scripts/run.py")
+    proc = subprocess.CompletedProcess([], 1, "", stderr)
+
+    with pytest.raises(ValueError) as raised:
+        _parse_trial_stdout(command, skill_dir, skill_md, script, entry, payload, proc)
+
+    structured = e2e._structured_failure_from_errors([str(raised.value)])
+    assert structured["layer"] == expected_layer
+    assert structured["target_file"] == expected_target
+
+
+def test_dependency_signature_changes_with_final_python_source(tmp_path, monkeypatch):
+    script = tmp_path / "scripts" / "run.py"
+    script.parent.mkdir()
+    script.write_text("import pandas\n", encoding="utf-8")
+    command = E2EWorkflowCommand(1, "SKILL.md", "scripts/run.py", "python scripts/run.py '{}'", "python", {})
+    monkeypatch.setattr(e2e, "_skill_plan_entry_for_file", _generic_python_entry)
+    monkeypatch.setattr(e2e, "_contract_resolution_for_trial", lambda *_a, **_k: (SimpleNamespace(declared_dependencies=[]), SimpleNamespace(declared_dependencies=[])))
+    before = e2e._deps_signature_for_commands(tmp_path, "# Demo", [command])
+    script.write_text("import pandas\nimport matplotlib.pyplot\n", encoding="utf-8")
+    after = e2e._deps_signature_for_commands(tmp_path, "# Demo", [command])
+    assert before != after
 
 
 @pytest.mark.asyncio
@@ -1884,7 +1923,7 @@ async def test_same_step_new_breakpoint_retains_candidate_for_next_diagnosis(tmp
     assert (session.workspace_dir / "scripts" / "one.py").read_text(encoding="utf-8") == candidate.strip()
 
 @pytest.mark.asyncio
-async def test_validate_skill_continues_after_duplicate_without_spending_attempt(monkeypatch, tmp_path):
+async def test_validate_skill_stops_after_terminal_duplicate_experiment(monkeypatch, tmp_path):
     from backend.services.creator import api
     from backend.services.creator.common import SkillActionRequest
     skill_dir = tmp_path / "demo"; (skill_dir / "scripts").mkdir(parents=True)
@@ -1900,4 +1939,5 @@ async def test_validate_skill_continues_after_duplicate_without_spending_attempt
     async def repair(**kwargs): return next(results)
     monkeypatch.setattr(api, "_repair_existing_file_for_e2e_failure", repair)
     response = await api.validate_skill(SkillActionRequest(skill_name="demo", auto_repair=True, max_e2e_repair_attempts=1))
-    assert response.success is True
+    assert response.success is False
+    assert "repair experiment" in response.message

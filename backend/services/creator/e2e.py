@@ -10,6 +10,7 @@ from .command_normalizer import canonicalize_skill_md_runtime_commands
 from .basic_format import check_patch_candidate_basic_format
 from ..skill_plan import parse_responsibility_edges
 from ..platform_io_contract import (
+    build_platform_io_contract,
     get_platform_output_sink,
     normalize_platform_output_sinks,
     project_and_commit_platform_outputs,
@@ -822,6 +823,29 @@ def _put_typed_spec(specs: dict[str, E2ETypedInputSpec], spec: E2ETypedInputSpec
     if old is None or priority.get(spec.source, 0) > priority.get(old.source, 0):
         specs[spec.name] = spec
 
+def _platform_runtime_file_input_names() -> set[str]:
+    """Return platform input roots whose values are runtime file collections.
+
+    This is derived from the canonical Platform IO Contract rather than
+    business keywords or Skill-specific field-name heuristics.
+    """
+    contract = build_platform_io_contract()
+    boundary = contract.get("platform_skill_boundary") or {}
+    source_semantics = boundary.get("input_source_semantics") or {}
+    runtime_files = source_semantics.get("runtime_files") or {}
+
+    names: set[str] = set()
+
+    canonical = str(runtime_files.get("canonical") or "").strip()
+    if canonical:
+        names.add(canonical)
+
+    for value in runtime_files.get("representations") or []:
+        name = str(value or "").strip()
+        if name:
+            names.add(name)
+
+    return names
 
 def _whole_e2e_placeholder_expr(value: Any) -> str | None:
     if not isinstance(value, str):
@@ -916,7 +940,48 @@ def _collect_e2e_typed_inputs_from_graph(
                 if len(parts) >= 2 and parts[1]:
                     argv_spec = specs.get(parts[1])
                     shape = argv_spec.shape if argv_spec else "string"
-                    _put_typed_spec(specs, E2ETypedInputSpec(name=f"fields.{parts[1]}", shape=shape, item_shape=_shape_item_shape(shape), required=True, source=(argv_spec.source if argv_spec else "placeholder"), target_file=command.script_path, confidence=(argv_spec.confidence if argv_spec else "low")))
+                    _put_typed_spec(
+                        specs,
+                        E2ETypedInputSpec(
+                            name=f"fields.{parts[1]}",
+                            shape=shape,
+                            item_shape=_shape_item_shape(shape),
+                            required=True,
+                            source=(argv_spec.source if argv_spec else "placeholder"),
+                            target_file=command.script_path,
+                            confidence=(argv_spec.confidence if argv_spec else "low"),
+                        ),
+                    )
+
+    # Platform runtime-file roots have authoritative transport semantics:
+    # their runtime value is a collection of file paths.
+    #
+    # Do this after collecting RequirementGraph / SkillPlan / argv-schema
+    # evidence so an untyped semantic declaration such as `input_files`
+    # cannot accidentally degrade the E2E fixture to a generic string.
+    # Platform runtime file inputs must be materialized as real file paths.
+    runtime_file_names = _platform_runtime_file_input_names()
+
+    used_roots = {
+        _placeholder_root(expr)
+        for command in commands
+        for expr in _placeholder_exprs_from_value(command.argv_template)
+    }
+
+    for name in runtime_file_names & used_roots:
+        existing = specs.get(name)
+
+        specs[name] = E2ETypedInputSpec(
+            name=name,
+            shape="list[file_path]",
+            item_shape="file_path",
+            required=existing.required if existing else True,
+            source="platform_io_contract",
+            target_file=existing.target_file if existing else "",
+            confidence="high",
+            properties=existing.properties if existing else {},
+        )
+
     return list(specs.values())
 
 

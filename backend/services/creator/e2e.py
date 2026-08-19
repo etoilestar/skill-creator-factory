@@ -1448,6 +1448,14 @@ def _validate_e2e_trial_case_spec(
         fixture = item.get("fixture")
         if not isinstance(fixture, dict):
             return None
+        fixture_kind = str(fixture.get("kind") or "")
+        scalar_shapes = {"string", "number", "integer", "boolean"}
+        if shape in scalar_shapes and fixture_kind != "scalar":
+            return None
+        if shape == "file_path" and fixture_kind == "scalar":
+            return None
+        if shape == "list[file_path]" and fixture_kind != "file_list":
+            return None
         if fixture.get("kind") == "scalar":
             scalar = fixture.get("value")
             expected = {"string": str, "number": (int, float), "integer": int, "boolean": bool}.get(shape)
@@ -1456,6 +1464,8 @@ def _validate_e2e_trial_case_spec(
             continue
         files = fixture.get("files") if fixture.get("kind") == "file_list" else [fixture]
         if not isinstance(files, list) or not 1 <= len(files) <= 3:
+            return None
+        if shape == "file_path" and len(files) != 1:
             return None
         for file_spec in files:
             if not isinstance(file_spec, dict):

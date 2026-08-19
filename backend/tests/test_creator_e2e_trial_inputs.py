@@ -82,6 +82,39 @@ def test_evidence_is_required_and_scoped_to_each_input_target():
     assert e2e._validate_e2e_trial_case_spec(wrong_target, input_specs=specs, requirement_ids_by_input=scoped) is None
 
 
+def test_shape_requires_matching_fixture_kind_and_file_cardinality():
+    text_file = {"format": "txt", "content_kind": "text", "text": "grounded"}
+
+    def validate(name, shape, fixture):
+        case = {"version": 1, "inputs": [{
+            "name": name,
+            "shape": shape,
+            "fixture": fixture,
+            "evidence_requirement_ids": ["R1"],
+        }]}
+        return e2e._validate_e2e_trial_case_spec(
+            case,
+            input_specs={name: _spec(name, shape)},
+            requirement_ids_by_input={name: {"R1"}},
+        )
+
+    one_file = {"kind": "file_list", "files": [text_file]}
+    two_files = {"kind": "file_list", "files": [text_file, text_file]}
+    scalar_string = {"kind": "scalar", "value": "sample"}
+    scalar_number = {"kind": "scalar", "value": 1.5}
+
+    assert validate("text", "string", one_file) is None
+    assert validate("amount", "number", text_file) is None
+    assert validate("document", "file_path", scalar_string) is None
+    assert validate("document", "file_path", two_files) is None
+    assert validate("documents", "list[file_path]", scalar_string) is None
+
+    assert validate("text", "string", scalar_string) is not None
+    assert validate("amount", "number", scalar_number) is not None
+    assert validate("document", "file_path", text_file) is not None
+    assert validate("documents", "list[file_path]", one_file) is not None
+
+
 def test_trial_case_is_built_once_and_fixture_is_stable(tmp_path, monkeypatch):
     skill_dir = tmp_path / "demo"
     skill_dir.mkdir()

@@ -1,6 +1,8 @@
 import csv
+import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from backend.services.creator import e2e
 
@@ -11,7 +13,7 @@ def _spec(name="input_files", shape="list[file_path]"):
 
 def _item(file_spec, *, name="input_files", shape="list[file_path]", evidence=None):
     return {"name": name, "shape": shape, "fixture": {"kind": "file_list", "files": [file_spec]},
-            "evidence_requirement_ids": evidence or ["R1"]}
+            "evidence_requirement_ids": ["R1"] if evidence is None else evidence}
 
 
 def test_grounded_csv_is_encoded_deterministically(tmp_path):
@@ -19,7 +21,7 @@ def test_grounded_csv_is_encoded_deterministically(tmp_path):
                   "columns": [{"name": "value_a", "type": "number"}, {"name": "value_b", "type": "number", "nullable": True}],
                   "rows": [{"value_a": 1, "value_b": 10}, {"value_a": 2, "value_b": None}, {"value_a": 3, "value_b": 30}]})
     case = {"version": 1, "inputs": [item]}
-    assert e2e._validate_e2e_trial_case_spec(case, input_specs={"input_files": _spec()}, requirement_ids={"R1"}) == case
+    assert e2e._validate_e2e_trial_case_spec(case, input_specs={"input_files": _spec()}, requirement_ids_by_input={"input_files": {"R1"}}) == case
     path = Path(e2e._materialize_e2e_trial_fixture(item, skill_dir=tmp_path)[0])
     with path.open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
@@ -43,8 +45,113 @@ def test_invalid_input_format_and_evidence_are_rejected():
     specs = {"input_files": _spec()}
     unknown = {"version": 1, "inputs": [_item({"format": "unknown_binary", "content_kind": "text", "text": "x"})]}
     invented = {"version": 1, "inputs": [_item({"format": "txt", "content_kind": "text", "text": "x"}, evidence=["R999"])]}
-    assert e2e._validate_e2e_trial_case_spec(unknown, input_specs=specs, requirement_ids={"R1"}) is None
-    assert e2e._validate_e2e_trial_case_spec(invented, input_specs=specs, requirement_ids={"R1"}) is None
+    assert e2e._validate_e2e_trial_case_spec(unknown, input_specs=specs, requirement_ids_by_input={"input_files": {"R1"}}) is None
+    assert e2e._validate_e2e_trial_case_spec(invented, input_specs=specs, requirement_ids_by_input={"input_files": {"R1"}}) is None
+
+
+def test_tabular_column_types_nullability_and_nonempty_rows_are_enforced():
+    specs = {"input_files": _spec()}
+    def accepted(columns, rows):
+        case = {"version": 1, "inputs": [_item({
+            "format": "csv", "content_kind": "tabular", "columns": columns, "rows": rows,
+        })]}
+        return e2e._validate_e2e_trial_case_spec(
+            case, input_specs=specs, requirement_ids_by_input={"input_files": {"R1"}},
+        )
+
+    assert accepted([{"name": "n", "type": "number"}], [{"n": True}]) is None
+    assert accepted([{"name": "i", "type": "integer"}], [{"i": 1.5}]) is None
+    assert accepted([{"name": "s", "type": "string"}], [{"s": 1}]) is None
+    assert accepted([{"name": "b", "type": "boolean"}], [{"b": 1}]) is None
+    assert accepted([{"name": "x", "type": "decimal"}], [{"x": 1}]) is None
+    assert accepted([{"name": "n", "type": "number"}], [{"n": None}]) is None
+    assert accepted([{"name": "n", "type": "number", "nullable": True}], []) is None
+    assert accepted([{"name": "n", "type": "number", "nullable": True}], [{"n": None}]) is not None
+
+
+def test_evidence_is_required_and_scoped_to_each_input_target():
+    specs = {
+        "input_files": _spec(),
+        "config_file": _spec("config_file", "file_path"),
+    }
+    file_spec = {"format": "txt", "content_kind": "text", "text": "grounded"}
+    missing = {"version": 1, "inputs": [_item(file_spec, evidence=[])]}
+    wrong_target = {"version": 1, "inputs": [_item(file_spec, evidence=["R2"])]}
+    scoped = {"input_files": {"R1"}, "config_file": {"R2"}}
+    assert e2e._validate_e2e_trial_case_spec(missing, input_specs=specs, requirement_ids_by_input=scoped) is None
+    assert e2e._validate_e2e_trial_case_spec(wrong_target, input_specs=specs, requirement_ids_by_input=scoped) is None
+
+
+def test_trial_case_is_built_once_and_fixture_is_stable(tmp_path, monkeypatch):
+    skill_dir = tmp_path / "demo"
+    skill_dir.mkdir()
+    session = e2e.CreatorE2ESession("session", "demo", skill_dir, skill_dir / ".venv", skill_dir / "outputs")
+    requirement = e2e.RequirementItem(id="R1", target_file="scripts/analyze.py", purpose="Read numeric input")
+    case = {"version": 1, "inputs": [_item({
+        "format": "csv", "content_kind": "tabular",
+        "columns": [{"name": "value", "type": "number"}], "rows": [{"value": 1}],
+    })]}
+    calls = []
+    monkeypatch.setattr(e2e, "_build_e2e_trial_case", lambda *args, **kwargs: calls.append(1) or case)
+    kwargs = dict(
+        typed_specs=[_spec()], requirements_by_file={"scripts/analyze.py": [requirement]},
+        skill_plan_entries={"scripts/analyze.py": SimpleNamespace(default_values={})},
+        external_context={}, requested_model=None, session=session,
+    )
+    first = e2e._prepare_e2e_trial_case(**kwargs)
+    first_path = Path(e2e._materialize_e2e_trial_fixture(first["inputs"][0], skill_dir=skill_dir)[0])
+    first_hash = hashlib.sha256(first_path.read_bytes()).hexdigest()
+    first_digest = session.trial_case_digest
+    second = e2e._prepare_e2e_trial_case(**kwargs)
+    second_path = Path(e2e._materialize_e2e_trial_fixture(second["inputs"][0], skill_dir=skill_dir)[0])
+    assert calls == [1]
+    assert session.trial_case_digest == first_digest
+    assert hashlib.sha256(second_path.read_bytes()).hexdigest() == first_hash
+
+
+def test_external_and_declared_default_prevent_trial_generation(tmp_path, monkeypatch):
+    def fail(*args, **kwargs):
+        raise AssertionError("trial builder must not run")
+    monkeypatch.setattr(e2e, "_build_e2e_trial_case", fail)
+    common = dict(typed_specs=[_spec()], requirements_by_file={}, requested_model=None, session=None)
+    assert e2e._prepare_e2e_trial_case(
+        **common, skill_plan_entries={"scripts/analyze.py": SimpleNamespace(default_values={})},
+        external_context={"input_files": ["/tmp/real.csv"]},
+    ) is None
+    assert e2e._prepare_e2e_trial_case(
+        **common, skill_plan_entries={"scripts/analyze.py": SimpleNamespace(default_values={"input_files": ["declared.csv"]})},
+        external_context={},
+    ) is None
+
+
+def test_declared_default_beats_trial_case_and_invalid_case_uses_generic_fallback(tmp_path):
+    command = e2e.E2EWorkflowCommand(1, "SKILL.md", "scripts/analyze.py", "", "python", {"input_files": "{{input_files}}"})
+    entry = SimpleNamespace(default_values={"input_files": ["declared.csv"]}, inputs=[], artifact_contract={})
+    grounded = {"version": 1, "inputs": [_item({"format": "txt", "content_kind": "text", "text": "grounded"})]}
+    payload = e2e._seed_initial_e2e_payload(
+        [command], external_context={}, skill_dir=tmp_path, requirements_by_file={},
+        skill_plan_entries={"scripts/analyze.py": entry}, trial_case=grounded,
+    )
+    assert payload["input_files"] == ["declared.csv"]
+
+    invalid = {"version": 1, "inputs": [_item({"format": "unknown", "content_kind": "text", "text": "bad"})]}
+    validated = e2e._validate_e2e_trial_case_spec(
+        invalid, input_specs={"input_files": _spec()}, requirement_ids_by_input={"input_files": {"R1"}},
+    )
+    assert validated is None
+    fallback_payload = e2e._seed_initial_e2e_payload(
+        [command], external_context={}, skill_dir=tmp_path,
+        requirements_by_file={"scripts/analyze.py": [e2e.RequirementItem(
+            id="R1", target_file="scripts/analyze.py", inputs=["input_files: list[file_path]"],
+        )]},
+        skill_plan_entries={"scripts/analyze.py": SimpleNamespace(
+            default_values={}, inputs=["input_files: list[file_path]"], artifact_contract={},
+        )},
+        trial_case=validated,
+    )
+    fallback = fallback_payload["input_files"]
+    assert fallback and Path(fallback[0]).is_file()
+    assert "Creator E2E" in Path(fallback[0]).read_text(encoding="utf-8")
 
 
 def test_trial_builder_prompt_contains_only_supplied_frozen_facts(monkeypatch):

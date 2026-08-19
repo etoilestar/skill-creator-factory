@@ -1420,7 +1420,7 @@ def _validate_e2e_trial_case_spec(
     value: Any,
     *,
     input_specs: dict[str, E2ETypedInputSpec],
-    requirement_ids: set[str],
+    requirement_ids_by_input: dict[str, set[str]],
 ) -> dict[str, Any] | None:
     """Validate the deliberately small, model-produced trial fixture format."""
     if not isinstance(value, dict) or value.get("status") == "unsupported" or value.get("version") != 1:
@@ -1438,7 +1438,12 @@ def _validate_e2e_trial_case_spec(
             return None
         seen.add(name)
         evidence = item.get("evidence_requirement_ids", [])
-        if not isinstance(evidence, list) or any(str(req_id) not in requirement_ids for req_id in evidence):
+        relevant_requirement_ids = requirement_ids_by_input.get(name, set())
+        if (
+            not isinstance(evidence, list)
+            or (relevant_requirement_ids and not evidence)
+            or any(str(req_id) not in relevant_requirement_ids for req_id in evidence)
+        ):
             return None
         fixture = item.get("fixture")
         if not isinstance(fixture, dict):
@@ -1460,13 +1465,38 @@ def _validate_e2e_trial_case_spec(
                 return None
             if fmt == "csv":
                 columns, rows = file_spec.get("columns"), file_spec.get("rows")
-                if content_kind != "tabular" or not isinstance(columns, list) or not columns or not isinstance(rows, list):
+                if content_kind != "tabular" or not isinstance(columns, list) or not columns or not isinstance(rows, list) or not rows:
                     return None
                 names = [str(column.get("name") or "") for column in columns if isinstance(column, dict)]
                 if len(names) != len(columns) or not all(names) or len(set(names)) != len(names):
                     return None
-                if any(not isinstance(row, dict) or not set(row).issubset(names) or any(cell is not None and not isinstance(cell, (str, int, float, bool)) for cell in row.values()) for row in rows):
+                column_types = {
+                    str(column["name"]): str(column.get("type") or "").lower()
+                    for column in columns
+                }
+                if any(value_type not in {"string", "number", "integer", "boolean"} for value_type in column_types.values()):
                     return None
+                nullable = {
+                    str(column["name"]): column.get("nullable") is True
+                    for column in columns
+                }
+                if any(not isinstance(row, dict) or not set(row).issubset(names) for row in rows):
+                    return None
+                for row in rows:
+                    for column_name, value_type in column_types.items():
+                        cell = row.get(column_name)
+                        if cell is None:
+                            if not nullable[column_name]:
+                                return None
+                            continue
+                        if value_type == "string" and not isinstance(cell, str):
+                            return None
+                        if value_type == "boolean" and not isinstance(cell, bool):
+                            return None
+                        if value_type == "integer" and (not isinstance(cell, int) or isinstance(cell, bool)):
+                            return None
+                        if value_type == "number" and (not isinstance(cell, (int, float)) or isinstance(cell, bool)):
+                            return None
             elif fmt == "json":
                 if content_kind != "json" or "value" not in file_spec:
                     return None
@@ -2284,17 +2314,22 @@ def _prepare_e2e_trial_case(
         return None
 
     requirements: list[dict[str, str]] = []
-    valid_ids: set[str] = set()
+    requirement_ids_by_input: dict[str, set[str]] = {}
     for target in {spec.target_file for spec in candidates.values()}:
         for requirement in requirements_by_file.get(target, []):
             req_id = str(getattr(requirement, "id", "") or "")
             if not req_id:
                 continue
-            valid_ids.add(req_id)
             text = str(getattr(requirement, "purpose", "") or "")
             if not text:
                 text = "; ".join(str(value) for value in (getattr(requirement, "inputs", []) or []))
             requirements.append({"id": req_id, "text": text})
+    for name, spec in candidates.items():
+        requirement_ids_by_input[name] = {
+            str(getattr(requirement, "id", "") or "")
+            for requirement in requirements_by_file.get(spec.target_file, [])
+            if str(getattr(requirement, "id", "") or "")
+        }
     facts = {"version": 1, "external_inputs": [
         {"platform_input": {"name": spec.name, "shape": _canonical_e2e_shape(spec.shape)},
          "target": {"script": spec.target_file, "input": spec.name},
@@ -2307,7 +2342,11 @@ def _prepare_e2e_trial_case(
     accepted = None
     try:
         generated = _build_e2e_trial_case(facts, requested_model=requested_model)
-        accepted = _validate_e2e_trial_case_spec(generated, input_specs=candidates, requirement_ids=valid_ids)
+        accepted = _validate_e2e_trial_case_spec(
+            generated,
+            input_specs=candidates,
+            requirement_ids_by_input=requirement_ids_by_input,
+        )
         if accepted is None:
             raise ValueError("deterministic trial case validation rejected the response")
     except Exception as exc:

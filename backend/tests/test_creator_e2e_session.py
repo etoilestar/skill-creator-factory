@@ -1668,7 +1668,10 @@ def test_e2e_callable_context_builder_projects_only_selected_toolpool_facts(monk
             {"tool_id": "tool_beta"},
         ],
         "resolved_tools": [
-            {"tool_id": "tool_alpha", "import_path": "module_x", "function_name": "fn_alpha"},
+            {"tool_id": "tool_alpha", "import_path": "module_x", "function_name": "fn_alpha",
+             "output_schema": {"type": "object", "properties": {
+                 "rows": {"type": "array", "items": {"type": "object", "additionalProperties": {"type": "string"}}},
+             }}},
             {"tool_id": "tool_beta", "import_path": "module_x", "function_name": "fn_beta"},
         ],
     })
@@ -1681,6 +1684,8 @@ def test_e2e_callable_context_builder_projects_only_selected_toolpool_facts(monk
     assert context["selected_tool_ids"] == ["tool_alpha"]
     assert [tool["tool_id"] for tool in context["available_tools"]] == ["tool_alpha"]
     assert [tool["tool_id"] for tool in context["resolved_tools"]] == ["tool_alpha"]
+    row_schema = context["resolved_tools"][0]["output_schema"]["properties"]["rows"]
+    assert row_schema["items"]["additionalProperties"] == {"type": "string"}
     assert e2e._registry_callable_identities(context) == {("module_x", "fn_alpha")}
 
 

@@ -77,6 +77,25 @@ _UNSAFE_FS_ATTRS = {"remove", "unlink", "rmdir", "rmtree", "chmod", "chown"}
 _RUNTIME_ENV_NAMES = {"TOOL_OUTPUT_DIR", "OUTPUT_DIR", "TOOL_TRIAL_RUN", "SKILL_TRIAL_RUN"}
 
 
+def callable_output_schema_completeness_issues(schema: Any, *, path: str = "output") -> list[str]:
+    """Report recursively incomplete array shapes without business semantics."""
+    if not isinstance(schema, dict):
+        return []
+    issues: list[str] = []
+    if schema.get("type") == "array":
+        if not isinstance(schema.get("items"), dict):
+            issues.append(f"{path}: array schema must declare items")
+        else:
+            issues.extend(callable_output_schema_completeness_issues(schema["items"], path=f"{path}.items"))
+    if schema.get("type") == "object":
+        for name, child in (schema.get("properties") or {}).items():
+            issues.extend(callable_output_schema_completeness_issues(child, path=f"{path}.{name}"))
+        additional = schema.get("additionalProperties")
+        if isinstance(additional, dict):
+            issues.extend(callable_output_schema_completeness_issues(additional, path=f"{path}.*"))
+    return issues
+
+
 @dataclass(frozen=True)
 class ToolSnippet:
     id: str
@@ -1035,6 +1054,43 @@ _read_capability("docx_parsing", "read_docx_text", "docx", "python-docx", ["docx
 _read_capability("pptx_parsing", "read_pptx_text", "pptx", "python-pptx", ["pptx"])
 _read_capability("spreadsheet_read", "read_spreadsheet", "xlsx", "openpyxl", ["openpyxl"])
 _read_capability("csv_read", "read_csv", "csv", None, [])
+
+_READ_CSV_OUTPUT_SCHEMA = {
+    "type": "object",
+    "required": ["columns", "rows", "row_count", "truncated", "text", "source_path"],
+    "properties": {
+        "columns": {"type": "array", "items": {"type": "string"}},
+        "rows": {
+            "type": "array",
+            "items": {"type": "object", "additionalProperties": {"type": "string"}},
+        },
+        "row_count": {"type": "integer"},
+        "truncated": {"type": "boolean"},
+        "text": {"type": "string"},
+        "source_path": {"type": "string"},
+    },
+}
+_csv_read = BUILTIN_TOOL_CAPABILITIES["csv_read"]
+_csv_read_function = _csv_read.functions[0]
+BUILTIN_TOOL_CAPABILITIES["csv_read"] = replace(
+    _csv_read,
+    output_schema=_READ_CSV_OUTPUT_SCHEMA,
+    functions=[replace(
+        _csv_read_function,
+        output_schema=_READ_CSV_OUTPUT_SCHEMA,
+        example_return=(
+            "{'columns': ['age', 'score'], 'rows': [{'age': '18', 'score': '90'}], "
+            "'row_count': 1, 'truncated': False, 'text': 'age,score\\n18,90', "
+            "'source_path': '/work/input.csv'}"
+        ),
+        common_mistakes=[
+            *_csv_read_function.common_mistakes,
+            "rows contains objects keyed by column name, not positional row arrays.",
+            "Consume a cell by its declared column key.",
+            "CSV cells returned by this helper are strings; numeric semantics require explicit parsing.",
+        ],
+    )],
+)
 
 BUILTIN_TOOL_CAPABILITIES["unified_file_text_read"] = replace(
     BUILTIN_TOOL_CAPABILITIES["unified_file_text_read"],

@@ -51,7 +51,9 @@ def test_document_helpers_create_valid_artifacts_and_extract_pdf_text(tmp_path, 
     with ZipFile(xlsx_path) as zf:
         assert "xl/workbook.xml" in zf.namelist()
     assert read_spreadsheet(xlsx_path)["row_count"] == 1
-    assert read_csv(csv_path)["row_count"] == 1
+    read_csv_result = read_csv(csv_path)
+    assert read_csv_result["row_count"] == 1
+    assert read_csv_result["rows"] == [{"A": "甲", "B": "2"}]
 
     skill_dir = tmp_path / "skill"
     skill_output_dir = skill_dir / "outputs"

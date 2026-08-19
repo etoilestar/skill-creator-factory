@@ -731,49 +731,90 @@ def _terminal_output_expected_type(key: str) -> str:
     sink = get_platform_output_sink(_SANDBOX_OUTPUT_CONTRACT, key)
     return json.dumps(sink["value_schema"], ensure_ascii=False, sort_keys=True) if sink else "platform terminal field"
 
-def _terminal_runtime_schema_mismatch(
+def _terminal_runtime_contract_violation(
     *,
     terminal_edges: list[dict[str, Any]],
     completed_outputs: dict[str, dict[str, Any]],
     platform_contract: dict[str, Any],
 ) -> dict[str, Any] | None:
+    """Locate a terminal producer that violated its frozen runtime contract.
+
+    This compares frozen terminal edges against observed producer stdout.
+    Runtime exception names / stderr text are not used to determine ownership.
+    """
+
     for edge in terminal_edges:
-        member = str(edge.get("from_node") or "").strip()
+        producer = str(edge.get("from_node") or "").strip()
         output_name = str(edge.get("from_output") or "").strip()
         sink_name = str(edge.get("to_input") or "").strip()
 
-        if not member or not output_name or not sink_name:
+        if not producer or not output_name or not sink_name:
             continue
 
-        member_outputs = completed_outputs.get(member)
-        if not isinstance(member_outputs, dict):
+        observed_outputs = completed_outputs.get(producer)
+
+        # If there is no observed producer stdout at all, there is not enough
+        # runtime evidence here to blame the producer. Leave it to upstream
+        # interface/graph handling.
+        if not isinstance(observed_outputs, dict):
             continue
 
-        if output_name not in member_outputs:
-            continue
+        # The producer ran successfully and emitted stdout, but failed to emit
+        # the output port required by the frozen terminal edge.
+        if output_name not in observed_outputs:
+            return {
+                "target_file": producer,
+                "output_name": output_name,
+                "sink_name": sink_name,
+                "expected": {
+                    "output_present": True,
+                },
+                "observed": {
+                    "output_present": False,
+                    "stdout_keys": sorted(
+                        str(key)
+                        for key in observed_outputs.keys()
+                    ),
+                },
+            }
 
         sink = get_platform_output_sink(
             platform_contract,
             sink_name,
         )
+
+        # Invalid / missing sink definitions belong to the frozen interface
+        # side, not to the producing script.
         if not isinstance(sink, dict):
             continue
 
-        schema = sink.get("value_schema")
-        if not isinstance(schema, dict):
+        expected_schema = sink.get("value_schema")
+
+        if not isinstance(expected_schema, dict):
             continue
 
-        value = member_outputs[output_name]
+        observed_value = observed_outputs[output_name]
 
-        if value_matches_platform_schema(value, schema):
+        if value_matches_platform_schema(
+            observed_value,
+            expected_schema,
+        ):
             continue
 
+        # The declared output exists, but its real runtime representation does
+        # not satisfy the frozen downstream sink contract.
         return {
-            "target_file": member,
+            "target_file": producer,
             "output_name": output_name,
             "sink_name": sink_name,
-            "expected_schema": dict(schema),
-            "actual_shape": _json_shape(value),
+            "expected": {
+                "output_present": True,
+                "value_schema": dict(expected_schema),
+            },
+            "observed": {
+                "output_present": True,
+                "value_shape": _json_shape(observed_value),
+            },
         }
 
     return None
@@ -4931,31 +4972,41 @@ def _run_skill_workflow_e2e_once(
                             "platform_output_payload": final_platform_payload,
                         })
                 except Exception as exc:
-                    runtime_mismatch = _terminal_runtime_schema_mismatch(
+                    runtime_violation = _terminal_runtime_contract_violation(
                         terminal_edges=terminal_edges,
                         completed_outputs=completed_outputs,
                         platform_contract=requirement_graph.platform_io_contract,
                     )
 
-                    if runtime_mismatch:
+                    if runtime_violation:
                         errors.append(
                             _e2e_error(
-                                target=runtime_mismatch["target_file"],
+                                target=runtime_violation["target_file"],
                                 layer="terminal_output_commit",
-                                message=str(exc),
+                                message=(
+                                        str(exc)
+                                        + "\nterminal_runtime_contract_violation="
+                                        + json.dumps(
+                                    runtime_violation,
+                                    ensure_ascii=False,
+                                    sort_keys=True,
+                                    default=str,
+                                )
+                                ),
                                 failed_step_index=len(commands) + 1,
-                                failure_code="script_terminal_output_schema_mismatch",
+                                failure_code="terminal_producer_contract_violation",
                                 target_region=(
                                         "stdout."
-                                        + runtime_mismatch["output_name"]
+                                        + runtime_violation["output_name"]
                                 ),
                                 repair_instruction=(
-                                    "The frozen terminal binding is valid, but the producing "
-                                    "script emitted a runtime value incompatible with the "
-                                    "platform sink value_schema. Repair only the producing "
-                                    "script's declared stdout field representation; preserve "
-                                    "the terminal Interface, platform sink, requirements, "
-                                    "graph, and business result."
+                                    "The producing script completed, but its observed stdout "
+                                    "does not satisfy the frozen terminal edge contract. "
+                                    "Repair only the producing script's stdout/output boundary "
+                                    "so the declared output port is emitted with a value that "
+                                    "satisfies the frozen downstream sink schema. "
+                                    "Preserve the frozen Interface, graph, platform sink, "
+                                    "requirements, Trial Case, and business result."
                                 ),
                             )
                         )

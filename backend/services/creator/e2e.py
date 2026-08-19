@@ -2,6 +2,7 @@
 
 import hashlib
 import csv
+import copy
 import uuid
 from collections import Counter
 
@@ -1417,6 +1418,42 @@ _E2E_TRIAL_FORMATS = {"txt", "md", "json", "csv", "pdf", "docx"}
 _E2E_TRIAL_CONTENT_KINDS = {"text", "json", "tabular"}
 
 
+def _canonicalize_e2e_trial_case_spec(value: Any) -> Any:
+    """Return a copy with fixture-derived metadata made authoritative.
+
+    This boundary deliberately knows only facts that can be mechanically
+    derived from the fixture itself.  It never coerces cell values or repairs
+    any other part of the model-proposed contract.
+    """
+    canonical = copy.deepcopy(value)
+    if not isinstance(canonical, dict):
+        return canonical
+    for item in canonical.get("inputs", []) if isinstance(canonical.get("inputs"), list) else []:
+        if not isinstance(item, dict) or not isinstance(item.get("fixture"), dict):
+            continue
+        fixture = item["fixture"]
+        files = fixture.get("files") if fixture.get("kind") == "file_list" else [fixture]
+        if not isinstance(files, list):
+            continue
+        for file_spec in files:
+            if (
+                not isinstance(file_spec, dict)
+                or file_spec.get("content_kind") != "tabular"
+                or not isinstance(file_spec.get("columns"), list)
+                or not isinstance(file_spec.get("rows"), list)
+            ):
+                continue
+            rows = file_spec["rows"]
+            if not all(isinstance(row, dict) for row in rows):
+                continue
+            for column in file_spec["columns"]:
+                if not isinstance(column, dict) or not isinstance(column.get("name"), str):
+                    continue
+                name = column["name"]
+                column["nullable"] = any(name not in row or row.get(name) is None for row in rows)
+    return canonical
+
+
 def _validate_e2e_trial_case_spec(
     value: Any,
     *,
@@ -2467,8 +2504,9 @@ def _prepare_e2e_trial_case(
         if isinstance(generated, dict) and generated.get("status") == "unsupported":
             fallback_reason = "unsupported"
             raise ValueError("trial case unsupported")
+        canonical = _canonicalize_e2e_trial_case_spec(generated)
         accepted = _validate_e2e_trial_case_spec(
-            generated,
+            canonical,
             input_specs=candidates,
             requirement_ids_by_input=requirement_ids_by_input,
         )
@@ -3500,7 +3538,7 @@ def _execute_e2e_python_command(
         capture_output=True,
         text=True,
         timeout=_SCRIPT_TRIAL_TIMEOUT_SECONDS,
-        env={**_build_script_runtime_env(trial_skill_dir), "SKILL_TRIAL_RUN": "1"},
+        env=_creator_e2e_subprocess_env(trial_skill_dir),
     )
 
 
@@ -3521,7 +3559,7 @@ def _execute_e2e_node_command(
         capture_output=True,
         text=True,
         timeout=_SCRIPT_TRIAL_TIMEOUT_SECONDS,
-        env={**_build_script_runtime_env(trial_skill_dir), "SKILL_TRIAL_RUN": "1"},
+        env=_creator_e2e_subprocess_env(trial_skill_dir),
     )
 
 
@@ -3543,8 +3581,18 @@ def _execute_e2e_shell_command(
         capture_output=True,
         text=True,
         timeout=_SCRIPT_TRIAL_TIMEOUT_SECONDS,
-        env={**_build_script_runtime_env(trial_skill_dir), "SKILL_TRIAL_RUN": "1"},
+        env=_creator_e2e_subprocess_env(trial_skill_dir),
     )
+
+
+def _creator_e2e_subprocess_env(trial_skill_dir: Path) -> dict[str, str]:
+    """Keep side effects in trial mode while allowing isolated local fixtures."""
+    return {
+        **_build_script_runtime_env(trial_skill_dir),
+        "SKILL_WORKDIR": str(trial_skill_dir),
+        "SKILL_TRIAL_RUN": "1",
+        "CREATOR_E2E_REAL_LOCAL_FIXTURES": "1",
+    }
 
 
 def _extract_failed_argv_keys(text: str) -> list[str]:

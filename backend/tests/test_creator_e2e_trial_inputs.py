@@ -69,6 +69,51 @@ def test_tabular_column_types_nullability_and_nonempty_rows_are_enforced():
     assert accepted([{"name": "n", "type": "number", "nullable": True}], [{"n": None}]) is not None
 
 
+def test_tabular_nullable_is_canonicalized_from_primary_rows():
+    proposed = {"version": 1, "inputs": [_item({
+        "format": "csv", "content_kind": "tabular",
+        "columns": [{"name": "salary", "type": "number", "nullable": False}],
+        "rows": [{"salary": 5000}, {"salary": None}],
+    })]}
+
+    canonical = e2e._canonicalize_e2e_trial_case_spec(proposed)
+
+    assert proposed["inputs"][0]["fixture"]["files"][0]["columns"][0]["nullable"] is False
+    assert canonical["inputs"][0]["fixture"]["files"][0]["columns"][0]["nullable"] is True
+    assert e2e._validate_e2e_trial_case_spec(
+        canonical, input_specs={"input_files": _spec()},
+        requirement_ids_by_input={"input_files": {"R1"}},
+    ) == canonical
+    assert e2e._stable_json_hash(canonical)
+
+
+def test_tabular_canonicalization_does_not_repair_primary_cell_errors():
+    proposed = {"version": 1, "inputs": [_item({
+        "format": "csv", "content_kind": "tabular",
+        "columns": [{"name": "value", "type": "integer", "nullable": True}],
+        "rows": [{"value": "abc"}],
+    })]}
+
+    canonical = e2e._canonicalize_e2e_trial_case_spec(proposed)
+
+    assert canonical["inputs"][0]["fixture"]["files"][0]["rows"][0]["value"] == "abc"
+    assert e2e._validate_e2e_trial_case_spec(
+        canonical, input_specs={"input_files": _spec()},
+        requirement_ids_by_input={"input_files": {"R1"}},
+    ) is None
+
+
+def test_tabular_nullable_is_false_when_all_rows_have_values():
+    proposed = {"version": 1, "inputs": [_item({
+        "format": "csv", "content_kind": "tabular",
+        "columns": [{"name": "value", "type": "integer", "nullable": True}],
+        "rows": [{"value": 1}, {"value": 2}],
+    })]}
+
+    canonical = e2e._canonicalize_e2e_trial_case_spec(proposed)
+    assert canonical["inputs"][0]["fixture"]["files"][0]["columns"][0]["nullable"] is False
+
+
 def test_evidence_is_required_and_scoped_to_each_input_target():
     specs = {
         "input_files": _spec(),
@@ -215,7 +260,7 @@ def test_structured_builder_contract_freezes_and_materializes_csv(tmp_path, monk
     response = {"version": 1, "inputs": [_item({
         "format": "csv", "content_kind": "tabular",
         "columns": [{"name": "value", "type": "number", "nullable": False}],
-        "rows": [{"value": 1}, {"value": 2}],
+        "rows": [{"value": 1}, {"value": None}],
     }, evidence=["R1", "R7"])]}
     captured = {}
     monkeypatch.setattr(e2e, "route_model", lambda *args, **kwargs: type("Route", (), {"model": "test"})())
@@ -232,12 +277,12 @@ def test_structured_builder_contract_freezes_and_materializes_csv(tmp_path, monk
         skill_plan_entries={"scripts/analyze.py": SimpleNamespace(default_values={})},
         external_context={}, requested_model=None, session=session,
     )
-    assert accepted == response
+    assert accepted["inputs"][0]["fixture"]["files"][0]["columns"][0]["nullable"] is True
     assert session.trial_case_prepared is True
     assert session.trial_case_digest
     path = Path(e2e._materialize_e2e_trial_fixture(accepted["inputs"][0], skill_dir=skill_dir)[0])
     assert path.is_file()
-    assert list(csv.DictReader(path.open(encoding="utf-8"))) == [{"value": "1"}, {"value": "2"}]
+    assert list(csv.DictReader(path.open(encoding="utf-8"))) == [{"value": "1"}, {"value": ""}]
     schema = json.dumps(captured["response_schema"])
     assert all(value in schema for value in ("input_files", "list[file_path]", "R1", "R7"))
 

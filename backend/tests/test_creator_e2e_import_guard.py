@@ -74,3 +74,52 @@ def test_execute_python_command_still_returns_real_process_error(tmp_path):
 
     assert proc.returncode != 0
     assert "ModuleNotFoundError" in proc.stderr
+
+
+def test_creator_e2e_subprocess_consumes_real_local_fixture_but_keeps_api_trial(tmp_path):
+    skill_dir = tmp_path / "local-fixture"
+    (skill_dir / "scripts").mkdir(parents=True)
+    fixture = skill_dir / ".creator_e2e" / "samples" / "input.csv"
+    fixture.parent.mkdir(parents=True)
+    fixture.write_text("value,score\n1,10\n2,\n3,30\n", encoding="utf-8")
+    (skill_dir / "scripts" / "run.py").write_text(
+        """import json
+import os
+import sys
+from backend.services.runtime_tools import api_get, read_csv
+
+payload = json.loads(sys.argv[1])
+result = read_csv(payload["path"])
+print(json.dumps({
+    "columns": result["columns"],
+    "rows": result["rows"],
+    "skill_trial": os.environ.get("SKILL_TRIAL_RUN"),
+    "real_local_fixtures": os.environ.get("CREATOR_E2E_REAL_LOCAL_FIXTURES"),
+    "api_mock": api_get("https://example.com")["json"]["mock"],
+}))
+""",
+        encoding="utf-8",
+    )
+    command = E2EWorkflowCommand(
+        1, "SKILL.md", "scripts/run.py", "python scripts/run.py ...", "python", {"path": str(fixture)},
+    )
+
+    proc = e2e._execute_e2e_python_command(
+        command=command,
+        trial_skill_dir=skill_dir,
+        rendered_payload={"path": str(fixture)},
+        venv_python=Path(sys.executable),
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    output = json.loads(proc.stdout)
+    assert output["columns"] == ["value", "score"]
+    assert output["rows"] == [
+        {"value": "1", "score": "10"},
+        {"value": "2", "score": ""},
+        {"value": "3", "score": "30"},
+    ]
+    assert {"A": "mock", "B": "value"} not in output["rows"]
+    assert output["skill_trial"] == "1"
+    assert output["real_local_fixtures"] == "1"
+    assert output["api_mock"] is True

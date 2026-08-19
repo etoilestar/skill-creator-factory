@@ -4,6 +4,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from backend.services.creator_tool_registry import (
+    callable_output_schema_completeness_issues,
     capabilities_for_role,
     get_role_pattern,
     get_script_roles,
@@ -15,6 +16,53 @@ from backend.services.creator_tool_registry import (
     tool_status,
     validate_capability_names,
 )
+
+
+def test_csv_read_contract_recursively_describes_consumable_rows():
+    capability = get_tool_capability("csv_read")
+    schema = capability.functions[0].output_schema
+
+    assert schema["properties"]["columns"]["items"]["type"] == "string"
+    assert schema["properties"]["rows"]["type"] == "array"
+    assert schema["properties"]["rows"]["items"]["type"] == "object"
+    assert schema["properties"]["rows"]["items"]["additionalProperties"]["type"] == "string"
+    assert schema["properties"]["truncated"]["type"] == "boolean"
+    assert callable_output_schema_completeness_issues(schema) == []
+    assert "not positional row arrays" in " ".join(capability.functions[0].common_mistakes)
+
+
+def test_callable_schema_completeness_lint_finds_nested_array_without_items():
+    schema = {"type": "object", "properties": {"records": {"type": "array"}}}
+    assert callable_output_schema_completeness_issues(schema) == [
+        "output.records: array schema must declare items"
+    ]
+
+
+def test_registration_boundary_rejects_incomplete_callable_array_schema():
+    from backend.services.creator_tool_registry import (
+        ToolCapability,
+        ToolFunctionManifest,
+        register_tool_capability,
+    )
+    import pytest
+
+    capability = ToolCapability(
+        name="incomplete_output",
+        display_name="Incomplete output",
+        category="test",
+        output_schema={"type": "object"},
+        functions=[ToolFunctionManifest(
+            function_name="read_records",
+            import_path="example",
+            short_description="Read records.",
+            when_to_use="Tests only.",
+            signature="read_records() -> dict",
+            output_schema={"type": "object", "properties": {"records": {"type": "array"}}},
+        )],
+    )
+
+    with pytest.raises(ValueError, match=r"functions\.read_records\.output\.records: array schema must declare items"):
+        register_tool_capability(capability)
 
 
 def test_registry_exposes_builtin_creator_tools():

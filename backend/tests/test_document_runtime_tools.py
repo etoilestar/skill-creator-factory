@@ -51,7 +51,9 @@ def test_document_helpers_create_valid_artifacts_and_extract_pdf_text(tmp_path, 
     with ZipFile(xlsx_path) as zf:
         assert "xl/workbook.xml" in zf.namelist()
     assert read_spreadsheet(xlsx_path)["row_count"] == 1
-    assert read_csv(csv_path)["row_count"] == 1
+    read_csv_result = read_csv(csv_path)
+    assert read_csv_result["row_count"] == 1
+    assert read_csv_result["rows"] == [{"A": "甲", "B": "2"}]
 
     skill_dir = tmp_path / "skill"
     skill_output_dir = skill_dir / "outputs"
@@ -75,6 +77,18 @@ def test_document_helpers_create_valid_artifacts_and_extract_pdf_text(tmp_path, 
     extracted = extract_pdf_text(skill_pdf_result["pdf_path"])
     assert extracted["page_count"] >= 1
     assert extracted["text"]
+
+
+def test_local_reader_keeps_mock_behavior_in_ordinary_skill_trial(tmp_path, monkeypatch):
+    csv_path = tmp_path / "input.csv"
+    csv_path.write_text("value,score\n1,10\n", encoding="utf-8")
+    monkeypatch.setenv("SKILL_TRIAL_RUN", "1")
+    monkeypatch.delenv("CREATOR_E2E_REAL_LOCAL_FIXTURES", raising=False)
+
+    result = read_csv(csv_path)
+
+    assert result["columns"] == ["A", "B"]
+    assert result["rows"] == [{"A": "mock", "B": "value"}]
 
 
 def test_document_helper_output_path_must_stay_under_output_dir(tmp_path):

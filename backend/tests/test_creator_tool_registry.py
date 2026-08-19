@@ -38,6 +38,33 @@ def test_callable_schema_completeness_lint_finds_nested_array_without_items():
     ]
 
 
+def test_registration_boundary_rejects_incomplete_callable_array_schema():
+    from backend.services.creator_tool_registry import (
+        ToolCapability,
+        ToolFunctionManifest,
+        register_tool_capability,
+    )
+    import pytest
+
+    capability = ToolCapability(
+        name="incomplete_output",
+        display_name="Incomplete output",
+        category="test",
+        output_schema={"type": "object"},
+        functions=[ToolFunctionManifest(
+            function_name="read_records",
+            import_path="example",
+            short_description="Read records.",
+            when_to_use="Tests only.",
+            signature="read_records() -> dict",
+            output_schema={"type": "object", "properties": {"records": {"type": "array"}}},
+        )],
+    )
+
+    with pytest.raises(ValueError, match=r"functions\.read_records\.output\.records: array schema must declare items"):
+        register_tool_capability(capability)
+
+
 def test_registry_exposes_builtin_creator_tools():
     names = {cap.name for cap in list_tool_capabilities()}
 

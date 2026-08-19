@@ -1894,6 +1894,14 @@ def get_tool_capability(name: str) -> ToolCapability | None:
 def register_tool_capability(capability: ToolCapability) -> ToolCapability:
     if not capability.name:
         raise ValueError("registered tool capability name is required")
+    issues = callable_output_schema_completeness_issues(capability.output_schema)
+    for function in capability.functions:
+        issues.extend(callable_output_schema_completeness_issues(
+            function.output_schema,
+            path=f"functions.{function.function_name}.output",
+        ))
+    if issues:
+        raise ValueError("registered callable output schema is incomplete: " + "; ".join(issues))
     _REGISTERED_TOOL_CAPABILITIES[capability.name] = capability
     return capability
 

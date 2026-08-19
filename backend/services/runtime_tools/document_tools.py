@@ -655,6 +655,16 @@ def _trial() -> bool:
     return os.environ.get("SKILL_TRIAL_RUN") == "1"
 
 
+def _mock_local_readers_in_trial() -> bool:
+    """Whether deterministic local readers should return their trial fixture.
+
+    Creator E2E supplies files inside its isolated workspace and explicitly
+    opts into consuming them.  This flag has no effect on network, publishing,
+    or other side-effecting runtime helpers.
+    """
+    return _trial() and os.environ.get("CREATOR_E2E_REAL_LOCAL_FIXTURES") != "1"
+
+
 def _allowed_input_roots() -> list[Path]:
     roots = [Path.cwd()]
     for name in ("SKILL_WORKDIR", "SKILL_DIR", "INPUT_DIR", "UPLOAD_DIR", "OUTPUT_DIR"):
@@ -679,7 +689,7 @@ def _safe_input_path(path: str | os.PathLike[str], suffixes: set[str]) -> Path:
 
 def read_docx_text(docx_path: str | os.PathLike[str]) -> dict[str, Any]:
     """Read text from a Word document."""
-    if _trial():
+    if _mock_local_readers_in_trial():
         return {"text": "Mock DOCX text during SKILL_TRIAL_RUN.", "paragraphs": ["Mock DOCX text during SKILL_TRIAL_RUN."], "source_path": str(docx_path)}
     path = _safe_input_path(docx_path, {".docx"})
     from docx import Document
@@ -691,7 +701,7 @@ def read_docx_text(docx_path: str | os.PathLike[str]) -> dict[str, Any]:
 
 def read_pptx_text(pptx_path: str | os.PathLike[str]) -> dict[str, Any]:
     """Read text from a PowerPoint deck."""
-    if _trial():
+    if _mock_local_readers_in_trial():
         return {"text": "Mock PPTX text during SKILL_TRIAL_RUN.", "paragraphs": ["Mock PPTX text during SKILL_TRIAL_RUN."], "source_path": str(pptx_path)}
     path = _safe_input_path(pptx_path, {".pptx"})
     from pptx import Presentation
@@ -707,7 +717,7 @@ def read_pptx_text(pptx_path: str | os.PathLike[str]) -> dict[str, Any]:
 def read_spreadsheet(path: str | os.PathLike[str], sheet_name: str | None = None, max_rows: int = 500) -> dict[str, Any]:
     """Read rows from an Excel spreadsheet."""
     max_rows = max(1, min(int(max_rows or 500), 5000))
-    if _trial():
+    if _mock_local_readers_in_trial():
         return {"sheets": [sheet_name or "Sheet1"], "columns": ["A", "B"], "rows": [{"A": "mock", "B": "value"}], "row_count": 1, "truncated": False}
     safe_path = _safe_input_path(path, {".xlsx", ".xlsm"})
     from openpyxl import load_workbook
@@ -730,7 +740,7 @@ def read_spreadsheet(path: str | os.PathLike[str], sheet_name: str | None = None
 def read_csv(path: str | os.PathLike[str], max_rows: int = 500, encoding: str = "utf-8") -> dict[str, Any]:
     """Read a CSV file into structured rows and columns."""
     max_rows = max(1, min(int(max_rows or 500), 5000))
-    if _trial():
+    if _mock_local_readers_in_trial():
         return {"columns": ["A", "B"], "rows": [{"A": "mock", "B": "value"}], "row_count": 1, "truncated": False, "text": "A,B\nmock,value", "source_path": str(path)}
     safe_path = _safe_input_path(path, {".csv", ".tsv"})
     delimiter = "\t" if safe_path.suffix.lower() == ".tsv" else ","

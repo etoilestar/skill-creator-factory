@@ -3538,7 +3538,7 @@ def _execute_e2e_python_command(
         capture_output=True,
         text=True,
         timeout=_SCRIPT_TRIAL_TIMEOUT_SECONDS,
-        env={**_build_script_runtime_env(trial_skill_dir), "SKILL_TRIAL_RUN": "1"},
+        env=_creator_e2e_subprocess_env(trial_skill_dir),
     )
 
 
@@ -3559,7 +3559,7 @@ def _execute_e2e_node_command(
         capture_output=True,
         text=True,
         timeout=_SCRIPT_TRIAL_TIMEOUT_SECONDS,
-        env={**_build_script_runtime_env(trial_skill_dir), "SKILL_TRIAL_RUN": "1"},
+        env=_creator_e2e_subprocess_env(trial_skill_dir),
     )
 
 
@@ -3581,8 +3581,18 @@ def _execute_e2e_shell_command(
         capture_output=True,
         text=True,
         timeout=_SCRIPT_TRIAL_TIMEOUT_SECONDS,
-        env={**_build_script_runtime_env(trial_skill_dir), "SKILL_TRIAL_RUN": "1"},
+        env=_creator_e2e_subprocess_env(trial_skill_dir),
     )
+
+
+def _creator_e2e_subprocess_env(trial_skill_dir: Path) -> dict[str, str]:
+    """Keep side effects in trial mode while allowing isolated local fixtures."""
+    return {
+        **_build_script_runtime_env(trial_skill_dir),
+        "SKILL_WORKDIR": str(trial_skill_dir),
+        "SKILL_TRIAL_RUN": "1",
+        "CREATOR_E2E_REAL_LOCAL_FIXTURES": "1",
+    }
 
 
 def _extract_failed_argv_keys(text: str) -> list[str]:

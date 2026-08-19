@@ -3658,7 +3658,38 @@ def _classify_argv_schema_failure(
     rendered_payload: dict[str, Any],
     stdout: str,
     stderr: str,
+    runtime_binding_trace: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    def _same_preview_value(left: Any, right: Any) -> bool:
+        if isinstance(left, dict) and isinstance(right, dict):
+            left_hash = str(left.get("value_hash") or "")
+            right_hash = str(right.get("value_hash") or "")
+            if left_hash and right_hash:
+                return left_hash == right_hash
+        return left == right
+
+    def _binding_forwards_source_unchanged(key: str) -> bool:
+        item = (runtime_binding_trace or {}).get(key)
+        if not isinstance(item, dict):
+            return False
+
+        placeholder_expr = str(item.get("placeholder_expr") or "").strip()
+        source_root = str(item.get("source_root") or "").strip()
+
+        if not placeholder_expr or not source_root:
+            return False
+
+        source_preview = item.get("source_value_preview")
+        rendered_preview = item.get("rendered_value_preview")
+
+        if source_preview is None or rendered_preview is None:
+            return False
+
+        return _same_preview_value(
+            source_preview,
+            rendered_preview,
+        )
+
     kind = _argv_schema_error_kind(stderr, stdout)
     if not kind:
         return {}
@@ -3706,6 +3737,26 @@ def _classify_argv_schema_failure(
         target_reason = "SKILL.md command rendered argv values whose JSON types do not match the script strict_json_argv_guard spec."
     elif kind == "empty_required":
         target_reason = "SKILL.md command rendered an empty value for a key required by the script strict_json_argv_guard spec."
+
+    failed_runtime_keys = [
+        key
+        for key in failed_keys
+        if key in (rendered_payload or {})
+    ]
+
+    if (
+        kind == "invalid_type"
+        and failed_runtime_keys
+        and all(
+            _binding_forwards_source_unchanged(key)
+            for key in failed_runtime_keys
+        )
+    ):
+        primary_target = command.script_path
+        target_reason = (
+            "The command binding forwarded the upstream runtime value unchanged, "
+            "but the generated script strict_json_argv_guard rejected that value."
+        )
 
     if script_reasons:
         primary_target = command.script_path
@@ -3756,7 +3807,9 @@ def _argv_schema_repair_instruction(script_path: str, details: dict[str, Any]) -
     }
     common = (
         f"argv_schema_error 归因：{target_reason}\n"
-        "strict_json_argv_guard(payload, spec) 是当前脚本入口接口事实；"
+        "strict_json_argv_guard(payload, spec) 是当前生成脚本的已观察入口接口事实；"
+        "如果 runtime binding 已经原样转发上游输入，而 guard 拒绝该值，"
+        "则应修复当前脚本的 argv guard / 直接消费逻辑，不能反向修改输入值或 SKILL.md。"
         "command_argv_keys/script_required_keys 仅作 diagnostics，不作为主提示或新合同。\n"
         f"diagnostics={json.dumps(diagnostics, ensure_ascii=False, sort_keys=True, default=str)}\n"
         "不得新增独立 canonical argv contract；不得因为 SKILL.md block 写错字段而让 script guard 迁就 block；禁止只改 guard schema；不要只修 guard。"
@@ -3843,6 +3896,7 @@ def _parse_e2e_stdout_json(
             rendered_payload=rendered_payload,
             stdout=stdout_tail,
             stderr=stderr_tail,
+            runtime_binding_trace=runtime_binding_trace,
         )
         is_argv_schema_error = bool(argv_details)
 

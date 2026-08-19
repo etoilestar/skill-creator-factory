@@ -4,6 +4,7 @@ from .common import *  # noqa: F403
 from .contracts import *  # noqa: F403
 from .e2e import *  # noqa: F403
 from .repair import *  # noqa: F403
+from ..platform_io_contract import get_platform_output_sink
 
 def _is_valid_normalized_script_source(file_path: str, content: str) -> bool:
     """Return whether content is safe to accept as the requested raw script.
@@ -1046,6 +1047,110 @@ def build_available_tool_context(
         "allowed_helper_imports": allowed_helper_imports,
     }
 
+def _project_terminal_sink_schema_to_stdout(
+    stdout_schema: dict[str, Any],
+    *,
+    function_execution_context: dict[str, Any] | None,
+    platform_contract: dict[str, Any],
+) -> dict[str, Any]:
+    projected = dict(stdout_schema or {})
+
+    raw_properties = projected.get("properties")
+    properties = {
+        str(key): dict(value) if isinstance(value, dict) else {}
+        for key, value in (
+            raw_properties.items()
+            if isinstance(raw_properties, dict)
+            else []
+        )
+    }
+
+    context = (
+        function_execution_context
+        if isinstance(function_execution_context, dict)
+        else {}
+    )
+
+    outgoing_edges = [
+        dict(edge)
+        for edge in (context.get("outgoing_edges") or [])
+        if isinstance(edge, dict)
+    ]
+
+    schemas_by_output: dict[str, list[dict[str, Any]]] = {}
+
+    for edge in outgoing_edges:
+        if str(edge.get("to_node") or "") != "platform_output_node":
+            continue
+
+        output_name = str(edge.get("from_output") or "").strip()
+        sink_name = str(edge.get("to_input") or "").strip()
+
+        if not output_name or output_name not in properties or not sink_name:
+            continue
+
+        sink = get_platform_output_sink(
+            platform_contract,
+            sink_name,
+        )
+        if not isinstance(sink, dict):
+            continue
+
+        value_schema = sink.get("value_schema")
+        if not isinstance(value_schema, dict) or not value_schema:
+            continue
+
+        schemas_by_output.setdefault(
+            output_name,
+            [],
+        ).append(dict(value_schema))
+
+    for output_name, schemas in schemas_by_output.items():
+        unique = {
+            json.dumps(
+                schema,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+            for schema in schemas
+        }
+
+        if len(unique) > 1:
+            raise ValueError(
+                "conflicting terminal sink schemas for stdout field: "
+                f"{output_name}"
+            )
+
+        sink_schema = dict(schemas[0])
+        existing = dict(properties.get(output_name) or {})
+
+        existing_type = str(existing.get("type") or "").strip()
+        sink_type = str(sink_schema.get("type") or "").strip()
+
+        if (
+            existing_type
+            and sink_type
+            and existing_type != sink_type
+        ):
+            raise ValueError(
+                "stdout field contract conflicts with terminal sink: "
+                f"{output_name}"
+            )
+
+        description = existing.get("description")
+
+        properties[output_name] = {
+            **existing,
+            **sink_schema,
+        }
+
+        if description:
+            properties[output_name]["description"] = description
+
+    projected["properties"] = properties
+    return projected
+
 def _script_local_contract_payload(
     *,
     file_path: str,
@@ -1138,7 +1243,13 @@ def _script_local_contract_payload(
         )
     else:
         function_execution_context = dict(function_execution_context)
+    platform_contract = build_platform_io_contract()
 
+    stdout_schema = _project_terminal_sink_schema_to_stdout(
+        stdout_schema,
+        function_execution_context=function_execution_context,
+        platform_contract=platform_contract,
+    )
     local_function_item = function_execution_context.get(
         "function_item"
     )
@@ -1244,9 +1355,7 @@ def _script_local_contract_payload(
                 .artifact_contract
             ),
         },
-        "platform_io_contract": (
-            build_platform_io_contract()
-        ),
+        "platform_io_contract": platform_contract,
         "platform_io_rules": (
             platform_io_contract_prompt_text()
         ),

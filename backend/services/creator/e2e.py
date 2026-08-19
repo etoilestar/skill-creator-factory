@@ -731,6 +731,52 @@ def _terminal_output_expected_type(key: str) -> str:
     sink = get_platform_output_sink(_SANDBOX_OUTPUT_CONTRACT, key)
     return json.dumps(sink["value_schema"], ensure_ascii=False, sort_keys=True) if sink else "platform terminal field"
 
+def _terminal_runtime_schema_mismatch(
+    *,
+    terminal_edges: list[dict[str, Any]],
+    completed_outputs: dict[str, dict[str, Any]],
+    platform_contract: dict[str, Any],
+) -> dict[str, Any] | None:
+    for edge in terminal_edges:
+        member = str(edge.get("from_node") or "").strip()
+        output_name = str(edge.get("from_output") or "").strip()
+        sink_name = str(edge.get("to_input") or "").strip()
+
+        if not member or not output_name or not sink_name:
+            continue
+
+        member_outputs = completed_outputs.get(member)
+        if not isinstance(member_outputs, dict):
+            continue
+
+        if output_name not in member_outputs:
+            continue
+
+        sink = get_platform_output_sink(
+            platform_contract,
+            sink_name,
+        )
+        if not isinstance(sink, dict):
+            continue
+
+        schema = sink.get("value_schema")
+        if not isinstance(schema, dict):
+            continue
+
+        value = member_outputs[output_name]
+
+        if value_matches_platform_schema(value, schema):
+            continue
+
+        return {
+            "target_file": member,
+            "output_name": output_name,
+            "sink_name": sink_name,
+            "expected_schema": dict(schema),
+            "actual_shape": _json_shape(value),
+        }
+
+    return None
 
 def _valid_terminal_output_value(key: str, value: Any) -> bool:
     sink = get_platform_output_sink(_SANDBOX_OUTPUT_CONTRACT, key)
@@ -4884,19 +4930,51 @@ def _run_skill_workflow_e2e_once(
                             "platform_output_keys": sorted(final_platform_payload),
                             "platform_output_payload": final_platform_payload,
                         })
-                except ValueError as exc:
-                    errors.append(_e2e_error(
-                        target="INTERFACE",
-                        layer="terminal_output_commit",
-                        message=str(exc),
-                        failed_step_index=len(commands) + 1,
-                        failure_code="upstream_interface_contract_conflict",
-                        target_region="frozen terminal binding",
-                        repair_instruction=(
-                            "Report the frozen terminal binding and platform sink contract conflict to the "
-                            "upstream Interface owner; E2E must not modify SKILL.md, scripts, or the graph."
-                        ),
-                    ))
+                except Exception as exc:
+                    runtime_mismatch = _terminal_runtime_schema_mismatch(
+                        terminal_edges=terminal_edges,
+                        completed_outputs=completed_outputs,
+                        platform_contract=requirement_graph.platform_io_contract,
+                    )
+
+                    if runtime_mismatch:
+                        errors.append(
+                            _e2e_error(
+                                target=runtime_mismatch["target_file"],
+                                layer="terminal_output_commit",
+                                message=str(exc),
+                                failed_step_index=len(commands) + 1,
+                                failure_code="script_terminal_output_schema_mismatch",
+                                target_region=(
+                                        "stdout."
+                                        + runtime_mismatch["output_name"]
+                                ),
+                                repair_instruction=(
+                                    "The frozen terminal binding is valid, but the producing "
+                                    "script emitted a runtime value incompatible with the "
+                                    "platform sink value_schema. Repair only the producing "
+                                    "script's declared stdout field representation; preserve "
+                                    "the terminal Interface, platform sink, requirements, "
+                                    "graph, and business result."
+                                ),
+                            )
+                        )
+                    else:
+                        errors.append(
+                            _e2e_error(
+                                target="INTERFACE",
+                                layer="terminal_output_commit",
+                                message=str(exc),
+                                failed_step_index=len(commands) + 1,
+                                failure_code="upstream_interface_contract_conflict",
+                                target_region="frozen terminal binding",
+                                repair_instruction=(
+                                    "Report the frozen terminal binding and platform sink "
+                                    "contract conflict to the upstream Interface owner; "
+                                    "E2E must not modify SKILL.md, scripts, or the graph."
+                                ),
+                            )
+                        )
 
     finally:
         if tmp_handle is not None:

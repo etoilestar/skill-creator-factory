@@ -78,7 +78,13 @@ class Settings(BaseSettings):
     # backend can apply its own defaults.
     temperature: Optional[float] = Field(None, validation_alias=AliasChoices("TEMPERATURE", "temperature"))
     max_tokens: Optional[int] = Field(None, validation_alias=AliasChoices("MAX_TOKENS", "max_tokens"))
-
+    reviewer_temperature: Optional[float] = Field(
+        None,
+        validation_alias=AliasChoices(
+            "REVIEWER_TEMPERATURE",
+            "reviewer_temperature",
+        ),
+    )
     # Timeout for LLM HTTP requests in seconds.
     llm_timeout_seconds: int = Field(6000, validation_alias=AliasChoices("LLM_TIMEOUT_SECONDS", "llm_timeout_seconds"))
     # Short, independent timeout for provider-agnostic health checks.

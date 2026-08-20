@@ -26,6 +26,7 @@ services:
       - DEFAULT_MODEL=${DEFAULT_MODEL:-qwen3:30b}
       - TEXT_MODEL=${TEXT_MODEL:-qwen3:30b}
       - CODE_MODEL=${CODE_MODEL:-qwen3-coder:30b}
+      - REVIEWER_TEMPERATURE=${REVIEWER_TEMPERATURE:-0.1}
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-bge-m3:latest}
       - PLANNER_MODEL=${PLANNER_MODEL:-qwen3:30b-instruct}
       - VALIDATOR_MODEL=${VALIDATOR_MODEL:-qwen3:8b}

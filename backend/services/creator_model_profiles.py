@@ -79,13 +79,29 @@ def resolve_creator_model_profile(
 ) -> CreatorModelProfile:
     if role not in ROLES:
         raise ValueError(f"Unknown Creator model profile: {role}")
+
     saved = _load()[role]
+
+    default_temperature = (
+        settings.reviewer_temperature
+        if role == "reviewer" and settings.reviewer_temperature is not None
+        else settings.temperature
+    )
+
     return CreatorModelProfile(
         base_url=str(saved.get("base_url") or settings.llm_base_url),
         api_key=str(saved["api_key"]) if saved.get("api_key") else None,
         model=str(saved.get("model") or fallback_model),
-        max_tokens=saved.get("max_tokens") if saved.get("max_tokens") is not None else settings.max_tokens,
-        temperature=saved.get("temperature") if saved.get("temperature") is not None else settings.temperature,
+        max_tokens=(
+            saved.get("max_tokens")
+            if saved.get("max_tokens") is not None
+            else settings.max_tokens
+        ),
+        temperature=(
+            saved.get("temperature")
+            if saved.get("temperature") is not None
+            else default_temperature
+        ),
     )
 
 

@@ -104,7 +104,20 @@
 
         <div class="input-area">
           <div v-if="error" class="error">{{ error }}</div>
-          
+          <div
+              v-if="recoverablePlanningFailure"
+              class="recoverable-planning-failure"
+          >
+              <span>当前规划步骤未完成，可以重新执行。</span>
+              <button
+                class="btn-primary"
+                type="button"
+                :disabled="streaming"
+                @click="retryPlanningStage"
+              >
+                重新执行当前步骤
+              </button>
+          </div>
           <div class="context-upload-panel">
             <label class="context-upload-label">
               上传创建上下文（不会自动加入 assets）
@@ -281,6 +294,7 @@ const skillName = ref('')
 const selectedExistingSkillName = ref('')
 const pendingSupplementQuestion = ref('')
 const pendingPrepareAction = ref('none')
+const recoverablePlanningFailure = ref(null)
 const reviewSummaryStage = ref('')
 const reviewSummaryTitle = computed(() => {
   if (creationPlan.value) return '创建要点'
@@ -705,6 +719,24 @@ function mergeFinalPlanGraph(plan) {
 // Send
 // ---------------------------------------------------------------------------
 
+function retryPlanningStage() {
+  const failure = recoverablePlanningFailure.value
+  if (!failure || streaming.value) return
+
+  recoverablePlanningFailure.value = null
+  error.value = ''
+
+  if (failure.retry_stage === 'graph') {
+    pendingPrepareAction.value = 'confirm'
+    input.value = 'A. 没有其他补充，按这些要点继续'
+  } else {
+    pendingPrepareAction.value = 'none'
+    input.value = rootUserRequest.value || '重新执行当前规划步骤'
+  }
+
+  send()
+}
+
 async function send() {
   let text = input.value.trim()
 
@@ -1055,6 +1087,24 @@ async function send() {
     }
 
     if (plan.status === 'blocked') {
+      if (plan.recoverable) {
+          recoverablePlanningFailure.value = plan
+
+          if (plan.blueprint_text) {
+            pendingBlueprintText.value = plan.blueprint_text
+          }
+
+          if (Array.isArray(plan.function_items) && plan.function_items.length) {
+            pendingFunctionItems.value = plan.function_items
+          }
+
+          if (
+            Array.isArray(plan.responsibility_edges) &&
+            plan.responsibility_edges.length
+          ) {
+            pendingResponsibilityEdges.value = plan.responsibility_edges
+          }
+      }
       const blockers = (
         plan.creation_blockers ||
         []

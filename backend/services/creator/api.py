@@ -3958,6 +3958,8 @@ class PreparePlanResponse(BaseModel):
     ] = Field(
         default_factory=list
     )
+    recoverable: bool = False
+    retry_stage: Literal["blueprint", "graph"] | None = None
 
 
 
@@ -11571,6 +11573,8 @@ async def _prepare_plan_impl(
                         field="function_items",
                     )
                 ],
+                recoverable=True,
+                retry_stage="blueprint",
             )
 
         if request.responsibility_edges is None:
@@ -11588,6 +11592,8 @@ async def _prepare_plan_impl(
                         field="responsibility_edges",
                     )
                 ],
+                recoverable=True,
+                retry_stage="blueprint",
             )
 
         prepared = {
@@ -11644,6 +11650,8 @@ async def _prepare_plan_impl(
                     "planner_structured_graph_protocol_failed", str(exc),
                     field="responsibility_edges",
                 )],
+                recoverable=True,
+                retry_stage="blueprint",
             )
 
         except Exception as exc:
@@ -12113,13 +12121,26 @@ async def _prepare_plan_impl(
                 current_edges = repaired["responsibility_edges"]
     if graph_error is not None:
         summary = await project_summary(blueprint_text, prepared)
-        return PreparePlanResponse(status="blocked", prepare_stage="blueprint_protocol_failed",
-            clarifying_questions=[], review_summary=_strip_prepare_summary_risks(summary),
-            blueprint_text=blueprint_text, skill_name=skill_name,
-            creation_blockers=[_prepare_protocol_issue("planner_structured_graph_protocol_failed",
-                f"已确认 structured ResponsibilityEdges 违反 endpoint topology protocol：{graph_error}",
-                field="responsibility_edges")])
-
+        return PreparePlanResponse(
+            status="blocked",
+            prepare_stage="blueprint_protocol_failed",
+            recoverable=True,
+            retry_stage="graph",
+            clarifying_questions=[],
+            review_summary=_strip_prepare_summary_risks(summary),
+            blueprint_text=blueprint_text,
+            skill_name=skill_name,
+            function_items=prepared.get("function_items") or [],
+            responsibility_edges=prepared.get("responsibility_edges") or [],
+            requirement_allocations=prepared.get("requirement_allocations") or [],
+            creation_blockers=[
+                _prepare_protocol_issue(
+                    "planner_structured_graph_protocol_failed",
+                    f"已确认 structured ResponsibilityEdges 违反 endpoint topology protocol：{graph_error}",
+                    field="responsibility_edges",
+                )
+            ],
+        )
     plan = None
 
     analyze_errors: list[
@@ -12260,6 +12281,8 @@ async def _prepare_plan_impl(
                 "strict_analyze_failed", "已确认 full blueprint 无法解析为创建计划。",
                 field="analyze_blueprint",
             )],
+            recoverable=True,
+            retry_stage="blueprint",
         )
 
     (

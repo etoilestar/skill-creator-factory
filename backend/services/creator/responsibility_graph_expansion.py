@@ -59,8 +59,30 @@ def _definite_type(contract: dict[str, Any]) -> str | None:
 
 
 def _types_conflict(left: dict[str, Any], right: dict[str, Any]) -> bool:
-    left_type, right_type = _definite_type(left), _definite_type(right)
-    return bool(left_type and right_type and left_type != right_type)
+    left_type = _definite_type(left)
+    right_type = _definite_type(right)
+
+    if left_type and right_type:
+        return left_type != right_type
+
+    return False
+
+def _output_can_bind_to_sink(
+    source: dict[str, Any],
+    target: dict[str, Any],
+) -> bool:
+    source_contract = source.get("contract") or {}
+    target_contract = target.get("contract") or {}
+
+    source_type = _definite_type(source_contract)
+    target_type = _definite_type(target_contract)
+
+    # 已知类型必须兼容
+    if source_type and target_type:
+        return source_type == target_type
+
+    # 未声明类型时不要阻塞
+    return True
 
 
 def _edge(from_node: str, from_output: str, to_node: str, to_input: str, *, constraints: list[dict] | None = None) -> dict:
@@ -311,6 +333,18 @@ def _materialize_interface_obligation(*, obligation: dict, selection: dict, regi
         target = next((value for value in registry["platform_outputs"] if value["slot_id"] == selection["target_id"]), None)
         if source is None or target is None:
             raise ResponsibilityGraphExpansionError("selected endpoint is outside declared interface obligation scope", code="invalid_interface_endpoint_reference")
+        if not _output_can_bind_to_sink(source, target):
+            raise ResponsibilityGraphExpansionError(
+                "script output cannot bind to platform output sink",
+                code="interface_terminal_type_conflict",
+                details={
+                    "source_member": source["target_file"],
+                    "source_output": source["port_id"],
+                    "source_contract": source.get("contract") or {},
+                    "target_platform_output": target["field"],
+                    "target_contract": target.get("contract") or {},
+                },
+            )
         if _types_conflict(source.get("contract") or {}, target.get("contract") or {}):
             raise ResponsibilityGraphExpansionError("selected endpoints have conflicting types", code="interface_endpoint_type_conflict")
         return _edge(source["target_file"], source["port_id"], PLATFORM_OUTPUT_NODE, target["field"])

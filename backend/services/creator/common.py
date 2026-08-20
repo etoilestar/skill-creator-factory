@@ -1795,29 +1795,58 @@ def _e2e_error(
     failure_code: str = "",
     target_region: str = "",
     repair_instruction: str = "",
+    details: dict[str, Any] | None = None,
 ) -> str:
+    failure_details = dict(details or {})
+
+    if failure_code:
+        failure_details.setdefault(
+            "failure_code",
+            failure_code,
+        )
+
     failure = {
         "failed_step_index": failed_step_index,
         "target_file": target,
         "target_region": target_region or (
             "frontmatter"
             if "frontmatter" in layer
-            else ("workflow block" if target == "SKILL.md" else "run()")
+            else (
+                "workflow block"
+                if target == "SKILL.md"
+                else "run()"
+            )
         ),
         "failed_command": "",
         "input_payload": {},
         "stdout": "",
         "stderr": message,
         "return_code": None,
-        "expected": "Creator E2E step must be executable and produce valid JSON/artifacts.",
+        "expected": (
+            "Creator E2E step must be executable and "
+            "produce valid JSON/artifacts."
+        ),
         "actual": message,
         "repair_instruction": repair_instruction or (
-            f"只修改 {target} 中与 {layer} 失败相关的最小区域，不修改其它文件。"
+            f"只修改 {target} 中与 {layer} 失败相关的最小区域，"
+            "不修改其它文件。"
         ),
         "layer": layer,
-        "details": {"failure_code": failure_code} if failure_code else {},
+        "details": failure_details,
     }
-    return f"E2E_REPAIR_TARGET={target}\nE2E_LAYER={layer}\nE2E_STRUCTURED_FAILURE={json.dumps(failure, ensure_ascii=False, sort_keys=True)}\n{message}"
+
+    return (
+        f"E2E_REPAIR_TARGET={target}\n"
+        f"E2E_LAYER={layer}\n"
+        "E2E_STRUCTURED_FAILURE="
+        + json.dumps(
+            failure,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        + "\n"
+        + message
+    )
 
 
 

@@ -670,6 +670,50 @@ def _failure_code_from_structured(structured: dict[str, Any] | None) -> str:
     details = structured.get("details") if isinstance(structured, dict) else {}
     return str((details or {}).get("failure_code") or "")
 
+def _deterministic_repair_authority(
+    structured_failure: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Return a validator-owned repair decision when one exists.
+
+    A deterministic repair authority means that runtime comparison has
+    already established the violated boundary and its owner.
+
+    Repair models may change implementation toward this authority, but
+    may not reinterpret or replace the authority itself.
+    """
+
+    if not isinstance(structured_failure, dict):
+        return {}
+
+    details = structured_failure.get("details")
+
+    if not isinstance(details, dict):
+        return {}
+
+    authority = details.get("repair_authority")
+
+    if not isinstance(authority, dict):
+        return {}
+
+    if authority.get("mode") != "deterministic":
+        return {}
+
+    target_file = str(
+        authority.get("target_file") or ""
+    ).strip()
+
+    if not target_file:
+        return {}
+
+    expected = authority.get("expected")
+    observed = authority.get("observed")
+
+    # A deterministic authority must contain an actual comparison.
+    # Otherwise it is only a hint and must not bypass diagnosis.
+    if expected is None or observed is None:
+        return {}
+
+    return dict(authority)
 
 def _allowed_edit_scope_for_failure(
     *,
@@ -5000,14 +5044,63 @@ def _run_skill_workflow_e2e_once(
                                         + runtime_violation["output_name"]
                                 ),
                                 repair_instruction=(
-                                    "The producing script completed, but its observed stdout "
-                                    "does not satisfy the frozen terminal edge contract. "
-                                    "Repair only the producing script's stdout/output boundary "
-                                    "so the declared output port is emitted with a value that "
-                                    "satisfies the frozen downstream sink schema. "
-                                    "Preserve the frozen Interface, graph, platform sink, "
-                                    "requirements, Trial Case, and business result."
+                                    "A deterministic runtime contract comparison has already "
+                                    "identified the violated boundary and repair owner. "
+                                    "Treat details.repair_authority as immutable authority. "
+                                    "Modify only the authorized implementation so the observed "
+                                    "runtime behavior satisfies expected. "
+                                    "Do not rewrite the frozen contract to match the current "
+                                    "implementation."
                                 ),
+                                details={
+                                    "repair_authority": {
+                                        "mode": "deterministic",
+                                        "source": "runtime_contract_comparator",
+                                        "target_file": (
+                                            runtime_violation["target_file"]
+                                        ),
+                                        "target_region": (
+                                                "stdout."
+                                                + runtime_violation["output_name"]
+                                        ),
+                                        "frozen_boundary": {
+                                            "producer": {
+                                                "node": (
+                                                    runtime_violation[
+                                                        "target_file"
+                                                    ]
+                                                ),
+                                                "port": (
+                                                    runtime_violation[
+                                                        "output_name"
+                                                    ]
+                                                ),
+                                            },
+                                            "consumer": {
+                                                "node": "platform_output",
+                                                "port": (
+                                                    runtime_violation[
+                                                        "sink_name"
+                                                    ]
+                                                ),
+                                            },
+                                        },
+                                        "expected": (
+                                            runtime_violation["expected"]
+                                        ),
+                                        "observed": (
+                                            runtime_violation["observed"]
+                                        ),
+                                        "mutable_scope": {
+                                            "files": [
+                                                runtime_violation[
+                                                    "target_file"
+                                                ]
+                                            ],
+                                            "kind": "implementation_only",
+                                        },
+                                    },
+                                },
                             )
                         )
                     else:
@@ -5433,11 +5526,52 @@ async def _repair_existing_file_for_e2e_failure(
     if e2e_session is None:
         e2e_session = _create_e2e_session(skill_name, source_skill_dir=skill_dir)
     before_identity = _e2e_failure_identity((e2e_errors or [""])[0], target_file=target_path)
-    boundary_facts = structured_failure.get("details") or {}
-    boundary_invalid = any(boundary_facts.get(flag) is False for flag in (
-        "fixture_valid", "placeholder_resolved", "argv_shape_valid", "command_script_interface_aligned",
-    ))
-    deterministic_target = "SKILL.md" if boundary_invalid else ""
+    boundary_facts = (
+            structured_failure.get("details")
+            or {}
+    )
+
+    repair_authority = (
+        _deterministic_repair_authority(
+            structured_failure
+        )
+    )
+
+    boundary_invalid = any(
+        boundary_facts.get(flag) is False
+        for flag in (
+            "fixture_valid",
+            "placeholder_resolved",
+            "argv_shape_valid",
+            "command_script_interface_aligned",
+        )
+    )
+
+    authority_target = str(
+        repair_authority.get("target_file")
+        or ""
+    ).strip()
+
+    if (
+            authority_target
+            and not _is_skill_repair_target(
+        e2e_session.workspace_dir,
+        authority_target,
+    )
+    ):
+        # Invalid authority metadata must never become permission
+        # to edit an arbitrary file.
+        repair_authority = {}
+        authority_target = ""
+
+    deterministic_target = (
+            authority_target
+            or (
+                "SKILL.md"
+                if boundary_invalid
+                else ""
+            )
+    )
     # A rejected failure/target experiment is terminal for that pair.  Do this
     # before diagnosis so changing hypothesis prose cannot reopen it.
     rejected_target = deterministic_target or target_path
@@ -5465,17 +5599,70 @@ async def _repair_existing_file_for_e2e_failure(
             "error_type": "callable_repair_evidence_missing",
             "sandbox_executed": False,
         }
-    diagnosis = ({
-        "repair_target": "SKILL.md", "symptom_file": target_path,
-        "root_cause_hypothesis": "Deterministic command/binding boundary is invalid.",
-        "evidence": boundary_facts.get("issues") or [],
-        "repair_instruction": "Only repair the failed SKILL.md command boundary.",
-        "confidence": "deterministic", "hypothesis_key": "deterministic-command-boundary",
-    } if deterministic_target else await _diagnose_e2e_failure_for_repair(
-        skill_name=skill_name, skill_dir=skill_dir, e2e_errors=e2e_errors,
-        e2e_session=e2e_session, requested_model=requested_model,
-        read_only_callable_context=read_only_callable_context,
-    ))
+    if repair_authority:
+        diagnosis = {
+            "repair_target": authority_target,
+            "symptom_file": target_path,
+            "root_cause_hypothesis": (
+                "A deterministic runtime contract comparison "
+                "has already identified the violated boundary."
+            ),
+            "evidence": [
+                repair_authority
+            ],
+            "repair_instruction": (
+                "Treat repair_authority as immutable. "
+                "Do not choose another repair target and do not "
+                "reinterpret the frozen boundary or expected contract. "
+                "Derive the smallest implementation behavior delta "
+                "that makes observed satisfy expected. "
+                "Preserve every contract and behavior outside "
+                "mutable_scope."
+            ),
+            "confidence": "deterministic",
+            "hypothesis_key": (
+                    "deterministic-repair-authority:"
+                    + _stable_json_hash(
+                repair_authority
+            )
+            ),
+        }
+
+    elif deterministic_target:
+        diagnosis = {
+            "repair_target": "SKILL.md",
+            "symptom_file": target_path,
+            "root_cause_hypothesis": (
+                "Deterministic command/binding "
+                "boundary is invalid."
+            ),
+            "evidence": (
+                    boundary_facts.get("issues")
+                    or []
+            ),
+            "repair_instruction": (
+                "Only repair the failed SKILL.md "
+                "command boundary."
+            ),
+            "confidence": "deterministic",
+            "hypothesis_key": (
+                "deterministic-command-boundary"
+            ),
+        }
+
+    else:
+        diagnosis = await (
+            _diagnose_e2e_failure_for_repair(
+                skill_name=skill_name,
+                skill_dir=skill_dir,
+                e2e_errors=e2e_errors,
+                e2e_session=e2e_session,
+                requested_model=requested_model,
+                read_only_callable_context=(
+                    read_only_callable_context
+                ),
+            )
+        )
     if diagnosis.get("status") == "diagnosis_exhausted":
         return {"status": "diagnosis_exhausted", "repaired_target": None, "next_target": None, "next_failure": e2e_errors}
     target_path = diagnosis["repair_target"]
@@ -5958,16 +6145,62 @@ async def _repair_existing_file_for_e2e_failure(
         "failure_layer": failure_layer,
         "failure_code": failure_code,
         "is_artifact_failure": is_artifact_failure,
-        "runtime_binding_trace": (failure_details or {}).get("runtime_binding_trace") or (failure_details or {}).get("variable_trace", {}).get("runtime_binding_trace") or {},
-        "rendered_payload": structured_failure.get("rendered_payload") or {},
-        "stdout": structured_failure.get("stdout") or "",
-        "stderr": structured_failure.get("stderr") or "",
-        "filesystem_trace": filesystem_trace_for_context,
-        "artifact_runtime_state": artifact_runtime_state,
-        "expected": structured_failure.get("expected") or "",
-        "actual": structured_failure.get("actual") or "",
-        "allowed_edit_scope": allowed_edit_scope,
-        "failed_command": structured_failure.get("failed_command") or "",
+        "runtime_binding_trace": (
+                (failure_details or {}).get(
+                    "runtime_binding_trace"
+                )
+                or (
+                        failure_details
+                        or {}
+                ).get(
+            "variable_trace",
+            {},
+        ).get(
+            "runtime_binding_trace"
+        )
+                or {}
+        ),
+        "rendered_payload": (
+                structured_failure.get(
+                    "rendered_payload"
+                )
+                or {}
+        ),
+        "stdout": (
+                structured_failure.get("stdout")
+                or ""
+        ),
+        "stderr": (
+                structured_failure.get("stderr")
+                or ""
+        ),
+        "filesystem_trace": (
+            filesystem_trace_for_context
+        ),
+        "artifact_runtime_state": (
+            artifact_runtime_state
+        ),
+        "expected": (
+                structured_failure.get("expected")
+                or ""
+        ),
+        "actual": (
+                structured_failure.get("actual")
+                or ""
+        ),
+        "allowed_edit_scope": (
+            allowed_edit_scope
+        ),
+        "failed_command": (
+                structured_failure.get(
+                    "failed_command"
+                )
+                or ""
+        ),
+
+        # 新增
+        "repair_authority": repair_authority,
+
         "debug_diagnosis": diagnosis,
     }
 
@@ -5999,6 +6232,20 @@ async def _repair_existing_file_for_e2e_failure(
         "Parameter provenance rules: platform/runtime input uses its exact runtime placeholder; previous-step output uses a graph-backed placeholder; only a user/frozen-contract constant may use a literal; a script-local optional default should preferably be omitted. A literal appearing only in the failing SKILL.md command is not provenance.",
         "Every placeholder introduced in NEW must have current runtime provenance from a platform input, previous successful stdout, frozen graph provenance, or another explicitly supplied runtime field. Do not invent options.*, fields.*, payload.*, or config.* unless that exact path exists in runtime evidence. A syntactically valid placeholder with no runtime producer is invalid.",
         "The patch must concretely implement the supplied repair instruction. Before returning compare OLD and NEW, confirm they differ, materially change the diagnosed behavior, and correct the failing expression/interface. Do not return no-op, comments-only, logging-only, or diagnostic-only edits.",
+        "Repair authority rule: "
+        "when repair_authority.mode == 'deterministic', "
+        "repair_authority is immutable runtime authority, not a suggestion. "
+        "The target, target_region, frozen_boundary, and expected contract "
+        "must not be re-selected, renamed, weakened, or rewritten merely "
+        "to fit the current implementation. "
+        "Treat observed only as runtime evidence. "
+        "First derive the smallest behavioral delta from observed to expected, "
+        "then modify only mutable_scope to implement that delta. "
+        "Preserve all unviolated identities, edges, contracts, inputs, outputs, "
+        "tool identities, and unrelated behavior. "
+        "If the required delta cannot be justified from the supplied authority "
+        "and runtime evidence, return no valid patch rather than inventing "
+        "a different contract.",
     ])
 
 

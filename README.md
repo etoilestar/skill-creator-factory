@@ -1,271 +1,417 @@
-# Skill Creator Factory
+# SuperSkills · Skill Creator Factory
 
-> 基于本地大模型的 AI Skill 创建与管理平台
+> 一个面向 AI Skill 全生命周期的本地优先平台：用 Creator 把需求变成可执行 Skill，用工具注册中心为脚本提供受控能力，再通过 Sandbox 验证、治理并发布为 OpenAI 兼容接口。
 
-一个全栈 Web 应用，让你通过对话式 AI 引导快速设计、调试和管理 Claude Skill（`SKILL.md` 指令集），并直接在沙盒中验证效果——全程运行在你自己的机器上，无需云端 API Key。
+## 目录
 
----
+- [项目能力](#项目能力)
+- [系统架构](#系统架构)
+- [Creator：从需求到 Skill](#creator从需求到-skill)
+- [工具系统：发现、绑定与运行](#工具系统发现绑定与运行)
+- [快速开始](#快速开始)
+- [使用指南](#使用指南)
+- [Skill 目录与规范](#skill-目录与规范)
+- [配置说明](#配置说明)
+- [API 概览](#api-概览)
+- [开发与测试](#开发与测试)
 
-## ✨ 功能特性
+## 项目能力
 
-| 功能 | 说明 |
-|------|------|
-| **Creator 模式** | 由 `kernel/SKILL.md` 驱动的 AI 助手，通过结构化 SOP 引导你完成 Skill 需求挖掘、架构蓝图、工程实现、测试迭代全流程 |
-| **Sandbox 模式** | 将任意已保存的 Skill 加载为系统提示词，立即在对话中验证效果 |
-| **Skills 库管理** | 内置浏览器：列表预览、全文查看、在线编辑、一键删除 |
-| **流式输出** | 后端通过 SSE 实时推送 LLM token，前端逐字呈现，无等待感 |
-| **本地 LLM 优先** | 兼容任何支持 OpenAI `/v1` 接口的本地后端（Ollama、LM Studio 等） |
-| **Docker 一键部署** | 单条命令启动完整服务栈 |
+| 模块 | 能力 |
+| --- | --- |
+| **Creator** | 对话式需求澄清、蓝图和职责图生成、文件逐项生成、严格校验、E2E 自动修复、打包；支持上传规划上下文和静态素材 |
+| **Creator 工具池** | 从系统清单、自定义清单和 Python 模块发现工具；按 Skill 和文件绑定工具；通过 Gate 限制生成代码可导入的运行时 helper |
+| **工具注册中心** | 工具草拟、代码生成、校验、注册、启停、编辑、删除、测试；支持可复用 snippet 的增删改查与测试 |
+| **模型配置** | 为 Creator 的 planner、reviewer 等角色配置模型档案，支持文本、代码、验证、视觉和图像模型分工 |
+| **Sandbox** | 加载已安装 Skill，规划单 Skill/多 Skill 工作流，上传运行输入，流式执行并渲染文本与产物 |
+| **Skills 管理** | Skill CRUD、资源编辑、ZIP 导入/升级、版本快照与回滚、allowlist、审批状态和审计事件 |
+| **Publish** | 将获准的 Skill 配置成端点，并通过 `/published/v1/chat/completions` 暴露 OpenAI 兼容调用方式 |
+| **本地优先** | FastAPI + Vue 3；兼容 Ollama、LM Studio 及其他 OpenAI 兼容模型服务；Docker Compose 一键启动 |
 
----
+## 系统架构
 
-## 🏗️ 架构概览
+```mermaid
+flowchart LR
+    U[浏览器] --> FE[Vue 3 / Vite]
+    FE -->|REST / SSE / NDJSON| API[FastAPI]
 
+    subgraph Backend[后端能力]
+      API --> C[Creator 编排]
+      API --> S[Sandbox 执行器]
+      API --> M[Skills 管理与治理]
+      API --> P[Publish Gateway]
+      C --> TP[Tool Pool / Tool Gate]
+      S --> RT[Runtime Tools]
+      TP --> RT
+    end
+
+    C --> K[(kernel/SKILL.md\nCreator SOP)]
+    C --> LIB[(skills/\n生成的 Skill)]
+    M --> LIB
+    S --> LIB
+    P --> LIB
+    C --> LLM[OpenAI 兼容 LLM]
+    S --> LLM
+    RT --> EXT[文档 / 检索 / 视觉 / API\n以及自定义工具]
 ```
-skill-creator-factory/
-├── backend/                  # FastAPI 后端（Python 3.11+）
-│   ├── main.py               # 应用入口，CORS 配置
-│   ├── config.py             # 环境变量 & 路径配置（pydantic-settings）
-│   ├── routers/
-│   │   ├── chat.py           # /api/chat 路由占位（共享前缀）
-│   │   ├── creator_chat.py   # POST /api/chat/creator
-│   │   ├── sandbox_chat.py   # POST /api/chat/sandbox/{name}
-│   │   ├── skills_chat.py    # /api/chat/skills/*（预留）
-│   │   ├── skills.py         # /api/skills + governance / approval / upgrade / rollback
-│   │   └── health.py         # GET /api/health
-│   └── services/
-│       ├── kernel_loader.py  # 按治理后的 skill resolver 加载 kernel / user skill
-│       ├── llm_proxy.py      # 流式代理至 Ollama/LM Studio（OpenAI 兼容）
-│       ├── skill_governance.py # registry / allowlist / 审批 / 版本 / 审计
-│       └── skill_manager.py  # Skill 安装 / CRUD / ZIP 导入升级 / 资源读写
-│
-├── frontend/                 # Vue 3 + Vite 前端
-│   └── src/
-│       ├── views/
-│       │   ├── CreatorView.vue   # Creator 对话界面
-│       │   ├── SandboxView.vue   # Sandbox 对话界面
-│       │   └── SkillsView.vue    # Skills 库管理界面
-│       └── composables/          # useChat / useSkills 封装
-│
-├── kernel/                   # Skill 创建引擎（只读）
-│   ├── SKILL.md              # Creator 模式系统提示词（5 阶段 SOP）
-│   ├── references/           # 最佳实践、交互指南、输出模式等参考文档
-│   └── scripts/
-│       ├── init_skill.py     # 脚手架：从模板初始化新 Skill 目录
-│       ├── package_skill.py  # 打包：将 Skill 目录压缩为 .skill 文件
-│       └── quick_validate.py # 验证：检查 frontmatter 规范
-│
-├── skills/                   # 用户 Skill 库（读写，默认为空）
+
+### 仓库结构
+
+```text
+superskills/
+├── backend/
+│   ├── main.py                         # FastAPI 入口与路由装配
+│   ├── routers/                        # Creator、Sandbox、Skills、Publish API
+│   ├── services/
+│   │   ├── creator/                    # Creator 计划、生成、修复、E2E 与 Tool Pool
+│   │   ├── runtime_tools/              # 平台运行时工具及自定义工具
+│   │   ├── creator_tool_registry.py    # 工具发现、校验、注册、测试
+│   │   ├── skill_governance.py         # 状态、allowlist、版本与审计
+│   │   └── skill_runtime.py            # Skill 可调用的平台 helper
+│   └── config/                         # 工具发现、系统清单和自定义清单
+├── frontend/src/
+│   ├── views/                          # Creator / Skills / Sandbox / Publish / Tools
+│   ├── components/                     # 任务、职责图、执行图、结果等组件
+│   └── composables/                    # Creator、Sandbox、Publish 状态与请求封装
+├── kernel/
+│   ├── SKILL.md                        # Creator 的分阶段 SOP 与约束
+│   ├── references/                     # 工作流、交互和最佳实践
+│   └── scripts/                        # 初始化、快速校验、打包 CLI
+├── skills/                             # 用户 Skill 工作区
 └── docker-compose.yml
 ```
 
-**数据流**
+## Creator：从需求到 Skill
 
+Creator 不只是“让模型一次性写几个文件”。它把用户意图转换为结构化事实、职责关系和文件计划，再在受控工具上下文内逐文件生成，并用真实运行结果闭环修复。
+
+### 完整流程图
+
+```mermaid
+flowchart TD
+    A[输入 Skill 目标\n可附规划上下文文件] --> B[Phase 1 · Prepare]
+    B --> B1{需求已就绪?}
+    B1 -->|否| B2[一次只澄清一个关键问题]
+    B2 --> B
+    B1 -->|是| C[Phase 2 · Blueprint]
+
+    C --> C1[冻结 I/O、工作流、Function Items\n职责边、文件职责和资源来源]
+    C1 --> C2[解析并校验蓝图]
+    C2 --> C3[展开职责图 / 生成创建摘要]
+    C3 --> D{用户确认?}
+    D -->|修改| B
+    D -->|确认| E[构建 Skill Tool Pool]
+
+    E --> F[Phase 3 · Implementation]
+    F --> F1[初始化目录，不预建空文件]
+    F1 --> F2[按文件计划选择当前文件绑定]
+    F2 --> F3[生成文件]
+    F3 --> F4{格式、职责、导入与契约通过?}
+    F4 -->|否| F5[边界内修复 / 重新生成]
+    F5 --> F3
+    F4 -->|是| F6[写入 skills/]
+    F6 --> F7{还有文件?}
+    F7 -->|是| F2
+
+    F7 -->|否| G[Phase 4 · Validation]
+    G --> G1[静态规范 + 严格 E2E]
+    G1 --> G2{验证通过?}
+    G2 -->|否| G3[定位失败层和责任文件]
+    G3 --> G4[生成局部补丁]
+    G4 --> G5[真实 E2E 验证；无改善则回滚]
+    G5 --> G1
+
+    G2 -->|是| H[Phase 5 · Package]
+    H --> H1[资源存在性检查]
+    H1 --> H2[生成可分发 .skill / ZIP]
 ```
-浏览器
-  │ POST /api/chat/creator
-  │   └─► FastAPI → kernel/SKILL.md (system prompt) → LLM (Ollama/LM Studio)
-  │         └─► SSE stream → 浏览器实时渲染
-  │
-  │ POST /api/chat/sandbox/{skill_name}
-  │   └─► FastAPI → skills/{name}/SKILL.md (system prompt) → LLM
-  │
-  │ GET/POST/DELETE /api/skills
-        └─► FastAPI → skills/ 目录 CRUD
+
+### 五个阶段
+
+1. **Prepare（需求解析）**：抽取输入、输出、工作流、依赖、运行时输入与 Creator 静态素材；信息不足时只询问当前最关键的问题。
+2. **Blueprint（蓝图）**：形成可解析的 SkillPlan，明确 Function Item、责任边、每个文件的唯一职责、资源来源和输出契约。蓝图确认后，文件集合成为下游生成的权威边界。
+3. **Implementation（实现）**：创建目录，按计划逐文件生成和写入。脚本生成前先取得该文件的工具绑定，代码不能把整个运行时工具命名空间当作自由可用。
+4. **Validation（验证与迭代）**：进行格式、资源、命令、导入、数据流和 E2E 校验；自动修复以局部实验推进，失败或无改善的补丁会被拒绝或回滚。
+5. **Packaging（打包）**：再次检查引用资源和端到端可用性，随后生成分发包。
+
+### Creator 中的三类文件
+
+- **`SKILL.md`**：Skill 的触发方式、工作流、命令及结果消费规则。
+- **`scripts/**`**：承担可执行、可测试的实质职责，可以使用当前文件绑定允许的工具。
+- **`references/**` / `assets/**`**：前者是按需阅读的知识，后者是静态模板或素材；二者都不是运行时工具，也不能声明工具调用。
+
+> Creator 上传的“上下文文件”只服务于创建阶段，不会自动成为 Skill asset。只有在蓝图中确认的静态素材才会被复制到 `assets/**`。Sandbox 中用户上传的文件属于运行时输入，也不应写成 Creator 静态素材。
+
+## 工具系统：发现、绑定与运行
+
+### 工具从哪里来
+
+工具发现由 `backend/config/creator_tool_discovery.json` 驱动，当前包含两类来源：
+
+1. **清单（registries）**
+   - `backend/config/creator_system_tool_manifests.json`：系统工具清单。
+   - `backend/config/tool_registry.custom.json`：通过工具注册中心写入的自定义清单。
+2. **Python 模块（modules）**
+   - `backend.services.runtime_tools` 下的 API、文档、检索、视觉、微信及自定义工具。
+   - `backend.services.skill_runtime` 暴露的文本生成、图像生成等平台 helper。
+
+每个工具清单可以描述 `tool_id`、用途、是否启用、Creator 可用性、能力标签、输入/输出 schema、副作用、依赖、可调用函数，以及正确用法 snippet。
+
+### 工具选择与执行流程
+
+```mermaid
+flowchart TD
+    R[蓝图声明抽象能力需求] --> D[Tool Discovery\n扫描系统/自定义清单和模块]
+    D --> X[Tool Pool Explorer\n查找候选能力]
+    X --> G{Tool Pool Gate}
+    G -->|禁用 / 不允许 Creator /\n能力或依赖不满足| DENY[拒绝加入并记录原因]
+    G -->|通过| POOL[Skill 级 Tool Pool]
+    POOL --> PLAN[Tool Planner]
+    PLAN --> BIND[按 scripts/文件生成只读绑定]
+    BIND --> CTX[向代码生成器注入\n函数签名、schema、示例和 snippets]
+    CTX --> CODE[生成或修复脚本]
+    CODE --> IG{Runtime Import Guard}
+    IG -->|存在越权 import| FIX[拒绝写入 / 定向修复]
+    FIX --> CTX
+    IG -->|仅使用 allowed_helper_imports| RUN[Sandbox / E2E 运行]
+    RUN --> OUT[结构化 stdout 与 artifacts]
 ```
 
----
+### 为什么同时需要 Tool Pool、文件绑定和 Import Guard
 
-## 🚀 快速开始
+- **Tool Pool 是 Skill 级候选集合**：记录这个 Skill 被批准使用哪些工具，而不是让所有脚本默认拥有全部工具。
+- **文件绑定是最小授权**：每个 `scripts/**` 文件只获得完成自身职责所需的 helper、函数签名和调用契约。
+- **Tool Gate 是准入控制**：工具未启用、未允许 Creator 使用、能力不匹配或依赖缺失时，不能进入生成上下文。
+- **Import Guard 是落地校验**：生成、修复和 E2E 阶段都不能重新引入已拒绝或未绑定的 helper。
+- **Snippet 是调用知识**：它向模型提供已验证的最小调用范式、返回值规则和常见错误，避免“函数存在但调用方式错误”。
+
+### 工具注册中心工作流
+
+```mermaid
+flowchart LR
+    A[描述新工具] --> B[Draft 清单]
+    B --> C[生成实现代码]
+    C --> D[Validate\nschema / import / contract]
+    D -->|失败| B
+    D -->|通过| E[Register 到自定义清单]
+    E --> F[Enable]
+    F --> G[添加 / 编辑 Snippets]
+    G --> H[Test 工具与 Snippet]
+    H --> I[Creator Discovery]
+    I --> J[经 Gate 加入 Tool Pool]
+```
+
+在前端访问 **`/creator/tools`** 可以完成工具的查看、创作、注册、启停和测试；**`/creator/model-profiles`** 用于管理 Creator 角色模型配置。新增工具后，先完成校验和测试，再允许 Creator 使用。
+
+## 快速开始
 
 ### 前置条件
 
-- [Docker & Docker Compose](https://docs.docker.com/get-docker/)（推荐）或 Python 3.11+ / Node.js 18+
-- 本地运行 [Ollama](https://ollama.ai) 或 [LM Studio](https://lmstudio.ai)，并已拉取至少一个模型
+- Docker 与 Docker Compose（推荐），或 Python 3.11+、Node.js 18+。
+- 一个可访问的 OpenAI 兼容文本模型服务，例如 Ollama 或 LM Studio。
+- 若使用视觉或图像能力，还需配置相应模型服务；只创建文本 Skill 时可以不配置。
 
-### 方式一：Docker（推荐）
+### Docker Compose（推荐）
 
 ```bash
-# 1. 克隆仓库
-git clone https://github.com/etoilestar/skill-creator-factory.git
-cd skill-creator-factory
+git clone <your-repository-url> superskills
+cd superskills
 
-# 2. （可选）复制并修改环境变量
-cp backend/.env.example .env
-# 编辑 .env：设置 LLM_BASE_URL 和 DEFAULT_MODEL
+# 可选：在仓库根目录创建 .env，覆盖 compose 默认值
+cat > .env <<'ENV'
+LLM_BASE_URL=http://host.docker.internal:11434
+DEFAULT_MODEL=qwen3:30b
+TEXT_MODEL=qwen3:30b
+CODE_MODEL=qwen3-coder:30b
+ENV
 
-# 3. 启动
-docker-compose up --build
+docker compose up --build
 ```
 
 | 服务 | 地址 |
-|------|------|
-| 前端 | http://localhost:5173 |
-| 后端 API | http://localhost:8000 |
-| API 文档 | http://localhost:8000/docs |
+| --- | --- |
+| Web UI | <http://localhost:5173> |
+| 后端 API | <http://localhost:58000> |
+| Swagger | <http://localhost:58000/docs> |
+| Published API | <http://localhost:58000/published/v1> |
 
-### 方式二：本地开发
+Compose 会把 `kernel/` 只读挂载，把 `skills/` 和 `logs/` 持久化，并通过 `host.docker.internal` 访问宿主机模型服务。当前 compose 含 NVIDIA GPU 设备预留；没有对应 GPU 或设备编号时，请按本机环境移除或调整 `deploy.resources.reservations.devices`。
 
-**后端**
+### 本地开发
 
 ```bash
-cd backend
-pip install -r requirements.txt
-
-# 配置环境变量
-cp .env.example .env   # 按需修改 LLM_BASE_URL / DEFAULT_MODEL
-
-# 启动（在仓库根目录执行）
+# 后端：从仓库根目录启动
+python -m venv .venv
+source .venv/bin/activate
+pip install -r backend/requirements.txt
+cp backend/.env.example backend/.env
 uvicorn backend.main:app --reload
 ```
 
-**前端**
-
 ```bash
+# 前端：另开终端
 cd frontend
 npm install
 npm run dev
 ```
 
----
+本地启动的后端默认是 `http://localhost:8000`；前端开发服务器会按 `frontend/vite.config.js` 中的代理配置访问 API。
 
-## ⚙️ 配置
+## 使用指南
 
-环境变量可在 `backend/.env` 中设置（Docker 模式在根目录 `.env` 或 `docker-compose.yml` 中覆盖）：
+### 创建一个 Skill
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `LLM_BASE_URL` | `http://localhost:11434` | 本地 LLM 后端地址。Ollama 默认 `:11434`，LM Studio 默认 `:1234` |
-| `DEFAULT_MODEL` | `llama3.2` | 默认使用的模型名称，须在你的 LLM 后端中已加载 |
+1. 打开 **Creator**，描述目标、输入示例、期望输出以及不可替代的外部依赖。
+2. 根据界面提示补齐关键问题；需要时上传仅供规划参考的上下文文件。
+3. 检查蓝图摘要、职责图、文件计划和静态素材清单，然后确认。
+4. 观察执行面板：Creator 会初始化目录、构建工具池、逐文件生成并校验。
+5. 运行严格验证；若失败，查看 E2E 诊断和自动修复事件。
+6. 验证通过后打包，或转到 **Sandbox** 做交互测试。
 
-**Docker 环境下访问宿主机 LLM**：`docker-compose.yml` 已预配置 `host.docker.internal` 解析，Linux 下同样有效。
+### 在 Sandbox 验证
 
----
+1. 在 **Skills** 中确认目标 Skill 可见且状态允许执行。
+2. 打开 **Sandbox** 并选择一个或多个 Skill。
+3. 上传本次运行输入（如有），输入真实测试任务。
+4. 检查规划、命令执行、stdout、最终回答及输出文件链接。
+5. 返回 Creator 或 Skills 编辑器修正问题，再重新验证。
 
-## 📖 使用指南
+### 治理与发布
 
-### Creator 模式
+1. 在 **Skills** 中导入、编辑或升级 Skill，并完成审批/启用。
+2. 使用版本历史和事件记录审查变更；需要时回滚到历史快照。
+3. 打开 **Publish**，选择获准 Skill 创建端点并启用。
+4. 调用 `GET /published/v1/models` 查看模型，再向 `POST /published/v1/chat/completions` 发送 OpenAI 风格请求。
 
-1. 打开 **Creator** 页面
-2. 告诉 AI 你想创建什么 Skill（例如："帮我做一个分析 Excel 报表的 Skill"）
-3. AI 会依照 5 阶段 SOP 逐步引导：
-   - **Phase 1** 深度需求挖掘（I/O 定义、技术方案、作用域）
-   - **Phase 2** 架构蓝图确认
-   - **Phase 3** 工程化实现（生成 SKILL.md 及资源文件）
-   - **Phase 4** 测试与迭代
-   - **Phase 5** 打包与分发
-4. 将 AI 生成的 `SKILL.md` 内容复制到 **Skills 库** 中保存
+## Skill 目录与规范
 
-### Sandbox 模式
-
-1. 在 **Skills 库** 中至少保存一个 Skill
-2. 打开 **Sandbox** 页面，从下拉列表选择 Skill
-3. 直接与该 Skill 对话，验证触发词、输出格式是否符合预期
-
-### Skills 库管理
-
-- **新建**：点击「+ 新建 Skill」，填写名称并编写 `SKILL.md` 内容
-- **编辑**：选中 Skill 后点击「编辑」
-- **删除**：选中 Skill 后点击「删除」，二次确认后不可恢复
-
----
-
-## 🛠️ Skill 规范
-
-每个 Skill 是一个目录，核心文件为 `SKILL.md`：
-
-```
-skills/{skill-name}/
-├── SKILL.md        ← 必须
-├── scripts/        ← 可选：可执行脚本（Python/Bash）
-├── references/     ← 可选：参考文档（按需加载进上下文）
-└── assets/         ← 可选：模板/素材（用于输出，不注入上下文）
+```text
+skills/my-skill/
+├── SKILL.md              # 必需：frontmatter + 执行指令
+├── scripts/              # 可选：Python / Bash 等可执行实现
+├── references/           # 可选：按需加载的参考资料
+├── assets/               # 可选：静态模板、样例和素材
+├── outputs/              # 运行产物（如该 Skill 产生文件）
+└── .creator/             # Creator 内部计划、工具池等状态
 ```
 
-**`SKILL.md` 最小结构**
+最小 `SKILL.md`：
 
 ```markdown
 ---
-name: my-skill-name          # 小写字母 + 数字 + 连字符，最多 64 字符
-description: 一句话说明做什么、何时触发。# 最多 1024 字符
+name: my-skill
+# 清楚说明做什么，以及在什么用户意图下触发
+description: Analyze a supplied report and return a structured summary.
 ---
 
 # My Skill
 
-具体指令内容…
+## 执行方式
+
+1. 检查输入。
+2. 按约定执行工作流。
+3. 返回结构化结果及产物链接。
 ```
 
-**命令行工具**（位于 `kernel/scripts/`）
+名称建议使用小写字母、数字和连字符。不要用 `helper`、`utils`、`tools` 等模糊文件名掩盖职责；一个脚本应有明确的输入、输出、失败边界和可验证责任。
+
+### 内核 CLI
 
 ```bash
-# 初始化新 Skill（含模板文件）
-python kernel/scripts/init_skill.py <skill-name> --path skills/
+# 初始化
+python kernel/scripts/init_skill.py my-skill --path skills/
 
-# 验证 Skill frontmatter 是否合规
-python kernel/scripts/quick_validate.py skills/<skill-name>
+# 快速检查 frontmatter 和目录规范
+python kernel/scripts/quick_validate.py skills/my-skill
 
-# 打包为可分发的 .skill 文件
-python kernel/scripts/package_skill.py skills/<skill-name> [output-dir]
+# 打包
+python kernel/scripts/package_skill.py skills/my-skill dist/
 ```
 
----
+## 配置说明
 
-## 🔌 API 参考
+常用环境变量如下；Compose 中的完整默认值以 `docker-compose.yml` 为准。
 
-后端运行后，完整交互文档见 **http://localhost:8000/docs**（Swagger UI）。
+| 变量 | Compose 默认值 | 用途 |
+| --- | --- | --- |
+| `LLM_BASE_URL` | `http://host.docker.internal:11434` | OpenAI 兼容文本模型服务 |
+| `DEFAULT_MODEL` | `qwen3:30b` | 未指定角色时的默认模型 |
+| `TEXT_MODEL` | `qwen3:30b` | 文本生成模型 |
+| `CODE_MODEL` | `qwen3-coder:30b` | Creator 文件/代码生成模型 |
+| `PLANNER_MODEL` | `qwen3:30b-instruct` | 规划角色模型 |
+| `VALIDATOR_MODEL` | `qwen3:8b` | 验证角色模型 |
+| `VISION_MODEL` | `qwen3-vl:32b` | 视觉理解模型 |
+| `EMBEDDING_MODEL` | `bge-m3:latest` | 检索向量模型 |
+| `IMAGE_BASE_URL` | `http://host.docker.internal:11435` | 图像模型服务 |
+| `IMAGE_MODEL` | `stable-diffusion-2-1-base` | 图像生成模型 |
+| `LLM_API_KEY` / `OPENAI_API_KEY` | 空 | 云端或需鉴权的兼容服务密钥 |
+| `MODEL_ROUTING_JSON` | 空 | 自定义模型路由 |
+| `SKILL_COMMAND_TIMEOUT` | `180` | Skill 命令超时（秒） |
+| `LLM_TIMEOUT_SECONDS` | `6000` | 模型请求超时（秒） |
+| `MAX_TOKENS` | `4096` | 默认最大生成 token |
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| `GET` | `/api/health` | 健康检查 + LLM 连接状态 |
-| `POST` | `/api/chat/creator` | Creator 模式流式对话（SSE） |
-| `POST` | `/api/chat/sandbox/{skill_name}` | Sandbox 模式流式对话（SSE） |
-| `GET` | `/api/skills` | 获取所有 Skill 列表 |
-| `POST` | `/api/skills` | 创建/覆盖一个 Skill |
-| `POST` | `/api/skills/import` | 导入 Skill ZIP，并记录安装治理信息 |
-| `GET` | `/api/skills/{skill_name}` | 获取单个 Skill 详情 |
-| `DELETE` | `/api/skills/{skill_name}` | 删除一个 Skill |
-| `POST` | `/api/skills/{skill_name}/status` | 提交审批 / 批准 / 驳回 / 隔离 / 启用 / 禁用 |
-| `POST` | `/api/skills/{skill_name}/upgrade` | 用 ZIP 升级一个 Skill |
-| `POST` | `/api/skills/{skill_name}/rollback` | 回滚到指定历史版本 |
-| `GET` | `/api/skills/{skill_name}/versions` | 查看当前版本与版本历史 |
-| `GET` | `/api/skills/{skill_name}/events` | 查看治理事件与审计记录 |
-| `GET/PUT` | `/api/skills/governance/allowlist` | 查看/更新 allowlist 配置 |
+## API 概览
 
-当前 Skill 运行治理支持：
+完整 schema 请以运行时 Swagger 为准。
 
-- `workspace / shared / managed / bundled` 多作用域解析
-- allowlist 控制可见性与可执行性
-- `draft / pending_review / approved / rejected / quarantined / disabled` 生命周期状态
-- ZIP 安装、升级、版本快照与回滚
-- 治理事件审计与前端最小治理视图
+### Creator
 
-**流式响应格式**（SSE）
+| 方法 | 路径 | 作用 |
+| --- | --- | --- |
+| `POST` | `/api/chat/creator` | Creator 分阶段对话（SSE） |
+| `POST` | `/api/creator/prepare-plan` | 生成结构化创建计划 |
+| `POST` | `/api/creator/prepare-plan/stream` | 以 NDJSON 推送计划事件 |
+| `POST` | `/api/creator/analyze-blueprint` | 解析并严格检查蓝图 |
+| `POST` | `/api/creator/upload-context-file` | 上传创建阶段上下文 |
+| `POST` | `/api/creator/init-from-blueprint` | 按蓝图初始化目录 |
+| `POST` | `/api/creator/generate-file` | 在职责和工具绑定下生成单文件 |
+| `POST` | `/api/creator/write-file` | 校验后写入单文件 |
+| `POST` | `/api/creator/validate-skill` | 严格 E2E 校验及可选自动修复 |
+| `POST` | `/api/creator/package-skill` | 校验并打包 Skill |
 
+### Creator 工具
+
+| 方法 | 路径 | 作用 |
+| --- | --- | --- |
+| `GET` | `/api/creator/tools` | 列出已发现工具 |
+| `POST` | `/api/creator/tools/draft` | 草拟工具 manifest |
+| `POST` | `/api/creator/tools/author/stream` | 流式创作工具 |
+| `POST` | `/api/creator/tools/validate` | 校验工具定义和实现 |
+| `POST` | `/api/creator/tools/register` | 注册到自定义清单 |
+| `PATCH` | `/api/creator/tools/{name}` | 更新工具 |
+| `POST` | `/api/creator/tools/{name}/test` | 测试工具 |
+| `POST` | `/api/creator/tools/{name}/enable` | 启用工具 |
+| `POST` | `/api/creator/tools/{name}/disable` | 停用工具 |
+| `GET/POST` | `/api/creator/tools/{name}/snippets` | 查询或新增调用片段 |
+| `POST` | `/api/creator/tools/{name}/snippets/{id}/test` | 测试调用片段 |
+
+### Skills、Sandbox 与 Publish
+
+| 方法 | 路径 | 作用 |
+| --- | --- | --- |
+| `GET/POST` | `/api/skills` | 列出或保存 Skill |
+| `POST` | `/api/skills/import` | ZIP 导入 |
+| `POST` | `/api/skills/{name}/upgrade` | ZIP 升级并创建版本记录 |
+| `POST` | `/api/skills/{name}/rollback` | 回滚历史版本 |
+| `POST` | `/api/skills/{name}/status` | 审批、隔离、启停等状态迁移 |
+| `POST` | `/api/chat/sandbox/{name}` | 执行 Sandbox 对话 |
+| `GET/POST` | `/api/publish/configs` | 查询或创建发布配置 |
+| `GET` | `/published/v1/models` | 查询已发布模型 |
+| `POST` | `/published/v1/chat/completions` | OpenAI 兼容调用入口 |
+
+## 开发与测试
+
+```bash
+# 后端内核脚本测试
+python -m unittest discover -s kernel/scripts -p 'test_*.py'
+
+# 前端单元测试
+cd frontend && npm test
+
+# 前端生产构建
+cd frontend && npm run build
 ```
-data: {"content": "token..."}
-data: {"content": "token..."}
-data: [DONE]
-```
 
-错误时返回：
+## License
 
-```
-data: {"error": "可读的错误信息"}
-```
-
----
-
-## 🤝 贡献
-
-欢迎提交 Issue 和 Pull Request。
-
-1. Fork 本仓库
-2. 创建功能分支：`git checkout -b feat/your-feature`
-3. 提交变更并推送
-4. 发起 Pull Request
-
----
-
-## 📄 许可证
-
-本项目内核（`kernel/`）遵循 [`kernel/LICENSE.txt`](kernel/LICENSE.txt) 中的许可条款。
+内核代码的许可条款见 [`kernel/LICENSE.txt`](kernel/LICENSE.txt)；同时请留意仓库中各子目录或第三方依赖附带的许可证文件。

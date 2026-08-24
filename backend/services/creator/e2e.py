@@ -987,6 +987,11 @@ def _canonical_e2e_shape(raw: Any) -> str:
     text = text.replace("array", "list").replace("path", "file_path")
     if not text:
         return "string"
+    list_match = re.fullmatch(r"list\s*\[\s*([^\]]+)\s*\]", text)
+    if list_match:
+        item_shape = _canonical_e2e_shape(list_match.group(1))
+        if item_shape in {"string", "number", "integer", "boolean", "object", "file_path"}:
+            return f"list[{item_shape}]"
     if "list" in text and ("file_path" in text or "file" in text):
         return "list[file_path]"
     if "list" in text and ("object" in text or "dict" in text):
@@ -1619,7 +1624,13 @@ def _validate_e2e_trial_case_spec(
             return None
         fixture_kind = str(fixture.get("kind") or "")
         scalar_shapes = {"string", "number", "integer", "boolean"}
+        json_value_shapes = {
+            "object", "list", "list[string]", "list[number]",
+            "list[integer]", "list[boolean]", "list[object]",
+        }
         if shape in scalar_shapes and fixture_kind != "scalar":
+            return None
+        if shape in json_value_shapes and fixture_kind != "json_value":
             return None
         if shape == "file_path" and fixture_kind == "scalar":
             return None
@@ -1629,6 +1640,10 @@ def _validate_e2e_trial_case_spec(
             scalar = fixture.get("value")
             expected = {"string": str, "number": (int, float), "integer": int, "boolean": bool}.get(shape)
             if expected is None or not isinstance(scalar, expected) or (shape in {"number", "integer"} and isinstance(scalar, bool)):
+                return None
+            continue
+        if fixture_kind == "json_value":
+            if not _e2e_json_value_matches_shape(fixture.get("value"), shape):
                 return None
             continue
         files = fixture.get("files") if fixture.get("kind") == "file_list" else [fixture]
@@ -1692,6 +1707,8 @@ def _materialize_e2e_trial_fixture(item: dict[str, Any], *, skill_dir: Path) -> 
     fixture = item["fixture"]
     if fixture.get("kind") == "scalar":
         return fixture["value"]
+    if fixture.get("kind") == "json_value":
+        return copy.deepcopy(fixture["value"])
     files = fixture["files"] if fixture.get("kind") == "file_list" else [fixture]
     paths: list[str] = []
     for index, file_spec in enumerate(files, 1):
@@ -1808,6 +1825,15 @@ def _e2e_trial_case_response_schema(facts: dict[str, Any]) -> dict[str, Any]:
                 "required": ["kind", "value"],
                 "properties": {"kind": {"const": "scalar"}, "value": {"type": shape}},
             }
+        elif shape in {"object", "list", "list[string]", "list[number]", "list[integer]", "list[boolean]", "list[object]"}:
+            fixture = {
+                "type": "object", "additionalProperties": False,
+                "required": ["kind", "value"],
+                "properties": {
+                    "kind": {"const": "json_value"},
+                    "value": _e2e_json_value_schema(shape),
+                },
+            }
         elif shape == "file_path":
             fixture = {"oneOf": [file_schema, {
                 "type": "object", "additionalProperties": False,
@@ -1838,6 +1864,55 @@ def _e2e_trial_case_response_schema(facts: dict[str, Any]) -> dict[str, Any]:
         "properties": {"status": {"const": "unsupported"}},
     }
     return {"oneOf": [trial_case, unsupported]}
+
+
+def _e2e_json_value_schema(shape: str) -> dict[str, Any]:
+    """Return the narrow JSON Schema used for non-file structured fixtures."""
+    canonical = _canonical_e2e_shape(shape)
+    if canonical == "object":
+        return {"type": "object", "minProperties": 1}
+    item_shape = _shape_item_shape(canonical)
+    item_schema: dict[str, Any] = {
+        "string": {"type": "string"},
+        "number": {"type": "number"},
+        "integer": {"type": "integer"},
+        "boolean": {"type": "boolean"},
+        "object": {"type": "object", "minProperties": 1},
+    }.get(item_shape, {})
+    return {"type": "array", "minItems": 1, "items": item_schema}
+
+
+def _e2e_json_value_matches_shape(value: Any, shape: str) -> bool:
+    """Deterministically validate a model-produced structured input value."""
+    canonical = _canonical_e2e_shape(shape)
+    if canonical == "object":
+        return isinstance(value, dict) and bool(value)
+    if not isinstance(value, list) or not value:
+        return False
+    item_shape = _shape_item_shape(canonical)
+    if not item_shape:
+        try:
+            json.dumps(value, allow_nan=False)
+        except (TypeError, ValueError):
+            return False
+        return True
+    expected: Any = {
+        "string": str,
+        "number": (int, float),
+        "integer": int,
+        "boolean": bool,
+        "object": dict,
+    }.get(item_shape)
+    if expected is None:
+        return False
+    for item in value:
+        if not isinstance(item, expected):
+            return False
+        if item_shape in {"number", "integer"} and isinstance(item, bool):
+            return False
+        if item_shape == "object" and not item:
+            return False
+    return True
 
 
 def _collect_placeholders_from_payload_template(template: dict[str, Any]) -> set[str]:
@@ -2594,7 +2669,11 @@ def _prepare_e2e_trial_case(
         shape = _canonical_e2e_shape(spec.shape)
         entry = skill_plan_entries.get(spec.target_file)
         defaults = getattr(entry, "default_values", {}) or {}
-        if shape not in {"string", "number", "integer", "boolean", "file_path", "list[file_path]"} or _json_value_non_empty(external.get(spec.name)) or spec.name in defaults:
+        if shape not in {
+            "string", "number", "integer", "boolean", "object", "list",
+            "list[string]", "list[number]", "list[integer]", "list[boolean]",
+            "list[object]", "file_path", "list[file_path]",
+        } or _json_value_non_empty(external.get(spec.name)) or spec.name in defaults:
             continue
         candidates.setdefault(spec.name, spec)
     if not candidates:

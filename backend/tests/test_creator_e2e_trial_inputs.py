@@ -160,6 +160,79 @@ def test_shape_requires_matching_fixture_kind_and_file_cardinality():
     assert validate("documents", "list[file_path]", one_file) is not None
 
 
+def test_structured_and_typed_list_fixtures_are_supported_without_files(tmp_path):
+    cases = [
+        ("options", "object", {"threshold": 0.75, "enabled": True}),
+        ("labels", "list[string]", ["alpha", "beta"]),
+        ("scores", "list[number]", [1, 2.5]),
+        ("records", "list[object]", [{"name": "alpha"}, {"name": "beta"}]),
+        ("items", "list", ["text", 2, {"enabled": True}]),
+    ]
+    for name, shape, value in cases:
+        item = {
+            "name": name,
+            "shape": shape,
+            "fixture": {"kind": "json_value", "value": value},
+            "evidence_requirement_ids": ["R1"],
+        }
+        case = {"version": 1, "inputs": [item]}
+        assert e2e._validate_e2e_trial_case_spec(
+            case,
+            input_specs={name: _spec(name, shape)},
+            requirement_ids_by_input={name: {"R1"}},
+        ) == case
+        assert e2e._materialize_e2e_trial_fixture(item, skill_dir=tmp_path) == value
+
+
+def test_structured_fixture_rejects_wrong_item_types_and_empty_values():
+    def validate(shape, value):
+        name = "value"
+        case = {"version": 1, "inputs": [{
+            "name": name,
+            "shape": shape,
+            "fixture": {"kind": "json_value", "value": value},
+            "evidence_requirement_ids": ["R1"],
+        }]}
+        return e2e._validate_e2e_trial_case_spec(
+            case,
+            input_specs={name: _spec(name, shape)},
+            requirement_ids_by_input={name: {"R1"}},
+        )
+
+    assert validate("object", {}) is None
+    assert validate("list[string]", [1]) is None
+    assert validate("list[number]", [True]) is None
+    assert validate("list[integer]", [1.5]) is None
+    assert validate("list[object]", [{}]) is None
+
+
+def test_prepare_trial_case_includes_non_file_structured_inputs(monkeypatch):
+    captured = {}
+    def build(facts, **kwargs):
+        captured["facts"] = facts
+        return {"status": "unsupported"}
+
+    monkeypatch.setattr(e2e, "_build_e2e_trial_case", build)
+    specs = [
+        _spec("options", "object"),
+        _spec("labels", "list[string]"),
+        _spec("count", "integer"),
+    ]
+    result = e2e._prepare_e2e_trial_case(
+        typed_specs=specs,
+        requirements_by_file={},
+        skill_plan_entries={"scripts/analyze.py": SimpleNamespace(default_values={})},
+        external_context={},
+        requested_model=None,
+        session=None,
+    )
+    assert result is None
+    assert {
+        item["platform_input"]["shape"]
+        for item in captured["facts"]["external_inputs"]
+    } == {"object", "list[string]", "integer"}
+
+
 def test_trial_case_is_built_once_and_fixture_is_stable(tmp_path, monkeypatch):
     skill_dir = tmp_path / "demo"
     skill_dir.mkdir()

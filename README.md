@@ -114,7 +114,8 @@ flowchart TD
     F7 -->|是| F2
 
     F7 -->|否| G[Phase 4 · Validation]
-    G --> G1[静态规范 + 严格 E2E]
+    G --> G0[基于冻结事实生成最小 E2E 输入样例]
+    G0 --> G1[静态规范 + 严格 E2E]
     G1 --> G2{验证通过?}
     G2 -->|否| G3[定位失败层和责任文件]
     G3 --> G4[生成局部补丁]
@@ -133,6 +134,40 @@ flowchart TD
 3. **Implementation（实现）**：创建目录，按计划逐文件生成和写入。脚本生成前先取得该文件的工具绑定，代码不能把整个运行时工具命名空间当作自由可用。
 4. **Validation（验证与迭代）**：进行格式、资源、命令、导入、数据流和 E2E 校验；自动修复以局部实验推进，失败或无改善的补丁会被拒绝或回滚。
 5. **Packaging（打包）**：再次检查引用资源和端到端可用性，随后生成分发包。
+
+### E2E 如何由模型创建输入 sample
+
+严格 E2E 在执行 Skill 前会准备一个 **Trial Case**。这不是固定塞入一段通用文本：系统先从已冻结的蓝图、Requirement Graph、脚本接口和平台输入边中收集缺失的类型化外部输入，再让 Validator 模型只生成满足这些事实的最小 happy-path sample。
+
+```mermaid
+flowchart TD
+    A[冻结的 Blueprint / Requirement Graph] --> B[收集脚本所需的类型化外部输入]
+    B --> C{调用方已提供值\n或蓝图已有 default?}
+    C -->|是| D[保留真实输入或 default]
+    C -->|否| E[构造受 JSON Schema 约束的 Trial Case 请求]
+    E --> F[Validator 模型生成最小 happy-path fixture]
+    F --> G{确定性校验通过?}
+    G -->|否 / unsupported| H[回退到平台确定性 sample 生成器]
+    G -->|是| I[冻结 Trial Case 与 digest]
+    I --> J[物化 scalar 或临时样例文件]
+    H --> J
+    D --> K[合并 E2E payload]
+    J --> K
+    K --> L[按 SKILL.md 命令顺序真实执行]
+    L --> M[检查参数映射、stdout、数据流和 artifacts]
+```
+
+模型生成 sample 时受到以下边界约束：
+
+- **只补缺失输入**：调用方已经传入的 `external_context`、蓝图 `default_values` 或显式 sample 会被优先保留，不会被模型覆盖。
+- **不能重新规划 Skill**：模型只接收冻结后的输入名称、shape、目标脚本和对应 requirement ID；系统提示明确禁止修改需求、接口、工具、脚本或蓝图。
+- **严格绑定 schema**：标量仅允许 `string`、`number`、`integer`、`boolean`；文件输入可生成 `txt`、`md`、`pdf`、`docx`、`json`、`csv`，文件列表最多 3 个。
+- **内容也会被校验**：例如 CSV 必须声明列名、类型和 nullable，并提供类型匹配的行；JSON 必须可序列化；文本类文件必须包含非空内容。模型结果未通过确定性校验或返回 `unsupported` 时，系统改用类型驱动的 fallback sample。
+- **样例会物化后再真实执行**：文件 fixture 写入 E2E 隔离工作区的 `.creator_e2e/samples/`，随后被填入命令 payload；PDF、DOCX、CSV、JSON 等不是伪路径，而是实际创建的最小文件。
+- **同一修复会话保持输入稳定**：通过校验的 Trial Case 会冻结并记录 digest，后续 E2E 修复轮次复用同一份 sample，避免输入漂移干扰补丁效果判断。
+- **不污染 Skill 资产**：这些 sample 是 `synthetic_fixture`，只用于隔离 E2E 试运行，不属于 `assets/**`，也不代表用户真实数据。
+
+对于没有可推导业务字段的顶层文本 envelope，平台仍会提供一段通用中英混合测试文本，用来验证参数传递、脚本消费和输出闭环；它不会凭空补出 `theme`、`topic` 等业务字段。
 
 ### Creator 中的三类文件
 

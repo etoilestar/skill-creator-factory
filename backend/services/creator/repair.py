@@ -260,6 +260,57 @@ def _literal_patch_marker(
 ) -> str:
     return f"<<<{kind}:{boundary}>>>"
 
+_LITERAL_PATCH_MARKER_KINDS = (
+    "CREATOR_PATCH",
+    "EDIT",
+    "OLD",
+    "NEW",
+    "END_EDIT",
+    "END_PATCH",
+)
+
+
+def _normalize_literal_patch_transport(
+    text: str,
+    *,
+    boundary: str,
+) -> str:
+    """Normalize harmless formatting drift in Creator patch markers.
+
+    Only protocol marker lines using the exact current boundary are normalized.
+    OLD/NEW payload content is never modified.
+    """
+    source = str(text or "")
+
+    if not boundary:
+        return source
+
+    for kind in _LITERAL_PATCH_MARKER_KINDS:
+        canonical = _literal_patch_marker(
+            boundary,
+            kind,
+        )
+
+        # Accept only small formatting drift around a marker that already
+        # contains the exact generated boundary. Examples:
+        #
+        #   `<<NEW:BOUNDARY>>>
+        #   <<NEW:BOUNDARY>>>
+        #   <<<NEW:BOUNDARY>>
+        #
+        # Do not repair arbitrary text or an incorrect boundary.
+        pattern = re.compile(
+            rf"(?m)^[ \t]*`?[ \t]*"
+            rf"<{{2,3}}{re.escape(kind)}:{re.escape(boundary)}>{{2,3}}"
+            rf"`?[ \t]*$"
+        )
+
+        source = pattern.sub(
+            canonical,
+            source,
+        )
+
+    return source
 
 def _literal_patch_protocol_example(
     *,
@@ -782,6 +833,13 @@ def _extract_json_or_diff_proposal(
         raw_text
     )
 
+    literal_text = stripped
+
+    if literal_boundary:
+        literal_text = _normalize_literal_patch_transport(
+            literal_text,
+            boundary=literal_boundary,
+        )
     parser_errors: list[str] = []
 
     parsed: dict[
@@ -800,7 +858,7 @@ def _extract_json_or_diff_proposal(
         try:
             literal_proposal = (
                 _extract_literal_exact_replace_proposal(
-                    raw_text,
+                    literal_text,
                     expected_target_file=(
                         expected_target_file
                     ),

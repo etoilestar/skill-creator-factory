@@ -2377,24 +2377,47 @@ async def _review_skill_md_blueprint_intent_with_model(
         *authoritative_by_prefix.values()
     )
 
-    # A blocking issue is another reviewer output channel into repair. Apply
-    # the same manifest containment as required_*_paths so an invented path
-    # cannot bypass authority merely by appearing in issue prose/repair_ops.
+    # A blocking issue is another reviewer output channel into repair.
+    # Final FilePlan/resource authority is the only authority for references/assets.
+    # Blueprint/reviewer prose cannot introduce resources that were not actually
+    # produced/uploaded into the authoritative FilePlan.
+    current_skill_paths = _skill_local_paths_in_markdown(content)
+
     contained_issues: list[Any] = []
     issue_overreach: list[dict[str, Any]] = []
+
     for issue in data["issues"]:
         if not isinstance(issue, dict):
             contained_issues.append(issue)
             continue
+
         mentioned_paths = set(
             _extract_declared_skill_paths(
                 json.dumps(issue, ensure_ascii=False, default=str)
             )
         )
-        unauthorized_paths = sorted(mentioned_paths - authoritative_paths)
-        if unauthorized_paths and not _skill_md_issue_is_authorized_resource_removal(issue):
-            issue_overreach.append({"paths": unauthorized_paths, "issue": issue})
+
+        unauthorized_paths = sorted(
+            mentioned_paths - authoritative_paths
+        )
+
+        authorized_resource_removal = (
+                bool(unauthorized_paths)
+                and _skill_md_issue_is_authorized_resource_removal(issue)
+                and all(
+            path in current_skill_paths
+            and path.startswith(("references/", "assets/"))
+            for path in unauthorized_paths
+        )
+        )
+
+        if unauthorized_paths and not authorized_resource_removal:
+            issue_overreach.append({
+                "paths": unauthorized_paths,
+                "issue": issue,
+            })
             continue
+
         contained_issues.append(issue)
     if issue_overreach:
         logger.warning(

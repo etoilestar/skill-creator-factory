@@ -1098,14 +1098,38 @@ def _collect_e2e_typed_inputs_from_graph(
         for req in reqs or []:
             for raw in getattr(req, "inputs", []) or []:
                 name, shape = _parse_typed_name(raw)
-                if name:
-                    _put_typed_spec(specs, E2ETypedInputSpec(name=name, shape=shape or "string", item_shape=_shape_item_shape(shape), required=True, source="requirement_graph", target_file=target_file, confidence="high"))
+
+                if name and shape:
+                    _put_typed_spec(
+                        specs,
+                        E2ETypedInputSpec(
+                            name=name,
+                            shape=shape,
+                            item_shape=_shape_item_shape(shape),
+                            required=True,
+                            source="requirement_graph",
+                            target_file=target_file,
+                            confidence="high",
+                        ),
+                    )
 
     for target_file, entry in (skill_plan_entries or {}).items():
         for raw in (getattr(entry, "inputs", []) or []) + (getattr(entry, "outputs", []) or []):
             name, shape = _parse_typed_name(raw)
-            if name:
-                _put_typed_spec(specs, E2ETypedInputSpec(name=name, shape=shape or "string", item_shape=_shape_item_shape(shape), required=True, source="skill_plan_entry", target_file=target_file, confidence="medium"))
+
+            if name and shape:
+                _put_typed_spec(
+                    specs,
+                    E2ETypedInputSpec(
+                        name=name,
+                        shape=shape,
+                        item_shape=_shape_item_shape(shape),
+                        required=True,
+                        source="skill_plan_entry",
+                        target_file=target_file,
+                        confidence="medium",
+                    ),
+                )
         artifact_contract = getattr(entry, "artifact_contract", None)
         if isinstance(artifact_contract, dict):
             for name, raw_shape in artifact_contract.items():

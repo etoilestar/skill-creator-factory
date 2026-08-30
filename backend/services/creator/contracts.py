@@ -957,12 +957,11 @@ def _build_skill_md_contract_text(blueprint_text: str) -> str:
     ])
 
 def _build_skill_md_e2e_authoring_guide(blueprint_text: str) -> str:
-    """Build first-round static authoring guidance for SKILL.md.
+    """Build first-round authoring guidance for SKILL.md.
 
-    Despite the historical function name, this guide intentionally does not
-    impose internal workflow dataflow.  First-round SKILL.md generation owns
-    static Markdown/platform boundaries only; second-round E2E owns placeholder
-    provenance, stdout field closure, and downstream parser alignment.
+    Bindings already frozen by upstream planning must be preserved during
+    SKILL.md generation. E2E validates real runtime behavior and resolves only
+    facts that were not deterministically known during generation.
     """
     script_paths = _paths_requiring_skill_md_mentions(blueprint_text, prefix="scripts/")
     reference_paths = _paths_requiring_skill_md_mentions(blueprint_text, prefix="references/")
@@ -975,7 +974,7 @@ def _build_skill_md_e2e_authoring_guide(blueprint_text: str) -> str:
         )
 
     lines: list[str] = [
-        "SKILL.md first-round static authoring guide（只约束静态格式和平台边界，不验证内部 dataflow）:",
+        "SKILL.md first-round authoring guide（已冻结的数据流必须在第一轮准确表达；E2E 只验证真实运行和未确定事实）:",
         "A. 命令块静态形态:",
         "- 对蓝图真实规划的 scripts/ 文件，使用标准 Markdown 独立 ```bash fenced code block。",
         "- 每个 fence 内只放一条命令；命令必须直接调用 scripts/ 路径。",
@@ -1041,9 +1040,9 @@ def _build_skill_md_e2e_authoring_guide(blueprint_text: str) -> str:
     lines.extend([
         "",
         "E. 第二轮 E2E 责任边界:",
-        "- placeholder 来源、前后脚本 stdout 字段闭环、最终 stdout 平台输出字段，不在第一轮 SKILL.md prompt 中证明。",
-        "- 第二轮 E2E 会按真实运行链路严格检查已选择字段名是否对齐：输入字段、脚本读取字段、上游 stdout 字段、下游 placeholder 不能错位。",
-        "- 如果这些内容不一致，第二轮 E2E 真实执行会基于实际 stdout/文件产物反馈修复 SKILL.md 或脚本。",
+        "- 上游规划已经确认的 source binding 属于冻结事实，第一轮 SKILL.md 必须保持其 source identity 和 binding granularity，不得重新选择来源。",
+        "- 未存在 confirmed/frozen binding 的 argv key，不得因为字段名、JSON 类型或业务语义而自行推断新的平台输入来源。",
+        "- E2E 负责验证真实运行中的 placeholder 解析、stdout、artifact 和跨步骤闭环，并处理生成阶段无法确定的运行事实。",
     ])
 
     return "\n".join(lines)
@@ -2867,27 +2866,68 @@ def _reconcile_block_review_with_runtime_contract(
         key_text = str(key)
         expected_type = str(expected_types.get(key_text) or "")
         source = _whole_value_placeholder_source(value)
+        expected_source = exact_bindings.get(key_text)
+
         if key_text in local_defaults and value != local_defaults[key_text]:
             _append_check(
-                value_checks, obj=key_text, passed=False,
+                value_checks,
+                obj=key_text,
+                passed=False,
                 evidence="command value does not equal the frozen local default",
-                message="command_provenance_mismatch", category="command_provenance_mismatch",
+                message="command_provenance_mismatch",
+                category="command_provenance_mismatch",
             )
             continue
+
+        # Upstream planning has already frozen the source binding.
+        # SKILL.md may not replace, split, rebuild, or otherwise reinterpret it.
+        if expected_source and not source:
+            value_checks = [
+                check
+                for check in value_checks
+                if not _review_item_matches_key(check, key_text)
+            ]
+
+            _append_check(
+                value_checks,
+                obj=key_text,
+                passed=False,
+                evidence=(
+                    f"argv key has frozen provenance {expected_source!r}, "
+                    "but the command does not preserve that binding as one "
+                    "direct placeholder expression"
+                ),
+                message="command_binding_identity_mismatch",
+                category="command_binding_identity_mismatch",
+            )
+            continue
+
+        if expected_source and str(source).strip() != str(expected_source).strip():
+            value_checks = [
+                check
+                for check in value_checks
+                if not _review_item_matches_key(check, key_text)
+            ]
+
+            _append_check(
+                value_checks,
+                obj=key_text,
+                passed=False,
+                evidence=(
+                    f"placeholder source {source!r} differs from "
+                    f"frozen provenance {expected_source!r}"
+                ),
+                message="command_provenance_mismatch",
+                category="command_provenance_mismatch",
+            )
+            continue
+
         if source:
             root = _placeholder_root(source)
             value_checks = [check for check in value_checks if not _review_item_matches_key(check, key_text)]
             type_checks = [check for check in type_checks if not _review_item_matches_key(check, key_text)]
             if root not in available_roots:
                 _append_check(value_checks, obj=key_text, passed=False, evidence="whole-value placeholder root is not in available_source_fields", message="placeholder source is not available", category="unknown_source")
-                continue
-            expected_source = exact_bindings.get(key_text)
-            if expected_source and str(source).strip() != expected_source:
-                _append_check(
-                    value_checks, obj=key_text, passed=False,
-                    evidence=f"placeholder source {source!r} differs from frozen provenance {expected_source!r}",
-                    message="command_provenance_mismatch", category="command_provenance_mismatch",
-                )
                 continue
             _append_check(value_checks, obj=key_text, passed=True, evidence="whole-value placeholder source root exists in available_source_fields", category="source_available")
             compatibility = _json_type_compatible(source_types.get(root, ""), expected_type)

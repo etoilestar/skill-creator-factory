@@ -5,6 +5,7 @@ import csv
 import copy
 import uuid
 from collections import Counter
+from dataclasses import replace
 
 from .common import *  # noqa: F403
 from .contracts import *  # noqa: F403
@@ -285,13 +286,19 @@ class E2EFailure:
 @dataclass(frozen=True)
 class E2ETypedInputSpec:
     name: str
-    shape: str = "string"
+    shape: str = ""
     item_shape: str = ""
     required: bool = True
     source: str = "placeholder"
     target_file: str = ""
     confidence: str = "low"
     properties: dict[str, str] = field(default_factory=dict)
+    provenance_source: str = ""
+    shape_source: str = ""
+    argv_schema_shape: str = ""
+    platform_io_shape: str = ""
+    graph_declared_shape: str = ""
+    skill_plan_declared_shape: str = ""
 
 
 def _format_e2e_failure(failure: E2EFailure) -> str:
@@ -986,7 +993,7 @@ def _canonical_e2e_shape(raw: Any) -> str:
     text = str(raw or "").strip().lower()
     text = text.replace("array", "list").replace("path", "file_path")
     if not text:
-        return "string"
+        return ""
     list_match = re.fullmatch(r"list\s*\[\s*([^\]]+)\s*\]", text)
     if list_match:
         item_shape = _canonical_e2e_shape(list_match.group(1))
@@ -1035,12 +1042,58 @@ def _parse_typed_name(raw: Any) -> tuple[str, str]:
 
 
 def _put_typed_spec(specs: dict[str, E2ETypedInputSpec], spec: E2ETypedInputSpec) -> None:
+    """Merge identity/provenance independently from runtime type evidence."""
     if not spec.name:
         return
-    priority = {"requirement_graph": 5, "skill_plan_entry": 4, "argv_schema": 3, "placeholder": 2, "external_context": 1}
+    provenance_priority = {
+        "requirement_graph": 5, "skill_plan_entry": 4,
+        "platform_io_contract": 3, "argv_schema": 2, "placeholder": 1,
+    }
+    shape_priority = {
+        "platform_io_contract": 5, "argv_schema": 4,
+        "requirement_graph": 3, "skill_plan_entry": 2, "placeholder": 1,
+    }
     old = specs.get(spec.name)
-    if old is None or priority.get(spec.source, 0) > priority.get(old.source, 0):
-        specs[spec.name] = spec
+    if old is None:
+        specs[spec.name] = replace(
+            spec,
+            provenance_source=spec.provenance_source or spec.source,
+            shape_source=(spec.shape_source or spec.source) if spec.shape else "",
+            argv_schema_shape=spec.shape if spec.source == "argv_schema" else spec.argv_schema_shape,
+            platform_io_shape=spec.shape if spec.source == "platform_io_contract" else spec.platform_io_shape,
+            graph_declared_shape=spec.shape if spec.source == "requirement_graph" else spec.graph_declared_shape,
+            skill_plan_declared_shape=spec.shape if spec.source == "skill_plan_entry" else spec.skill_plan_declared_shape,
+        )
+        return
+
+    old_provenance = old.provenance_source or old.source
+    new_provenance = spec.provenance_source or spec.source
+    provenance_source = (
+        new_provenance
+        if provenance_priority.get(new_provenance, 0) > provenance_priority.get(old_provenance, 0)
+        else old_provenance
+    )
+    old_shape_source = old.shape_source or (old.source if old.shape else "")
+    new_shape_source = spec.shape_source or (spec.source if spec.shape else "")
+    use_new_shape = bool(spec.shape) and (
+        not old.shape
+        or shape_priority.get(new_shape_source, 0) > shape_priority.get(old_shape_source, 0)
+    )
+    specs[spec.name] = replace(
+        old,
+        shape=spec.shape if use_new_shape else old.shape,
+        item_shape=spec.item_shape if use_new_shape else old.item_shape,
+        source=new_shape_source if use_new_shape else old.source,
+        shape_source=new_shape_source if use_new_shape else old_shape_source,
+        provenance_source=provenance_source,
+        target_file=old.target_file or spec.target_file,
+        confidence=spec.confidence if use_new_shape else old.confidence,
+        properties=old.properties or spec.properties,
+        argv_schema_shape=(spec.shape if spec.source == "argv_schema" else "") or old.argv_schema_shape or spec.argv_schema_shape,
+        platform_io_shape=(spec.shape if spec.source == "platform_io_contract" else "") or old.platform_io_shape or spec.platform_io_shape,
+        graph_declared_shape=(spec.shape if spec.source == "requirement_graph" else "") or old.graph_declared_shape or spec.graph_declared_shape,
+        skill_plan_declared_shape=(spec.shape if spec.source == "skill_plan_entry" else "") or old.skill_plan_declared_shape or spec.skill_plan_declared_shape,
+    )
 
 def _platform_runtime_file_input_names() -> set[str]:
     """Return platform input roots whose values are runtime file collections.
@@ -1099,7 +1152,7 @@ def _collect_e2e_typed_inputs_from_graph(
             for raw in getattr(req, "inputs", []) or []:
                 name, shape = _parse_typed_name(raw)
 
-                if name and shape:
+                if name:
                     _put_typed_spec(
                         specs,
                         E2ETypedInputSpec(
@@ -1117,7 +1170,7 @@ def _collect_e2e_typed_inputs_from_graph(
         for raw in (getattr(entry, "inputs", []) or []) + (getattr(entry, "outputs", []) or []):
             name, shape = _parse_typed_name(raw)
 
-            if name and shape:
+            if name:
                 _put_typed_spec(
                     specs,
                     E2ETypedInputSpec(
@@ -1213,16 +1266,34 @@ def _collect_e2e_typed_inputs_from_graph(
 
     for name in runtime_file_names & used_roots:
         existing = specs.get(name)
+        _put_typed_spec(
+            specs,
+            E2ETypedInputSpec(
+                name=name,
+                shape="list[file_path]",
+                item_shape="file_path",
+                required=existing.required if existing else True,
+                source="platform_io_contract",
+                target_file=existing.target_file if existing else "",
+                confidence="high",
+                properties=existing.properties if existing else {},
+            ),
+        )
 
-        specs[name] = E2ETypedInputSpec(
-            name=name,
-            shape="list[file_path]",
-            item_shape="file_path",
-            required=existing.required if existing else True,
-            source="platform_io_contract",
-            target_file=existing.target_file if existing else "",
-            confidence="high",
-            properties=existing.properties if existing else {},
+    for spec in specs.values():
+        logger.info(
+            "[Creator][E2E][typed_input_resolution] %s",
+            json.dumps({
+                "name": spec.name,
+                "resolved_shape": spec.shape or "unknown",
+                "shape_source": spec.shape_source or "unknown",
+                "provenance_source": spec.provenance_source or "unknown",
+                "target_file": spec.target_file,
+                "argv_schema_shape": spec.argv_schema_shape,
+                "platform_io_shape": spec.platform_io_shape,
+                "graph_declared_shape": spec.graph_declared_shape,
+                "skill_plan_declared_shape": spec.skill_plan_declared_shape,
+            }, ensure_ascii=False, sort_keys=True),
         )
 
     return list(specs.values())
@@ -2730,7 +2801,10 @@ def _prepare_e2e_trial_case(
          }]}
         for spec in candidates.values()
     ]}
-    logger.info("[Creator][E2E][trial_case_build_start] input_names=%s", sorted(candidates))
+    logger.info(
+        "[Creator][E2E][trial_case_build_start] typed_input_specs=%s",
+        json.dumps({name: spec.shape for name, spec in sorted(candidates.items())}, sort_keys=True),
+    )
     accepted = None
     fallback_reason = "schema_invalid"
     try:
@@ -2745,6 +2819,7 @@ def _prepare_e2e_trial_case(
             requirement_ids_by_input=requirement_ids_by_input,
         )
         if accepted is None:
+            fallback_reason = "trial_fixture_invalid"
             raise ValueError("deterministic trial case validation rejected the response")
     except Exception as exc:
         if isinstance(exc, (json.JSONDecodeError,)) or "invalid JSON" in str(exc):
@@ -2754,7 +2829,17 @@ def _prepare_e2e_trial_case(
     if session is not None:
         session.trial_case, session.trial_case_digest, session.trial_case_prepared = accepted, digest, True
     if accepted is not None:
-        logger.info("[Creator][E2E][trial_case_frozen] digest=%s input_names=%s fixture_kinds=%s", digest, sorted(candidates), [item["fixture"].get("kind", item["fixture"].get("content_kind")) for item in accepted["inputs"]])
+        logger.info(
+            "[Creator][E2E][trial_case_frozen] digest=%s fixtures=%s",
+            digest,
+            json.dumps({
+                item["name"]: {
+                    "shape": item["shape"],
+                    "fixture_kind": item["fixture"].get("kind", item["fixture"].get("content_kind")),
+                }
+                for item in accepted["inputs"]
+            }, sort_keys=True),
+        )
     return accepted
 
 

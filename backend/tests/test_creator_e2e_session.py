@@ -843,6 +843,76 @@ def test_e2e_infers_unindexed_placeholder_root_shape_from_list_argv(tmp_path):
     assert "documents" not in payload
 
 
+@pytest.mark.parametrize(("runtime_type", "expected_shape"), [("list", "list"), ("dict", "object")])
+def test_untyped_requirement_identity_does_not_override_strict_argv_type(
+    tmp_path, runtime_type, expected_shape,
+):
+    skill_dir = tmp_path / runtime_type
+    (skill_dir / "scripts").mkdir(parents=True)
+    (skill_dir / "scripts" / "consume.py").write_text(
+        "from backend.services.runtime_tools import strict_json_argv_guard\n"
+        "def parse(payload):\n"
+        f"    return strict_json_argv_guard(payload, {{'foo': {{'type': {runtime_type}, 'required': True}}}})\n",
+        encoding="utf-8",
+    )
+    command = E2EWorkflowCommand(
+        1, "SKILL.md", "scripts/consume.py", "python scripts/consume.py '{}'", "python",
+        {"foo": "{{foo}}"},
+    )
+    requirements = {
+        "scripts/consume.py": [e2e.RequirementItem(target_file="scripts/consume.py", inputs=["foo"])]
+    }
+
+    specs = e2e._collect_e2e_typed_inputs_from_graph(
+        commands=[command], requirements_by_file=requirements,
+        skill_plan_entries=None, skill_dir=skill_dir,
+    )
+    spec = {item.name: item for item in specs}["foo"]
+
+    assert spec.shape == expected_shape
+    assert spec.shape_source == "argv_schema"
+    assert spec.provenance_source == "requirement_graph"
+
+
+def test_platform_file_collection_authority_survives_indexed_placeholders(tmp_path):
+    command = E2EWorkflowCommand(
+        1, "SKILL.md", "scripts/consume.py", "python scripts/consume.py '{}'", "python",
+        {"left": "{{input_files[0]}}", "right": "{{input_files[1]}}"},
+    )
+
+    specs = e2e._collect_e2e_typed_inputs_from_graph(
+        commands=[command], requirements_by_file={}, skill_plan_entries=None, skill_dir=tmp_path,
+    )
+    spec = {item.name: item for item in specs}["input_files"]
+
+    assert spec.shape == "list[file_path]"
+    assert spec.item_shape == "file_path"
+    assert spec.shape_source == "platform_io_contract"
+
+
+def test_strict_string_argv_remains_string_runtime_shape(tmp_path):
+    skill_dir = tmp_path / "strict-string"
+    (skill_dir / "scripts").mkdir(parents=True)
+    (skill_dir / "scripts" / "consume.py").write_text(
+        "from backend.services.runtime_tools import strict_json_argv_guard\n"
+        "def parse(payload):\n"
+        "    return strict_json_argv_guard(payload, {'foo': {'type': str, 'required': True}})\n",
+        encoding="utf-8",
+    )
+    command = E2EWorkflowCommand(
+        1, "SKILL.md", "scripts/consume.py", "python scripts/consume.py '{}'", "python",
+        {"foo": "{{foo}}"},
+    )
+
+    specs = e2e._collect_e2e_typed_inputs_from_graph(
+        commands=[command], requirements_by_file={}, skill_plan_entries=None, skill_dir=skill_dir,
+    )
+    spec = {item.name: item for item in specs}["foo"]
+
+    assert spec.shape == "string"
+    assert spec.shape_source == "argv_schema"
+
+
 def test_e2e_input_files_files_alias_sync_preserves_non_empty_external_context(tmp_path):
     skill_dir = tmp_path / "alias-sync"
     skill_dir.mkdir()

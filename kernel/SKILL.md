@@ -96,7 +96,7 @@ the protocol permits omission.
 
 - 多脚本之间不得重复拥有同一个核心业务责任。上游已经负责产生某项业务结果时，下游应消费该结果完成自己的职责，不应再次实现上游核心动作。
 
-- 上游 outputs 与下游 inputs 应在语义上可追踪，但字段名不要求逐字一致；真实运行映射由第二轮 E2E 验证和修复。
+- 上游 outputs 与下游 inputs 应在语义上可追踪；Interface Plan / ResponsibilityGraph 已确定的运行映射属于冻结事实，下游生成必须保持。第二轮 E2E 负责验证这些映射在真实 runtime 中是否成立，并只修复尚未确定或真实执行暴露的问题，不重新规划已冻结的数据流。
 
 - 当前 script 内部产生且只在当前 script 内部消费的中间值，不得提升为该 script 的 required external input。
 

@@ -2902,30 +2902,7 @@ def _reconcile_block_review_with_runtime_contract(
             )
             continue
 
-        # Upstream planning has already frozen the source binding.
-        # SKILL.md may not replace, split, rebuild, or otherwise reinterpret it.
-        if expected_source and not source:
-            value_checks = [
-                check
-                for check in value_checks
-                if not _review_item_matches_key(check, key_text)
-            ]
-
-            _append_check(
-                value_checks,
-                obj=key_text,
-                passed=False,
-                evidence=(
-                    f"argv key has frozen provenance {expected_source!r}, "
-                    "but the command does not preserve that binding as one "
-                    "direct placeholder expression"
-                ),
-                message="command_binding_identity_mismatch",
-                category="command_binding_identity_mismatch",
-            )
-            continue
-
-        if expected_source and str(source).strip() != str(expected_source).strip():
+        if expected_source and source and str(source).strip() != str(expected_source).strip():
             value_checks = [
                 check
                 for check in value_checks

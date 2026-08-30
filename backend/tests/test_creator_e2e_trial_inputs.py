@@ -326,6 +326,55 @@ def test_trial_builder_prompt_contains_only_supplied_frozen_facts(monkeypatch):
         assert required_contract in schema
 
 
+def test_trial_schema_binds_file_collection_and_object_fixture_kinds():
+    facts = {"external_inputs": [
+        {
+            "platform_input": {"name": "input_files", "shape": "list[file_path]"},
+            "target": {"script": "scripts/analyze.py", "input": "input_files"},
+            "requirements": [],
+        },
+        {
+            "platform_input": {"name": "fields", "shape": "object"},
+            "target": {"script": "scripts/analyze.py", "input": "fields"},
+            "requirements": [],
+        },
+    ]}
+
+    schema = e2e._e2e_trial_case_response_schema(facts)
+    variants = schema["oneOf"][0]["properties"]["inputs"]["items"]["oneOf"]
+    by_name = {
+        variant["properties"]["name"]["const"]: variant
+        for variant in variants
+    }
+
+    input_files = by_name["input_files"]
+    assert input_files["properties"]["shape"]["const"] == "list[file_path]"
+    assert input_files["properties"]["fixture"]["properties"]["kind"]["const"] == "file_list"
+    fields = by_name["fields"]
+    assert fields["properties"]["shape"]["const"] == "object"
+    assert fields["properties"]["fixture"]["properties"]["kind"]["const"] == "json_value"
+
+
+def test_csv_file_list_materializes_each_file_with_csv_suffix(tmp_path):
+    csv_file = {
+        "format": "csv",
+        "content_kind": "tabular",
+        "columns": [{"name": "value", "type": "string", "nullable": False}],
+        "rows": [{"value": "one"}],
+    }
+    item = {
+        "name": "input_files",
+        "shape": "list[file_path]",
+        "fixture": {"kind": "file_list", "files": [csv_file, csv_file]},
+        "evidence_requirement_ids": [],
+    }
+
+    paths = [Path(value) for value in e2e._materialize_e2e_trial_fixture(item, skill_dir=tmp_path)]
+
+    assert [path.name for path in paths] == ["input_files_1.csv", "input_files_2.csv"]
+    assert all(path.is_file() and path.suffix == ".csv" for path in paths)
+
+
 def test_structured_builder_contract_freezes_and_materializes_csv(tmp_path, monkeypatch):
     skill_dir = tmp_path / "demo"
     skill_dir.mkdir()

@@ -890,6 +890,29 @@ def test_platform_file_collection_authority_survives_indexed_placeholders(tmp_pa
     assert spec.shape_source == "platform_io_contract"
 
 
+def test_strict_string_argv_remains_string_runtime_shape(tmp_path):
+    skill_dir = tmp_path / "strict-string"
+    (skill_dir / "scripts").mkdir(parents=True)
+    (skill_dir / "scripts" / "consume.py").write_text(
+        "from backend.services.runtime_tools import strict_json_argv_guard\n"
+        "def parse(payload):\n"
+        "    return strict_json_argv_guard(payload, {'foo': {'type': str, 'required': True}})\n",
+        encoding="utf-8",
+    )
+    command = E2EWorkflowCommand(
+        1, "SKILL.md", "scripts/consume.py", "python scripts/consume.py '{}'", "python",
+        {"foo": "{{foo}}"},
+    )
+
+    specs = e2e._collect_e2e_typed_inputs_from_graph(
+        commands=[command], requirements_by_file={}, skill_plan_entries=None, skill_dir=skill_dir,
+    )
+    spec = {item.name: item for item in specs}["foo"]
+
+    assert spec.shape == "string"
+    assert spec.shape_source == "argv_schema"
+
+
 def test_e2e_input_files_files_alias_sync_preserves_non_empty_external_context(tmp_path):
     skill_dir = tmp_path / "alias-sync"
     skill_dir.mkdir()

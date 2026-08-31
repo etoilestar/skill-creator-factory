@@ -6479,6 +6479,323 @@ async def _diagnose_e2e_failure_for_repair(*, skill_name: str, skill_dir: Path, 
         messages.append({"role": "user", "content": "Your proposal was invalid. Return a different valid repair target JSON proposal."})
     return {"status": "diagnosis_exhausted", "symptom_file": symptom}
 
+async def _review_failed_e2e_after_local_repairs(
+    *,
+    skill_name: str,
+    target_path: str,
+    current_content: str,
+    skill_md: str,
+    e2e_errors: list[str],
+    diagnosis: dict[str, Any],
+    minimal_repair_context: dict[str, Any],
+    e2e_entry_context: dict[str, Any],
+    e2e_session: CreatorE2ESession,
+    requested_model: str | None = None,
+) -> dict[str, Any]:
+    """
+    E2E 局部修复多次失败后，交给 Reviewer 做第二轮责任审查。
+
+    Reviewer 只分析：
+    - 当前真实 runtime failure；
+    - 当前目标文件实现；
+    - 已冻结/已知的当前文件合同；
+    - 前面局部 repair 为什么没有解决。
+
+    Reviewer 不写代码、不直接修改合同。
+    """
+
+    route = route_model(
+        VALIDATOR_TASK,
+        requested_model=requested_model,
+        reason=(
+            "Creator E2E local repair exhausted; "
+            "second-round reviewer re-analysis"
+        ),
+    )
+
+    review_payload = {
+        "skill_name": skill_name,
+        "target_file": target_path,
+
+        "structured_failure": (
+            _structured_failure_from_errors(e2e_errors)
+        ),
+
+        "current_target_content": (
+            current_content[-18000:]
+        ),
+
+        # SKILL.md 只作为当前 workflow/runtime 上下文，
+        # 不是让 reviewer 重写它。
+        "current_skill_md": (
+            skill_md[-12000:]
+        ),
+
+        # 当前文件已经解析出的接口/职责事实。
+        "entry_contract": (
+            e2e_entry_context or {}
+        ),
+
+        "runtime_repair_context": (
+            minimal_repair_context or {}
+        ),
+
+        "previous_e2e_diagnosis": (
+            diagnosis or {}
+        ),
+
+        # 只给最近几次现场修复记录，防止 prompt 无限增长。
+        "local_repair_history": (
+            list(e2e_session.debug_attempts or [])[-6:]
+        ),
+    }
+
+    system_prompt = """
+你是 Superskills Creator 的第二轮 Reviewer。
+
+第一轮开发人员已经生成了文件，第一轮 Reviewer 也已经审阅过。
+现在真实 E2E 试运行失败，并且现场局部 repair 已经尝试但没有稳定解决。
+
+你的职责不是写代码，而是根据：
+1. 当前冻结/已知合同；
+2. 当前文件实现；
+3. 真实 runtime traceback / rendered argv / binding；
+4. 已尝试的局部修复记录；
+
+重新判断问题。
+
+优先假设合同和第一轮设计仍然有效。
+不要因为代码难修、patch no-op、算法复杂，就宣称合同有问题。
+
+只有合同本身确实没有定义合法行为，
+或者合同之间存在真实冲突，
+才能返回 contract_review_required。
+
+如果合同已经足够明确，而当前实现没有完整履行合同，
+返回 repairable，并给代码模型明确、局部、可执行的修改要求。
+
+不得输出代码。
+不得输出 patch。
+不得重新生成整个文件。
+不得建议整函数重写或整文件重写。
+不得修改 Trial Case 来迁就业务代码。
+
+只输出 JSON。
+""".strip()
+
+    user_prompt = (
+        json.dumps(
+            review_payload,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+        + """
+
+返回：
+
+{
+  "status": "repairable" | "contract_review_required" | "invalid_e2e_case",
+  "issue_type": "wiring" | "implementation" | "contract_gap" | "e2e_case",
+  "repair_target": "SKILL.md 或当前 Skill 中已有 scripts/*.py；contract gap 时可为空",
+  "root_cause": "明确根因",
+  "violated_requirement_ids": [],
+  "contract_evidence": [],
+  "runtime_evidence": [],
+  "repair_instructions": [],
+  "must_preserve": []
+}
+
+规则：
+
+- wiring：
+  command / placeholder / argv / binding / handoff 有问题。
+
+- implementation：
+  接口已经正确到达，但脚本实现没有完成已有合同。
+
+- contract_gap：
+  只有当前合同本身不足以确定正确行为时才能使用。
+
+- invalid_e2e_case：
+  必须有明确冻结输入合同证据证明当前 Trial Case 非法，
+  不能仅因为当前脚本跑不通就判定 case 非法。
+
+repairable 时必须提供具体 repair_instructions，
+但不能输出源码。
+"""
+    )
+
+    messages = [
+        {
+            "role": "system",
+            "content": system_prompt,
+        },
+        {
+            "role": "user",
+            "content": user_prompt,
+        },
+    ]
+
+    last_error = ""
+
+    for _ in range(2):
+        try:
+            text = _complete_chat_once_sync_for_e2e(
+                messages,
+                route.model,
+            )
+
+            data = (
+                _parse_validator_json_object(
+                    str(text or "")
+                )
+                or {}
+            )
+
+            status = str(
+                data.get("status") or ""
+            ).strip()
+
+            issue_type = str(
+                data.get("issue_type") or ""
+            ).strip()
+
+            repair_target = str(
+                data.get("repair_target") or ""
+            ).strip()
+
+            if status not in {
+                "repairable",
+                "contract_review_required",
+                "invalid_e2e_case",
+            }:
+                raise ValueError(
+                    f"invalid reviewer status: {status!r}"
+                )
+
+            if status == "repairable":
+                if not repair_target:
+                    raise ValueError(
+                        "repairable reviewer result "
+                        "must provide repair_target"
+                    )
+
+                if not _is_skill_repair_target(
+                    e2e_session.workspace_dir,
+                    repair_target,
+                ):
+                    raise ValueError(
+                        "reviewer returned invalid "
+                        f"repair_target={repair_target!r}"
+                    )
+
+                instructions = (
+                    data.get("repair_instructions")
+                    or []
+                )
+
+                if not instructions:
+                    raise ValueError(
+                        "repairable reviewer result "
+                        "must provide repair_instructions"
+                    )
+
+            result = {
+                "status": status,
+                "issue_type": issue_type,
+                "repair_target": repair_target,
+                "root_cause": str(
+                    data.get("root_cause") or ""
+                ),
+                "violated_requirement_ids": list(
+                    data.get(
+                        "violated_requirement_ids"
+                    )
+                    or []
+                ),
+                "contract_evidence": list(
+                    data.get(
+                        "contract_evidence"
+                    )
+                    or []
+                ),
+                "runtime_evidence": list(
+                    data.get(
+                        "runtime_evidence"
+                    )
+                    or []
+                ),
+                "repair_instructions": list(
+                    data.get(
+                        "repair_instructions"
+                    )
+                    or []
+                ),
+                "must_preserve": list(
+                    data.get(
+                        "must_preserve"
+                    )
+                    or []
+                ),
+            }
+
+            logger.info(
+                "[Creator][E2E]"
+                "[reviewer_reanalysis_result] %s",
+                json.dumps(
+                    {
+                        "target_file": target_path,
+                        "status": result["status"],
+                        "issue_type": result["issue_type"],
+                        "repair_target": result["repair_target"],
+                        "violated_requirement_ids": (
+                            result[
+                                "violated_requirement_ids"
+                            ]
+                        ),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                ),
+            )
+
+            return result
+
+        except Exception as exc:
+            last_error = str(exc)
+
+            messages.append({
+                "role": "user",
+                "content": (
+                    "上一轮 Reviewer JSON 不合法。"
+                    f"error={last_error}\n"
+                    "请严格按照指定 JSON schema "
+                    "重新输出，不要输出解释或代码。"
+                ),
+            })
+
+    logger.warning(
+        "[Creator][E2E]"
+        "[reviewer_reanalysis_unavailable] "
+        "target=%s error=%s",
+        target_path,
+        last_error,
+    )
+
+    return {
+        "status": "review_unavailable",
+        "issue_type": "",
+        "repair_target": "",
+        "root_cause": last_error,
+        "violated_requirement_ids": [],
+        "contract_evidence": [],
+        "runtime_evidence": [],
+        "repair_instructions": [],
+        "must_preserve": [],
+    }
 
 async def _repair_existing_file_for_e2e_failure(
     *,
@@ -6572,15 +6889,42 @@ async def _repair_existing_file_for_e2e_failure(
     # A rejected failure/target experiment is terminal for that pair.  Do this
     # before diagnosis so changing hypothesis prose cannot reopen it.
     rejected_target = deterministic_target or target_path
-    if _count_matching_no_progress_attempts(
-        e2e_session, repair_target=rejected_target, before_failure_identity=before_identity,
-    ):
-        return {
-            "status": "debug_hypothesis_rejected", "rejection_reason": "repair_experiment_already_rejected",
-            "progress_reason": "same_breakpoint_repeated", "sandbox_executed": False,
-            "candidate_retained": False, "candidate_rolled_back": False,
-            "repaired_target": rejected_target, "next_target": None, "next_failure": e2e_errors,
-        }
+
+    prior_no_progress_count = (
+        _count_matching_no_progress_attempts(
+            e2e_session,
+            repair_target=rejected_target,
+            before_failure_identity=before_identity,
+        )
+    )
+
+    # 只要同一 target + breakpoint 曾经已经做过局部修复，
+    # 且确认没有进展，就不要再次重复同样的普通 E2E repair。
+    # 下一阶段交给 Reviewer 带着现场证据重新审合同和实现。
+    force_reviewer_reanalysis = (
+            prior_no_progress_count > 0
+    )
+
+    if force_reviewer_reanalysis:
+        logger.info(
+            "[Creator][E2E]"
+            "[local_repair_exhausted] %s",
+            json.dumps(
+                {
+                    "target_file": rejected_target,
+                    "failure_identity": before_identity,
+                    "no_progress_count": (
+                        prior_no_progress_count
+                    ),
+                    "reason": (
+                        "previous_local_repair_no_progress"
+                    ),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ),
+        )
     if target_path.startswith("scripts/") and read_only_callable_context:
         source_path = e2e_session.workspace_dir / target_path
         source = source_path.read_text(encoding="utf-8", errors="replace") if source_path.is_file() else ""
@@ -7001,15 +7345,111 @@ async def _repair_existing_file_for_e2e_failure(
                 except Exception:
                     run_args_analysis = {}
 
+            raw_requirements = (
+                    getattr(
+                        e2e_entry,
+                        "requirements",
+                        [],
+                    )
+                    or []
+            )
+
+            normalized_requirements = []
+
+            for item in raw_requirements:
+                if hasattr(item, "model_dump"):
+                    try:
+                        normalized_requirements.append(
+                            item.model_dump(mode="json")
+                        )
+                        continue
+                    except Exception:
+                        pass
+
+                normalized_requirements.append(
+                    str(item)
+                )
+
             e2e_entry_context = {
                 "path": target_path,
+
                 "runtime": getattr(
                     e2e_entry,
                     "runtime",
                     "",
                 ),
-                "script_argv_schema": argv_schema,
-                "run_args_analysis": run_args_analysis,
+
+                "purpose": getattr(
+                    e2e_entry,
+                    "purpose",
+                    "",
+                ),
+
+                "inputs": list(
+                    getattr(
+                        e2e_entry,
+                        "inputs",
+                        [],
+                    )
+                    or []
+                ),
+
+                "outputs": list(
+                    getattr(
+                        e2e_entry,
+                        "outputs",
+                        [],
+                    )
+                    or []
+                ),
+
+                "dependencies": list(
+                    getattr(
+                        e2e_entry,
+                        "dependencies",
+                        [],
+                    )
+                    or []
+                ),
+
+                "runtime_contract": (
+                        getattr(
+                            e2e_entry,
+                            "runtime_contract",
+                            {},
+                        )
+                        or {}
+                ),
+
+                "artifact_contract": (
+                        getattr(
+                            e2e_entry,
+                            "artifact_contract",
+                            {},
+                        )
+                        or {}
+                ),
+
+                "coverage_requirements": (
+                        getattr(
+                            e2e_entry,
+                            "coverage_requirements",
+                            [],
+                        )
+                        or []
+                ),
+
+                "requirements": (
+                    normalized_requirements
+                ),
+
+                "script_argv_schema": (
+                    argv_schema
+                ),
+
+                "run_args_analysis": (
+                    run_args_analysis
+                ),
             }
 
         except Exception:
@@ -7273,7 +7713,26 @@ async def _repair_existing_file_for_e2e_failure(
     last_failure = ""
     # The production API owns the overall (<=10) debug-experiment loop. Keep
     # legacy direct callers usable while they migrate to the session loop.
-    max_candidate_attempts = 10 if standalone_repair else 2
+    # 普通 E2E：
+    # attempt 1~2 = 原有 localized repair
+    # attempt 3   = Reviewer re-analysis 后，
+    #               仍使用 localized coder patch
+    #
+    # standalone caller 保留原有较大总预算，
+    # 但 Reviewer guided repair 仍只执行一次。
+    reviewer_guided_attempt = 3
+
+    max_candidate_attempts = (
+        10
+        if standalone_repair
+        else reviewer_guided_attempt
+    )
+
+    start_candidate_attempt = (
+        reviewer_guided_attempt
+        if force_reviewer_reanalysis
+        else 1
+    )
     sandbox_executed = False
 
     working_content = (
@@ -7294,12 +7753,17 @@ async def _repair_existing_file_for_e2e_failure(
     consecutive_argv_schema_noops = 0
 
     for candidate_attempt in range(
-        1,
-        max_candidate_attempts + 1,
+            start_candidate_attempt,
+            max_candidate_attempts + 1,
     ):
         current_content = working_content
         use_full_rewrite = False
+        reviewer_guided = (
+            candidate_attempt
+            == reviewer_guided_attempt
+        )
 
+        reviewer_result: dict[str, Any] = {}
         effective_skill_md = (
             current_content
             if target_path == "SKILL.md"
@@ -7313,6 +7777,240 @@ async def _repair_existing_file_for_e2e_failure(
                 base_task_context
                 + "\n\n当前失败 command block：\n"
                 + str(minimal_repair_context.get("failed_command") or "")[:4000]
+            )
+
+        if reviewer_guided:
+            logger.info(
+                "[Creator][E2E]"
+                "[reviewer_reanalysis_start] %s",
+                json.dumps(
+                    {
+                        "target_file": target_path,
+                        "candidate_attempt": (
+                            candidate_attempt
+                        ),
+                        "failure_identity": (
+                            before_identity
+                        ),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                ),
+            )
+
+            reviewer_result = await (
+                _review_failed_e2e_after_local_repairs(
+                    skill_name=skill_name,
+                    target_path=target_path,
+                    current_content=current_content,
+                    skill_md=effective_skill_md,
+                    e2e_errors=(
+                        baseline_errors
+                        or e2e_errors
+                    ),
+                    diagnosis=diagnosis,
+                    minimal_repair_context=(
+                        minimal_repair_context
+                    ),
+                    e2e_entry_context=(
+                        e2e_entry_context
+                    ),
+                    e2e_session=e2e_session,
+                    requested_model=requested_model,
+                )
+            )
+
+            reviewer_status = str(
+                reviewer_result.get(
+                    "status"
+                )
+                or ""
+            )
+
+            reviewer_target = str(
+                reviewer_result.get(
+                    "repair_target"
+                )
+                or ""
+            ).strip()
+
+
+            # -----------------------------
+            # 合同确实不足
+            # -----------------------------
+            if (
+                reviewer_status
+                == "contract_review_required"
+            ):
+                logger.warning(
+                    "[Creator][E2E]"
+                    "[contract_review_required] %s",
+                    json.dumps(
+                        reviewer_result,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        default=str,
+                    )[:5000],
+                )
+
+                if repair_events is not None:
+                    repair_events.extend(
+                        e2e_session.events
+                    )
+
+                return {
+                    "status": (
+                        "contract_review_required"
+                    ),
+                    "repaired_target": (
+                        target_path
+                    ),
+                    "next_target": None,
+                    "next_failure": (
+                        baseline_errors
+                        or e2e_errors
+                    ),
+                    "reviewer_result": (
+                        reviewer_result
+                    ),
+                    "attempt": (
+                        candidate_attempt
+                    ),
+                }
+
+
+            # -----------------------------
+            # Trial Case 确实有问题
+            # -----------------------------
+            if (
+                reviewer_status
+                == "invalid_e2e_case"
+            ):
+                return {
+                    "status": (
+                        "e2e_case_review_required"
+                    ),
+                    "repaired_target": (
+                        target_path
+                    ),
+                    "next_target": None,
+                    "next_failure": (
+                        baseline_errors
+                        or e2e_errors
+                    ),
+                    "reviewer_result": (
+                        reviewer_result
+                    ),
+                    "attempt": (
+                        candidate_attempt
+                    ),
+                }
+
+
+            # -----------------------------
+            # Reviewer 自己不可用
+            # -----------------------------
+            if (
+                reviewer_status
+                != "repairable"
+            ):
+                return {
+                    "status": (
+                        "escalate_to_creator_review"
+                    ),
+                    "repaired_target": (
+                        target_path
+                    ),
+                    "next_target": None,
+                    "next_failure": (
+                        baseline_errors
+                        or e2e_errors
+                    ),
+                    "reviewer_result": (
+                        reviewer_result
+                    ),
+                    "attempt": (
+                        candidate_attempt
+                    ),
+                }
+
+
+            # -----------------------------
+            # Reviewer 发现真正目标是另一个文件
+            # 例如原来修 script，
+            # 重新审后确认其实是 SKILL wiring。
+            # -----------------------------
+            if (
+                reviewer_target
+                and reviewer_target
+                != target_path
+            ):
+                return {
+                    "status": "target_changed",
+                    "repaired_target": (
+                        target_path
+                    ),
+                    "next_target": (
+                        reviewer_target
+                    ),
+                    "next_failure": [
+                        (
+                            "SECOND_ROUND_REVIEWER="
+                            + json.dumps(
+                                reviewer_result,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                default=str,
+                            )
+                        ),
+                        *(
+                            baseline_errors
+                            or e2e_errors
+                        ),
+                    ],
+                    "reviewer_result": (
+                        reviewer_result
+                    ),
+                    "attempt": (
+                        candidate_attempt
+                    ),
+                }
+
+
+            # -----------------------------
+            # 关键：
+            # Reviewer 只分析；
+            # 后面仍然交现有 coder patch。
+            # -----------------------------
+            reviewer_feedback = (
+                "\n\n"
+                "SECOND_ROUND_REVIEWER_ANALYSIS：\n"
+                + json.dumps(
+                    reviewer_result,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                    default=str,
+                )
+                + "\n\n"
+                "Reviewer 已完成根因分析。"
+                "你现在是代码修改模型，"
+                "不要重新判断合同或重新选择修复目标。"
+                "严格按照 repair_instructions "
+                "对当前目标文件做最小 localized patch。"
+                "必须保留 must_preserve。"
+                "禁止整函数重写。"
+                "禁止整文件重写。"
+            )
+
+            repair_feedback = (
+                deterministic_error
+                + reviewer_feedback
+            )
+
+            effective_task_context += (
+                reviewer_feedback
             )
 
         if "proposal_noop" in repair_feedback:
@@ -7899,6 +8597,59 @@ async def _repair_existing_file_for_e2e_failure(
                         e2e_session.events[-1].update({"status": "debug_hypothesis_rejected", "no_progress_count": no_progress_count, "writeback_status": "rolled_back"})
                     if repair_events is not None:
                         repair_events.extend(e2e_session.events)
+                    if reviewer_guided:
+                        logger.warning(
+                            "[Creator][E2E]"
+                            "[reviewer_guided_repair_failed] %s",
+                            json.dumps(
+                                {
+                                    "target_file": (
+                                        target_path
+                                    ),
+                                    "candidate_attempt": (
+                                        candidate_attempt
+                                    ),
+                                    "reason": (
+                                        "same_breakpoint_repeated"
+                                    ),
+                                    "reviewer_result": (
+                                        reviewer_result
+                                    ),
+                                },
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                default=str,
+                            )[:5000],
+                        )
+
+                        return {
+                            "status": (
+                                "escalate_to_creator_review"
+                            ),
+                            "repaired_target": (
+                                target_path
+                            ),
+                            "next_target": None,
+                            "next_failure": (
+                                gate_errors
+                            ),
+                            "reviewer_result": (
+                                reviewer_result
+                            ),
+                            "rejection_reason": (
+                                "reviewer_guided_repair_"
+                                "made_no_progress"
+                            ),
+                            "progress_reason": (
+                                "same_breakpoint_repeated"
+                            ),
+                            "candidate_retained": False,
+                            "candidate_rolled_back": True,
+                            "attempt": (
+                                candidate_attempt
+                            ),
+                        }
+
                     return {"status": "debug_hypothesis_rejected", "rejection_reason": "same_breakpoint_repeated",
                             "progress_reason": "same_breakpoint_repeated", "sandbox_executed": True,
                             "candidate_retained": False, "candidate_rolled_back": True, "repaired_target": target_path,
@@ -8469,6 +9220,47 @@ async def _repair_existing_file_for_e2e_failure(
                 max_candidate_attempts,
                 candidate_exc,
             )
+
+            if reviewer_guided:
+                logger.warning(
+                    "[Creator][E2E]"
+                    "[reviewer_guided_repair_failed] "
+                    "target=%s error=%s",
+                    target_path,
+                    candidate_exc,
+                )
+
+                if repair_events is not None:
+                    repair_events.extend(
+                        e2e_session.events
+                    )
+
+                return {
+                    "status": (
+                        "escalate_to_creator_review"
+                    ),
+                    "repaired_target": (
+                        target_path
+                    ),
+                    "next_target": None,
+                    "next_failure": (
+                        repair_feedback.split(
+                            "\n\n"
+                        )[:8]
+                    ),
+                    "last_failure": (
+                        str(candidate_exc)[:12000]
+                    ),
+                    "reviewer_result": (
+                        reviewer_result
+                    ),
+                    "attempt": (
+                        candidate_attempt
+                    ),
+                    "error_type": (
+                        "reviewer_guided_repair_failed"
+                    ),
+                }
 
             continue
 

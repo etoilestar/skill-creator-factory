@@ -16675,12 +16675,19 @@ async def validate_skill(request: SkillActionRequest):
         # This is the runtime symptom location, not a confirmed repair target.
         # _repair_existing_file_for_e2e_failure performs the diagnosis phase.
         target_path = _e2e_symptom_file_from_errors(blocking_errors)
-        if any("E2E_LAYER=e2e_input_fixture" in error for error in blocking_errors):
+        creator_e2e_input_layers = {
+            "e2e_case_plan", "e2e_case_generation", "e2e_case_validation",
+            "e2e_case_materialization", "e2e_input_fixture",
+        }
+        if any(
+            any(f"E2E_LAYER={layer}" in error for layer in creator_e2e_input_layers)
+            for error in blocking_errors
+        ):
             return SkillActionResponse(
                 success=False,
                 path=None,
                 message=(
-                    "Creator E2E 输入 fixture 构造失败；已在脚本执行前停止，"
+                    "Creator E2E 输入 Case 基础设施失败；已在脚本执行前停止，"
                     "不会将系统制造的错误输入交给业务脚本自动修复：\n"
                     + "\n\n".join(blocking_errors)
                 ),

@@ -188,7 +188,7 @@ def test_structured_and_typed_list_fixtures_are_supported_without_files(tmp_path
         assert e2e._materialize_e2e_trial_fixture(item, skill_dir=tmp_path) == value
 
 
-def test_structured_fixture_rejects_wrong_item_types_and_empty_values():
+def test_structured_fixture_rejects_wrong_item_types_but_allows_empty_values():
     def validate(shape, value):
         name = "value"
         case = {"version": 1, "inputs": [{
@@ -203,11 +203,12 @@ def test_structured_fixture_rejects_wrong_item_types_and_empty_values():
             requirement_ids_by_input={name: {"R1"}},
         )
 
-    assert validate("object", {}) is None
+    assert validate("object", {}) is not None
+    assert validate("list[string]", []) is not None
     assert validate("list[string]", [1]) is None
     assert validate("list[number]", [True]) is None
     assert validate("list[integer]", [1.5]) is None
-    assert validate("list[object]", [{}]) is None
+    assert validate("list[object]", [{}]) is not None
 
 
 def test_prepare_trial_case_includes_non_file_structured_inputs(monkeypatch):
@@ -230,7 +231,7 @@ def test_prepare_trial_case_includes_non_file_structured_inputs(monkeypatch):
         requested_model=None,
         session=None,
     )
-    assert result is None
+    assert {item["name"] for item in result["inputs"]} == {"options", "labels", "count"}
     assert {
         item["platform_input"]["shape"]
         for item in captured["facts"]["external_inputs"]
@@ -277,6 +278,33 @@ def test_external_and_declared_default_prevent_trial_generation(tmp_path, monkey
         **common, skill_plan_entries={"scripts/analyze.py": SimpleNamespace(default_values={"input_files": ["declared.csv"]})},
         external_context={},
     ) is None
+
+
+@pytest.mark.parametrize(("external_context", "default_values"), [
+    ({"input_files": ["/tmp/real.csv"]}, {}),
+    ({}, {"input_files": ["declared.csv"]}),
+])
+def test_no_trial_candidates_is_a_normal_frozen_session_state(
+    tmp_path, monkeypatch, external_context, default_values,
+):
+    monkeypatch.setattr(
+        e2e, "_build_e2e_trial_case",
+        lambda *args, **kwargs: pytest.fail("trial builder must not run"),
+    )
+    session = e2e.CreatorE2ESession(
+        "session", "demo", tmp_path, tmp_path / ".venv", tmp_path / "outputs",
+    )
+
+    assert e2e._prepare_e2e_trial_case(
+        typed_specs=[_spec()], requirements_by_file={},
+        skill_plan_entries={"scripts/analyze.py": SimpleNamespace(default_values=default_values)},
+        external_context=external_context, requested_model=None, session=session,
+    ) is None
+    assert session.trial_case is None
+    assert session.trial_case_digest == ""
+    assert session.trial_case_prepared is True
+    assert session.input_case_plan_failure == ""
+    assert session.input_case_plan_failure_details == {}
 
 
 def test_declared_default_beats_trial_case_and_unknown_format_has_no_generic_fallback(tmp_path):
@@ -355,6 +383,104 @@ def test_trial_schema_binds_file_collection_and_object_fixture_kinds():
     fields = by_name["fields"]
     assert fields["properties"]["shape"]["const"] == "object"
     assert fields["properties"]["fixture"]["properties"]["kind"]["const"] == "json_value"
+
+
+def test_case_plan_merges_nested_roots_and_derives_index_cardinality():
+    plan = e2e._build_e2e_input_case_plan([
+        e2e.E2ETypedInputSpec(name="fields", shape="object", required=False),
+        e2e.E2ETypedInputSpec(name="fields.key", shape="string"),
+        e2e.E2ETypedInputSpec(name="records", shape="list[object]", required_paths=("1.id",), min_items=2),
+    ])
+
+    assert set(plan.inputs) == {"fields", "records"}
+    assert plan.inputs["fields"].required_paths == ("key",)
+    assert plan.inputs["records"].min_items == 2
+    fixture = e2e._synthesize_e2e_input_fixture(plan.inputs["records"])
+    assert fixture["value"][1]["id"] == "sample"
+
+
+def test_strict_argv_requiredness_has_independent_highest_authority():
+    plan = e2e._build_e2e_input_case_plan([
+        e2e.E2ETypedInputSpec(name="options", shape="object", required=True, source="requirement_graph"),
+        e2e.E2ETypedInputSpec(name="options", shape="object", required=False, source="argv_schema"),
+        e2e.E2ETypedInputSpec(name="options", shape="object", required=True, source="placeholder"),
+    ])
+
+    assert plan.inputs["options"].required is False
+    assert plan.inputs["options"].required_source == "argv_schema"
+
+
+def test_per_input_validation_preserves_valid_siblings_and_falls_back_locally():
+    plan = e2e._build_e2e_input_case_plan([
+        _spec("mode", "string"),
+        e2e.E2ETypedInputSpec(name="fields", shape="object", required_paths=("key",)),
+    ])
+    trial = {"version": 1, "inputs": [
+        {"name": "mode", "shape": "string", "fixture": {"kind": "scalar", "value": "fast"}, "evidence_requirement_ids": []},
+        {"name": "fields", "shape": "object", "fixture": {"kind": "json_value", "value": {}}, "evidence_requirement_ids": []},
+    ]}
+
+    states = e2e._validate_e2e_trial_inputs(trial, plan=plan, requirement_ids_by_input={})
+    assert states["mode"].status == "accepted"
+    assert states["fields"].status == "invalid"
+    assert e2e._synthesize_e2e_input_fixture(plan.inputs["fields"])["value"] == {"key": "sample"}
+
+
+def test_optional_empty_object_and_list_are_valid_case_values():
+    object_spec = e2e.E2EInputCaseSpec("fields", "argv_schema", "object", required=False)
+    list_spec = e2e.E2EInputCaseSpec("tags", "argv_schema", "list[string]", item_shape="string", required=False)
+    assert e2e._e2e_value_matches_case_spec({}, object_spec)
+    assert e2e._e2e_value_matches_case_spec([], list_spec)
+
+
+def test_candidate_invariant_veto_rejects_new_runtime_sentinel():
+    assert e2e._e2e_candidate_invariant_veto(
+        '"foo": "{{foo}}"', '"foo": "__RUNTIME_INPUT_FILES__"',
+    ) == ["introduced_runtime_sentinel"]
+
+
+def test_candidate_invariant_veto_rejects_frozen_boundary_changes():
+    before = e2e._e2e_error(target="scripts/x.py", layer="script_exit", message="before", details={
+        "frozen_provenance": {"foo": "external_context"},
+        "frozen_argv_interface": {"foo": "list[string]"},
+    })
+    after = e2e._e2e_error(target="scripts/x.py", layer="script_exit", message="after", details={
+        "frozen_provenance": {"foo": "literal"},
+        "frozen_argv_interface": {"foo": "string"},
+    })
+
+    assert e2e._e2e_candidate_invariant_veto(
+        "unchanged", "unchanged", original_errors=[before], new_errors=[after],
+    ) == ["frozen_provenance_changed", "frozen_argv_interface_changed"]
+
+
+def test_unknown_file_authority_is_creator_owned_case_plan_failure(tmp_path):
+    session = e2e.CreatorE2ESession(
+        "session", "demo", tmp_path, tmp_path / ".venv", tmp_path / "outputs",
+    )
+    with pytest.raises(e2e.E2ECaseInfrastructureError) as raised:
+        e2e._prepare_e2e_trial_case(
+            typed_specs=[_spec("uploads", "list[file_path]")],
+            requirements_by_file={},
+            skill_plan_entries={"scripts/analyze.py": SimpleNamespace(default_values={})},
+            external_context={}, requested_model=None, session=session,
+        )
+
+    failure = e2e._structured_failure_from_errors([
+        e2e._e2e_case_infrastructure_failure(raised.value),
+    ])
+    assert failure["target_file"] == "creator_e2e"
+    assert failure["layer"] == "e2e_case_plan"
+    assert failure["details"]["repair_owner"] == "creator_e2e"
+    assert failure["details"]["skill_repair_allowed"] is False
+    assert session.input_case_plan_failure == "file_format_unknown"
+    with pytest.raises(e2e.E2ECaseInfrastructureError, match="file_format_unknown"):
+        e2e._prepare_e2e_trial_case(
+            typed_specs=[_spec("uploads", "list[file_path]")],
+            requirements_by_file={},
+            skill_plan_entries={"scripts/analyze.py": SimpleNamespace(default_values={})},
+            external_context={}, requested_model=None, session=session,
+        )
 
 
 def test_csv_file_list_materializes_each_file_with_csv_suffix(tmp_path):
@@ -580,8 +706,9 @@ def test_malformed_structured_builder_response_is_rejected_to_fallback(tmp_path,
         skill_plan_entries={"scripts/analyze.py": SimpleNamespace(default_values={})},
         external_context={}, requested_model=None, session=session,
     )
-    assert accepted is None
+    assert accepted is not None
     assert session.trial_case_prepared is True
-    assert session.trial_case_digest == ""
+    assert session.trial_case_digest
+    assert accepted["inputs"][0]["fixture"]["files"][0]["format"] == "csv"
     with pytest.raises(ValueError, match="format authority is unknown"):
         e2e._materialize_e2e_sample_value(_spec(), skill_dir=skill_dir)

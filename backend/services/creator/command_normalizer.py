@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 from ..skill_dataflow import (
     normalize_bare_json_placeholders,
+    parse_placeholder_expr,
     placeholder_pattern,
 )
 _PLATFORM_PLACEHOLDER_RE = placeholder_pattern()
@@ -145,11 +146,18 @@ def _sanitize_template_value(value: str) -> tuple[str, dict[str, Any] | None, bo
     if not match:
         return value, None, False
     expr = match.group(1).strip()
-    input_match = re.fullmatch(r"(?:input_files|uploaded_files)\[(\d+)\]", expr)
-    if input_match:
-        index = int(input_match.group(1))
-        placeholder = "__RUNTIME_INPUT_FILE__" if index == 0 else f"__RUNTIME_INPUT_FILE_{index}__"
-        return placeholder, {"source": "runtime_input_file", "index": index, "placeholder": placeholder}, True
+    # Platform placeholders are the public provenance protocol.  In particular,
+    # indexed file collections must remain visible to the typed E2E resolver;
+    # translating them to Creator-only runtime sentinels here erases their root
+    # and bypasses Trial Case fixture generation.
+    placeholder_path = parse_placeholder_expr(expr)
+    if placeholder_path and placeholder_path.segments:
+        return value, {
+            "source": "platform_input",
+            "root": placeholder_path.root,
+            "segments": list(placeholder_path.segments),
+            "placeholder": f"{{{{{expr}}}}}",
+        }, False
     path_match = re.fullmatch(r"(references|assets)/([A-Za-z0-9._/-]+)", expr)
     if path_match and ".." not in path_match.group(2).split("/"):
         path = f"{path_match.group(1)}/{path_match.group(2)}"
@@ -267,9 +275,7 @@ def _complex_template_paths(
                 + "}}"
             )
 
-            if not _PLATFORM_PLACEHOLDER_RE.fullmatch(
-                token
-            ):
+            if not _PLATFORM_PLACEHOLDER_RE.fullmatch(token):
                 found.append(path or "$")
 
     return found

@@ -3,6 +3,10 @@ import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
+import zipfile
+
+import pytest
+from PIL import Image
 
 from backend.services.creator import e2e
 
@@ -237,7 +241,7 @@ def test_trial_case_is_built_once_and_fixture_is_stable(tmp_path, monkeypatch):
     skill_dir = tmp_path / "demo"
     skill_dir.mkdir()
     session = e2e.CreatorE2ESession("session", "demo", skill_dir, skill_dir / ".venv", skill_dir / "outputs")
-    requirement = e2e.RequirementItem(id="R1", target_file="scripts/analyze.py", purpose="Read numeric input")
+    requirement = e2e.RequirementItem(id="R1", target_file="scripts/analyze.py", purpose="Read numeric CSV input")
     case = {"version": 1, "inputs": [_item({
         "format": "csv", "content_kind": "tabular",
         "columns": [{"name": "value", "type": "number"}], "rows": [{"value": 1}],
@@ -275,7 +279,7 @@ def test_external_and_declared_default_prevent_trial_generation(tmp_path, monkey
     ) is None
 
 
-def test_declared_default_beats_trial_case_and_invalid_case_uses_generic_fallback(tmp_path):
+def test_declared_default_beats_trial_case_and_unknown_format_has_no_generic_fallback(tmp_path):
     command = e2e.E2EWorkflowCommand(1, "SKILL.md", "scripts/analyze.py", "", "python", {"input_files": "{{input_files}}"})
     entry = SimpleNamespace(default_values={"input_files": ["declared.csv"]}, inputs=[], artifact_contract={})
     grounded = {"version": 1, "inputs": [_item({"format": "txt", "content_kind": "text", "text": "grounded"})]}
@@ -290,7 +294,8 @@ def test_declared_default_beats_trial_case_and_invalid_case_uses_generic_fallbac
         invalid, input_specs={"input_files": _spec()}, requirement_ids_by_input={"input_files": {"R1"}},
     )
     assert validated is None
-    fallback_payload = e2e._seed_initial_e2e_payload(
+    with pytest.raises(ValueError, match="format authority is unknown"):
+        e2e._seed_initial_e2e_payload(
         [command], external_context={}, skill_dir=tmp_path,
         requirements_by_file={"scripts/analyze.py": [e2e.RequirementItem(
             id="R1", target_file="scripts/analyze.py", inputs=["input_files: list[file_path]"],
@@ -299,10 +304,7 @@ def test_declared_default_beats_trial_case_and_invalid_case_uses_generic_fallbac
             default_values={}, inputs=["input_files: list[file_path]"], artifact_contract={},
         )},
         trial_case=validated,
-    )
-    fallback = fallback_payload["input_files"]
-    assert fallback and Path(fallback[0]).is_file()
-    assert "Creator E2E" in Path(fallback[0]).read_text(encoding="utf-8")
+        )
 
 
 def test_trial_builder_prompt_contains_only_supplied_frozen_facts(monkeypatch):
@@ -312,7 +314,7 @@ def test_trial_builder_prompt_contains_only_supplied_frozen_facts(monkeypatch):
         captured.update(kwargs)
         return {"status": "unsupported"}
     monkeypatch.setattr(e2e, "_complete_creator_json_object_once_sync_for_e2e", complete)
-    facts = {"external_inputs": [{"platform_input": {"name": "input_files", "shape": "list[file_path]"},
+    facts = {"external_inputs": [{"platform_input": {"name": "input_files", "shape": "list[file_path]", "file_contract": {"allowed_formats": ["csv"], "min_items": 1, "max_items": 2}},
               "target": {"script": "scripts/analyze.py", "input": "input_files"},
               "requirements": [{"id": "R1", "text": "Read numeric CSV"}]}]}
     assert e2e._build_e2e_trial_case(facts) == {"status": "unsupported"}
@@ -375,6 +377,158 @@ def test_csv_file_list_materializes_each_file_with_csv_suffix(tmp_path):
     assert all(path.is_file() and path.suffix == ".csv" for path in paths)
 
 
+def test_indexed_file_fixture_renders_without_runtime_literal_events(tmp_path):
+    first = tmp_path / "a.csv"
+    second = tmp_path / "b.csv"
+    first.write_text("value\n1\n", encoding="utf-8")
+    second.write_text("value\n2\n", encoding="utf-8")
+    command = e2e.E2EWorkflowCommand(
+        1, "SKILL.md", "scripts/compare.py", "", "python",
+        {"input_files": ["{{input_files[0]}}", "{{input_files[1]}}"]},
+    )
+    payload = {"input_files": [str(first), str(second)]}
+    specs = [e2e.E2ETypedInputSpec(
+        name="input_files", shape="list[file_path]", source="platform_io_contract",
+    )]
+
+    rendered = e2e._render_e2e_command_payload(
+        command, payload=payload, typed_input_specs=specs,
+    )
+    e2e._validate_e2e_input_fixtures(
+        command=command, payload=payload, rendered_payload=rendered,
+        typed_input_specs=specs,
+    )
+    materialized, events = e2e._materialize_rendered_e2e_payload_runtime_literals(
+        rendered, skill_dir=tmp_path, target_file=command.script_path,
+    )
+
+    assert materialized == {"input_files": [str(first), str(second)]}
+    assert events == []
+
+
+@pytest.mark.parametrize("bad_value", [
+    ["__RUNTIME_INPUT_FILE__"],
+    [{"path": "a.csv"}],
+])
+def test_input_fixture_gate_rejects_unmaterialized_file_lists(tmp_path, bad_value):
+    command = e2e.E2EWorkflowCommand(
+        1, "SKILL.md", "scripts/compare.py", "", "python",
+        {"input_files": "{{input_files}}"},
+    )
+    specs = [e2e.E2ETypedInputSpec(
+        name="input_files", shape="list[file_path]", source="platform_io_contract",
+    )]
+
+    with pytest.raises(ValueError, match="E2E_LAYER=e2e_input_fixture"):
+        e2e._validate_e2e_input_fixtures(
+            command=command,
+            payload={"input_files": bad_value},
+            rendered_payload={"input_files": bad_value},
+            typed_input_specs=specs,
+        )
+
+
+def test_input_fixture_gate_validates_rendered_argv_not_only_source(tmp_path):
+    real = tmp_path / "real.csv"
+    real.write_text("value\n1\n", encoding="utf-8")
+    command = e2e.E2EWorkflowCommand(
+        1, "SKILL.md", "scripts/compare.py", "", "python",
+        {"documents": "{{documents}}"},
+    )
+    specs = [e2e.E2ETypedInputSpec(name="documents", shape="list[file_path]")]
+    with pytest.raises(ValueError, match="rendered_argv.documents"):
+        e2e._validate_e2e_input_fixtures(
+            command=command, payload={"documents": [str(real)]},
+            rendered_payload={"documents": [{"path": str(real)}]},
+            typed_input_specs=specs,
+        )
+
+
+def test_legacy_file_kind_fallback_never_guesses_from_names_or_output_descriptions():
+    kinds = e2e._infer_e2e_file_sample_kinds(
+        name="csv_files",
+        shape="list[file_path]",
+        target_file="scripts/analyze.py",
+        skill_md="Input: two CSV files. Output: report.pdf",
+        script_content="output_path = 'outputs/report.pdf'",
+    )
+
+    assert kinds == []
+
+
+@pytest.mark.parametrize(("fmt", "content_kind", "extension"), [
+    ("txt", "text", ".txt"), ("md", "text", ".md"),
+    ("html", "text", ".html"), ("pdf", "document", ".pdf"),
+    ("docx", "document", ".docx"),
+])
+def test_registry_materializes_valid_text_and_document_formats(tmp_path, fmt, content_kind, extension):
+    item = _item({"format": fmt, "content_kind": content_kind, "text": "Creator fixture"})
+    path = Path(e2e._materialize_e2e_trial_fixture(item, skill_dir=tmp_path)[0])
+    assert path.suffix == extension and path.stat().st_size > 0
+    if fmt == "html":
+        assert "<html" in path.read_text(encoding="utf-8").lower()
+    elif fmt == "pdf":
+        assert path.read_bytes().startswith(b"%PDF-")
+    elif fmt == "docx":
+        with zipfile.ZipFile(path) as archive:
+            assert "word/document.xml" in archive.namelist()
+
+
+@pytest.mark.parametrize(("fmt", "expected_format"), [
+    ("png", "PNG"), ("jpg", "JPEG"), ("jpeg", "JPEG"),
+    ("tif", "TIFF"), ("tiff", "TIFF"), ("webp", "WEBP"), ("bmp", "BMP"),
+])
+def test_registry_materializes_real_image_aliases(tmp_path, fmt, expected_format):
+    item = _item({"format": fmt, "content_kind": "image", "width": 64, "height": 64, "mode": "RGB"})
+    path = Path(e2e._materialize_e2e_trial_fixture(item, skill_dir=tmp_path)[0])
+    with Image.open(path) as image:
+        assert image.format == expected_format
+        image.verify()
+
+
+def test_registry_materializes_json_and_restricts_schema_to_frozen_formats(tmp_path):
+    item = _item({"format": "json", "content_kind": "json", "value": {"ok": True}})
+    path = Path(e2e._materialize_e2e_trial_fixture(item, skill_dir=tmp_path)[0])
+    assert json.loads(path.read_text(encoding="utf-8")) == {"ok": True}
+    facts = {"external_inputs": [{
+        "platform_input": {"name": "images", "shape": "list[file_path]", "file_contract": {
+            "allowed_formats": ["tif", "png"], "min_items": 2, "max_items": 2,
+        }}, "target": {}, "requirements": [],
+    }]}
+    schema_text = json.dumps(e2e._e2e_trial_case_response_schema(facts))
+    assert '"const": "tiff"' in schema_text and '"const": "png"' in schema_text
+    assert '"const": "csv"' not in schema_text
+
+
+@pytest.mark.parametrize(("purpose", "expected"), [
+    ("Read PNG image and output report.pdf", ("png",)),
+    ("Read TIFF image and output preview.png", ("tiff",)),
+    ("Read HTML page and output screenshot.png", ("html",)),
+])
+def test_file_format_authority_ignores_output_clause(purpose, expected):
+    spec = e2e._resolve_e2e_file_input_spec(
+        _spec("source", "list[file_path]"),
+        [e2e.RequirementItem(target_file="scripts/a.py", purpose=purpose)],
+    )
+    assert spec.allowed_formats == expected
+
+
+def test_file_format_authority_resolves_cardinality_and_mixed_policy():
+    homogeneous = e2e._resolve_e2e_file_input_spec(
+        _spec("uploads", "list[file_path]"),
+        [e2e.RequirementItem(target_file="scripts/a.py", inputs=["exactly two CSV input files"])],
+    )
+    assert homogeneous.allowed_formats == ("csv",)
+    assert (homogeneous.min_items, homogeneous.max_items, homogeneous.homogeneous) == (2, 2, True)
+
+    mixed = e2e._resolve_e2e_file_input_spec(
+        _spec("uploads", "list[file_path]"),
+        [e2e.RequirementItem(target_file="scripts/a.py", inputs=["one PDF and one PNG input"])],
+    )
+    assert mixed.allowed_formats == ("pdf", "png")
+    assert mixed.homogeneous is False
+
+
 def test_structured_builder_contract_freezes_and_materializes_csv(tmp_path, monkeypatch):
     skill_dir = tmp_path / "demo"
     skill_dir.mkdir()
@@ -429,5 +583,5 @@ def test_malformed_structured_builder_response_is_rejected_to_fallback(tmp_path,
     assert accepted is None
     assert session.trial_case_prepared is True
     assert session.trial_case_digest == ""
-    fallback = e2e._materialize_e2e_sample_value(_spec(), skill_dir=skill_dir)
-    assert fallback and Path(fallback[0]).is_file()
+    with pytest.raises(ValueError, match="format authority is unknown"):
+        e2e._materialize_e2e_sample_value(_spec(), skill_dir=skill_dir)

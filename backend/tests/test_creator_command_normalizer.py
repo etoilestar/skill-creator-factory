@@ -9,6 +9,7 @@ from backend.services.creator.command_normalizer import (
     replace_skill_md_command_block,
     validate_runtime_command_format,
 )
+from backend.services.skill_dataflow import parse_placeholder_expr
 from backend.services.creator.e2e import _is_skill_md_command_format_error
 
 
@@ -199,18 +200,43 @@ python scripts/run.py '{"value": {{value | default("x")}}}'
     assert any(issue.code == "missing_command_arg_binding" for issue in result.issues)
 
 
-def test_json_argv_input_files_template_is_safely_sanitized():
+def test_json_argv_indexed_input_files_preserve_platform_provenance():
     skill_md = """```bash
-python scripts/extract.py '{"input_file":"{{input_files[0]}}","model":"{{model}}"}'
+python scripts/extract.py '{"input_files":["{{input_files[0]}}","{{input_files[1]}}"],"model":"{{model}}"}'
 ```
 """
     result = canonicalize_skill_md_runtime_commands(skill_name="s", skill_md=skill_md)
     assert result.changed
     assert not result.blocked
-    assert "{{input_files[0]}}" not in result.content
-    assert "__RUNTIME_INPUT_FILE__" in result.content
+    assert "{{input_files[0]}}" in result.content
+    assert "{{input_files[1]}}" in result.content
+    assert "__RUNTIME_INPUT_FILE" not in result.content
     assert "TEXT_MODEL" in result.content
     assert "argv JSON contract" in result.content
+
+
+@pytest.mark.parametrize(("expr", "root", "segments"), [
+    ("foo[0]", "foo", (0,)),
+    ("records.1", "records", (1,)),
+    ("payload.documents[0]", "payload", ("documents", 0)),
+    ("payload.documents.0", "payload", ("documents", 0)),
+])
+def test_generic_placeholder_path_parser(expr, root, segments):
+    parsed = parse_placeholder_expr(expr)
+    assert parsed.root == root
+    assert parsed.segments == segments
+
+
+@pytest.mark.parametrize("root", ["foo", "records", "images", "documents", "numbers"])
+def test_command_normalizer_preserves_any_indexed_source(root):
+    skill_md = f'''```bash
+python scripts/run.py '{{"value":"{{{{{root}[0]}}}}"}}'
+```
+'''
+    result = canonicalize_skill_md_runtime_commands(skill_name="s", skill_md=skill_md)
+    assert not result.blocked
+    assert f"{{{{{root}[0]}}}}" in result.content
+    assert "__RUNTIME_INPUT" not in result.content
 
 
 def test_json_argv_reference_template_is_safely_sanitized_to_path():

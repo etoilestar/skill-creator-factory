@@ -4757,20 +4757,92 @@ def _classify_argv_schema_failure(
     if run_reads_guard_undeclared:
         script_reasons.append("run(args) reads keys that strict_json_argv_guard did not declare")
 
-    default_skill_md_kinds = {"unknown_key", "missing_required", "invalid_type", "empty_required", "non_object_argv", "missing_json_argv"}
-    primary_target = "SKILL.md" if kind in default_skill_md_kinds else "SKILL.md"
-    target_reason = "SKILL.md command JSON argv does not match the current script entry strict_json_argv_guard spec."
-    if kind in {"non_object_argv", "missing_json_argv"}:
-        target_reason = "SKILL.md command did not provide exactly one JSON object argv."
-    elif kind == "unknown_key":
-        target_reason = "SKILL.md command passed argv keys outside the script strict_json_argv_guard spec."
-    elif kind == "missing_required":
-        target_reason = "SKILL.md command omitted required keys declared by the script strict_json_argv_guard spec."
-    elif kind == "invalid_type":
-        target_reason = "SKILL.md command rendered argv values whose JSON types do not match the script strict_json_argv_guard spec."
-    elif kind == "empty_required":
-        target_reason = "SKILL.md command rendered an empty value for a key required by the script strict_json_argv_guard spec."
+    primary_target = "SKILL.md"
 
+    target_reason = (
+        "SKILL.md command JSON argv does not match "
+        "the current script entry strict_json_argv_guard spec."
+    )
+
+    failed_runtime_keys = [
+        key
+        for key in failed_keys
+        if key in (rendered_payload or {})
+    ]
+
+    failed_command_keys = [
+        key
+        for key in failed_keys
+        if key in (command.argv_template or {})
+    ]
+
+    bindings_forwarded_unchanged = bool(
+        failed_runtime_keys
+        and all(
+            _binding_forwards_source_unchanged(key)
+            for key in failed_runtime_keys
+        )
+    )
+
+    if kind in {"non_object_argv", "missing_json_argv"}:
+        primary_target = "SKILL.md"
+        target_reason = (
+            "SKILL.md command did not provide exactly one JSON object argv."
+        )
+
+    elif kind == "unknown_key":
+        # SKILL.md 传了脚本根本不接受的 key。
+        primary_target = "SKILL.md"
+        target_reason = (
+            "SKILL.md command passed argv keys outside "
+            "the script strict_json_argv_guard spec."
+        )
+
+    elif kind == "missing_required":
+        # 如果脚本要求的 key 根本没有进入 rendered argv，
+        # 优先认为 SKILL.md command 漏参。
+        if failed_keys and not failed_runtime_keys:
+            primary_target = "SKILL.md"
+            target_reason = (
+                "A key required by the script strict_json_argv_guard "
+                "is missing from the rendered SKILL.md command argv."
+            )
+        else:
+            # 理论上很少走到这里；如果 key 已经进入 runtime，
+            # 再由 script consistency 规则决定。
+            primary_target = command.script_path
+            target_reason = (
+                "The required argv key reached runtime but the script "
+                "still reported it as missing; inspect the script argv parser/guard."
+            )
+
+    elif kind == "invalid_type":
+        if bindings_forwarded_unchanged:
+            primary_target = command.script_path
+            target_reason = (
+                "The SKILL.md command forwarded the upstream runtime value unchanged, "
+                "but the generated script strict_json_argv_guard rejected its type."
+            )
+        else:
+            primary_target = "SKILL.md"
+            target_reason = (
+                "The rendered SKILL.md command changed or constructed the value "
+                "in a way that does not match the script argv type."
+            )
+
+    elif kind == "empty_required":
+        if bindings_forwarded_unchanged:
+            primary_target = command.script_path
+            target_reason = (
+                "The SKILL.md command forwarded the upstream runtime value unchanged, "
+                "but the generated script strict_json_argv_guard rejected the empty value."
+            )
+        else:
+            primary_target = "SKILL.md"
+            target_reason = (
+                "The rendered SKILL.md command produced an empty required value "
+                "without faithfully forwarding the upstream source."
+            )
     failed_runtime_keys = [
         key
         for key in failed_keys
@@ -8246,8 +8318,6 @@ async def _repair_existing_file_for_e2e_failure(
                     in {
                         "unknown_key",
                         "missing_required",
-                        "invalid_type",
-                        "empty_required",
                     }
                 ):
                     switch_message = (

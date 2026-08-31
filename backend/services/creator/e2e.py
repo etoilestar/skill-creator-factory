@@ -27,7 +27,12 @@ from backend.routers.chat_utils import (
 from ..llm_proxy import complete_json_object_once
 
 
-
+_E2E_PIP_INDEX_URL = (
+    "https://pypi.tuna.tsinghua.edu.cn/simple"
+)
+_E2E_PIP_INSTALL_TIMEOUT_SECONDS = 300
+_E2E_PIP_NETWORK_TIMEOUT_SECONDS = 30
+_E2E_PIP_RETRIES = 3
 
 _COMMAND_FORMAT_ERROR_LAYERS = {
     "invalid_json_arg",
@@ -9656,7 +9661,13 @@ def _install_declared_dependency_packages(venv_python: Path, dependencies: list[
     if not dependencies:
         return
     missing: list[str] = []
-    dependency_import_names = {"python-docx": "docx", "python-pptx": "pptx"}
+    dependency_import_names = {
+        "python-docx": "docx",
+        "python_docx": "docx",
+
+        "python-pptx": "pptx",
+        "python_pptx": "pptx",
+    }
     for dependency in dependencies:
         module_name = dependency_import_names.get(dependency, dependency).replace("-", "_")
         check = subprocess.run(
@@ -9670,15 +9681,39 @@ def _install_declared_dependency_packages(venv_python: Path, dependencies: list[
             timeout=10,
         )
         if check.returncode != 0:
-            missing.append(dependency)
+            package_name = (
+                dependency_package_names.get(
+                    dependency,
+                    dependency,
+                )
+            )
+
+            if package_name not in missing:
+                missing.append(package_name)
 
     if not missing:
         return
 
     logger.info("skill-env: pip installing %s deps into venv: %s", source_label, missing)
     result = subprocess.run(
-        [str(venv_python), "-m", "pip", "install", "--quiet", *missing],
-        timeout=180,
+        [
+            str(venv_python),
+            "-m",
+            "pip",
+            "install",
+            "--quiet",
+            "--disable-pip-version-check",
+            "--no-input",
+            "--prefer-binary",
+            "--index-url",
+            _E2E_PIP_INDEX_URL,
+            "--timeout",
+            str(_E2E_PIP_NETWORK_TIMEOUT_SECONDS),
+            "--retries",
+            str(_E2E_PIP_RETRIES),
+            *missing,
+        ],
+        timeout=_E2E_PIP_INSTALL_TIMEOUT_SECONDS,
         capture_output=True,
         text=True,
     )

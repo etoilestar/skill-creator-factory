@@ -183,6 +183,11 @@ _venv_created_lock = __import__("threading").Lock()
 # run_command 依赖缺失时最多重试次数
 _MAX_DEP_RETRY = 3
 
+# Python 依赖安装配置
+_PIP_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
+_PIP_INSTALL_TIMEOUT_SECONDS = 300
+_PIP_NETWORK_TIMEOUT_SECONDS = 30
+_PIP_RETRIES = 3
 # 目录快照时跳过的子目录名（虚拟环境、包缓存等）
 _SNAPSHOT_EXCLUDE_DIRS: frozenset[str] = frozenset({
     ".venv", "node_modules", "__pycache__", ".runtime", ".git",
@@ -374,19 +379,38 @@ def _install_python_import_dependency(import_name: str, venv_python: Path) -> di
     started_at = time.monotonic()
     try:
         result = subprocess.run(
-            [str(venv_python), "-m", "pip", "install", "--quiet", package],
-            timeout=180,
+            [
+                str(venv_python),
+                "-m",
+                "pip",
+                "install",
+                "--quiet",
+                "--disable-pip-version-check",
+                "--no-input",
+                "--prefer-binary",
+                "--index-url",
+                _PIP_INDEX_URL,
+                "--timeout",
+                str(_PIP_NETWORK_TIMEOUT_SECONDS),
+                "--retries",
+                str(_PIP_RETRIES),
+                package,
+            ],
+            timeout=_PIP_INSTALL_TIMEOUT_SECONDS,
             capture_output=True,
             text=True,
         )
     except subprocess.TimeoutExpired:
         duration_ms = round((time.monotonic() - started_at) * 1000)
         logger.warning(
-            "skill-env: dependency install timed out python=%s packages=%s duration_ms=%s timeout_seconds=%s",
+            "skill-env: dependency install timed out "
+            "python=%s packages=%s duration_ms=%s "
+            "timeout_seconds=%s index_url=%s",
             venv_python,
             packages,
             duration_ms,
-            180,
+            _PIP_INSTALL_TIMEOUT_SECONDS,
+            _PIP_INDEX_URL,
         )
         raise
     duration_ms = round((time.monotonic() - started_at) * 1000)
@@ -477,8 +501,24 @@ def _scan_and_install_python_deps(script_path: Path, venv_python: Path) -> dict[
         started_at = time.monotonic()
         try:
             result = subprocess.run(
-                [str(venv_python), "-m", "pip", "install", "--quiet"] + to_install,
-                timeout=180,
+                [
+                    str(venv_python),
+                    "-m",
+                    "pip",
+                    "install",
+                    "--quiet",
+                    "--disable-pip-version-check",
+                    "--no-input",
+                    "--prefer-binary",
+                    "--index-url",
+                    _PIP_INDEX_URL,
+                    "--timeout",
+                    str(_PIP_NETWORK_TIMEOUT_SECONDS),
+                    "--retries",
+                    str(_PIP_RETRIES),
+                    *to_install,
+                ],
+                timeout=_PIP_INSTALL_TIMEOUT_SECONDS,
                 capture_output=True,
                 text=True,
             )
@@ -489,7 +529,7 @@ def _scan_and_install_python_deps(script_path: Path, venv_python: Path) -> dict[
                 venv_python,
                 to_install,
                 duration_ms,
-                180,
+                _PIP_INSTALL_TIMEOUT_SECONDS,
             )
             raise
         duration_ms = round((time.monotonic() - started_at) * 1000)

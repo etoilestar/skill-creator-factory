@@ -17,7 +17,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 _COMMAND_BLOCK_RE = re.compile(r"```(?:bash|sh|shell)?\s*\n([\s\S]*?)\n```", re.IGNORECASE)
-_PLACEHOLDER_RE = re.compile(r"{{\s*([A-Za-z_][\w-]*(?:\.[A-Za-z_][\w-]*|\.[0-9]+)*)\s*}}")
+_PLACEHOLDER_EXPR = r"[A-Za-z_][\w-]*(?:(?:\.[A-Za-z_][\w-]*|\.[0-9]+)|(?:\[(?:[A-Za-z_][\w-]*|[0-9]+)\]))*"
+_PLACEHOLDER_RE = re.compile(r"{{\s*(" + _PLACEHOLDER_EXPR + r")\s*}}")
 _KEY_VALUE_RE = re.compile(r"(?P<key>[A-Za-z_][\w-]*(?:\.[A-Za-z_][\w-]*)*)\s*[：:=]\s*(?P<value>[^，。\n,;；]+)")
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,31 @@ class SkillCommandDataflow:
     script_path: str
     command: str
     required_variables: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PlaceholderPath:
+    root: str
+    segments: tuple[str | int, ...] = ()
+
+    @property
+    def dotted(self) -> str:
+        return ".".join([self.root, *(str(part) for part in self.segments)])
+
+
+def parse_placeholder_expr(expr: str) -> PlaceholderPath | None:
+    """Parse bracket or dotted platform paths without assigning semantics."""
+    value = str(expr or "").strip()
+    if not re.fullmatch(_PLACEHOLDER_EXPR, value):
+        return None
+    tokens = re.findall(r"(?:^|\.)([A-Za-z_][\w-]*|\d+)|\[([A-Za-z_][\w-]*|\d+)\]", value)
+    parts = [left or bracket for left, bracket in tokens]
+    if not parts:
+        return None
+    return PlaceholderPath(
+        root=parts[0],
+        segments=tuple(int(part) if part.isdigit() else part for part in parts[1:]),
+    )
 
 
 class DataflowError(ValueError):
@@ -950,4 +976,3 @@ def _source_path_for_error(source: Any) -> str:
             if source.get(key):
                 return _strip_braces(str(source[key]))
     return ""
-

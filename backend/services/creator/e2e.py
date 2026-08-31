@@ -12,6 +12,7 @@ from .contracts import *  # noqa: F403
 from .command_normalizer import canonicalize_skill_md_runtime_commands
 from .basic_format import check_patch_candidate_basic_format
 from ..skill_plan import parse_responsibility_edges
+from ..skill_dataflow import parse_placeholder_expr
 from ..platform_io_contract import (
     build_platform_io_contract,
     get_platform_output_sink,
@@ -301,6 +302,17 @@ class E2ETypedInputSpec:
     skill_plan_declared_shape: str = ""
 
 
+@dataclass(frozen=True)
+class E2EFileInputSpec:
+    source_name: str
+    runtime_shape: str
+    allowed_formats: tuple[str, ...] = ()
+    min_items: int = 1
+    max_items: int = 3
+    homogeneous: bool | None = None
+    format_source: str = "unknown"
+
+
 def _format_e2e_failure(failure: E2EFailure) -> str:
     return (
         f"E2E_SYMPTOM_FILE={failure.target_file}\n"
@@ -534,6 +546,22 @@ def _validate_e2e_input_fixtures(
     }
     issues: list[dict[str, Any]] = []
 
+    def file_value_issues(value: Any, *, name: str, location: str) -> list[dict[str, Any]]:
+        values = value if isinstance(value, list) else [value]
+        found: list[dict[str, Any]] = []
+        for index, path in enumerate(values):
+            reason = ""
+            if not isinstance(path, str):
+                reason = "file_fixture_not_materialized_to_path"
+            elif _E2E_RUNTIME_INPUT_LITERAL_RE.fullmatch(path.strip()):
+                reason = "runtime_input_sentinel_in_trial_fixture"
+            elif not Path(path).is_file():
+                reason = "fixture_path_missing"
+            if reason:
+                found.append({"name": name, "location": location, "index": index,
+                              "actual_shape": _json_shape(path), "reason": reason})
+        return found
+
     for root in sorted(used_roots):
         spec = specs.get(root)
         shape = _canonical_e2e_shape(spec.shape if spec else "")
@@ -544,22 +572,24 @@ def _validate_e2e_input_fixtures(
         if shape == "list[file_path]" and (not isinstance(value, list) or not value):
             issues.append({"name": root, "expected_shape": shape, "actual_shape": _json_shape(value)})
             continue
-        for index, path in enumerate(paths):
-            reason = ""
-            if not isinstance(path, str):
-                reason = "file_fixture_not_materialized_to_path"
-            elif _E2E_RUNTIME_INPUT_LITERAL_RE.fullmatch(path.strip()):
-                reason = "runtime_input_sentinel_in_trial_fixture"
-            elif not Path(path).is_file():
-                reason = "fixture_path_missing"
-            if reason:
-                issues.append({
-                    "name": root,
-                    "index": index,
-                    "expected_shape": shape,
-                    "actual_shape": _json_shape(path),
-                    "reason": reason,
-                })
+        issues.extend(file_value_issues(paths, name=root, location="source_payload"))
+
+    for argv_key, template_value in command.argv_template.items():
+        roots = {_placeholder_root(expr) for expr in _placeholder_exprs_from_value(template_value)}
+        file_roots = [root for root in roots if _canonical_e2e_shape(specs.get(root).shape if specs.get(root) else "") in {"file_path", "list[file_path]"}]
+        if file_roots:
+            issues.extend(file_value_issues(rendered_payload.get(str(argv_key)), name=file_roots[0], location=f"rendered_argv.{argv_key}"))
+
+    def find_sentinels(value: Any, location: str = "rendered_argv") -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                find_sentinels(child, f"{location}.{key}")
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                find_sentinels(child, f"{location}[{index}]")
+        elif isinstance(value, str) and _E2E_RUNTIME_INPUT_LITERAL_RE.fullmatch(value.strip()):
+            issues.append({"location": location, "reason": "runtime_input_sentinel_in_rendered_argv"})
+    find_sentinels(rendered_payload)
 
     if issues:
         raise ValueError(_e2e_error(
@@ -1033,16 +1063,13 @@ def _placeholder_exprs_from_value(value: Any) -> list[str]:
 
 
 def _placeholder_root(expr: str) -> str:
-    expr = _normalize_e2e_placeholder_expr(expr)
-    if not expr:
-        return ""
-    return re.split(r"[.\[]", expr, maxsplit=1)[0].strip()
+    parsed = parse_placeholder_expr(expr)
+    return parsed.root if parsed else ""
 
 
 def _normalize_e2e_placeholder_expr(expr: str) -> str:
-    value = str(expr or "").strip()
-    value = re.sub(r"\[([^\]]+)\]", r".\1", value)
-    return value
+    parsed = parse_placeholder_expr(expr)
+    return parsed.dotted if parsed else str(expr or "").strip()
 
 
 def _canonical_e2e_shape(raw: Any) -> str:
@@ -1379,31 +1406,6 @@ def _read_e2e_script_for_samples(skill_dir: Path | None, target_file: str = "") 
         return ""
 
 
-def _e2e_file_kind_from_text(text: str) -> list[str]:
-    lowered = str(text or "").lower()
-    kinds: list[str] = []
-
-    # Keep this generic: infer file formats from extensions / common MIME words,
-    # not business-specific skill names.
-    checks = [
-        ("pdf", ("pdf", ".pdf", "application/pdf")),
-        ("docx", ("docx", ".docx", "word document", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")),
-        ("txt", ("txt", ".txt", "plain text", "text/plain")),
-        ("md", ("markdown", ".md", "text/markdown")),
-        ("csv", ("csv", ".csv", "text/csv")),
-        ("json", ("json", ".json", "application/json")),
-        ("html", ("html", ".html", ".htm", "text/html")),
-        ("png", ("png", ".png", "image/png")),
-        ("jpg", ("jpg", ".jpg", ".jpeg", "image/jpeg")),
-    ]
-
-    for kind, needles in checks:
-        if any(needle in lowered for needle in needles):
-            kinds.append(kind)
-
-    return list(dict.fromkeys(kinds))
-
-
 def _infer_e2e_file_sample_kinds(
     *,
     name: str = "",
@@ -1419,18 +1421,7 @@ def _infer_e2e_file_sample_kinds(
     and script bodies: output artifact descriptions (for example report.pdf)
     are not evidence about an input fixture's format.
     """
-    input_identity_evidence = "\n".join([
-        str(name or ""),
-        str(shape or ""),
-        str(target_file or ""),
-    ])
-
-    deduped = _e2e_file_kind_from_text(input_identity_evidence)
-
-    if not deduped:
-        deduped = ["txt"]
-
-    return deduped[: max(1, max_count)]
+    return []
 
 
 def _pdf_escape_text(text: str) -> str:
@@ -1524,66 +1515,319 @@ def _write_minimal_docx(path: Path, text: str) -> None:
         zf.writestr("word/document.xml", document_xml)
 
 
-def _write_minimal_png(path: Path) -> None:
-    # 1x1 transparent PNG.
-    path.write_bytes(bytes.fromhex(
-        "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
-        "0000000a49444154789c636000000200015d0b2a0000000049454e44ae426082"
-    ))
+@dataclass(frozen=True)
+class E2EFileFixtureHandler:
+    canonical_format: str
+    aliases: tuple[str, ...]
+    extension: str
+    content_kind: str
+    fixture_schema: Any
+    validator: Any
+    materializer: Any
 
 
-def _write_minimal_jpg(path: Path) -> None:
-    # 1x1 JPEG.
-    path.write_bytes(bytes.fromhex(
-        "ffd8ffe000104a46494600010101006000600000ffdb00430003020203020203"
-        "030303040304050805050404050a070706080c0a0c0c0b0a0b0b0d0e12100d0e"
-        "110e0b0b1016101113141515150c0f171816141812141514ffc0000b08000100"
-        "0101011100ffc4001400010000000000000000000000000000000000000000ff"
-        "da0008010100003f00d2cf20ffd9"
-    ))
+def _text_fixture_schema(fmt: str, content_kind: str) -> dict[str, Any]:
+    return {"type": "object", "additionalProperties": False,
+            "required": ["format", "content_kind", "text"],
+            "properties": {"format": {"const": fmt}, "content_kind": {"const": content_kind},
+                           "text": {"type": "string", "minLength": 1}}}
+
+
+def _image_fixture_schema(fmt: str, _kind: str) -> dict[str, Any]:
+    return {"type": "object", "additionalProperties": False,
+            "required": ["format", "content_kind", "width", "height", "mode"],
+            "properties": {"format": {"const": fmt}, "content_kind": {"const": "image"},
+                           "width": {"type": "integer", "minimum": 1, "maximum": 512},
+                           "height": {"type": "integer", "minimum": 1, "maximum": 512},
+                           "mode": {"type": "string", "enum": ["RGB", "RGBA", "L"]},
+                           "background": {"type": "string"}}}
+
+
+def _csv_fixture_schema(fmt: str, _kind: str) -> dict[str, Any]:
+    scalar = {"type": ["string", "number", "integer", "boolean", "null"]}
+    column = {"type": "object", "additionalProperties": False,
+              "required": ["name", "type", "nullable"],
+              "properties": {"name": {"type": "string", "minLength": 1},
+                             "type": {"type": "string", "enum": ["string", "number", "integer", "boolean"]},
+                             "nullable": {"type": "boolean"}}}
+    return {"type": "object", "additionalProperties": False,
+            "required": ["format", "content_kind", "columns", "rows"],
+            "properties": {"format": {"const": fmt}, "content_kind": {"const": "tabular"},
+                           "columns": {"type": "array", "minItems": 1, "items": column},
+                           "rows": {"type": "array", "minItems": 1,
+                                    "items": {"type": "object", "additionalProperties": scalar}}}}
+
+
+def _json_fixture_schema(fmt: str, _kind: str) -> dict[str, Any]:
+    return {"type": "object", "additionalProperties": False,
+            "required": ["format", "content_kind", "value"],
+            "properties": {"format": {"const": fmt}, "content_kind": {"const": "json"}, "value": {}}}
+
+
+def _validate_text_spec(spec: dict[str, Any]) -> bool:
+    return isinstance(spec.get("text"), str) and bool(spec["text"].strip())
+
+
+def _validate_image_spec(spec: dict[str, Any]) -> bool:
+    return (spec.get("content_kind") == "image" and isinstance(spec.get("width"), int)
+            and isinstance(spec.get("height"), int) and 1 <= spec["width"] <= 512
+            and 1 <= spec["height"] <= 512 and spec.get("mode") in {"RGB", "RGBA", "L"})
+
+
+def _validate_csv_spec(spec: dict[str, Any]) -> bool:
+    columns, rows = spec.get("columns"), spec.get("rows")
+    if spec.get("content_kind") != "tabular" or not isinstance(columns, list) or not columns or not isinstance(rows, list) or not rows:
+        return False
+    names = [column.get("name") for column in columns if isinstance(column, dict)]
+    if not (len(names) == len(columns) and all(isinstance(name, str) and name for name in names)
+            and len(set(names)) == len(names) and all(isinstance(row, dict) and set(row).issubset(names) for row in rows)):
+        return False
+    types = {column["name"]: column.get("type") for column in columns}
+    nullable = {column["name"]: column.get("nullable") is True for column in columns}
+    if any(value_type not in {"string", "number", "integer", "boolean"} for value_type in types.values()):
+        return False
+    for row in rows:
+        for name, value_type in types.items():
+            value = row.get(name)
+            if value is None:
+                if not nullable[name]:
+                    return False
+            elif value_type == "string" and not isinstance(value, str):
+                return False
+            elif value_type == "boolean" and not isinstance(value, bool):
+                return False
+            elif value_type == "integer" and (not isinstance(value, int) or isinstance(value, bool)):
+                return False
+            elif value_type == "number" and (not isinstance(value, (int, float)) or isinstance(value, bool)):
+                return False
+    return True
+
+
+def _validate_json_spec(spec: dict[str, Any]) -> bool:
+    try:
+        json.dumps(spec["value"], allow_nan=False)
+    except (KeyError, TypeError, ValueError):
+        return False
+    return spec.get("content_kind") == "json"
+
+
+def _materialize_text_fixture(spec: dict[str, Any], path: Path) -> None:
+    path.write_text(spec["text"], encoding="utf-8")
+    if not path.read_text(encoding="utf-8").strip():
+        raise ValueError("empty text fixture")
+
+
+def _materialize_html_fixture(spec: dict[str, Any], path: Path) -> None:
+    text = spec["text"]
+    if "<html" not in text.lower() and "<!doctype html" not in text.lower():
+        text = ("<!doctype html><html><head><meta charset=\"utf-8\"><title>E2E Fixture</title>"
+                f"</head><body><p>{text}</p></body></html>")
+    path.write_text(text, encoding="utf-8")
+    rendered = path.read_text(encoding="utf-8").lower()
+    if "<html" not in rendered and "<!doctype html" not in rendered:
+        raise ValueError("invalid HTML fixture")
+
+
+def _materialize_csv_fixture(spec: dict[str, Any], path: Path) -> None:
+    names = [column["name"] for column in spec["columns"]]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=names, extrasaction="raise")
+        writer.writeheader()
+        for row in spec["rows"]:
+            writer.writerow({name: ("true" if value is True else "false" if value is False else "" if value is None else value) for name, value in row.items()})
+    with path.open(encoding="utf-8", newline="") as handle:
+        assert next(csv.DictReader(handle), None) is not None
+
+
+def _materialize_json_fixture(spec: dict[str, Any], path: Path) -> None:
+    path.write_text(json.dumps(spec["value"], ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    json.loads(path.read_text(encoding="utf-8"))
+
+
+def _materialize_image_fixture(spec: dict[str, Any], path: Path, *, pillow_format: str) -> None:
+    from PIL import Image
+    mode = spec["mode"]
+    if pillow_format == "JPEG" and mode == "RGBA":
+        mode = "RGB"
+    color = spec.get("background") or ("white" if mode != "RGBA" else "transparent")
+    image = Image.new(mode, (spec["width"], spec["height"]), color)
+    image.save(path, format=pillow_format)
+    with Image.open(path) as check:
+        check.verify()
+
+
+def _document_materializer(writer: Any) -> Any:
+    def materialize(spec: dict[str, Any], path: Path) -> None:
+        writer(path, spec["text"])
+        if writer is _write_minimal_pdf:
+            if not path.read_bytes().startswith(b"%PDF-"):
+                raise ValueError("invalid PDF fixture")
+        else:
+            import zipfile
+            with zipfile.ZipFile(path) as archive:
+                if "word/document.xml" not in archive.namelist():
+                    raise ValueError("invalid DOCX fixture")
+    return materialize
+
+
+def _image_materializer(fmt: str) -> Any:
+    return lambda spec, path: _materialize_image_fixture(spec, path, pillow_format=fmt)
+
+
+FILE_FIXTURE_FORMATS: dict[str, E2EFileFixtureHandler] = {}
+
+
+def _register_file_fixture_handler(handler: E2EFileFixtureHandler) -> None:
+    for name in (handler.canonical_format, *handler.aliases):
+        FILE_FIXTURE_FORMATS[name] = handler
+
+
+def _register_builtin_file_fixture_handlers() -> None:
+    text_handlers = [
+        ("txt", (), ".txt", _materialize_text_fixture),
+        ("md", (), ".md", _materialize_text_fixture),
+        ("html", (), ".html", _materialize_html_fixture),
+    ]
+    for fmt, aliases, extension, materializer in text_handlers:
+        _register_file_fixture_handler(E2EFileFixtureHandler(fmt, aliases, extension, "text", _text_fixture_schema, _validate_text_spec, materializer))
+    _register_file_fixture_handler(E2EFileFixtureHandler("csv", (), ".csv", "tabular", _csv_fixture_schema, _validate_csv_spec, _materialize_csv_fixture))
+    _register_file_fixture_handler(E2EFileFixtureHandler("json", (), ".json", "json", _json_fixture_schema, _validate_json_spec, _materialize_json_fixture))
+    for fmt, extension, writer in (("pdf", ".pdf", _write_minimal_pdf), ("docx", ".docx", _write_minimal_docx)):
+        _register_file_fixture_handler(E2EFileFixtureHandler(fmt, (), extension, "document", _text_fixture_schema, _validate_text_spec, _document_materializer(writer)))
+    for fmt, aliases, extension, pillow_fmt in (
+        ("png", (), ".png", "PNG"), ("jpeg", ("jpg",), ".jpg", "JPEG"),
+        ("tiff", ("tif",), ".tiff", "TIFF"), ("webp", (), ".webp", "WEBP"),
+        ("bmp", (), ".bmp", "BMP"),
+    ):
+        _register_file_fixture_handler(E2EFileFixtureHandler(fmt, aliases, extension, "image", _image_fixture_schema, _validate_image_spec, _image_materializer(pillow_fmt)))
+
+
+_register_builtin_file_fixture_handlers()
+
+
+def _resolve_file_fixture_handler(fmt: str) -> E2EFileFixtureHandler | None:
+    return FILE_FIXTURE_FORMATS.get(str(fmt or "").strip().lower())
+
+
+def _canonical_file_fixture_format(fmt: str) -> str:
+    handler = _resolve_file_fixture_handler(fmt)
+    return handler.canonical_format if handler else ""
+
+
+def _formats_from_input_evidence(text: str) -> tuple[str, ...]:
+    value = str(text or "").lower()
+    found: list[str] = []
+    for alias, handler in FILE_FIXTURE_FORMATS.items():
+        if re.search(rf"(?<![a-z0-9])\.?{re.escape(alias)}(?![a-z0-9])", value):
+            if handler.canonical_format not in found:
+                found.append(handler.canonical_format)
+    return tuple(found)
+
+
+def _resolve_e2e_file_input_spec(
+    typed_spec: E2ETypedInputSpec,
+    requirements: list[RequirementItem],
+) -> E2EFileInputSpec:
+    """Resolve format/cardinality solely from frozen input-side evidence."""
+    evidence_groups: list[tuple[str, list[str]]] = []
+    input_declarations = [str(value) for req in requirements for value in (req.inputs or [])]
+    constraint_values: list[str] = []
+    for req in requirements:
+        for constraint in req.constraints or []:
+            constraint_label = " ".join([str(constraint.name or ""), str(constraint.kind or "")]).lower()
+            if re.search(r"\b(?:output|result|artifact|export)\b|(?:输出|产物|导出)", constraint_label):
+                continue
+            raw = constraint.value
+            if isinstance(raw, dict):
+                raw = raw.get("allowed_formats") or raw.get("formats") or raw.get("format") or ""
+            if isinstance(raw, list):
+                constraint_values.extend(str(value) for value in raw)
+            else:
+                constraint_values.append(str(raw or ""))
+    purposes = [
+        re.split(r"\b(?:output|result|report|generate|create|produce|write|save|return|export)\b|(?:输出|生成|导出)", str(req.purpose or ""), maxsplit=1, flags=re.I)[0]
+        for req in requirements
+    ]
+    evidence_groups.extend([
+        ("requirement_input", input_declarations),
+        ("requirement_constraint", constraint_values),
+        ("requirement_input_context", purposes),
+    ])
+    allowed: tuple[str, ...] = ()
+    source = "unknown"
+    authority_text = ""
+    for candidate_source, values in evidence_groups:
+        formats = _formats_from_input_evidence("\n".join(values))
+        if formats:
+            allowed, source, authority_text = formats, candidate_source, "\n".join(values)
+            break
+    shape = _canonical_e2e_shape(typed_spec.shape)
+    minimum, maximum = (1, 1) if shape == "file_path" else (1, 3)
+    cardinality_match = re.search(r"\b(?:exactly\s+)?(one|two|three|[1-3])\b|([一二三两])(?:个|份|张)", authority_text.lower())
+    if cardinality_match and shape == "list[file_path]":
+        raw = cardinality_match.group(1) or cardinality_match.group(2)
+        count = {"one": 1, "two": 2, "three": 3, "一": 1, "二": 2, "两": 2, "三": 3}.get(raw, int(raw) if raw.isdigit() else 1)
+        minimum = maximum = count
+    result = E2EFileInputSpec(
+        source_name=typed_spec.name, runtime_shape=shape, allowed_formats=allowed,
+        min_items=minimum, max_items=maximum,
+        homogeneous=True if len(allowed) == 1 else (False if len(allowed) > 1 else None),
+        format_source=source,
+    )
+    logger.info("[Creator][E2E][file_input_resolution] %s", json.dumps({
+        "name": result.source_name, "shape": result.runtime_shape,
+        "allowed_formats": list(result.allowed_formats), "format_source": result.format_source,
+        "cardinality": {"min": result.min_items, "max": result.max_items},
+        "collection_format_policy": "homogeneous" if result.homogeneous else "mixed" if result.homogeneous is False else "unknown",
+    }, ensure_ascii=False, sort_keys=True))
+    return result
 
 
 def _e2e_sample_suffix_for_kind(kind: str) -> str:
-    return {
-        "pdf": ".pdf",
-        "docx": ".docx",
-        "txt": ".txt",
-        "md": ".md",
-        "csv": ".csv",
-        "json": ".json",
-        "html": ".html",
-        "png": ".png",
-        "jpg": ".jpg",
-        "jpeg": ".jpg",
-    }.get(str(kind or "").lower(), ".txt")
+    handler = _resolve_file_fixture_handler(kind)
+    return handler.extension if handler else ""
 
 
 def _write_e2e_sample_file_by_kind(path: Path, *, kind: str, name: str, index: int) -> None:
-    kind = str(kind or "txt").lower()
-    sample_text = (
-        f"Creator E2E sample content for {name or 'input'} #{index}.\n"
-        "This file is generated deterministically to validate file input handling, "
-        "script execution, stdout JSON, and final workflow closure.\n"
-    )
-
-    if kind == "pdf":
-        _write_minimal_pdf(path, sample_text)
-    elif kind == "docx":
-        _write_minimal_docx(path, sample_text)
-    elif kind == "md":
-        path.write_text("# Creator E2E Sample\n\n" + sample_text, encoding="utf-8")
-    elif kind == "csv":
-        path.write_text("title,content\nCreator E2E Sample," + sample_text.replace("\n", " ") + "\n", encoding="utf-8")
-    elif kind == "json":
-        path.write_text(json.dumps({"title": "Creator E2E Sample", "content": sample_text}, ensure_ascii=False), encoding="utf-8")
-    elif kind == "html":
-        path.write_text(f"<html><body><h1>Creator E2E Sample</h1><p>{sample_text}</p></body></html>", encoding="utf-8")
-    elif kind == "png":
-        _write_minimal_png(path)
-    elif kind in {"jpg", "jpeg"}:
-        _write_minimal_jpg(path)
+    handler = _resolve_file_fixture_handler(kind)
+    if handler is None:
+        raise ValueError(f"unsupported E2E file fixture format: {kind}")
+    sample_text = f"Creator E2E sample content for {name or 'input'} #{index}.\n"
+    if handler.content_kind == "image":
+        spec = {"format": handler.canonical_format, "content_kind": "image", "width": 64, "height": 64, "mode": "RGB"}
+    elif handler.canonical_format == "csv":
+        spec = {"format": "csv", "content_kind": "tabular",
+                "columns": [{"name": "content", "type": "string", "nullable": False}],
+                "rows": [{"content": sample_text.strip()}]}
+    elif handler.canonical_format == "json":
+        spec = {"format": "json", "content_kind": "json", "value": {"content": sample_text.strip()}}
+    elif handler.canonical_format == "html":
+        spec = {"format": "html", "content_kind": "text", "text": sample_text}
     else:
-        path.write_text(sample_text, encoding="utf-8")
+        spec = {"format": handler.canonical_format, "content_kind": handler.content_kind, "text": sample_text}
+    handler.materializer(spec, path)
+
+
+def _e2e_sample_path(
+    skill_dir: Path | None,
+    name: str,
+    index: int = 1,
+    *,
+    kind: str | None = None,
+    suffix: str | None = None,
+) -> Path:
+    base = (skill_dir / ".creator_e2e" / "samples") if skill_dir is not None else Path(tempfile.mkdtemp(prefix="creator-e2e-samples-"))
+    base.mkdir(parents=True, exist_ok=True)
+
+    sample_kind = str(kind or "").strip().lower()
+    if not _resolve_file_fixture_handler(sample_kind):
+        raise ValueError(f"unsupported E2E file fixture format: {sample_kind or 'unknown'}")
+    sample_suffix = suffix or _e2e_sample_suffix_for_kind(sample_kind)
+
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name or "input").strip("._") or "input"
+    path = base / f"{safe}_{index}{sample_suffix}"
+
+    return path
 
 
 def _e2e_sample_file(
@@ -1594,14 +1838,8 @@ def _e2e_sample_file(
     kind: str | None = None,
     suffix: str | None = None,
 ) -> str:
-    base = (skill_dir / ".creator_e2e" / "samples") if skill_dir is not None else Path(tempfile.mkdtemp(prefix="creator-e2e-samples-"))
-    base.mkdir(parents=True, exist_ok=True)
-
-    sample_kind = str(kind or "").strip().lower() or "txt"
-    sample_suffix = suffix or _e2e_sample_suffix_for_kind(sample_kind)
-
-    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name or "input").strip("._") or "input"
-    path = base / f"{safe}_{index}{sample_suffix}"
+    sample_kind = str(kind or "").strip().lower()
+    path = _e2e_sample_path(skill_dir, name, index, kind=sample_kind, suffix=suffix)
 
     _write_e2e_sample_file_by_kind(path, kind=sample_kind, name=name, index=index)
     return str(path)
@@ -1646,6 +1884,8 @@ def _materialize_e2e_sample_value(
             script_content=script_content,
             max_count=1,
         )
+        if not kinds:
+            raise ValueError(f"E2E file format authority is unknown for {spec.name}")
         return _e2e_sample_file(skill_dir, spec.name, 1, kind=kinds[0])
 
     if shape.startswith("list"):
@@ -1660,6 +1900,8 @@ def _materialize_e2e_sample_value(
                 script_content=script_content,
                 max_count=3,
             )
+            if not kinds:
+                raise ValueError(f"E2E file format authority is unknown for {spec.name}")
             return [
                 _e2e_sample_file(skill_dir, spec.name, index + 1, kind=kind)
                 for index, kind in enumerate(kinds)
@@ -1679,8 +1921,8 @@ def _materialize_e2e_sample_value(
     return "sample value"
 
 
-_E2E_TRIAL_FORMATS = {"txt", "md", "json", "csv", "pdf", "docx"}
-_E2E_TRIAL_CONTENT_KINDS = {"text", "json", "tabular"}
+_E2E_TRIAL_FORMATS = set(FILE_FIXTURE_FORMATS)
+_E2E_TRIAL_CONTENT_KINDS = {handler.content_kind for handler in FILE_FIXTURE_FORMATS.values()}
 
 
 def _canonicalize_e2e_trial_case_spec(value: Any) -> Any:
@@ -1783,51 +2025,8 @@ def _validate_e2e_trial_case_spec(
         for file_spec in files:
             if not isinstance(file_spec, dict):
                 return None
-            fmt, content_kind = str(file_spec.get("format") or "").lower(), str(file_spec.get("content_kind") or "").lower()
-            if fmt not in _E2E_TRIAL_FORMATS or content_kind not in _E2E_TRIAL_CONTENT_KINDS:
-                return None
-            if fmt == "csv":
-                columns, rows = file_spec.get("columns"), file_spec.get("rows")
-                if content_kind != "tabular" or not isinstance(columns, list) or not columns or not isinstance(rows, list) or not rows:
-                    return None
-                names = [str(column.get("name") or "") for column in columns if isinstance(column, dict)]
-                if len(names) != len(columns) or not all(names) or len(set(names)) != len(names):
-                    return None
-                column_types = {
-                    str(column["name"]): str(column.get("type") or "").lower()
-                    for column in columns
-                }
-                if any(value_type not in {"string", "number", "integer", "boolean"} for value_type in column_types.values()):
-                    return None
-                nullable = {
-                    str(column["name"]): column.get("nullable") is True
-                    for column in columns
-                }
-                if any(not isinstance(row, dict) or not set(row).issubset(names) for row in rows):
-                    return None
-                for row in rows:
-                    for column_name, value_type in column_types.items():
-                        cell = row.get(column_name)
-                        if cell is None:
-                            if not nullable[column_name]:
-                                return None
-                            continue
-                        if value_type == "string" and not isinstance(cell, str):
-                            return None
-                        if value_type == "boolean" and not isinstance(cell, bool):
-                            return None
-                        if value_type == "integer" and (not isinstance(cell, int) or isinstance(cell, bool)):
-                            return None
-                        if value_type == "number" and (not isinstance(cell, (int, float)) or isinstance(cell, bool)):
-                            return None
-            elif fmt == "json":
-                if content_kind != "json" or "value" not in file_spec:
-                    return None
-                try:
-                    json.dumps(file_spec["value"], allow_nan=False)
-                except (TypeError, ValueError):
-                    return None
-            elif content_kind != "text" or not isinstance(file_spec.get("text"), str) or not file_spec["text"].strip():
+            handler = _resolve_file_fixture_handler(str(file_spec.get("format") or ""))
+            if handler is None or file_spec.get("content_kind") != handler.content_kind or not handler.validator(file_spec):
                 return None
     return value
 
@@ -1843,23 +2042,11 @@ def _materialize_e2e_trial_fixture(item: dict[str, Any], *, skill_dir: Path) -> 
     files = fixture["files"] if fixture.get("kind") == "file_list" else ([] if materialized is not None else [fixture])
     paths: list[str] = []
     for index, file_spec in enumerate(files, 1):
-        fmt = file_spec["format"]
-        path = Path(_e2e_sample_file(skill_dir, item["name"], index, kind=fmt))
-        if fmt == "csv":
-            names = [column["name"] for column in file_spec["columns"]]
-            with path.open("w", encoding="utf-8", newline="") as handle:
-                writer = csv.DictWriter(handle, fieldnames=names, extrasaction="raise")
-                writer.writeheader()
-                for row in file_spec["rows"]:
-                    writer.writerow({name: ("true" if value is True else "false" if value is False else "" if value is None else value) for name, value in row.items()})
-        elif fmt == "json":
-            path.write_text(json.dumps(file_spec["value"], ensure_ascii=False, sort_keys=True), encoding="utf-8")
-        elif fmt == "pdf":
-            _write_minimal_pdf(path, file_spec["text"])
-        elif fmt == "docx":
-            _write_minimal_docx(path, file_spec["text"])
-        else:
-            path.write_text(file_spec["text"], encoding="utf-8")
+        handler = _resolve_file_fixture_handler(file_spec["format"])
+        if handler is None or not handler.validator(file_spec):
+            raise ValueError(f"unsupported or invalid E2E file fixture: {file_spec.get('format')}")
+        path = _e2e_sample_path(skill_dir, item["name"], index, kind=handler.canonical_format)
+        handler.materializer(file_spec, path)
         paths.append(str(path))
     if materialized is None:
         materialized = paths if _canonical_e2e_shape(item["shape"]).startswith("list") else paths[0]
@@ -1871,6 +2058,10 @@ def _materialize_e2e_trial_fixture(item: dict[str, Any], *, skill_dir: Path) -> 
             "fixture_kind": fixture.get("kind", fixture.get("content_kind")),
             "materialized_shape": _json_shape(materialized),
             "paths": paths or None,
+            "files": [{"canonical_format": _canonical_file_fixture_format(spec["format"]),
+                       "extension": _e2e_sample_suffix_for_kind(spec["format"]),
+                       "content_kind": _resolve_file_fixture_handler(spec["format"]).content_kind,
+                       "path": path} for spec, path in zip(files, paths)],
         }, ensure_ascii=False, sort_keys=True),
     )
     return materialized
@@ -1912,49 +2103,22 @@ def _complete_creator_json_object_once_sync_for_e2e(**kwargs: Any) -> dict[str, 
 
 def _e2e_trial_case_response_schema(facts: dict[str, Any]) -> dict[str, Any]:
     """Bind the Trial Case output contract to the supplied frozen input facts."""
-    scalar_json = {"type": ["string", "number", "integer", "boolean", "null"]}
-    column = {
-        "type": "object",
-        "additionalProperties": False,
-        "required": ["name", "type", "nullable"],
-        "properties": {
-            "name": {"type": "string", "minLength": 1},
-            "type": {"type": "string", "enum": ["string", "number", "integer", "boolean"]},
-            "nullable": {"type": "boolean"},
-        },
-    }
-    text_file_variants = [
-        {
-            "type": "object", "additionalProperties": False,
-            "required": ["format", "content_kind", "text"],
-            "properties": {
-                "format": {"const": fmt}, "content_kind": {"const": "text"},
-                "text": {"type": "string", "minLength": 1},
-            },
-        }
-        for fmt in ("txt", "md", "pdf", "docx")
-    ]
-    csv_file = {
-        "type": "object", "additionalProperties": False,
-        "required": ["format", "content_kind", "columns", "rows"],
-        "properties": {
-            "format": {"const": "csv"}, "content_kind": {"const": "tabular"},
-            "columns": {"type": "array", "minItems": 1, "items": column},
-            "rows": {"type": "array", "minItems": 1, "items": {
-                "type": "object", "additionalProperties": scalar_json,
-            }},
-        },
-    }
-    json_file = {
-        "type": "object", "additionalProperties": False,
-        "required": ["format", "content_kind", "value"],
-        "properties": {"format": {"const": "json"}, "content_kind": {"const": "json"}, "value": {}},
-    }
-    file_schema = {"oneOf": [*text_file_variants, json_file, csv_file]}
     input_variants: list[dict[str, Any]] = []
     for frozen in facts.get("external_inputs", []):
         platform_input = frozen.get("platform_input", {}) if isinstance(frozen, dict) else {}
         name, shape = str(platform_input.get("name") or ""), _canonical_e2e_shape(str(platform_input.get("shape") or ""))
+        file_contract = platform_input.get("file_contract") if isinstance(platform_input.get("file_contract"), dict) else {}
+        allowed_formats = [fmt for fmt in file_contract.get("allowed_formats", []) if _resolve_file_fixture_handler(fmt)]
+        file_variants = [
+            _resolve_file_fixture_handler(fmt).fixture_schema(
+                _resolve_file_fixture_handler(fmt).canonical_format,
+                _resolve_file_fixture_handler(fmt).content_kind,
+            )
+            for fmt in allowed_formats
+        ]
+        file_schema = {"oneOf": file_variants}
+        min_items = int(file_contract.get("min_items") or 1)
+        max_items = int(file_contract.get("max_items") or (1 if shape == "file_path" else 3))
         evidence_ids = [str(item.get("id")) for item in frozen.get("requirements", []) if isinstance(item, dict) and item.get("id")]
         evidence_schema: dict[str, Any] = {
             "type": "array", "uniqueItems": True,
@@ -1987,7 +2151,7 @@ def _e2e_trial_case_response_schema(facts: dict[str, Any]) -> dict[str, Any]:
             fixture = {
                 "type": "object", "additionalProperties": False,
                 "required": ["kind", "files"],
-                "properties": {"kind": {"const": "file_list"}, "files": {"type": "array", "minItems": 1, "maxItems": 3, "items": file_schema}},
+                "properties": {"kind": {"const": "file_list"}, "files": {"type": "array", "minItems": min_items, "maxItems": max_items, "items": file_schema}},
             }
         input_variants.append({
             "type": "object", "additionalProperties": False,
@@ -2341,6 +2505,8 @@ def _materialize_e2e_runtime_literal_scalar(
             script_content=script_content,
             max_count=3,
         )
+        if not kinds:
+            raise ValueError("legacy runtime input sentinel has no frozen file format authority")
         return [
             _e2e_sample_file(skill_dir, key or "runtime_input_file", idx + 1, kind=kind)
             for idx, kind in enumerate(kinds)
@@ -2355,6 +2521,8 @@ def _materialize_e2e_runtime_literal_scalar(
             script_content=script_content,
             max_count=1,
         )
+        if not kinds:
+            raise ValueError("legacy runtime input sentinel has no frozen file format authority")
         return _e2e_sample_file(skill_dir, key or "runtime_input_file", index, kind=kinds[0])
 
     if token in {"__RUNTIME_INPUT_TEXT__", "__RUNTIME_INPUT__", "__USER_INPUT__"}:
@@ -2511,11 +2679,10 @@ def _seed_initial_e2e_payload(
     if not isinstance(payload.get("options"), dict):
         payload["options"] = {}
 
-    if not isinstance(payload.get("input_files"), list):
-        payload["input_files"] = []
-
-    if not isinstance(payload.get("files"), list):
-        payload["files"] = list(payload.get("input_files") or [])
+    runtime_file_roots = _platform_runtime_file_input_names()
+    for root in runtime_file_roots:
+        if not isinstance(payload.get(root), list):
+            payload[root] = []
 
     typed_specs = _collect_e2e_typed_inputs_from_graph(
         commands=commands,
@@ -2638,7 +2805,7 @@ def _seed_initial_e2e_payload(
         if container is not None and not _json_value_non_empty(container.get(path_parts[-1])):
             container[path_parts[-1]] = default_value
 
-    platform_roots = {"user_request", "input", "text", "payload", "fields", "options", "input_files", "files", "resources"}
+    platform_roots = {"user_request", "input", "text", "payload", "fields", "options", "resources"} | runtime_file_roots
     for spec in typed_specs:
         if spec.name in {"fields", "options"} and isinstance(payload.get(spec.name), dict):
             continue
@@ -2658,18 +2825,14 @@ def _seed_initial_e2e_payload(
                 else _materialize_e2e_sample_value(spec, skill_dir=skill_dir)
             )
 
-    if (
-        isinstance(payload.get("input_files"), list)
-        and payload.get("input_files")
-        and (not isinstance(payload.get("files"), list) or not payload.get("files"))
-    ):
-        payload["files"] = list(payload["input_files"])
-    if (
-        isinstance(payload.get("files"), list)
-        and payload.get("files")
-        and (not isinstance(payload.get("input_files"), list) or not payload.get("input_files"))
-    ):
-        payload["input_files"] = list(payload["files"])
+    frozen_runtime_files = next(
+        (payload[root] for root in runtime_file_roots if isinstance(payload.get(root), list) and payload[root]),
+        None,
+    )
+    if frozen_runtime_files is not None:
+        for root in runtime_file_roots:
+            if not isinstance(payload.get(root), list) or not payload[root]:
+                payload[root] = list(frozen_runtime_files)
 
     if commands:
         first = commands[0]
@@ -2824,6 +2987,18 @@ def _prepare_e2e_trial_case(
             session.trial_case_prepared = True
         return None
 
+    file_specs: dict[str, E2EFileInputSpec] = {}
+    for name, spec in candidates.items():
+        if _canonical_e2e_shape(spec.shape) in {"file_path", "list[file_path]"}:
+            file_specs[name] = _resolve_e2e_file_input_spec(
+                spec, requirements_by_file.get(spec.target_file, []),
+            )
+    if any(not spec.allowed_formats for spec in file_specs.values()):
+        logger.warning("[Creator][E2E][trial_case_fallback] reason=file_format_unknown")
+        if session is not None:
+            session.trial_case_prepared = True
+        return None
+
     requirements: list[dict[str, str]] = []
     requirement_ids_by_input: dict[str, set[str]] = {}
     for target in {spec.target_file for spec in candidates.values()}:
@@ -2842,7 +3017,16 @@ def _prepare_e2e_trial_case(
             if str(getattr(requirement, "id", "") or "")
         }
     facts = {"version": 1, "external_inputs": [
-        {"platform_input": {"name": spec.name, "shape": _canonical_e2e_shape(spec.shape)},
+        {"platform_input": {
+             "name": spec.name, "shape": _canonical_e2e_shape(spec.shape),
+             **({"file_contract": {
+                 "allowed_formats": list(file_specs[spec.name].allowed_formats),
+                 "min_items": file_specs[spec.name].min_items,
+                 "max_items": file_specs[spec.name].max_items,
+                 "homogeneous": file_specs[spec.name].homogeneous,
+                 "format_source": file_specs[spec.name].format_source,
+             }} if spec.name in file_specs else {}),
+         },
          "target": {"script": spec.target_file, "input": spec.name},
          "requirements": [item for item in requirements if item["id"] in {
              str(getattr(req, "id", "") or "") for req in requirements_by_file.get(spec.target_file, [])

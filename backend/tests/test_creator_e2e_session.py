@@ -919,14 +919,12 @@ def test_e2e_input_files_files_alias_sync_preserves_non_empty_external_context(t
     commands = [E2EWorkflowCommand(1, "SKILL.md", "scripts/a.py", "python scripts/a.py '{}'", "python", {})]
 
     reqs = {"scripts/a.py": [e2e.RequirementItem(target_file="scripts/a.py", inputs=["input_files: list[file_path]"])]}
-    payload = e2e._seed_initial_e2e_payload(commands, skill_dir=skill_dir, requirements_by_file=reqs)
-    assert payload["input_files"]
-    assert payload["files"] == payload["input_files"]
+    with pytest.raises(ValueError, match="format authority is unknown"):
+        e2e._seed_initial_e2e_payload(commands, skill_dir=skill_dir, requirements_by_file=reqs)
 
     reqs = {"scripts/a.py": [e2e.RequirementItem(target_file="scripts/a.py", inputs=["files: list[file_path]"])]}
-    payload = e2e._seed_initial_e2e_payload(commands, skill_dir=skill_dir, requirements_by_file=reqs)
-    assert payload["files"]
-    assert payload["input_files"] == payload["files"]
+    with pytest.raises(ValueError, match="format authority is unknown"):
+        e2e._seed_initial_e2e_payload(commands, skill_dir=skill_dir, requirements_by_file=reqs)
 
     payload = e2e._seed_initial_e2e_payload(
         commands,
@@ -950,11 +948,8 @@ def test_e2e_fields_fallback_normalizes_bracket_placeholder(tmp_path):
     )
     command = E2EWorkflowCommand(1, "SKILL.md", "scripts/consume.py", "python scripts/consume.py '{}'", "python", {"first": "{{fields.attachments[0]}}"})
 
-    payload = e2e._seed_initial_e2e_payload([command], skill_dir=skill_dir)
-
-    assert payload["fields"][dynamic_key]
-    assert all(isinstance(path, str) for path in payload["fields"][dynamic_key])
-    assert all(Path(path).is_file() for path in payload["fields"][dynamic_key])
+    with pytest.raises(ValueError, match="format authority is unknown"):
+        e2e._seed_initial_e2e_payload([command], skill_dir=skill_dir)
 
 
 def test_e2e_missing_placeholder_reports_index_not_integer_and_empty_expr():

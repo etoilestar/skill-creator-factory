@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 from ..skill_dataflow import (
     normalize_bare_json_placeholders,
+    parse_placeholder_expr,
     placeholder_pattern,
 )
 _PLATFORM_PLACEHOLDER_RE = placeholder_pattern()
@@ -149,12 +150,12 @@ def _sanitize_template_value(value: str) -> tuple[str, dict[str, Any] | None, bo
     # indexed file collections must remain visible to the typed E2E resolver;
     # translating them to Creator-only runtime sentinels here erases their root
     # and bypasses Trial Case fixture generation.
-    input_match = re.fullmatch(r"(input_files|uploaded_files)\[(\d+)\]", expr)
-    if input_match:
+    placeholder_path = parse_placeholder_expr(expr)
+    if placeholder_path and placeholder_path.segments:
         return value, {
             "source": "platform_input",
-            "root": input_match.group(1),
-            "index": int(input_match.group(2)),
+            "root": placeholder_path.root,
+            "segments": list(placeholder_path.segments),
             "placeholder": f"{{{{{expr}}}}}",
         }, False
     path_match = re.fullmatch(r"(references|assets)/([A-Za-z0-9._/-]+)", expr)
@@ -274,12 +275,7 @@ def _complex_template_paths(
                 + "}}"
             )
 
-            if not _PLATFORM_PLACEHOLDER_RE.fullmatch(
-                token
-            ) and not re.fullmatch(
-                r"\{\{\s*(?:input_files|uploaded_files)\[\d+\]\s*\}\}",
-                token,
-            ):
+            if not _PLATFORM_PLACEHOLDER_RE.fullmatch(token):
                 found.append(path or "$")
 
     return found

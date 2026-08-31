@@ -3312,9 +3312,12 @@ def _prepare_e2e_trial_case(
         candidates.setdefault(spec.name, spec)
     if not candidates:
         if session is not None:
+            session.trial_case = None
+            session.trial_case_digest = ""
             session.trial_case_prepared = True
-            session.input_case_plan_failure = "file_format_unknown"
-            session.input_case_plan_failure_details = {"unsupported_inputs": unknown, "plan_digest": plan.digest}
+            session.input_case_plan_failure = ""
+            session.input_case_plan_failure_details = {}
+        logger.info("[Creator][E2E][input_case_no_generation_needed]")
         return None
 
     plan = _build_e2e_input_case_plan(
@@ -3329,6 +3332,8 @@ def _prepare_e2e_trial_case(
         logger.warning("[Creator][E2E][case_plan_unsupported] reason=file_format_unknown inputs=%s", unknown)
         if session is not None:
             session.trial_case_prepared = True
+            session.input_case_plan_failure = "file_format_unknown"
+            session.input_case_plan_failure_details = {"unsupported_inputs": unknown, "plan_digest": plan.digest}
         raise E2ECaseInfrastructureError(
             "file_format_unknown",
             details={"unsupported_inputs": unknown, "plan_digest": plan.digest},

@@ -280,6 +280,33 @@ def test_external_and_declared_default_prevent_trial_generation(tmp_path, monkey
     ) is None
 
 
+@pytest.mark.parametrize(("external_context", "default_values"), [
+    ({"input_files": ["/tmp/real.csv"]}, {}),
+    ({}, {"input_files": ["declared.csv"]}),
+])
+def test_no_trial_candidates_is_a_normal_frozen_session_state(
+    tmp_path, monkeypatch, external_context, default_values,
+):
+    monkeypatch.setattr(
+        e2e, "_build_e2e_trial_case",
+        lambda *args, **kwargs: pytest.fail("trial builder must not run"),
+    )
+    session = e2e.CreatorE2ESession(
+        "session", "demo", tmp_path, tmp_path / ".venv", tmp_path / "outputs",
+    )
+
+    assert e2e._prepare_e2e_trial_case(
+        typed_specs=[_spec()], requirements_by_file={},
+        skill_plan_entries={"scripts/analyze.py": SimpleNamespace(default_values=default_values)},
+        external_context=external_context, requested_model=None, session=session,
+    ) is None
+    assert session.trial_case is None
+    assert session.trial_case_digest == ""
+    assert session.trial_case_prepared is True
+    assert session.input_case_plan_failure == ""
+    assert session.input_case_plan_failure_details == {}
+
+
 def test_declared_default_beats_trial_case_and_unknown_format_has_no_generic_fallback(tmp_path):
     command = e2e.E2EWorkflowCommand(1, "SKILL.md", "scripts/analyze.py", "", "python", {"input_files": "{{input_files}}"})
     entry = SimpleNamespace(default_values={"input_files": ["declared.csv"]}, inputs=[], artifact_contract={})
@@ -427,13 +454,16 @@ def test_candidate_invariant_veto_rejects_frozen_boundary_changes():
     ) == ["frozen_provenance_changed", "frozen_argv_interface_changed"]
 
 
-def test_unknown_file_authority_is_creator_owned_case_plan_failure():
+def test_unknown_file_authority_is_creator_owned_case_plan_failure(tmp_path):
+    session = e2e.CreatorE2ESession(
+        "session", "demo", tmp_path, tmp_path / ".venv", tmp_path / "outputs",
+    )
     with pytest.raises(e2e.E2ECaseInfrastructureError) as raised:
         e2e._prepare_e2e_trial_case(
             typed_specs=[_spec("uploads", "list[file_path]")],
             requirements_by_file={},
             skill_plan_entries={"scripts/analyze.py": SimpleNamespace(default_values={})},
-            external_context={}, requested_model=None, session=None,
+            external_context={}, requested_model=None, session=session,
         )
 
     failure = e2e._structured_failure_from_errors([
@@ -443,6 +473,14 @@ def test_unknown_file_authority_is_creator_owned_case_plan_failure():
     assert failure["layer"] == "e2e_case_plan"
     assert failure["details"]["repair_owner"] == "creator_e2e"
     assert failure["details"]["skill_repair_allowed"] is False
+    assert session.input_case_plan_failure == "file_format_unknown"
+    with pytest.raises(e2e.E2ECaseInfrastructureError, match="file_format_unknown"):
+        e2e._prepare_e2e_trial_case(
+            typed_specs=[_spec("uploads", "list[file_path]")],
+            requirements_by_file={},
+            skill_plan_entries={"scripts/analyze.py": SimpleNamespace(default_values={})},
+            external_context={}, requested_model=None, session=session,
+        )
 
 
 def test_csv_file_list_materializes_each_file_with_csv_suffix(tmp_path):

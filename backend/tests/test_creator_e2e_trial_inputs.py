@@ -372,6 +372,17 @@ def test_case_plan_merges_nested_roots_and_derives_index_cardinality():
     assert fixture["value"][1]["id"] == "sample"
 
 
+def test_strict_argv_requiredness_has_independent_highest_authority():
+    plan = e2e._build_e2e_input_case_plan([
+        e2e.E2ETypedInputSpec(name="options", shape="object", required=True, source="requirement_graph"),
+        e2e.E2ETypedInputSpec(name="options", shape="object", required=False, source="argv_schema"),
+        e2e.E2ETypedInputSpec(name="options", shape="object", required=True, source="placeholder"),
+    ])
+
+    assert plan.inputs["options"].required is False
+    assert plan.inputs["options"].required_source == "argv_schema"
+
+
 def test_per_input_validation_preserves_valid_siblings_and_falls_back_locally():
     plan = e2e._build_e2e_input_case_plan([
         _spec("mode", "string"),
@@ -399,6 +410,39 @@ def test_candidate_invariant_veto_rejects_new_runtime_sentinel():
     assert e2e._e2e_candidate_invariant_veto(
         '"foo": "{{foo}}"', '"foo": "__RUNTIME_INPUT_FILES__"',
     ) == ["introduced_runtime_sentinel"]
+
+
+def test_candidate_invariant_veto_rejects_frozen_boundary_changes():
+    before = e2e._e2e_error(target="scripts/x.py", layer="script_exit", message="before", details={
+        "frozen_provenance": {"foo": "external_context"},
+        "frozen_argv_interface": {"foo": "list[string]"},
+    })
+    after = e2e._e2e_error(target="scripts/x.py", layer="script_exit", message="after", details={
+        "frozen_provenance": {"foo": "literal"},
+        "frozen_argv_interface": {"foo": "string"},
+    })
+
+    assert e2e._e2e_candidate_invariant_veto(
+        "unchanged", "unchanged", original_errors=[before], new_errors=[after],
+    ) == ["frozen_provenance_changed", "frozen_argv_interface_changed"]
+
+
+def test_unknown_file_authority_is_creator_owned_case_plan_failure():
+    with pytest.raises(e2e.E2ECaseInfrastructureError) as raised:
+        e2e._prepare_e2e_trial_case(
+            typed_specs=[_spec("uploads", "list[file_path]")],
+            requirements_by_file={},
+            skill_plan_entries={"scripts/analyze.py": SimpleNamespace(default_values={})},
+            external_context={}, requested_model=None, session=None,
+        )
+
+    failure = e2e._structured_failure_from_errors([
+        e2e._e2e_case_infrastructure_failure(raised.value),
+    ])
+    assert failure["target_file"] == "creator_e2e"
+    assert failure["layer"] == "e2e_case_plan"
+    assert failure["details"]["repair_owner"] == "creator_e2e"
+    assert failure["details"]["skill_repair_allowed"] is False
 
 
 def test_csv_file_list_materializes_each_file_with_csv_suffix(tmp_path):

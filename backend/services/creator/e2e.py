@@ -2322,15 +2322,72 @@ def _validate_e2e_trial_case_spec(
             continue
         if fixture_kind == "json_value":
             fixture_value = fixture.get("value")
-            case_spec = spec if isinstance(spec, E2EInputCaseSpec) else E2EInputCaseSpec(
-                name=spec.name, provenance_source=spec.provenance_source or spec.source,
-                runtime_shape=spec.shape, item_shape=spec.item_shape, required=spec.required,
-                nullable=spec.nullable, required_paths=spec.required_paths,
-                min_items=spec.min_items, max_items=spec.max_items,
+
+            case_spec = (
+                spec
+                if isinstance(
+                    spec,
+                    E2EInputCaseSpec,
+                )
+                else E2EInputCaseSpec(
+                    name=spec.name,
+                    provenance_source=(
+                            spec.provenance_source
+                            or spec.source
+                    ),
+                    runtime_shape=spec.shape,
+                    item_shape=spec.item_shape,
+                    required=spec.required,
+                    nullable=spec.nullable,
+                    default_available=(
+                        spec.default_available
+                    ),
+                    default_value=(
+                        spec.default_value
+                    ),
+                    required_paths=(
+                        spec.required_paths
+                    ),
+                    optional_paths=(
+                        spec.optional_paths
+                    ),
+                    consumed_paths=(
+                        spec.consumed_paths
+                    ),
+                    min_items=spec.min_items,
+                    max_items=spec.max_items,
+                )
             )
-            if not _e2e_value_matches_case_spec(fixture_value, case_spec):
+
+            # Creator-owned deterministic invariant:
+            # optional open collections must stay minimal.
+            if (
+                    not case_spec.required
+                    and not case_spec.default_available
+            ):
+                if (
+                        case_spec.runtime_shape == "list"
+                        and not case_spec.item_shape
+                        and not case_spec.required_paths
+                        and fixture_value != []
+                ):
+                    return None
+
+                if (
+                        case_spec.runtime_shape == "object"
+                        and not case_spec.required_paths
+                        and fixture_value != {}
+                ):
+                    return None
+
+            if not _e2e_value_matches_case_spec(
+                    fixture_value,
+                    case_spec,
+            ):
                 return None
+
             continue
+
         files = fixture.get("files") if fixture.get("kind") == "file_list" else [fixture]
         minimum = getattr(spec, "min_items", 1) or 1
         maximum = getattr(spec, "max_items", None) or (1 if shape == "file_path" else 3)
@@ -2451,25 +2508,159 @@ def _e2e_trial_case_response_schema(facts: dict[str, Any]) -> dict[str, Any]:
                 "required": ["kind", "value"],
                 "properties": {"kind": {"const": "scalar"}, "value": {"type": shape}},
             }
-        elif shape in {"object", "list", "list[string]", "list[number]", "list[integer]", "list[boolean]", "list[object]"}:
+        elif shape in {
+            "object",
+            "list",
+            "list[string]",
+            "list[number]",
+            "list[integer]",
+            "list[boolean]",
+            "list[object]",
+        }:
+            required = bool(
+                platform_input.get(
+                    "required",
+                    True,
+                )
+            )
+
+            default_available = bool(
+                platform_input.get(
+                    "default_available",
+                    False,
+                )
+            )
+
+            item_shape = _canonical_e2e_shape(
+                str(
+                    platform_input.get(
+                        "item_shape"
+                    )
+                    or ""
+                )
+            )
+
+            required_paths = tuple(
+                platform_input.get(
+                    "required_paths"
+                )
+                or ()
+            )
+
+            properties = (
+                platform_input.get(
+                    "properties"
+                )
+                if isinstance(
+                    platform_input.get(
+                        "properties"
+                    ),
+                    dict,
+                )
+                else {}
+            )
+
             case_spec = E2EInputCaseSpec(
                 name=name,
-                provenance_source=str(platform_input.get("provenance_source") or "frozen_contract"),
+                provenance_source=str(
+                    platform_input.get(
+                        "provenance_source"
+                    )
+                    or "frozen_contract"
+                ),
                 runtime_shape=shape,
-                required=bool(platform_input.get("required", True)),
-                nullable=bool(platform_input.get("nullable", False)),
-                required_paths=tuple(platform_input.get("required_paths") or ()),
-                min_items=int(platform_input.get("min_items") or 0),
-                max_items=platform_input.get("max_items"),
+                item_shape=item_shape,
+                required=required,
+                nullable=bool(
+                    platform_input.get(
+                        "nullable",
+                        False,
+                    )
+                ),
+                default_available=default_available,
+                default_value=(
+                    platform_input.get(
+                        "default_value"
+                    )
+                ),
+                required_paths=required_paths,
+                optional_paths=tuple(
+                    platform_input.get(
+                        "optional_paths"
+                    )
+                    or ()
+                ),
+                consumed_paths=tuple(
+                    platform_input.get(
+                        "consumed_paths"
+                    )
+                    or ()
+                ),
+                min_items=int(
+                    platform_input.get(
+                        "min_items"
+                    )
+                    or 0
+                ),
+                max_items=(
+                    platform_input.get(
+                        "max_items"
+                    )
+                ),
             )
+
+            # E2E 不替用户发明 optional 开放集合内容。
+            #
+            # optional + no default + open list  -> []
+            # optional + no default + open object -> {}
+            if (
+                    not required
+                    and not default_available
+                    and shape == "list"
+                    and not item_shape
+                    and not required_paths
+            ):
+                value_schema = {
+                    "type": "array",
+                    "minItems": 0,
+                    "maxItems": 0,
+                }
+
+            elif (
+                    not required
+                    and not default_available
+                    and shape == "object"
+                    and not properties
+                    and not required_paths
+            ):
+                value_schema = {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "maxProperties": 0,
+                }
+
+            else:
+                value_schema = (
+                    _e2e_input_case_schema(
+                        case_spec
+                    )
+                )
+
             fixture = {
-                "type": "object", "additionalProperties": False,
-                "required": ["kind", "value"],
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "kind",
+                    "value",
+                ],
                 "properties": {
-                    "kind": {"const": "json_value"},
-                    "value": _e2e_input_case_schema(case_spec),
+                    "kind": {
+                        "const": "json_value"
+                    },
+                    "value": value_schema,
                 },
             }
+
         elif shape == "file_path":
             fixture = {"oneOf": [file_schema, {
                 "type": "object", "additionalProperties": False,
@@ -9667,6 +9858,13 @@ def _install_declared_dependency_packages(venv_python: Path, dependencies: list[
 
         "python-pptx": "pptx",
         "python_pptx": "pptx",
+    }
+    dependency_package_names = {
+        "python-docx": "python-docx",
+        "python_docx": "python-docx",
+
+        "python-pptx": "python-pptx",
+        "python_pptx": "python-pptx",
     }
     for dependency in dependencies:
         module_name = dependency_import_names.get(dependency, dependency).replace("-", "_")

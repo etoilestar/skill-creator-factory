@@ -1771,6 +1771,7 @@ def _image_materializer(fmt: str) -> Any:
 
 
 FILE_FIXTURE_FORMATS: dict[str, E2EFileFixtureHandler] = {}
+MAX_E2E_CASE_REPAIR_ATTEMPTS = 2
 
 
 def _register_file_fixture_handler(handler: E2EFileFixtureHandler) -> None:
@@ -1827,6 +1828,18 @@ def _resolve_e2e_file_input_spec(
     """Resolve format/cardinality solely from frozen input-side evidence."""
     evidence_groups: list[tuple[str, list[str]]] = []
     input_declarations = [str(value) for req in requirements for value in (req.inputs or [])]
+    # RequirementItem used to discard these frozen prose fields and the
+    # resolver consequently consulted only its structured projections.  Prose
+    # is authoritative input-side evidence, but trim explicit output clauses
+    # so an output such as report.pdf can never select an input fixture type.
+    requirement_texts: list[str] = []
+    for req in requirements:
+        raw = next((str(getattr(req, field, "") or "") for field in ("requirement", "text", "purpose")
+                    if str(getattr(req, field, "") or "").strip()), "")
+        requirement_texts.append(re.split(
+            r"\b(?:output|result|report|generate|create|produce|write|save|return|export)\b|(?:输出|生成|导出)",
+            raw, maxsplit=1, flags=re.I,
+        )[0])
     constraint_values: list[str] = []
     for req in requirements:
         for constraint in req.constraints or []:
@@ -1845,6 +1858,7 @@ def _resolve_e2e_file_input_spec(
         for req in requirements
     ]
     evidence_groups.extend([
+        ("requirement_text", requirement_texts),
         ("requirement_input", input_declarations),
         ("requirement_constraint", constraint_values),
         ("requirement_input_context", purposes),
@@ -3323,6 +3337,45 @@ def _prepare_e2e_trial_case(
     plan = _build_e2e_input_case_plan(
         list(candidates.values()), requirements_by_file=requirements_by_file,
     )
+    # A case-plan defect belongs to creator_e2e, not to skill repair.  Re-run
+    # the frozen-evidence resolver before declaring the case unsupported.  The
+    # rebuild is deliberately case-only: accepted sibling specs are retained
+    # verbatim and no SkillPlan/code is regenerated.
+    for repair_attempt in range(1, MAX_E2E_CASE_REPAIR_ATTEMPTS + 1):
+        failed_names = {
+            name for name, spec in plan.inputs.items()
+            if spec.runtime_shape in {"file_path", "list[file_path]"} and not spec.allowed_formats
+        }
+        if not failed_names:
+            break
+        rebuilt = _build_e2e_input_case_plan(
+            [candidates[name] for name in failed_names], requirements_by_file=requirements_by_file,
+        )
+        repaired_inputs = dict(plan.inputs)
+        changed = False
+        for name in failed_names:
+            replacement = rebuilt.inputs[name]
+            if replacement.allowed_formats:
+                before = repaired_inputs[name]
+                repaired_inputs[name] = replacement
+                changed = True
+                logger.info("[Creator][E2E][input_case_plan_repaired] %s", json.dumps({
+                    "input": name,
+                    "attempt": repair_attempt,
+                    "before": {"allowed_formats": list(before.allowed_formats), "min_items": before.min_items,
+                               "max_items": before.max_items},
+                    "after": {"allowed_formats": list(replacement.allowed_formats), "min_items": replacement.min_items,
+                              "max_items": replacement.max_items},
+                    "evidence_source": replacement.file_format_source,
+                    "repair_owner": "creator_e2e",
+                    "skill_repair_allowed": False,
+                    "case_repair_allowed": True,
+                }, ensure_ascii=False, sort_keys=True))
+        if changed:
+            plan = E2EInputCasePlan(inputs=repaired_inputs, digest=_case_plan_digest(repaired_inputs))
+        else:
+            logger.info("[Creator][E2E][input_case_repair_attempt] attempt=%s result=unresolved inputs=%s",
+                        repair_attempt, sorted(failed_names))
     if session is not None:
         session.input_case_plan_digest = plan.digest
 
@@ -3333,10 +3386,13 @@ def _prepare_e2e_trial_case(
         if session is not None:
             session.trial_case_prepared = True
             session.input_case_plan_failure = "file_format_unknown"
-            session.input_case_plan_failure_details = {"unsupported_inputs": unknown, "plan_digest": plan.digest}
+            session.input_case_plan_failure_details = {"unsupported_inputs": unknown, "plan_digest": plan.digest,
+                                                       "repair_attempts": MAX_E2E_CASE_REPAIR_ATTEMPTS,
+                                                       "case_repair_allowed": True}
         raise E2ECaseInfrastructureError(
             "file_format_unknown",
-            details={"unsupported_inputs": unknown, "plan_digest": plan.digest},
+            details={"unsupported_inputs": unknown, "plan_digest": plan.digest,
+                     "repair_attempts": MAX_E2E_CASE_REPAIR_ATTEMPTS, "case_repair_allowed": True},
         )
 
     requirements: list[dict[str, str]] = []

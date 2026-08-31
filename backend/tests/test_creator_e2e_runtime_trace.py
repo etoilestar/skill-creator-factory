@@ -1,3 +1,5 @@
+import pytest
+
 from backend.services.creator.e2e import (
     _artifact_runtime_state,
     _e2e_behavior_fingerprint,
@@ -185,7 +187,7 @@ def test_non_runtime_file_absolute_strings_are_not_fixture_checked():
     assert facts["fixture_valid"] is True
 
 
-def test_platform_runtime_files_seed_is_real_file_collection(tmp_path):
+def test_platform_runtime_files_without_frozen_format_authority_are_unsupported(tmp_path):
     (tmp_path / "scripts").mkdir()
     (tmp_path / "SKILL.md").write_text("# CSV workflow\n", encoding="utf-8")
     (tmp_path / "scripts" / "run.py").write_text("EXPECTED_TYPES = {'input_files': 'list[str]'}\n", encoding="utf-8")
@@ -194,12 +196,8 @@ def test_platform_runtime_files_seed_is_real_file_collection(tmp_path):
         {"input_files": "{{input_files}}"},
     )
 
-    payload = e2e._seed_initial_e2e_payload([command], skill_dir=tmp_path)
-
-    assert isinstance(payload["input_files"], list)
-    assert payload["input_files"]
-    assert all(__import__("pathlib").Path(path).is_file() for path in payload["input_files"])
-    assert "sample value" not in payload["input_files"]
+    with pytest.raises(ValueError, match="format authority is unknown"):
+        e2e._seed_initial_e2e_payload([command], skill_dir=tmp_path)
 
 
 def test_new_breakpoint_is_false_progress_when_boundary_remains_invalid():

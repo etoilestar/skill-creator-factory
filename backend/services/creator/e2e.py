@@ -1433,19 +1433,14 @@ def _collect_e2e_typed_inputs_from_graph(
                         min_items=max(current.min_items, (max(indexes) + 1) if indexes else 0),
                     ))
 
-    # Platform runtime-file roots have authoritative transport semantics:
-    # their runtime value is a collection of file paths.
-    #
-    # Do this after collecting RequirementGraph / SkillPlan / argv-schema
-    # evidence so an untyped semantic declaration such as `input_files`
-    # cannot accidentally degrade the E2E fixture to a generic string.
-    # Platform runtime file inputs must be materialized as real file paths.
     runtime_file_names = _platform_runtime_file_input_names()
 
     used_roots = {
         _placeholder_root(expr)
         for command in commands
-        for expr in _placeholder_exprs_from_value(command.argv_template)
+        for expr in _placeholder_exprs_from_value(
+            command.argv_template
+        )
     }
 
     for name in runtime_file_names & used_roots:
@@ -2460,6 +2455,138 @@ def _build_e2e_trial_case(facts: dict[str, Any], *, requested_model: str | None 
         response_schema=schema,
     )
 
+def _review_e2e_trial_case(
+    *,
+    facts: dict[str, Any],
+    trial_case: dict[str, Any],
+    requested_model: str | None = None,
+) -> dict[str, Any]:
+    """
+    Review only whether the generated E2E input case is a valid
+    and meaningful projection of the frozen input contract.
+
+    This reviewer must not review or repair Skill implementation.
+    """
+
+    route = route_model(
+        VALIDATOR_TASK,
+        requested_model=requested_model,
+        reason="creator E2E trial case semantic review",
+    )
+
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "passed",
+            "issues",
+            "repair_instructions",
+        ],
+        "properties": {
+            "passed": {
+                "type": "boolean",
+            },
+            "issues": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "input",
+                        "code",
+                        "message",
+                    ],
+                    "properties": {
+                        "input": {
+                            "type": "string",
+                        },
+                        "code": {
+                            "type": "string",
+                        },
+                        "message": {
+                            "type": "string",
+                        },
+                    },
+                },
+            },
+            "repair_instructions": {
+                "type": "string",
+            },
+        },
+    }
+
+    system_prompt = """
+你是 Creator E2E Trial Case Reviewer。
+
+你只审查 E2E 输入样本是否正确。
+不得审查或修改 Skill 实现。
+不得修改 RequirementGraph、ResponsibilityGraph 或 InterfacePlan。
+不得输出代码。
+
+审查标准只有：
+
+1. 输入必须遵守 frozen external input contract；
+2. required input 必须存在，optional input 不得无依据发明额外业务信息；
+3. shape / file format / cardinality / nested path 必须与 frozen contract 一致；
+4. file input 必须表示真正可 materialize 的文件 fixture，
+   不能用不存在的假路径代替 runtime file；
+5. 输入内容应是最小合法 happy-path，
+   但必须足以触发该输入相关的已冻结 requirement；
+6. 不得把 SKILL.md 中的示例值当成平台真实输入事实。
+
+如果只是 Skill 代码不能处理一个合法输入，
+必须 passed=true。
+那属于后续 E2E 的实现问题，不属于 Trial Case 问题。
+
+只输出 JSON。
+""".strip()
+
+    payload = {
+        "frozen_input_facts": facts,
+        "trial_case": trial_case,
+    }
+
+    result = (
+        _complete_creator_json_object_once_sync_for_e2e(
+            messages=[
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        default=str,
+                    ),
+                },
+            ],
+            model=route.model,
+            phase="creator_e2e_trial_case_review",
+            response_schema=schema,
+        )
+    )
+
+    return (
+        result
+        if isinstance(result, dict)
+        else {
+            "passed": False,
+            "issues": [
+                {
+                    "input": "",
+                    "code": "review_invalid",
+                    "message": (
+                        "Trial Case Reviewer "
+                        "returned invalid output."
+                    ),
+                }
+            ],
+            "repair_instructions": "",
+        }
+    )
 
 def _complete_creator_json_object_once_sync_for_e2e(**kwargs: Any) -> dict[str, Any]:
     """Synchronously reuse Creator's existing strict JSON-Schema completion."""
@@ -3676,6 +3803,54 @@ def _prepare_e2e_trial_case(
                 "name": name, "reason": fallback_reason, "fallback": "deterministic",
             }, sort_keys=True))
         accepted = {"version": 1, "inputs": fallback_items} if fallback_items else None
+
+    if accepted is not None:
+        review = _review_e2e_trial_case(
+            facts=facts,
+            trial_case=accepted,
+            requested_model=requested_model,
+        )
+
+        logger.info(
+            "[Creator][E2E]"
+            "[trial_case_review] %s",
+            json.dumps(
+                {
+                    "passed": bool(
+                        review.get("passed")
+                    ),
+                    "issues": (
+                            review.get("issues")
+                            or []
+                    ),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ),
+        )
+
+        if review.get("passed") is not True:
+            if session is not None:
+                session.trial_case_prepared = True
+                session.input_case_plan_failure = (
+                    "trial_case_review_failed"
+                )
+                session.input_case_plan_failure_details = {
+                    "review": review,
+                    "plan_digest": plan.digest,
+                }
+
+            raise E2ECaseInfrastructureError(
+                "trial_case_review_failed",
+                details={
+                    "review": review,
+                    "plan_digest": plan.digest,
+                    "repair_owner": "creator_e2e",
+                    "skill_repair_allowed": False,
+                },
+            )
+
     digest = _stable_json_hash(accepted) if accepted is not None else ""
     if session is not None:
         session.trial_case, session.trial_case_digest, session.trial_case_prepared = accepted, digest, True

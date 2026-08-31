@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from backend.services.creator import e2e
 
 
@@ -373,6 +375,69 @@ def test_csv_file_list_materializes_each_file_with_csv_suffix(tmp_path):
 
     assert [path.name for path in paths] == ["input_files_1.csv", "input_files_2.csv"]
     assert all(path.is_file() and path.suffix == ".csv" for path in paths)
+
+
+def test_indexed_file_fixture_renders_without_runtime_literal_events(tmp_path):
+    first = tmp_path / "a.csv"
+    second = tmp_path / "b.csv"
+    first.write_text("value\n1\n", encoding="utf-8")
+    second.write_text("value\n2\n", encoding="utf-8")
+    command = e2e.E2EWorkflowCommand(
+        1, "SKILL.md", "scripts/compare.py", "", "python",
+        {"input_files": ["{{input_files[0]}}", "{{input_files[1]}}"]},
+    )
+    payload = {"input_files": [str(first), str(second)]}
+    specs = [e2e.E2ETypedInputSpec(
+        name="input_files", shape="list[file_path]", source="platform_io_contract",
+    )]
+
+    rendered = e2e._render_e2e_command_payload(
+        command, payload=payload, typed_input_specs=specs,
+    )
+    e2e._validate_e2e_input_fixtures(
+        command=command, payload=payload, rendered_payload=rendered,
+        typed_input_specs=specs,
+    )
+    materialized, events = e2e._materialize_rendered_e2e_payload_runtime_literals(
+        rendered, skill_dir=tmp_path, target_file=command.script_path,
+    )
+
+    assert materialized == {"input_files": [str(first), str(second)]}
+    assert events == []
+
+
+@pytest.mark.parametrize("bad_value", [
+    ["__RUNTIME_INPUT_FILE__"],
+    [{"path": "a.csv"}],
+])
+def test_input_fixture_gate_rejects_unmaterialized_file_lists(tmp_path, bad_value):
+    command = e2e.E2EWorkflowCommand(
+        1, "SKILL.md", "scripts/compare.py", "", "python",
+        {"input_files": "{{input_files}}"},
+    )
+    specs = [e2e.E2ETypedInputSpec(
+        name="input_files", shape="list[file_path]", source="platform_io_contract",
+    )]
+
+    with pytest.raises(ValueError, match="E2E_LAYER=e2e_input_fixture"):
+        e2e._validate_e2e_input_fixtures(
+            command=command,
+            payload={"input_files": bad_value},
+            rendered_payload={"input_files": bad_value},
+            typed_input_specs=specs,
+        )
+
+
+def test_legacy_file_kind_fallback_ignores_output_artifact_descriptions():
+    kinds = e2e._infer_e2e_file_sample_kinds(
+        name="csv_files",
+        shape="list[file_path]",
+        target_file="scripts/analyze.py",
+        skill_md="Input: two CSV files. Output: report.pdf",
+        script_content="output_path = 'outputs/report.pdf'",
+    )
+
+    assert kinds == ["csv"]
 
 
 def test_structured_builder_contract_freezes_and_materializes_csv(tmp_path, monkeypatch):

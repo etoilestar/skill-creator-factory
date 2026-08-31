@@ -199,16 +199,17 @@ python scripts/run.py '{"value": {{value | default("x")}}}'
     assert any(issue.code == "missing_command_arg_binding" for issue in result.issues)
 
 
-def test_json_argv_input_files_template_is_safely_sanitized():
+def test_json_argv_indexed_input_files_preserve_platform_provenance():
     skill_md = """```bash
-python scripts/extract.py '{"input_file":"{{input_files[0]}}","model":"{{model}}"}'
+python scripts/extract.py '{"input_files":["{{input_files[0]}}","{{input_files[1]}}"],"model":"{{model}}"}'
 ```
 """
     result = canonicalize_skill_md_runtime_commands(skill_name="s", skill_md=skill_md)
     assert result.changed
     assert not result.blocked
-    assert "{{input_files[0]}}" not in result.content
-    assert "__RUNTIME_INPUT_FILE__" in result.content
+    assert "{{input_files[0]}}" in result.content
+    assert "{{input_files[1]}}" in result.content
+    assert "__RUNTIME_INPUT_FILE" not in result.content
     assert "TEXT_MODEL" in result.content
     assert "argv JSON contract" in result.content
 

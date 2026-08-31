@@ -516,6 +516,62 @@ def _e2e_runtime_boundary_facts(
     }
 
 
+_E2E_RUNTIME_INPUT_LITERAL_RE = re.compile(r"^__RUNTIME_INPUT(?:_[A-Z]+)*(?:_\d+)?__$")
+
+
+def _validate_e2e_input_fixtures(
+    *,
+    command: E2EWorkflowCommand,
+    payload: dict[str, Any],
+    rendered_payload: dict[str, Any],
+    typed_input_specs: list[E2ETypedInputSpec],
+) -> None:
+    """Reject malformed synthetic file fixtures before any business script runs."""
+    specs = {spec.name: spec for spec in typed_input_specs}
+    used_roots = {
+        _placeholder_root(expr)
+        for expr in _placeholder_exprs_from_value(command.argv_template)
+    }
+    issues: list[dict[str, Any]] = []
+
+    for root in sorted(used_roots):
+        spec = specs.get(root)
+        shape = _canonical_e2e_shape(spec.shape if spec else "")
+        if shape not in {"file_path", "list[file_path]"}:
+            continue
+        value = payload.get(root)
+        paths = value if shape == "list[file_path]" and isinstance(value, list) else [value]
+        if shape == "list[file_path]" and (not isinstance(value, list) or not value):
+            issues.append({"name": root, "expected_shape": shape, "actual_shape": _json_shape(value)})
+            continue
+        for index, path in enumerate(paths):
+            reason = ""
+            if not isinstance(path, str):
+                reason = "file_fixture_not_materialized_to_path"
+            elif _E2E_RUNTIME_INPUT_LITERAL_RE.fullmatch(path.strip()):
+                reason = "runtime_input_sentinel_in_trial_fixture"
+            elif not Path(path).is_file():
+                reason = "fixture_path_missing"
+            if reason:
+                issues.append({
+                    "name": root,
+                    "index": index,
+                    "expected_shape": shape,
+                    "actual_shape": _json_shape(path),
+                    "reason": reason,
+                })
+
+    if issues:
+        raise ValueError(_e2e_error(
+            target="Creator E2E input fixture",
+            layer="e2e_input_fixture",
+            message=(
+                "trial_fixture_invalid: E2E synthetic input failed deterministic pre-execution validation.\n"
+                f"issues={json.dumps(issues, ensure_ascii=False, sort_keys=True)}\n"
+                "This is an input-construction failure; do not diagnose or repair the Skill script."
+            ),
+        ))
+
 def _verified_bindings_from_runtime_trace(
     *,
     runtime_binding_trace: dict[str, Any],
@@ -1359,39 +1415,17 @@ def _infer_e2e_file_sample_kinds(
 ) -> list[str]:
     """Infer representative sample file kinds for Creator E2E.
 
-    This deliberately uses generic evidence:
-    - argv key / spec name
-    - expected shape
-    - target script path
-    - SKILL.md
-    - script source
-
-    It does not hardcode business skill names.
+    This is a legacy fallback only.  It deliberately excludes whole SKILL.md
+    and script bodies: output artifact descriptions (for example report.pdf)
+    are not evidence about an input fixture's format.
     """
-    evidence = "\n".join([
+    input_identity_evidence = "\n".join([
         str(name or ""),
         str(shape or ""),
         str(target_file or ""),
-        str(skill_md or "")[:16000],
-        str(script_content or "")[:16000],
     ])
 
-    key_kinds = _e2e_file_kind_from_text(" ".join([str(name or ""), str(shape or ""), str(target_file or "")]))
-    context_kinds = _e2e_file_kind_from_text(evidence)
-
-    ordered: list[str] = []
-
-    # If the argv key itself says pdf/docx/csv/etc., obey it first.
-    ordered.extend(key_kinds)
-
-    # Otherwise infer from SKILL.md / script content.
-    ordered.extend(context_kinds)
-
-    # For generic "document/file/path" inputs, prefer document formats when declared.
-    # This helps catch fake txt-only implementations for a skill that claims PDF/DOCX support.
-    priority = ["pdf", "docx", "txt", "md", "csv", "json", "html", "png", "jpg"]
-
-    deduped = [kind for kind in priority if kind in set(ordered)]
+    deduped = _e2e_file_kind_from_text(input_identity_evidence)
 
     if not deduped:
         deduped = ["txt"]
@@ -1801,10 +1835,12 @@ def _validate_e2e_trial_case_spec(
 def _materialize_e2e_trial_fixture(item: dict[str, Any], *, skill_dir: Path) -> Any:
     fixture = item["fixture"]
     if fixture.get("kind") == "scalar":
-        return fixture["value"]
-    if fixture.get("kind") == "json_value":
-        return copy.deepcopy(fixture["value"])
-    files = fixture["files"] if fixture.get("kind") == "file_list" else [fixture]
+        materialized = fixture["value"]
+    elif fixture.get("kind") == "json_value":
+        materialized = copy.deepcopy(fixture["value"])
+    else:
+        materialized = None
+    files = fixture["files"] if fixture.get("kind") == "file_list" else ([] if materialized is not None else [fixture])
     paths: list[str] = []
     for index, file_spec in enumerate(files, 1):
         fmt = file_spec["format"]
@@ -1825,7 +1861,19 @@ def _materialize_e2e_trial_fixture(item: dict[str, Any], *, skill_dir: Path) -> 
         else:
             path.write_text(file_spec["text"], encoding="utf-8")
         paths.append(str(path))
-    return paths if _canonical_e2e_shape(item["shape"]).startswith("list") else paths[0]
+    if materialized is None:
+        materialized = paths if _canonical_e2e_shape(item["shape"]).startswith("list") else paths[0]
+    logger.info(
+        "[Creator][E2E][trial_fixture_materialized] %s",
+        json.dumps({
+            "name": item["name"],
+            "shape": _canonical_e2e_shape(item["shape"]),
+            "fixture_kind": fixture.get("kind", fixture.get("content_kind")),
+            "materialized_shape": _json_shape(materialized),
+            "paths": paths or None,
+        }, ensure_ascii=False, sort_keys=True),
+    )
+    return materialized
 
 
 def _build_e2e_trial_case(facts: dict[str, Any], *, requested_model: str | None = None) -> Any:
@@ -4884,12 +4932,30 @@ def _run_skill_workflow_e2e_once(
                     typed_input_specs=typed_input_specs,
                 )
 
+                # Trial Case values are frozen input authority.  Validate them
+                # before the legacy sentinel compatibility materializer can
+                # conceal a malformed new-path fixture.
+                _validate_e2e_input_fixtures(
+                    command=command,
+                    payload=payload,
+                    rendered_payload=rendered_payload,
+                    typed_input_specs=typed_input_specs,
+                )
+
                 rendered_payload, runtime_literal_events = _materialize_rendered_e2e_payload_runtime_literals(
                     rendered_payload,
                     skill_dir=trial_skill_dir,
                     target_file=command.script_path,
                     skill_md=trial_skill_md,
                     script_content=content,
+                )
+
+                logger.info(
+                    "[Creator][E2E][rendered_input_validation] %s",
+                    json.dumps({
+                        "script": command.script_path,
+                        "argv_shape": _json_object_shape(rendered_payload),
+                    }, ensure_ascii=False, sort_keys=True),
                 )
 
                 if runtime_literal_events:

@@ -655,6 +655,45 @@ def test_file_format_authority_resolves_cardinality_and_mixed_policy():
     assert mixed.homogeneous is False
 
 
+@pytest.mark.parametrize(("requirement_text", "shape", "expected_format", "count"), [
+    ("Skill 必须读取两个 CSV 文件作为输入数据源。", "list[file_path]", "csv", 2),
+    ("读取一个 PDF 文件", "file_path", "pdf", 1),
+    ("读取两个 PNG 图片", "list[file_path]", "png", 2),
+    ("读取 TIFF/TIF 图像", "file_path", "tiff", 1),
+])
+def test_frozen_requirement_text_resolves_and_materializes_file_case(
+    tmp_path, requirement_text, shape, expected_format, count,
+):
+    typed = _spec("uploads", shape)
+    requirement = e2e.RequirementItem(
+        id="R1", target_file=typed.target_file, requirement=requirement_text,
+    )
+    resolved = e2e._resolve_e2e_file_input_spec(typed, [requirement])
+    assert resolved.allowed_formats == (expected_format,)
+    assert resolved.format_source == "requirement_text"
+    assert (resolved.min_items, resolved.max_items) == (count, count)
+
+    plan = e2e._build_e2e_input_case_plan(
+        [typed], requirements_by_file={typed.target_file: [requirement]},
+    )
+    fixture = e2e._synthesize_e2e_input_fixture(plan.inputs[typed.name])
+    item = {"name": typed.name, "shape": shape, "fixture": fixture,
+            "evidence_requirement_ids": ["R1"]}
+    materialized = e2e._materialize_e2e_trial_fixture(item, skill_dir=tmp_path)
+    paths = materialized if isinstance(materialized, list) else [materialized]
+    assert len(paths) == count
+    assert all(Path(path).suffix.lower() == e2e.FILE_FIXTURE_FORMATS[expected_format].extension for path in paths)
+
+
+def test_frozen_requirement_without_format_remains_unknown():
+    resolved = e2e._resolve_e2e_file_input_spec(
+        _spec("upload", "file_path"),
+        [e2e.RequirementItem(target_file="scripts/analyze.py", requirement="处理用户上传的文件")],
+    )
+    assert resolved.allowed_formats == ()
+    assert resolved.format_source == "unknown"
+
+
 def test_structured_builder_contract_freezes_and_materializes_csv(tmp_path, monkeypatch):
     skill_dir = tmp_path / "demo"
     skill_dir.mkdir()

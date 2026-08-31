@@ -247,8 +247,12 @@ class FunctionItem(BaseModel):
     # transport aliases instead of silently dropping them (the old
     # ``extra=ignore`` behaviour made Creator E2E lose facts such as "two CSV
     # files" before it reached the case resolver).
-    requirement: str = Field("", exclude=True)
-    text: str = Field("", exclude=True)
+    # These fields are part of the frozen ResponsibilityGraph transport.  In
+    # particular, graph.model_dump(mode="json") is the production persistence
+    # boundary used by Creator; excluding them here loses authoritative prose
+    # before E2E reloads the graph.
+    requirement: str = ""
+    text: str = ""
     inputs: list[str] = Field(default_factory=list)
     default_values: dict[str, Any] = Field(default_factory=dict)
     outputs: list[str] = Field(default_factory=list)
@@ -272,6 +276,8 @@ class FunctionItem(BaseModel):
             merged["purpose"] = merged.get("description")
         if not merged.get("requirement") and merged.get("description"):
             merged["requirement"] = merged.get("description")
+        if not merged.get("purpose"):
+            merged["purpose"] = merged.get("requirement") or merged.get("text") or ""
         if not merged.get("inputs") and merged.get("semantic_inputs"):
             merged["inputs"] = merged.get("semantic_inputs")
         if not merged.get("outputs") and merged.get("semantic_outputs"):

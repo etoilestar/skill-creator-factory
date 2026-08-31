@@ -694,6 +694,37 @@ def test_frozen_requirement_without_format_remains_unknown():
     assert resolved.format_source == "unknown"
 
 
+def test_requirement_prose_survives_production_graph_round_trip_and_resolves():
+    prose = "Skill 必须读取两个 CSV 文件作为输入数据源。"
+    original = e2e.RequirementItem(
+        id="R1", target_file="scripts/main.py", requirement=prose,
+    )
+    graph = e2e.RequirementGraph(requirements=[original])
+
+    # Exercise the same model JSON transport and parser/normalizer used for a
+    # persisted frozen ResponsibilityGraph, rather than resolving the original
+    # in-memory object.
+    serialized = json.dumps(graph.model_dump(mode="json"), ensure_ascii=False)
+    loaded = e2e.normalize_requirement_graph(
+        e2e.parse_requirement_graph_result(serialized),
+    )
+    assert loaded.requirements[0].requirement == prose
+
+    payload = e2e.function_item_prompt_payload(original)
+    assert payload["requirement"] == prose
+    assert payload["text"] == ""
+
+    resolved = e2e._resolve_e2e_file_input_spec(
+        e2e.E2ETypedInputSpec(
+            name="input_files", shape="list[file_path]", target_file="scripts/main.py",
+        ),
+        loaded.requirements,
+    )
+    assert resolved.allowed_formats == ("csv",)
+    assert resolved.format_source == "requirement_text"
+    assert (resolved.min_items, resolved.max_items) == (2, 2)
+
+
 def test_structured_builder_contract_freezes_and_materializes_csv(tmp_path, monkeypatch):
     skill_dir = tmp_path / "demo"
     skill_dir.mkdir()

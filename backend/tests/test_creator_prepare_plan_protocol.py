@@ -54,7 +54,10 @@ async def test_blueprint_repair_marks_only_truly_repeated_issues_unresolved(
 
 @pytest.mark.asyncio
 async def test_blueprint_repair_converts_clarification_to_structured_failure(monkeypatch):
+    calls = []
+
     async def fake_complete(*_args, **_kwargs):
+        calls.append(_kwargs)
         return json.dumps({"status": "needs_clarification", "clarifying_questions": ["输入？"]})
 
     monkeypatch.setattr(api, "complete_creator_role_once", fake_complete)
@@ -69,8 +72,31 @@ async def test_blueprint_repair_converts_clarification_to_structured_failure(mon
     assert raised.value.result == {
         "phase": "blueprint_repair",
         "status": "repair_failed",
-        "reason": "repair_output_role_violation",
+        "reason": "blueprint_repair_role_violation",
     }
+    assert len(calls) == 1
+    assert calls[0]["stage"] == "blueprint_repair"
+
+
+@pytest.mark.asyncio
+async def test_blueprint_repair_rejects_clarifying_questions_regardless_of_status(monkeypatch):
+    async def fake_complete(*_args, **_kwargs):
+        return json.dumps({
+            "status": "ready",
+            "internal_blueprint_text": "candidate",
+            "clarifying_questions": ["输入？"],
+        })
+
+    monkeypatch.setattr(api, "complete_creator_role_once", fake_complete)
+
+    with pytest.raises(api.BlueprintRepairFailed) as raised:
+        await api._repair_prepare_blueprint_protocol(
+            request=_request(),
+            blueprint_text="original blueprint",
+            protocol_errors=[{"code": "invalid", "field": "SkillPlan"}],
+        )
+
+    assert raised.value.result["reason"] == "blueprint_repair_role_violation"
 
 
 @pytest.mark.asyncio

@@ -72,11 +72,11 @@ from .protocol import StructuredOutputError, parse_structured_output, validate_p
 
 async def complete_creator_role_once(
     messages: list[dict[str, Any]], role: Literal["planner", "reviewer"], *,
-    fallback_model: str, stage: str = "creator",
+    fallback_model: str, stage: str | None = None,
 ) -> str:
     """Injectable API seam that retains production role-profile routing."""
     return await creator_model_call(
-        messages, role=role, fallback_model=fallback_model, stage=stage,
+        messages, role=role, fallback_model=fallback_model, stage=stage or "creator",
         model_call=complete_chat_once,
     )
 

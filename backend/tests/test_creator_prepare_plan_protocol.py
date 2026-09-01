@@ -16,6 +16,28 @@ def _request(**kwargs):
 
 
 @pytest.mark.asyncio
+async def test_blueprint_repair_forwards_blueprint_repair_stage(monkeypatch):
+    calls = []
+
+    async def fake_complete(*_args, **kwargs):
+        calls.append(kwargs)
+        return json.dumps({"status": "ready", "internal_blueprint_text": "repaired"})
+
+    monkeypatch.setattr(api, "complete_creator_role_once", fake_complete)
+    monkeypatch.setattr(api, "_prepare_repair_candidate_is_valid", lambda _candidate: True)
+    monkeypatch.setattr(api, "_normalize_prepare_blueprint_references", lambda candidate: candidate)
+    monkeypatch.setattr(api, "_preflight_prepare_blueprint_text", lambda _candidate: [])
+
+    await api._repair_prepare_blueprint_protocol(
+        request=_request(),
+        blueprint_text="original blueprint",
+        protocol_errors=[{"code": "invalid", "field": "SkillPlan"}],
+    )
+
+    assert calls[0]["stage"] == "blueprint_repair"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("second_issue", "expected_repeated"),
     [

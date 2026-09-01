@@ -75,7 +75,7 @@ INVALID_PHASE_TRANSITION = "invalid_phase_transition"
 ALLOWED_PHASE_STATUSES: Mapping[str, frozenset[str]] = {
     "requirement_analysis": frozenset({"ready", "needs_clarification"}),
     "blueprint_generation": frozenset({"ready", "need_revision", "failed"}),
-    "blueprint_repair": frozenset({"ready", "need_revision", "failed"}),
+    "blueprint_repair": frozenset({"ready", "failed"}),
     "graph_generation": frozenset({"ready", "need_revision", "failed"}),
     "graph_repair": frozenset({"ready", "need_revision", "failed"}),
 }
@@ -85,6 +85,11 @@ def validate_phase_status(payload: Mapping[str, Any], *, phase: str) -> dict[str
     """Return a protocol error rather than allowing a model to change phase."""
     result = dict(payload)
     status = str(result.get("status") or "")
+    if phase == "blueprint_repair" and status == "needs_clarification":
+        return {
+            "status": "failed",
+            "reason": "repair_output_role_violation",
+        }
     allowed = ALLOWED_PHASE_STATUSES.get(phase)
     if allowed is not None and status not in allowed:
         return {

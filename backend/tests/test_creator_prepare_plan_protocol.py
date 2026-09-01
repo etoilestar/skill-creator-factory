@@ -32,7 +32,7 @@ async def test_blueprint_repair_marks_only_truly_repeated_issues_unresolved(
 
     async def fake_complete(messages, *_args, **_kwargs):
         prompts.append(json.loads(messages[1]["content"]))
-        return json.dumps({"internal_blueprint_text": next(responses)})
+        return json.dumps({"status": "ready", "internal_blueprint_text": next(responses)})
 
     validation_results = iter([[second_issue], []])
     monkeypatch.setattr(api, "complete_creator_role_once", fake_complete)
@@ -47,9 +47,55 @@ async def test_blueprint_repair_marks_only_truly_repeated_issues_unresolved(
     )
 
     assert repaired == "candidate two"
-    repeated = prompts[1]["remaining_issues_from_previous_repair"]
-    assert bool(repeated) is expected_repeated
-    assert ("remains unresolved" in prompts[1]["repair_directive"]) is expected_repeated
+    assert set(prompts[0]) == {"current_blueprint", "validation_errors", "required_schema"}
+    assert set(prompts[1]) == {"current_blueprint", "validation_errors", "required_schema"}
+    assert prompts[1]["validation_errors"] == [second_issue]
+
+
+@pytest.mark.asyncio
+async def test_blueprint_repair_converts_clarification_to_structured_failure(monkeypatch):
+    async def fake_complete(*_args, **_kwargs):
+        return json.dumps({"status": "needs_clarification", "clarifying_questions": ["输入？"]})
+
+    monkeypatch.setattr(api, "complete_creator_role_once", fake_complete)
+
+    with pytest.raises(api.BlueprintRepairFailed) as raised:
+        await api._repair_prepare_blueprint_protocol(
+            request=_request(),
+            blueprint_text="original blueprint",
+            protocol_errors=[{"code": "invalid", "field": "SkillPlan"}],
+        )
+
+    assert raised.value.result == {
+        "phase": "blueprint_repair",
+        "status": "repair_failed",
+        "reason": "repair_output_role_violation",
+    }
+
+
+@pytest.mark.asyncio
+async def test_blueprint_repair_retries_invalid_output_once(monkeypatch):
+    calls = []
+    candidate = _ready_blueprint()
+
+    async def fake_complete(messages, *_args, **_kwargs):
+        calls.append(messages)
+        if len(calls) == 1:
+            return "not json"
+        return json.dumps({"status": "ready", "internal_blueprint_text": candidate})
+
+    monkeypatch.setattr(api, "complete_creator_role_once", fake_complete)
+    monkeypatch.setattr(api, "_preflight_prepare_blueprint_text", lambda _candidate: [])
+
+    repaired = await api._repair_prepare_blueprint_protocol(
+        request=_request(),
+        blueprint_text=candidate + "\ninvalid trailing content",
+        protocol_errors=[{"code": "invalid", "field": "SkillPlan"}],
+    )
+
+    assert repaired == candidate.strip()
+    assert len(calls) == 2
+    assert calls[1][-1]["content"].startswith("输出完整 internal_blueprint_text JSON")
 
 
 async def _async_result(value):
@@ -822,7 +868,7 @@ async def test_blueprint_resource_repair_rejects_script_topology_change(monkeypa
     repaired_candidate = initial.replace(_script_plan_block("scripts/b.py") + "\n", "")
 
     async def fake_complete(*_args, **_kwargs):
-        return json.dumps({"internal_blueprint_text": repaired_candidate})
+        return json.dumps({"status": "ready", "internal_blueprint_text": repaired_candidate})
 
     monkeypatch.setattr(api, "complete_creator_role_once", fake_complete)
     repaired = await api._repair_prepare_blueprint_protocol(
@@ -845,7 +891,7 @@ async def test_blueprint_protocol_repair_can_correct_invalid_script_path(monkeyp
     repaired_candidate = initial.replace("scripts/<name>.py", "scripts/a.py")
 
     async def fake_complete(*_args, **_kwargs):
-        return json.dumps({"internal_blueprint_text": repaired_candidate})
+        return json.dumps({"status": "ready", "internal_blueprint_text": repaired_candidate})
 
     monkeypatch.setattr(api, "complete_creator_role_once", fake_complete)
     repaired = await api._repair_prepare_blueprint_protocol(
@@ -879,7 +925,7 @@ async def test_blueprint_mixed_resource_and_script_path_repair_can_fix_both(monk
     )
 
     async def fake_complete(*_args, **_kwargs):
-        return json.dumps({"internal_blueprint_text": repaired_candidate})
+        return json.dumps({"status": "ready", "internal_blueprint_text": repaired_candidate})
 
     monkeypatch.setattr(api, "complete_creator_role_once", fake_complete)
     repaired = await api._repair_prepare_blueprint_protocol(
@@ -919,7 +965,7 @@ async def test_blueprint_repair_cannot_expand_frozen_resource_authority(monkeypa
     ) + "\n- path: `references/b.md`\n  role: reference\n  source: bundled\n"
 
     async def fake_complete(*_args, **_kwargs):
-        return json.dumps({"internal_blueprint_text": repaired_candidate})
+        return json.dumps({"status": "ready", "internal_blueprint_text": repaired_candidate})
 
     monkeypatch.setattr(api, "complete_creator_role_once", fake_complete)
     repaired = await api._repair_prepare_blueprint_protocol(
@@ -942,7 +988,7 @@ async def test_blueprint_repair_cannot_self_authorize_bundled_asset(monkeypatch)
     )
 
     async def fake_complete(*_args, **_kwargs):
-        return json.dumps({"internal_blueprint_text": repaired_candidate})
+        return json.dumps({"status": "ready", "internal_blueprint_text": repaired_candidate})
 
     monkeypatch.setattr(api, "complete_creator_role_once", fake_complete)
     repaired = await api._repair_prepare_blueprint_protocol(

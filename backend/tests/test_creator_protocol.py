@@ -40,11 +40,10 @@ def test_structured_output_retries_once_then_returns_protocol_failure():
 def test_repair_cannot_silently_return_to_clarification():
     result = validate_phase_status({"status": "needs_clarification"}, phase="blueprint_repair")
     assert result == {
-        "status": "invalid_phase_transition",
-        "current_phase": "blueprint_repair",
-        "returned_status": "needs_clarification",
+        "status": "failed",
+        "reason": "repair_output_role_violation",
     }
-    assert classify_result(result) == ErrorKind.PROTOCOL_ERROR
+    assert classify_result(result) == ErrorKind.FATAL_ERROR
 
 
 def test_revision_has_explicit_two_hop_route():

@@ -63,6 +63,7 @@ async def test_platform_boundary_contract_reviewer_rejects_platform_as_internal_
     async def reviewer(messages, _model):
         assert PLATFORM_BOUNDARY_CONTRACT in messages[0]["content"]
         return json.dumps({"passed": False, "issues": [{
+            "severity": "blocking", "code": "disconnected_data_flow",
             "message": "The external request does not provide A's derived alpha value.",
             "affected_interfaces": ["I3"],
             "affected_inputs": [{"target_member": "scripts/b.py", "target_input": "alpha"}],
@@ -81,7 +82,7 @@ async def test_platform_boundary_contract_reviewer_rejects_platform_as_internal_
             review_mode=review_mode,
         )
         assert len(issues) == 1
-        assert "code" not in issues[0]["details"]
+        assert issues[0]["details"]["code"] == "disconnected_data_flow"
 
 
 def test_platform_boundary_contract_allows_nested_platform_source():
@@ -289,10 +290,10 @@ def test_critic_protocol_is_two_strings_only():
     assert validate_interface_repair_critic(value, validation_issues=[], current_interface_plan={}, frozen_function_items=[], repair_scope={}) == value
 
 
-def test_reviewer_issue_has_no_taxonomy():
-    raw = {"message": "semantic mismatch", "affected_interfaces": ["I1"], "affected_inputs": [{"target_member": "scripts/unit_a.py", "target_input": "slot_x"}], "evidence": {"observed": "value_a", "expected": "value_b"}}
+def test_reviewer_issue_has_explicit_severity_and_code():
+    raw = {"severity": "blocking", "code": "type_mismatch", "message": "semantic mismatch", "affected_interfaces": ["I1"], "affected_inputs": [{"target_member": "scripts/unit_a.py", "target_input": "slot_x"}], "evidence": {"observed": "value_a", "expected": "value_b"}}
     issue = normalize_interface_review_issue(raw, [item("scripts/unit_a.py", ["slot_x"], ["value_a"])], {"interfaces": [p2m("I1", "scripts/unit_a.py")]})
-    assert "code" not in issue and "category" not in issue
+    assert issue["severity"] == "blocking" and issue["code"] == "type_mismatch"
 
 
 @pytest.mark.asyncio
@@ -802,6 +803,34 @@ async def test_reviewer_protocol_repair_runs_on_reviewer_route():
 
 
 @pytest.mark.asyncio
+async def test_nonblocking_interface_review_issues_are_retained_without_failing(caplog):
+    items = [item("scripts/unit_a.py", ["slot_x"], ["file_outputs"])]
+    plan = {"interfaces": [p2m("I1", "scripts/unit_a.py"), m2p("I2", "scripts/unit_a.py", "file_outputs")]}
+
+    async def reviewer(messages, _model):
+        prompt = messages[0]["content"]
+        assert "abstract file_outputs port may carry" in prompt
+        assert "Evidence may come only from the" in prompt
+        return json.dumps({"passed": True, "issues": [{
+            "severity": "warning", "code": "output_description_clarity",
+            "message": "The file format could be documented more explicitly.",
+            "affected_interfaces": ["I2"], "affected_inputs": [],
+            "evidence": {"observed": "abstract file output", "expected": "optional clearer documentation"},
+        }]})
+
+    with caplog.at_level("INFO"):
+        issues = await review_interface_plan_semantically(
+            original_user_goal="create a CSV reconciliation skill",
+            frozen_function_items=items, interface_plan=plan,
+            requirement_allocations=[], requirement_channels={}, system_requirements=[],
+            platform_contract=platform(), reviewer_model="reviewer-test-model",
+            model_call=reviewer,
+        )
+    assert issues[0]["severity"] == "warning"
+    assert "blocking_issue_count=0 warning_issue_count=1 advisory_issue_count=0" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_correction_receives_uncovered_slot_and_existing_binding_semantic_fact():
     items = [
         item("scripts/a.py", [], [
@@ -838,6 +867,7 @@ async def test_correction_receives_uncovered_slot_and_existing_binding_semantic_
         binding = payload["current_interface_plan"]["interfaces"][0]
         if binding.get("source_output") == "alpha":
             return json.dumps({"passed": False, "issues": [{
+                "severity": "blocking", "code": "parameter_type_mismatch",
                 "message": "declared alpha does not satisfy beta",
                 "affected_interfaces": ["I1"],
                 "affected_inputs": [{"target_member": "scripts/b.py", "target_input": "beta"}],

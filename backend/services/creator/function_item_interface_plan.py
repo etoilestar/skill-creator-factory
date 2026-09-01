@@ -652,16 +652,29 @@ Return strict parseable JSON only."""
     return _parse_object(text)
 
 
-INTERFACE_REVIEW_ISSUE_FIELDS = {"message", "affected_interfaces", "affected_inputs", "evidence"}
-INTERFACE_REVIEW_SCHEMA = {"passed": "boolean", "issues": [{"message": "string", "affected_interfaces": ["string"], "affected_inputs": [{"target_member": "string", "target_input": "string"}], "evidence": {"observed": "any", "expected": "any"}}]}
+INTERFACE_REVIEW_SEVERITIES = {"blocking", "warning", "advisory"}
+INTERFACE_REVIEW_ISSUE_FIELDS = {"severity", "code", "message", "affected_interfaces", "affected_inputs", "evidence"}
+INTERFACE_REVIEW_SCHEMA = {
+    "passed": "boolean",
+    "issues": [{
+        "severity": "blocking | warning | advisory", "code": "string",
+        "message": "string", "affected_interfaces": ["string"],
+        "affected_inputs": [{"target_member": "string", "target_input": "string"}],
+        "evidence": {"observed": "any", "expected": "any"},
+    }],
+}
 
 
 def normalize_interface_review_issue(raw_issue: dict[str, Any], frozen_function_items: list[dict[str, Any]], current_interface_plan: dict[str, Any], *, path: str = "$.issues[]") -> dict[str, Any]:
     """Validate a free-form semantic defect envelope and logical references."""
     if not isinstance(raw_issue, dict) or set(raw_issue) != INTERFACE_REVIEW_ISSUE_FIELDS:
         _raise("semantic review issue has invalid shape", "invalid_interface_semantic_review_protocol", path=path)
+    severity, code = raw_issue["severity"], raw_issue["code"]
     message, interface_ids, affected_inputs, evidence = raw_issue["message"], raw_issue["affected_interfaces"], raw_issue["affected_inputs"], raw_issue["evidence"]
-    if not isinstance(message, str) or not message.strip() or not isinstance(interface_ids, list) or not isinstance(affected_inputs, list) or not isinstance(evidence, dict) or set(evidence) != {"observed", "expected"}:
+    if (severity not in INTERFACE_REVIEW_SEVERITIES or not isinstance(code, str) or not code.strip()
+            or not isinstance(message, str) or not message.strip() or not isinstance(interface_ids, list)
+            or not isinstance(affected_inputs, list) or not isinstance(evidence, dict)
+            or set(evidence) != {"observed", "expected"}):
         _raise("semantic review issue is not auditable", "invalid_interface_semantic_review_protocol", path=path)
     known_interfaces = {str(value.get("interface_id") or "") for value in current_interface_plan.get("interfaces") or []}
     inputs = {item["target_file"]: {value["name"] for value in item["inputs"]} for item in _compact_function_items(frozen_function_items)}
@@ -672,7 +685,7 @@ def normalize_interface_review_issue(raw_issue: dict[str, Any], frozen_function_
         if not isinstance(value, dict) or set(value) != {"target_member", "target_input"} or value.get("target_input") not in inputs.get(value.get("target_member"), set()):
             _raise("review issue references an unknown logical input", "invalid_interface_semantic_review_reference", path=f"{path}.affected_inputs[{index}]")
         normalized_inputs.append(dict(value))
-    envelope = {"message": message.strip(), "affected_interfaces": list(interface_ids), "affected_inputs": normalized_inputs, "evidence": dict(evidence)}
+    envelope = {"severity": severity, "code": code.strip(), "message": message.strip(), "affected_interfaces": list(interface_ids), "affected_inputs": normalized_inputs, "evidence": dict(evidence)}
     return {**envelope, "stage": "interface_semantic_review", "path": path, "interface_id": interface_ids[0] if interface_ids else "", "details": envelope}
 
 
@@ -701,9 +714,14 @@ def _validate_interface_review_response(
         normalize_interface_review_issue(raw, frozen_function_items, interface_plan, path=f"$.issues[{index}]")
         for index, raw in enumerate(value["issues"])
     ]
-    if value["passed"] != (not issues):
+    if value["passed"] != (not any(issue["severity"] == "blocking" for issue in issues)):
         _raise("semantic review passed flag contradicts issues", "invalid_interface_semantic_review_protocol", path="$.passed")
     return issues
+
+
+def blocking_interface_review_issues(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return only findings that may block the plan or trigger repair."""
+    return [issue for issue in issues if issue.get("severity") == "blocking"]
 
 
 async def _reformat_interface_review_response(
@@ -713,7 +731,7 @@ async def _reformat_interface_review_response(
     prompt = """Repair only the JSON protocol shape.
 Preserve every semantic conclusion, message, affected reference, and evidence.
 Do not add, remove, merge, split, or reinterpret issues.
-Every issue must use the single supplied taxonomy-free issue schema.
+Every issue must use the single supplied severity-and-code issue schema.
 Return only the corrected JSON object."""
     payload = {
         "review_schema": INTERFACE_REVIEW_SCHEMA,
@@ -797,11 +815,32 @@ intended semantic platform value, and whether selected final platform results
 semantically satisfy the requested output. Do not search for predefined error
 categories and do not propose a repair.
 
+SCOPE BOUNDARY
+Review only whether the Interface Plan violates the frozen requirements,
+frozen Blueprint/FunctionItems, or frozen platform/interface contract in the
+payload. Never add an input or output absent from the Blueprint, split an
+existing abstract output, promote an implementation detail into an Interface
+requirement, infer undeclared fields from experience, or change the original
+Interface semantics. In particular, an abstract file_outputs port may carry
+CSV, Markdown, or JSON files and does not require a separate csv_report output.
+An optional fields value does not imply a required fields.primary_key member.
+
 4. EVIDENCE STANDARD
 A structurally valid logical reference is not automatically semantically correct.
 A different valid design is not a defect. Report only a concrete defect in this
-plan, supported by observed and expected facts. An issue is not a record that a
-fact was reviewed.
+plan, supported by observed and expected facts. Evidence may come only from the
+frozen requirements, frozen Blueprint/FunctionItems, and frozen platform or
+Interface schema in the payload. Do not use inferred best practices, tool
+implementation habits, file/directory naming conventions, or undeclared fields.
+An issue is not a record that a fact was reviewed.
+
+SEVERITY
+Use blocking only when an Interface references a nonexistent input, a
+Blueprint-required output is wholly absent, the data flow cannot connect, or
+parameter types cannot match. These remain blocking even when a plausible
+implementation workaround exists. Use warning for clarity suggestions such as
+more explicit output naming, file-format documentation, or field documentation.
+Use advisory for implementation, filename, or directory-layout suggestions.
 
 5. AUTHORITY LIMIT
 Do not select opaque Graph endpoint IDs, generate edges, change Interface records,
@@ -812,8 +851,9 @@ declared, evaluate whether that nested platform value can semantically satisfy
 target_input. Report a defect without proposing another path.
 
 6. OUTPUT CONTRACT
-Verify every affected Interface and logical input exists. passed=true exactly
-when issues is empty.
+Verify every affected Interface and logical input exists. passed=false exactly
+when at least one issue has severity=blocking. Warning/advisory issues are
+retained while passed remains true.
 Return only strict JSON matching this schema:
 """ + mode_contract + """
 
@@ -861,7 +901,13 @@ Return only strict JSON matching this schema:
     except Exception:
         # Model transport failures remain transport failures, not protocol repair.
         raise
-    logger.info("[Creator][interface_semantic_review] result=%s issue_count=%d", "passed" if not issues else "issues_found", len(issues))
+    counts = {severity: sum(issue["severity"] == severity for issue in issues)
+              for severity in INTERFACE_REVIEW_SEVERITIES}
+    logger.info(
+        "[Creator][interface_review] phase=interface_review result=%s blocking_issue_count=%d warning_issue_count=%d advisory_issue_count=%d",
+        "failed" if counts["blocking"] else "passed", counts["blocking"],
+        counts["warning"], counts["advisory"],
+    )
     return issues
 
 
@@ -950,7 +996,9 @@ async def _audit_existing_bindings_fail_open(
             exc.code,
         )
         return [], False
-    facts = _existing_binding_acceptance_facts(issues, interface_plan)
+    facts = _existing_binding_acceptance_facts(
+        blocking_interface_review_issues(issues), interface_plan
+    )
     logger.info(
         "[Creator][existing_binding_semantic_review] semantic_audit_available=true issue_count=%d acceptance_fact_count=%d",
         len(issues), len(facts),
@@ -1155,7 +1203,9 @@ Return strict JSON matching INTERFACE_SCHEMA only."""
             reviewer_model=reviewer_model,
             model_call=reviewer_model_call or model_call,
         )
-    combined_issues = merge_interface_validation_issues(review_issues)
+    combined_issues = merge_interface_validation_issues(
+        blocking_interface_review_issues(review_issues)
+    )
     logger.info(
         "[Creator][interface_validation] stage=initial deterministic_issue_count=%d review_issue_count=%d combined_issue_count=%d repairable=%s",
         len(deterministic_issues), len(review_issues), len(combined_issues), bool(combined_issues),
@@ -1433,7 +1483,8 @@ Return only strict JSON matching critic_schema."""
                 model_call=reviewer_model_call or model_call,
             )
         graph_issues: list[dict[str, Any]] = []
-        if not remaining and not review_issues and repair_stage == "graph_expansion_feedback":
+        blocking_review_issues = blocking_interface_review_issues(review_issues)
+        if not remaining and not blocking_review_issues and repair_stage == "graph_expansion_feedback":
             # Local import avoids the module cycle: graph expansion consumes Interface helpers.
             from .responsibility_graph_expansion import (
                 validate_responsibility_graph_candidate,
@@ -1452,7 +1503,7 @@ Return only strict JSON matching critic_schema."""
                     "stage": "graph_validation",
                 }]
         residual = merge_interface_validation_issues(
-            remaining, review_issues, graph_issues,
+            remaining, blocking_review_issues, graph_issues,
         )
         return CandidateEvaluation(
             accepted=not residual, candidate=candidate,

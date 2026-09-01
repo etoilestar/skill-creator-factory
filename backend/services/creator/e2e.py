@@ -539,71 +539,35 @@ def _e2e_runtime_boundary_facts(
     script_content: str,
     runtime_binding_trace: dict[str, Any],
 ) -> dict[str, Any]:
-    """Return deterministic facts which must hold before blaming a script.
 
-    In particular, JSON rendering deliberately preserves the value of a whole
-    placeholder.  Wrapping a collection placeholder in a JSON list is therefore
-    a command error, not an invitation to make the script accept ``list[list]``.
-    """
     try:
-        schema = extract_python_strict_argv_schema(script_content) if command.script_path.endswith(".py") else {}
+        schema = (
+            extract_python_strict_argv_schema(
+                script_content
+            )
+            if command.script_path.endswith(".py")
+            else {}
+        )
     except Exception:
         schema = {}
-    expected_types = schema.get("expected_types") if isinstance(schema, dict) else {}
-    expected_types = expected_types if isinstance(expected_types, dict) else {}
-    required_keys = set(schema.get("required_keys") or []) if isinstance(schema, dict) else set()
-    allowed_keys = set(schema.get("allowed_keys") or []) if isinstance(schema, dict) else set()
 
-    issues: list[dict[str, Any]] = []
-    for argv_key, template_value in (command.argv_template or {}).items():
-        key = str(argv_key)
-        expected = _canonical_e2e_shape(expected_types.get(key) or "")
-        # A one-element template list containing a whole collection placeholder
-        # is unambiguously a duplicate wrapper, regardless of business/file type.
-        if isinstance(template_value, list) and len(template_value) == 1:
-            expr = _whole_e2e_placeholder_expr(template_value[0])
-            source = _resolve_e2e_payload_expr(expr, payload=payload, missing=[]) if expr else None
-            if expr and isinstance(source, list) and (expected.startswith("list") or isinstance(rendered_payload.get(key), list)):
-                issues.append({
-                    "error_code": "collection_placeholder_double_wrapped",
-                    "argv_key": key,
-                    "placeholder_expression": expr,
-                    "placeholder_source_root": _placeholder_root(expr),
-                    "source_runtime_shape": _json_shape(source),
-                    "rendered_shape": _json_shape(rendered_payload.get(key)),
-                    "expected_shape": expected or "list",
-                })
-
-    missing_required = sorted(str(key) for key in required_keys - set(rendered_payload))
-    unknown_keys = sorted(str(key) for key in set(rendered_payload) - allowed_keys) if allowed_keys else []
-    if missing_required:
-        issues.append({"error_code": "command_argv_missing", "keys": missing_required})
-    if unknown_keys:
-        issues.append({"error_code": "command_argv_extra", "keys": unknown_keys})
-
-    fixture_paths: list[str] = []
-    runtime_file_roots = _platform_runtime_file_input_names()
-    for binding in runtime_binding_trace.values():
-        source_root = str(binding.get("source_root") or "")
-        if source_root not in runtime_file_roots:
-            continue
-        source = payload.get(source_root)
-        if isinstance(source, list) and source and all(isinstance(item, str) for item in source):
-            fixture_paths.extend(item for item in source if Path(item).is_absolute())
-    fixture_valid = all(Path(path).is_file() for path in fixture_paths)
-    argv_shape_valid = not issues
     return {
-        "fixture_valid": fixture_valid,
-        "placeholder_resolved": True,
-        "argv_shape_valid": argv_shape_valid,
-        "command_script_interface_aligned": not missing_required and not unknown_keys and argv_shape_valid,
-        "repair_layer": "script" if argv_shape_valid and not missing_required and not unknown_keys else "command",
-        "repair_target": command.script_path if argv_shape_valid and not missing_required and not unknown_keys else "SKILL.md",
-        "issues": issues,
-        "rendered_payload": rendered_payload,
-        "runtime_binding_trace": runtime_binding_trace,
-        "value_provenance_roots": sorted(str(binding.get("source_root") or "") for binding in runtime_binding_trace.values()),
-        "script_argv_schema": schema,
+        "source_payload_shape":
+            _json_object_shape(payload),
+
+        "rendered_payload_shape":
+            _json_object_shape(
+                rendered_payload
+            ),
+
+        "runtime_binding_trace":
+            runtime_binding_trace,
+
+        "script_argv_schema":
+            schema,
+
+        "command_argv_template":
+            command.argv_template,
     }
 
 
@@ -2462,10 +2426,13 @@ def _review_e2e_trial_case(
     requested_model: str | None = None,
 ) -> dict[str, Any]:
     """
-    Review only whether the generated E2E input case is a valid
-    and meaningful projection of the frozen input contract.
+    Semantic review for one already schema-valid Trial Case.
 
-    This reviewer must not review or repair Skill implementation.
+    Structural representation validity belongs to the JSON Schema and
+    materializer, not to this reviewer.
+
+    Reviewer only decides whether the proposed Case is a meaningful,
+    non-contradictory witness of the frozen requirements.
     """
 
     route = route_model(
@@ -2502,6 +2469,11 @@ def _review_e2e_trial_case(
                         },
                         "code": {
                             "type": "string",
+                            "enum": [
+                                "semantic_witness_invalid",
+                                "requirement_contradiction",
+                                "requirement_not_exercised",
+                            ],
                         },
                         "message": {
                             "type": "string",
@@ -2516,27 +2488,132 @@ def _review_e2e_trial_case(
     }
 
     system_prompt = """
-你是 Creator E2E Trial Case Reviewer。
+你是 Creator E2E Trial Case Semantic Reviewer。
 
-你只审查 E2E 输入样本是否正确。
-不得审查或修改 Skill 实现。
-不得修改 RequirementGraph、ResponsibilityGraph 或 InterfacePlan。
-不得输出代码。
+你审查的对象已经通过 Creator 的结构化 JSON Schema。
+因此你不能重新定义或否定 Trial Case 的序列化协议。
 
-审查标准只有：
+你的唯一任务是判断：
 
-1. 输入必须遵守 frozen external input contract；
-2. required input 必须存在，optional input 不得无依据发明额外业务信息；
-3. shape / file format / cardinality / nested path 必须与 frozen contract 一致；
-4. file input 必须表示真正可 materialize 的文件 fixture，
-   不能用不存在的假路径代替 runtime file；
-5. 输入内容应是最小合法 happy-path，
-   但必须足以触发该输入相关的已冻结 requirement；
-6. 不得把 SKILL.md 中的示例值当成平台真实输入事实。
+“这个 Trial Case 在 Creator materialize 成真实 runtime 输入以后，
+是否是一个合理、最小、能够有效触发 frozen requirements 的 E2E 测试样本？”
 
-如果只是 Skill 代码不能处理一个合法输入，
+严格遵守以下边界。
+
+一、必须区分 Case representation 与 runtime representation
+
+Trial Case 中：
+
+- scalar fixture:
+    {"kind":"scalar","value":...}
+  materialize 后才成为 runtime scalar。
+
+- json_value fixture:
+    {"kind":"json_value","value":...}
+  materialize 后才成为 runtime JSON value。
+
+- file fixture:
+    描述 Creator 应创建的真实本地文件内容。
+
+- file_list fixture:
+    描述 Creator 应创建的一组真实本地文件。
+
+对于 file_path / list[file_path]：
+
+Trial Case 阶段出现 file fixture / file_list 是正确表示形式。
+Reviewer 不得要求 Trial Case 自己直接包含 /tmp/x.csv、
+data/x.csv 等现成路径。
+
+Creator 会在 Reviewer 通过以后：
+
+file fixture
+→ materialize local file
+→ runtime file path
+
+因此禁止仅因为 fixture 不是最终 path string 而判失败。
+
+二、不得重新做 JSON Schema 审查
+
+以下内容已经由 Creator schema 负责：
+
+- root input 名称；
+- root shape；
+- fixture kind；
+- scalar 类型；
+- file format；
+- file cardinality；
+- file fixture 基础结构。
+
+不要因为上述理由重复判失败。
+
+三、open object / open list 不是 closed schema
+
+如果 frozen facts 只声明：
+
+shape = object
+
+且没有明确声明：
+
+- closed properties
+- forbidden properties
+- additionalProperties=false
+
+则不得认为 object 必须为 {}，
+也不得仅因为出现额外字段而判 invalid_input_shape。
+
+required_paths=[] 只表示没有被冻结的必填 nested path，
+不表示禁止其它字段。
+
+四、Reviewer 只允许判断语义 witness
+
+只在以下情况下 passed=false：
+
+1. semantic_witness_invalid
+   Case 本身虽然结构合法，但内容明显让 E2E 无法测试目标行为。
+
+2. requirement_contradiction
+   Case 内容直接违反 frozen requirement。
+
+3. requirement_not_exercised
+   Case 提前提供了 requirement 本来要求 Skill 自己计算、
+   推断、转换、发现或生成的答案，从而绕过了核心行为。
+
+例如：
+
+Requirement：
+“Skill 必须自动识别主键。”
+
+如果 Trial Case 提供：
+
+{"primary_key":"id"}
+
+且该值会使脚本不需要自动识别主键，
+可以判：
+
+requirement_not_exercised
+
+但不能判：
+
+invalid_input_shape
+
+因为 object 的结构本身可能完全合法。
+
+五、不要审查 Skill 实现
+
+如果 Case 是合法测试输入，
+但你怀疑脚本无法处理，
 必须 passed=true。
-那属于后续 E2E 的实现问题，不属于 Trial Case 问题。
+
+脚本问题由后续真实 E2E subprocess 判断。
+
+六、倾向让真实 E2E 执行
+
+只有存在明确 frozen-requirement 证据时才能拒绝 Case。
+
+有歧义时优先 passed=true，
+让真实 subprocess 暴露实现问题。
+
+不要因为“可能”“通常”“建议”“最好”而拒绝 Case。
 
 只输出 JSON。
 """.strip()
@@ -2544,6 +2621,24 @@ def _review_e2e_trial_case(
     payload = {
         "frozen_input_facts": facts,
         "trial_case": trial_case,
+
+        # Explicit Creator-owned representation semantics.
+        "trial_case_representation_contract": {
+            "scalar": (
+                "fixture.value becomes the runtime scalar"
+            ),
+            "json_value": (
+                "fixture.value becomes the runtime JSON value"
+            ),
+            "file_path": (
+                "file fixture is materialized by Creator "
+                "into one real local file path"
+            ),
+            "list[file_path]": (
+                "file_list fixtures are materialized by Creator "
+                "into a list of real local file paths"
+            ),
+        },
     }
 
     result = (
@@ -2577,7 +2672,8 @@ def _review_e2e_trial_case(
             "issues": [
                 {
                     "input": "",
-                    "code": "review_invalid",
+                    "code":
+                        "semantic_witness_invalid",
                     "message": (
                         "Trial Case Reviewer "
                         "returned invalid output."
@@ -2602,223 +2698,6 @@ def _complete_creator_json_object_once_sync_for_e2e(**kwargs: Any) -> dict[str, 
         return asyncio.run(call())
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         return executor.submit(lambda: asyncio.run(call())).result()
-
-
-def _e2e_trial_case_response_schema(facts: dict[str, Any]) -> dict[str, Any]:
-    """Bind the Trial Case output contract to the supplied frozen input facts."""
-    input_variants: list[dict[str, Any]] = []
-    for frozen in facts.get("external_inputs", []):
-        platform_input = frozen.get("platform_input", {}) if isinstance(frozen, dict) else {}
-        name, shape = str(platform_input.get("name") or ""), _canonical_e2e_shape(str(platform_input.get("shape") or ""))
-        file_contract = platform_input.get("file_contract") if isinstance(platform_input.get("file_contract"), dict) else {}
-        allowed_formats = [fmt for fmt in file_contract.get("allowed_formats", []) if _resolve_file_fixture_handler(fmt)]
-        file_variants = [
-            _resolve_file_fixture_handler(fmt).fixture_schema(
-                _resolve_file_fixture_handler(fmt).canonical_format,
-                _resolve_file_fixture_handler(fmt).content_kind,
-            )
-            for fmt in allowed_formats
-        ]
-        file_schema = {"oneOf": file_variants}
-        min_items = int(file_contract.get("min_items") or 1)
-        max_items = int(file_contract.get("max_items") or (1 if shape == "file_path" else 3))
-        evidence_ids = [str(item.get("id")) for item in frozen.get("requirements", []) if isinstance(item, dict) and item.get("id")]
-        evidence_schema: dict[str, Any] = {
-            "type": "array", "uniqueItems": True,
-            "items": {"type": "string", "enum": evidence_ids} if evidence_ids else {"type": "string"},
-            "minItems": 1 if evidence_ids else 0,
-            "maxItems": len(evidence_ids),
-        }
-        if shape in {"string", "number", "integer", "boolean"}:
-            fixture = {
-                "type": "object", "additionalProperties": False,
-                "required": ["kind", "value"],
-                "properties": {"kind": {"const": "scalar"}, "value": {"type": shape}},
-            }
-        elif shape in {
-            "object",
-            "list",
-            "list[string]",
-            "list[number]",
-            "list[integer]",
-            "list[boolean]",
-            "list[object]",
-        }:
-            required = bool(
-                platform_input.get(
-                    "required",
-                    True,
-                )
-            )
-
-            default_available = bool(
-                platform_input.get(
-                    "default_available",
-                    False,
-                )
-            )
-
-            item_shape = _canonical_e2e_shape(
-                str(
-                    platform_input.get(
-                        "item_shape"
-                    )
-                    or ""
-                )
-            )
-
-            required_paths = tuple(
-                platform_input.get(
-                    "required_paths"
-                )
-                or ()
-            )
-
-            properties = (
-                platform_input.get(
-                    "properties"
-                )
-                if isinstance(
-                    platform_input.get(
-                        "properties"
-                    ),
-                    dict,
-                )
-                else {}
-            )
-
-            case_spec = E2EInputCaseSpec(
-                name=name,
-                provenance_source=str(
-                    platform_input.get(
-                        "provenance_source"
-                    )
-                    or "frozen_contract"
-                ),
-                runtime_shape=shape,
-                item_shape=item_shape,
-                required=required,
-                nullable=bool(
-                    platform_input.get(
-                        "nullable",
-                        False,
-                    )
-                ),
-                default_available=default_available,
-                default_value=(
-                    platform_input.get(
-                        "default_value"
-                    )
-                ),
-                required_paths=required_paths,
-                optional_paths=tuple(
-                    platform_input.get(
-                        "optional_paths"
-                    )
-                    or ()
-                ),
-                consumed_paths=tuple(
-                    platform_input.get(
-                        "consumed_paths"
-                    )
-                    or ()
-                ),
-                min_items=int(
-                    platform_input.get(
-                        "min_items"
-                    )
-                    or 0
-                ),
-                max_items=(
-                    platform_input.get(
-                        "max_items"
-                    )
-                ),
-            )
-
-            # E2E 不替用户发明 optional 开放集合内容。
-            #
-            # optional + no default + open list  -> []
-            # optional + no default + open object -> {}
-            if (
-                    not required
-                    and not default_available
-                    and shape == "list"
-                    and not item_shape
-                    and not required_paths
-            ):
-                value_schema = {
-                    "type": "array",
-                    "minItems": 0,
-                    "maxItems": 0,
-                }
-
-            elif (
-                    not required
-                    and not default_available
-                    and shape == "object"
-                    and not properties
-                    and not required_paths
-            ):
-                value_schema = {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "maxProperties": 0,
-                }
-
-            else:
-                value_schema = (
-                    _e2e_input_case_schema(
-                        case_spec
-                    )
-                )
-
-            fixture = {
-                "type": "object",
-                "additionalProperties": False,
-                "required": [
-                    "kind",
-                    "value",
-                ],
-                "properties": {
-                    "kind": {
-                        "const": "json_value"
-                    },
-                    "value": value_schema,
-                },
-            }
-
-        elif shape == "file_path":
-            fixture = {"oneOf": [file_schema, {
-                "type": "object", "additionalProperties": False,
-                "required": ["kind", "files"],
-                "properties": {"kind": {"const": "file_list"}, "files": {"type": "array", "minItems": 1, "maxItems": 1, "items": file_schema}},
-            }]}
-        else:
-            fixture = {
-                "type": "object", "additionalProperties": False,
-                "required": ["kind", "files"],
-                "properties": {"kind": {"const": "file_list"}, "files": {"type": "array", "minItems": min_items, "maxItems": max_items, "items": file_schema}},
-            }
-        input_variants.append({
-            "type": "object", "additionalProperties": False,
-            "required": ["name", "shape", "fixture", "evidence_requirement_ids"],
-            "properties": {"name": {"const": name}, "shape": {"const": shape}, "fixture": fixture, "evidence_requirement_ids": evidence_schema},
-        })
-    trial_case = {
-        "type": "object", "additionalProperties": False,
-        "required": ["version", "inputs"],
-        "properties": {
-            "version": {"const": 1},
-            "inputs": {"type": "array", "minItems": 1, "maxItems": len(input_variants), "items": {"oneOf": input_variants}},
-        },
-    }
-    unsupported = {
-        "type": "object", "additionalProperties": False, "required": ["status"],
-        "properties": {"status": {"const": "unsupported"}},
-    }
-    return {"oneOf": [trial_case, unsupported]}
-
 
 def _e2e_json_value_schema(shape: str) -> dict[str, Any]:
     """Return the narrow JSON Schema used for non-file structured fixtures."""
@@ -3282,245 +3161,489 @@ def _materialize_rendered_e2e_payload_runtime_literals(
     return materialized, events
 
 
-def _seed_initial_e2e_payload(
-    commands: list[E2EWorkflowCommand],
-    *,
-    external_context: dict[str, Any] | None = None,
-    skill_dir: Path | None = None,
-    requirements_by_file: dict[str, list[RequirementItem]] | None = None,
-    skill_plan_entries: dict[str, SkillPlanEntry] | None = None,
-    trial_case: dict[str, Any] | None = None,
+def _e2e_trial_case_response_schema(
+    facts: dict[str, Any],
 ) -> dict[str, Any]:
-    """Seed Creator E2E with a non-empty generic external input envelope.
-
-    第二轮 E2E 需要真实跑 workflow。若 validate-skill 没传用户消息，
-    也必须给 {{user_request}} / {{input}} / {{text}} / {{payload}}
-    一个非空通用测试值，否则第一步会收到空字符串，导致参数接入审查误判。
-
-    fields.<key> 占位符按第一步脚本 strict_json_argv_guard schema 补 typed E2E
-    测试值；这些值只存在于 runtime payload，不写回 SKILL.md。
     """
-    base_context = external_context
-    if not isinstance(base_context, dict):
-        base_context = build_creator_external_input_context(messages=[])
+    Build the structural output schema for the Trial Case model.
 
-    payload: dict[str, Any] = dict(base_context or {})
-    trial_inputs = {
-        str(item.get("name")): item
-        for item in ((trial_case or {}).get("inputs") or [])
-        if isinstance(item, dict)
-    }
+    The schema enforces serialization/materialization structure only.
 
-    seed_value = ""
-    for key in ("user_request", "input", "text", "payload"):
-        value = payload.get(key)
-        if isinstance(value, str) and value.strip():
-            seed_value = value.strip()
-            break
+    It deliberately does NOT decide semantic questions such as:
+    - whether an optional list should be empty;
+    - whether an optional object should contain fields;
+    - whether a particular sample value is meaningful.
 
-    if not seed_value:
-        seed_value = (
-            "Creator E2E 验证输入：请根据这个请求完成当前 Skill 的主要任务，"
-            "内容包含中文、English words 和标点，用于验证参数传递、脚本消费和输出闭环。"
+    Those questions belong to _review_e2e_trial_case().
+    """
+
+    input_variants: list[
+        dict[str, Any]
+    ] = []
+
+    for frozen in (
+        facts.get("external_inputs")
+        or []
+    ):
+        if not isinstance(frozen, dict):
+            continue
+
+        platform_input = (
+            frozen.get("platform_input")
+            if isinstance(
+                frozen.get(
+                    "platform_input"
+                ),
+                dict,
+            )
+            else {}
         )
 
-    for key in ("user_request", "input", "text", "payload"):
-        if not _json_value_non_empty(payload.get(key)):
-            payload[key] = seed_value
+        name = str(
+            platform_input.get("name")
+            or ""
+        ).strip()
 
-    if not isinstance(payload.get("fields"), dict):
-        payload["fields"] = {}
+        shape = _canonical_e2e_shape(
+            str(
+                platform_input.get("shape")
+                or ""
+            )
+        )
 
-    if not isinstance(payload.get("options"), dict):
-        payload["options"] = {}
-
-    runtime_file_roots = _platform_runtime_file_input_names()
-    for root in runtime_file_roots:
-        if not isinstance(payload.get(root), list):
-            payload[root] = []
-
-    typed_specs = _collect_e2e_typed_inputs_from_graph(
-        commands=commands,
-        requirements_by_file=requirements_by_file or {},
-        skill_plan_entries=skill_plan_entries,
-        skill_dir=skill_dir,
-    )
-    typed_specs_by_target = {
-        (spec.target_file, spec.name): spec
-        for spec in typed_specs
-    }
-    defaults_by_target = {
-        (target_file, str(input_name)): default_value
-        for target_file, entry in (skill_plan_entries or {}).items()
-        for input_name, default_value in (
-            getattr(entry, "default_values", {}) or {}
-        ).items()
-    }
-    responsibility_edges = parse_responsibility_edges(
-        _read_e2e_skill_md_for_samples(skill_dir)
-    )
-    for edge in responsibility_edges:
-        if str(edge.get("from_node") or "") != "platform_input_node":
+        if not name or not shape:
             continue
-        root = str(edge.get("from_output") or "").strip()
-        target_file = str(edge.get("to_node") or "").strip()
-        target_input = str(edge.get("to_input") or "").strip()
-        bindings = [
-            constraint
-            for constraint in (edge.get("constraints") or [])
-            if isinstance(constraint, dict)
-            and constraint.get("type") == "platform_parameter_binding"
+
+        file_contract = (
+            platform_input.get(
+                "file_contract"
+            )
+            if isinstance(
+                platform_input.get(
+                    "file_contract"
+                ),
+                dict,
+            )
+            else {}
+        )
+
+        allowed_formats = [
+            fmt
+            for fmt in (
+                file_contract.get(
+                    "allowed_formats"
+                )
+                or []
+            )
+            if _resolve_file_fixture_handler(
+                fmt
+            )
+            is not None
         ]
-        if not root or len(bindings) > 1:
-            continue
-        binding = bindings[0] if bindings else None
-        source_key = str((binding or {}).get("source_key") or "").strip()
-        if binding is None:
-            expr = next((
-                _whole_e2e_placeholder_expr(command.argv_template.get(target_input))
-                for command in commands
-                if command.script_path == target_file
-                and target_input in command.argv_template
-            ), None)
-            expr_parts = str(expr or "").split(".")
-            if len(expr_parts) < 2 or expr_parts[0] != root:
-                continue
-            source_key = ".".join(expr_parts[1:])
-            key_parts = expr_parts[1:]
-        elif not source_key:
-            continue
-        else:
-            key_parts = [source_key]
-        container = payload.get(root)
-        if not isinstance(container, dict):
-            if _json_value_non_empty(container):
-                continue
-            container = {}
-            payload[root] = container
-        for key_part in key_parts[:-1]:
-            child = container.get(key_part)
-            if not isinstance(child, dict):
-                if _json_value_non_empty(child):
-                    container = None
-                    break
-                child = {}
-                container[key_part] = child
-            container = child
-        if container is None or _json_value_non_empty(container.get(key_parts[-1])):
-            continue
-        if binding is not None and "default" in binding and binding.get("default") is not None:
-            container[key_parts[-1]] = binding["default"]
-            continue
-        target_default = (target_file, target_input)
-        if target_default in defaults_by_target:
-            container[key_parts[-1]] = defaults_by_target[target_default]
-            continue
-        if binding is not None and "sample" in binding and binding.get("sample") is not None:
-            container[key_parts[-1]] = binding["sample"]
-            continue
-        spec = typed_specs_by_target.get((target_file, target_input))
-        if spec is not None:
-            trial_item = trial_inputs.get(root) or trial_inputs.get(spec.name)
-            container[key_parts[-1]] = (
-                _materialize_e2e_trial_fixture(trial_item, skill_dir=skill_dir)
-                if trial_item is not None and skill_dir is not None
-                else _materialize_e2e_sample_value(spec, skill_dir=skill_dir)
+
+        evidence_ids = [
+            str(item.get("id"))
+            for item in (
+                frozen.get(
+                    "requirements"
+                )
+                or []
+            )
+            if (
+                isinstance(item, dict)
+                and item.get("id")
+            )
+        ]
+
+        evidence_schema: dict[
+            str,
+            Any,
+        ] = {
+            "type": "array",
+            "uniqueItems": True,
+            "items": (
+                {
+                    "type": "string",
+                    "enum": evidence_ids,
+                }
+                if evidence_ids
+                else {
+                    "type": "string"
+                }
+            ),
+            "minItems": (
+                1
+                if evidence_ids
+                else 0
+            ),
+            "maxItems": len(
+                evidence_ids
+            ),
+        }
+
+        # =====================================================
+        # Scalar runtime value
+        # =====================================================
+        if shape in {
+            "string",
+            "number",
+            "integer",
+            "boolean",
+        }:
+            fixture_schema: dict[
+                str,
+                Any,
+            ] = {
+                "type": "object",
+                "additionalProperties":
+                    False,
+                "required": [
+                    "kind",
+                    "value",
+                ],
+                "properties": {
+                    "kind": {
+                        "const": "scalar"
+                    },
+                    "value": {
+                        "type": shape
+                    },
+                },
+            }
+
+        # =====================================================
+        # Structured JSON runtime value
+        # =====================================================
+        elif shape in {
+            "object",
+            "list",
+            "list[string]",
+            "list[number]",
+            "list[integer]",
+            "list[boolean]",
+            "list[object]",
+        }:
+            case_spec = E2EInputCaseSpec(
+                name=name,
+                provenance_source=str(
+                    platform_input.get(
+                        "provenance_source"
+                    )
+                    or "frozen_contract"
+                ),
+                runtime_shape=shape,
+                item_shape=(
+                    _canonical_e2e_shape(
+                        str(
+                            platform_input.get(
+                                "item_shape"
+                            )
+                            or ""
+                        )
+                    )
+                    or _shape_item_shape(
+                        shape
+                    )
+                ),
+                required=bool(
+                    platform_input.get(
+                        "required",
+                        True,
+                    )
+                ),
+                nullable=bool(
+                    platform_input.get(
+                        "nullable",
+                        False,
+                    )
+                ),
+                default_available=bool(
+                    platform_input.get(
+                        "default_available",
+                        False,
+                    )
+                ),
+                default_value=(
+                    platform_input.get(
+                        "default_value"
+                    )
+                ),
+                required_paths=tuple(
+                    platform_input.get(
+                        "required_paths"
+                    )
+                    or ()
+                ),
+                optional_paths=tuple(
+                    platform_input.get(
+                        "optional_paths"
+                    )
+                    or ()
+                ),
+                consumed_paths=tuple(
+                    platform_input.get(
+                        "consumed_paths"
+                    )
+                    or ()
+                ),
+                min_items=int(
+                    platform_input.get(
+                        "min_items"
+                    )
+                    or 0
+                ),
+                max_items=(
+                    platform_input.get(
+                        "max_items"
+                    )
+                ),
             )
 
-    platform_edge_targets = {
-        (
-            str(edge.get("to_node") or "").strip(),
-            str(edge.get("to_input") or "").strip(),
-        )
-        for edge in responsibility_edges
-        if str(edge.get("from_node") or "") == "platform_input_node"
-    }
-    for (target_file, input_name), default_value in defaults_by_target.items():
-        if (target_file, input_name) in platform_edge_targets:
-            continue
-        expr = next((
-            _whole_e2e_placeholder_expr(command.argv_template.get(input_name))
-            for command in commands
-            if command.script_path == target_file
-            and input_name in command.argv_template
-        ), None)
-        path_parts = str(expr or "").split(".")
-        if not path_parts or not path_parts[0]:
-            continue
-        container = payload
-        for path_part in path_parts[:-1]:
-            child = container.get(path_part)
-            if not isinstance(child, dict):
-                if _json_value_non_empty(child):
-                    container = None
-                    break
-                child = {}
-                container[path_part] = child
-            container = child
-        if container is not None and not _json_value_non_empty(container.get(path_parts[-1])):
-            container[path_parts[-1]] = default_value
-
-    platform_roots = {"user_request", "input", "text", "payload", "fields", "options", "resources"} | runtime_file_roots
-    for spec in typed_specs:
-        if spec.name in {"fields", "options"} and isinstance(payload.get(spec.name), dict):
-            continue
-        if "." in spec.name:
-            root, child = spec.name.split(".", 1)
-            if root not in {"fields", "options"}:
-                continue
-            container = payload.get(root)
-            if isinstance(container, dict) and not _json_value_non_empty(container.get(child)):
-                container[child] = _materialize_e2e_sample_value(spec, skill_dir=skill_dir)
-            continue
-        if spec.name in platform_roots and not _json_value_non_empty(payload.get(spec.name)):
-            trial_item = trial_inputs.get(spec.name)
-            payload[spec.name] = (
-                _materialize_e2e_trial_fixture(trial_item, skill_dir=skill_dir)
-                if trial_item is not None and skill_dir is not None
-                else _materialize_e2e_sample_value(spec, skill_dir=skill_dir)
+            value_schema = (
+                _e2e_input_case_schema(
+                    case_spec
+                )
             )
 
-    frozen_runtime_files = next(
-        (payload[root] for root in runtime_file_roots if isinstance(payload.get(root), list) and payload[root]),
-        None,
-    )
-    if frozen_runtime_files is not None:
-        for root in runtime_file_roots:
-            if not isinstance(payload.get(root), list) or not payload[root]:
-                payload[root] = list(frozen_runtime_files)
+            fixture_schema = {
+                "type": "object",
+                "additionalProperties":
+                    False,
+                "required": [
+                    "kind",
+                    "value",
+                ],
+                "properties": {
+                    "kind": {
+                        "const":
+                            "json_value"
+                    },
+                    "value":
+                        value_schema,
+                },
+            }
 
-    if commands:
-        first = commands[0]
-        schema: dict[str, Any] = {"expected_types": {}}
-        if skill_dir is not None and first.script_path.endswith(".py"):
-            script_file = skill_dir / first.script_path
-            if script_file.is_file():
-                try:
-                    schema = extract_python_strict_argv_schema(script_file.read_text(encoding="utf-8"))
-                except Exception:
-                    schema = {"expected_types": {}}
-        expected_types = schema.get("expected_types") if isinstance(schema, dict) else {}
-        if not isinstance(expected_types, dict):
-            expected_types = {}
-        placeholders = _placeholder_exprs_from_value(first.argv_template)
-        fields = payload.get("fields")
-        if isinstance(fields, dict):
-            for expr in placeholders:
-                normalized = _normalize_e2e_placeholder_expr(expr)
-                parts = normalized.split(".")
-                if len(parts) < 2 or parts[0] != "fields" or not parts[1]:
-                    continue
-                key = parts[1]
-                if _json_value_non_empty(fields.get(key)):
-                    continue
-                value_type = str(expected_types.get(key) or "").lower()
-                shape = _canonical_e2e_shape(value_type)
-                fields[key] = _materialize_e2e_sample_value(
-                    E2ETypedInputSpec(name=key, shape=shape, item_shape=_shape_item_shape(shape), source="argv_schema", target_file=first.script_path, confidence="high"),
-                    skill_dir=skill_dir,
+        # =====================================================
+        # One runtime file path
+        # =====================================================
+        elif shape == "file_path":
+            file_variants = []
+
+            for fmt in allowed_formats:
+                handler = (
+                    _resolve_file_fixture_handler(
+                        fmt
+                    )
                 )
 
-    return payload
+                if handler is None:
+                    continue
+
+                file_variants.append(
+                    handler.fixture_schema(
+                        handler.canonical_format,
+                        handler.content_kind,
+                    )
+                )
+
+            direct_file_schema: dict[
+                str,
+                Any,
+            ] = {
+                "oneOf": file_variants
+            }
+
+            fixture_schema = {
+                "oneOf": [
+                    direct_file_schema,
+                    {
+                        "type": "object",
+                        "additionalProperties":
+                            False,
+                        "required": [
+                            "kind",
+                            "files",
+                        ],
+                        "properties": {
+                            "kind": {
+                                "const":
+                                    "file_list"
+                            },
+                            "files": {
+                                "type":
+                                    "array",
+                                "minItems": 1,
+                                "maxItems": 1,
+                                "items":
+                                    direct_file_schema,
+                            },
+                        },
+                    },
+                ],
+            }
+
+        # =====================================================
+        # Collection of runtime file paths
+        # =====================================================
+        elif shape == "list[file_path]":
+            file_variants = []
+
+            for fmt in allowed_formats:
+                handler = (
+                    _resolve_file_fixture_handler(
+                        fmt
+                    )
+                )
+
+                if handler is None:
+                    continue
+
+                file_variants.append(
+                    handler.fixture_schema(
+                        handler.canonical_format,
+                        handler.content_kind,
+                    )
+                )
+
+            file_schema = {
+                "oneOf": file_variants
+            }
+
+            min_items = int(
+                file_contract.get(
+                    "min_items"
+                )
+                or platform_input.get(
+                    "min_items"
+                )
+                or 1
+            )
+
+            max_items_raw = (
+                file_contract.get(
+                    "max_items"
+                )
+            )
+
+            if max_items_raw is None:
+                max_items_raw = (
+                    platform_input.get(
+                        "max_items"
+                    )
+                )
+
+            max_items = (
+                int(max_items_raw)
+                if max_items_raw
+                is not None
+                else max(
+                    min_items,
+                    3,
+                )
+            )
+
+            fixture_schema = {
+                "type": "object",
+                "additionalProperties":
+                    False,
+                "required": [
+                    "kind",
+                    "files",
+                ],
+                "properties": {
+                    "kind": {
+                        "const":
+                            "file_list"
+                    },
+                    "files": {
+                        "type":
+                            "array",
+                        "minItems":
+                            min_items,
+                        "maxItems":
+                            max_items,
+                        "items":
+                            file_schema,
+                    },
+                },
+            }
+
+        else:
+            # Unknown shapes should not normally reach the Trial Case model.
+            # Keep the schema non-inventive rather than guessing a value.
+            continue
+
+        input_variants.append({
+            "type": "object",
+            "additionalProperties": False,
+            "required": [
+                "name",
+                "shape",
+                "fixture",
+                "evidence_requirement_ids",
+            ],
+            "properties": {
+                "name": {
+                    "const": name
+                },
+                "shape": {
+                    "const": shape
+                },
+                "fixture":
+                    fixture_schema,
+                "evidence_requirement_ids":
+                    evidence_schema,
+            },
+        })
+
+    trial_case_schema: dict[
+        str,
+        Any,
+    ] = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "version",
+            "inputs",
+        ],
+        "properties": {
+            "version": {
+                "const": 1
+            },
+            "inputs": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": len(
+                    input_variants
+                ),
+                "items": {
+                    "oneOf":
+                        input_variants
+                },
+            },
+        },
+    }
+
+    unsupported_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "status",
+        ],
+        "properties": {
+            "status": {
+                "const":
+                    "unsupported"
+            },
+        },
+    }
+
+    return {
+        "oneOf": [
+            trial_case_schema,
+            unsupported_schema,
+        ],
+    }
 
 
 def _e2e_repair_target_from_errors(errors: list[str]) -> str:
@@ -3615,6 +3738,78 @@ def _stable_json_hash(value: Any) -> str:
     payload = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
+def _repair_e2e_trial_case(
+    *,
+    facts: dict[str, Any],
+    previous_case: dict[str, Any],
+    review: dict[str, Any],
+    requested_model: str | None = None,
+) -> dict[str, Any]:
+    """
+    Regenerate only the Trial Case.
+
+    Frozen facts are immutable.
+    Skill files are immutable.
+    """
+
+    route = route_model(
+        VALIDATOR_TASK,
+        requested_model=requested_model,
+        reason="creator E2E trial case repair",
+    )
+
+    response_schema = (
+        _e2e_trial_case_response_schema(
+            facts
+        )
+    )
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You repair only a Creator E2E Trial Case. "
+                "Frozen requirements and interfaces are immutable. "
+                "Do not modify or reinterpret the Skill. "
+                "Return a replacement Trial Case that satisfies "
+                "the same JSON Schema and addresses only the "
+                "semantic reviewer issues."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "frozen_input_facts":
+                        facts,
+                    "previous_trial_case":
+                        previous_case,
+                    "review_issues":
+                        review.get(
+                            "issues"
+                        )
+                        or [],
+                    "review_repair_instructions":
+                        review.get(
+                            "repair_instructions"
+                        )
+                        or "",
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ),
+        },
+    ]
+
+    return (
+        _complete_creator_json_object_once_sync_for_e2e(
+            messages=messages,
+            model=route.model,
+            phase="creator_e2e_trial_case_repair",
+            response_schema=response_schema,
+        )
+    )
 
 def _prepare_e2e_trial_case(
     *,
@@ -3625,186 +3820,606 @@ def _prepare_e2e_trial_case(
     requested_model: str | None,
     session: CreatorE2ESession | None,
 ) -> dict[str, Any] | None:
-    if session is not None and session.trial_case_prepared:
-        if session.input_case_plan_failure:
-            raise E2ECaseInfrastructureError(
-                session.input_case_plan_failure,
-                details=session.input_case_plan_failure_details,
-            )
-        logger.info("[Creator][E2E][trial_case_reused] digest=%s", session.trial_case_digest)
-        return session.trial_case
+    """
+    Build one frozen E2E Trial Case.
 
-    external = external_context if isinstance(external_context, dict) else {}
+    Authority flow:
+
+        frozen typed inputs
+            -> determine which inputs need synthetic E2E values
+            -> close E2E InputCasePlan
+            -> Trial Case model
+            -> Trial Case Reviewer
+            -> freeze reviewed Trial Case
+
+    Important rules:
+
+    1. Merely having a key in external_context does NOT mean that a real
+       runtime value exists. Empty platform-envelope placeholders such as
+       [] / {} / "" must not suppress Trial Case generation.
+
+    2. Only a meaningful external value or a frozen/default value suppresses
+       synthetic Trial Case generation.
+
+    3. "No Case needed" is not cached as a frozen prepared Case.
+
+    4. A previously frozen Trial Case may only be reused when its
+       InputCasePlan digest is still identical to the current plan.
+    """
+
+    external = (
+        external_context
+        if isinstance(external_context, dict)
+        else {}
+    )
+
+    supported_shapes = {
+        "string",
+        "number",
+        "integer",
+        "boolean",
+        "object",
+        "list",
+        "list[string]",
+        "list[number]",
+        "list[integer]",
+        "list[boolean]",
+        "list[object]",
+        "file_path",
+        "list[file_path]",
+    }
+
     candidates: dict[str, E2ETypedInputSpec] = {}
+
+    # =========================================================
+    # 1. Decide which frozen external inputs actually need an
+    #    E2E Trial Case.
+    #
+    # Do NOT use:
+    #
+    #     if spec.name in external
+    #
+    # because platform envelopes may contain empty placeholders.
+    # =========================================================
     for spec in typed_specs:
-        shape = _canonical_e2e_shape(spec.shape)
-        entry = skill_plan_entries.get(spec.target_file)
-        defaults = getattr(entry, "default_values", {}) or {}
-        if shape not in {
-            "string", "number", "integer", "boolean", "object", "list",
-            "list[string]", "list[number]", "list[integer]", "list[boolean]",
-            "list[object]", "file_path", "list[file_path]",
-        } or _json_value_non_empty(external.get(spec.name)) or spec.name in defaults:
+        shape = _canonical_e2e_shape(
+            spec.shape
+        )
+
+        if shape not in supported_shapes:
             continue
-        candidates.setdefault(spec.name, spec)
+
+        entry = skill_plan_entries.get(
+            spec.target_file
+        )
+
+        defaults = (
+            getattr(
+                entry,
+                "default_values",
+                {},
+            )
+            or {}
+        )
+
+        # Only a meaningful actual external runtime value suppresses
+        # synthetic Trial Case generation.
+        if _json_value_non_empty(
+            external.get(spec.name)
+        ):
+            continue
+
+        # Explicit frozen/default values are already authoritative.
+        if (
+            spec.default_available
+            or spec.name in defaults
+        ):
+            continue
+
+        candidates.setdefault(
+            spec.name,
+            spec,
+        )
+
+    # =========================================================
+    # 2. No synthetic input is needed.
+    #
+    # IMPORTANT:
+    # Do not mark trial_case_prepared=True here.
+    #
+    # Otherwise a temporary "no Case needed" decision becomes a
+    # permanent cache entry for the whole E2E repair session.
+    # =========================================================
     if not candidates:
         if session is not None:
             session.trial_case = None
             session.trial_case_digest = ""
-            session.trial_case_prepared = True
+            session.input_case_plan_digest = ""
+            session.input_case_fixture_digests = {}
             session.input_case_plan_failure = ""
             session.input_case_plan_failure_details = {}
-        logger.info("[Creator][E2E][input_case_no_generation_needed]")
+
+            # A no-case result is not a frozen Case.
+            session.trial_case_prepared = False
+
+        logger.info(
+            "[Creator][E2E]"
+            "[input_case_no_generation_needed] "
+            "typed_inputs=%s external_non_empty=%s",
+            sorted(
+                spec.name
+                for spec in typed_specs
+            ),
+            sorted(
+                str(key)
+                for key, value
+                in external.items()
+                if _json_value_non_empty(value)
+            ),
+        )
+
         return None
 
+    # =========================================================
+    # 3. Close current frozen InputCasePlan.
+    # =========================================================
     plan = _build_e2e_input_case_plan(
-        list(candidates.values()), requirements_by_file=requirements_by_file,
+        list(candidates.values()),
+        requirements_by_file=
+            requirements_by_file,
     )
-    # A case-plan defect belongs to creator_e2e, not to skill repair.  Re-run
-    # the frozen-evidence resolver before declaring the case unsupported.  The
-    # rebuild is deliberately case-only: accepted sibling specs are retained
-    # verbatim and no SkillPlan/code is regenerated.
-    for repair_attempt in range(1, MAX_E2E_CASE_REPAIR_ATTEMPTS + 1):
-        failed_names = {
-            name for name, spec in plan.inputs.items()
-            if spec.runtime_shape in {"file_path", "list[file_path]"} and not spec.allowed_formats
-        }
-        if not failed_names:
-            break
-        rebuilt = _build_e2e_input_case_plan(
-            [candidates[name] for name in failed_names], requirements_by_file=requirements_by_file,
-        )
-        repaired_inputs = dict(plan.inputs)
-        changed = False
-        for name in failed_names:
-            replacement = rebuilt.inputs[name]
-            if replacement.allowed_formats:
-                before = repaired_inputs[name]
-                repaired_inputs[name] = replacement
-                changed = True
-                logger.info("[Creator][E2E][input_case_plan_repaired] %s", json.dumps({
-                    "input": name,
-                    "attempt": repair_attempt,
-                    "before": {"allowed_formats": list(before.allowed_formats), "min_items": before.min_items,
-                               "max_items": before.max_items},
-                    "after": {"allowed_formats": list(replacement.allowed_formats), "min_items": replacement.min_items,
-                              "max_items": replacement.max_items},
-                    "evidence_source": replacement.file_format_source,
-                    "repair_owner": "creator_e2e",
-                    "skill_repair_allowed": False,
-                    "case_repair_allowed": True,
-                }, ensure_ascii=False, sort_keys=True))
-        if changed:
-            plan = E2EInputCasePlan(inputs=repaired_inputs, digest=_case_plan_digest(repaired_inputs))
-        else:
-            logger.info("[Creator][E2E][input_case_repair_attempt] attempt=%s result=unresolved inputs=%s",
-                        repair_attempt, sorted(failed_names))
-    if session is not None:
-        session.input_case_plan_digest = plan.digest
 
-    file_specs = {name: spec for name, spec in plan.inputs.items() if spec.runtime_shape in {"file_path", "list[file_path]"}}
-    if any(not spec.allowed_formats for spec in file_specs.values()):
-        unknown = sorted(name for name, spec in file_specs.items() if not spec.allowed_formats)
-        logger.warning("[Creator][E2E][case_plan_unsupported] reason=file_format_unknown inputs=%s", unknown)
+    # =========================================================
+    # 4. Session reuse is allowed only for the same frozen plan.
+    #
+    # This prevents:
+    #
+    #   first run → no/wrong Case cached
+    #   SKILL repair changes command/interface
+    #   second run → stale Case blindly reused
+    # =========================================================
+    if session is not None:
+        same_plan = bool(
+            session.input_case_plan_digest
+            and session.input_case_plan_digest
+            == plan.digest
+        )
+
+        if (
+            same_plan
+            and session.input_case_plan_failure
+        ):
+            raise E2ECaseInfrastructureError(
+                session.input_case_plan_failure,
+                details=(
+                    session
+                    .input_case_plan_failure_details
+                ),
+            )
+
+        if (
+            same_plan
+            and session.trial_case_prepared
+            and isinstance(
+                session.trial_case,
+                dict,
+            )
+        ):
+            logger.info(
+                "[Creator][E2E]"
+                "[trial_case_reused] "
+                "plan_digest=%s "
+                "case_digest=%s",
+                plan.digest,
+                session.trial_case_digest,
+            )
+
+            return session.trial_case
+
+        # Current frozen plan changed.
+        # Invalidate only Trial Case cache, not the whole E2E session.
+        if not same_plan:
+            session.trial_case = None
+            session.trial_case_digest = ""
+            session.trial_case_prepared = False
+            session.input_case_fixture_digests = {}
+            session.input_case_plan_failure = ""
+            session.input_case_plan_failure_details = {}
+
+        session.input_case_plan_digest = (
+            plan.digest
+        )
+
+    # =========================================================
+    # 5. File inputs require enough frozen information to
+    #    materialize a real local fixture.
+    # =========================================================
+    unknown_file_inputs = sorted(
+        name
+        for name, spec in plan.inputs.items()
+        if (
+            spec.runtime_shape
+            in {
+                "file_path",
+                "list[file_path]",
+            }
+            and not spec.allowed_formats
+        )
+    )
+
+    if unknown_file_inputs:
+        details = {
+            "unsupported_inputs":
+                unknown_file_inputs,
+            "plan_digest":
+                plan.digest,
+            "repair_owner":
+                "creator_e2e",
+            "skill_repair_allowed":
+                False,
+        }
+
         if session is not None:
-            session.trial_case_prepared = True
-            session.input_case_plan_failure = "file_format_unknown"
-            session.input_case_plan_failure_details = {"unsupported_inputs": unknown, "plan_digest": plan.digest,
-                                                       "repair_attempts": MAX_E2E_CASE_REPAIR_ATTEMPTS,
-                                                       "case_repair_allowed": True}
+            session.trial_case_prepared = False
+            session.input_case_plan_failure = (
+                "file_format_unknown"
+            )
+            session.input_case_plan_failure_details = (
+                details
+            )
+
+        logger.warning(
+            "[Creator][E2E]"
+            "[case_plan_unsupported] "
+            "reason=file_format_unknown "
+            "inputs=%s",
+            unknown_file_inputs,
+        )
+
         raise E2ECaseInfrastructureError(
             "file_format_unknown",
-            details={"unsupported_inputs": unknown, "plan_digest": plan.digest,
-                     "repair_attempts": MAX_E2E_CASE_REPAIR_ATTEMPTS, "case_repair_allowed": True},
+            details=details,
         )
 
-    requirements: list[dict[str, str]] = []
-    requirement_ids_by_input: dict[str, set[str]] = {}
-    for target in {spec.target_file for spec in candidates.values()}:
-        for requirement in requirements_by_file.get(target, []):
-            req_id = str(getattr(requirement, "id", "") or "")
+    # =========================================================
+    # 6. Preserve frozen requirement prose for Model + Reviewer.
+    # =========================================================
+    requirements: list[
+        dict[str, str]
+    ] = []
+
+    requirements_by_id: dict[
+        str,
+        RequirementItem,
+    ] = {}
+
+    for target_file in {
+        spec.target_file
+        for spec in candidates.values()
+    }:
+        for requirement in (
+            requirements_by_file.get(
+                target_file,
+                [],
+            )
+            or []
+        ):
+            req_id = str(
+                getattr(
+                    requirement,
+                    "id",
+                    "",
+                )
+                or ""
+            ).strip()
+
             if not req_id:
                 continue
-            text = str(getattr(requirement, "purpose", "") or "")
-            if not text:
-                text = "; ".join(str(value) for value in (getattr(requirement, "inputs", []) or []))
-            requirements.append({"id": req_id, "text": text})
-    for name, spec in candidates.items():
-        requirement_ids_by_input[name] = {
-            str(getattr(requirement, "id", "") or "")
-            for requirement in requirements_by_file.get(spec.target_file, [])
-            if str(getattr(requirement, "id", "") or "")
-        }
-    facts = {"version": 1, "external_inputs": [
-        {"platform_input": {
-             "name": spec.name, "shape": spec.runtime_shape,
-             "provenance_source": spec.provenance_source,
-             "required": spec.required, "nullable": spec.nullable,
-             "required_paths": list(spec.required_paths),
-             "min_items": spec.min_items, "max_items": spec.max_items,
-             **({"file_contract": {
-                 "allowed_formats": list(file_specs[spec.name].allowed_formats),
-                 "min_items": file_specs[spec.name].min_items,
-                 "max_items": file_specs[spec.name].max_items,
-                 "homogeneous": file_specs[spec.name].homogeneous_files,
-                 "format_source": file_specs[spec.name].file_format_source,
-             }} if spec.name in file_specs else {}),
-         },
-         "target": {"script": spec.target_file, "input": spec.name},
-         "requirements": [item for item in requirements if item["id"] in {
-             str(getattr(req, "id", "") or "") for req in requirements_by_file.get(spec.target_file, [])
-         }]}
-        for spec in plan.inputs.values()
-    ]}
-    logger.info(
-        "[Creator][E2E][trial_case_build_start] typed_input_specs=%s",
-        json.dumps({name: spec.shape for name, spec in sorted(candidates.items())}, sort_keys=True),
-    )
-    accepted = None
-    fallback_reason = "schema_invalid"
-    try:
-        generated = _build_e2e_trial_case(facts, requested_model=requested_model)
-        if isinstance(generated, dict) and generated.get("status") == "unsupported":
-            fallback_reason = "unsupported"
-            raise ValueError("trial case unsupported")
-        canonical = _canonicalize_e2e_trial_case_spec(generated)
-        states = _validate_e2e_trial_inputs(
-            canonical, plan=plan, requirement_ids_by_input=requirement_ids_by_input,
-        )
-        proposed = {item["name"]: item for item in canonical.get("inputs", []) if isinstance(item, dict) and item.get("name")}
-        accepted_items: list[dict[str, Any]] = []
-        for name, state in states.items():
-            if state.status == "accepted":
-                accepted_items.append(proposed[name])
-            elif state.status == "invalid":
-                fixture = _synthesize_e2e_input_fixture(plan.inputs[name])
-                accepted_items.append({"name": name, "shape": plan.inputs[name].runtime_shape,
-                                       "fixture": fixture, "evidence_requirement_ids": sorted(requirement_ids_by_input.get(name, set()))})
-                logger.info("[Creator][E2E][input_case_fallback] %s", json.dumps({
-                    "name": name, "reason": state.reason, "fallback": "deterministic",
-                }, sort_keys=True))
-        accepted = {"version": 1, "inputs": accepted_items}
-    except Exception as exc:
-        if isinstance(exc, (json.JSONDecodeError,)) or "invalid JSON" in str(exc):
-            fallback_reason = "json_parse_failed"
-        logger.warning("[Creator][E2E][trial_case_fallback] reason=%s", fallback_reason)
-        fallback_items = []
-        for name, spec in plan.inputs.items():
-            if not spec.required and spec.default_available:
-                continue
-            try:
-                fixture = _synthesize_e2e_input_fixture(spec)
-            except ValueError:
-                fallback_items = []
-                break
-            fallback_items.append({"name": name, "shape": spec.runtime_shape, "fixture": fixture,
-                                   "evidence_requirement_ids": sorted(requirement_ids_by_input.get(name, set()))})
-            logger.info("[Creator][E2E][input_case_fallback] %s", json.dumps({
-                "name": name, "reason": fallback_reason, "fallback": "deterministic",
-            }, sort_keys=True))
-        accepted = {"version": 1, "inputs": fallback_items} if fallback_items else None
 
-    if accepted is not None:
+            requirements_by_id.setdefault(
+                req_id,
+                requirement,
+            )
+
+    for req_id, requirement in (
+        requirements_by_id.items()
+    ):
+        text = next(
+            (
+                str(
+                    getattr(
+                        requirement,
+                        field_name,
+                        "",
+                    )
+                    or ""
+                ).strip()
+                for field_name in (
+                    "requirement",
+                    "text",
+                    "purpose",
+                )
+                if str(
+                    getattr(
+                        requirement,
+                        field_name,
+                        "",
+                    )
+                    or ""
+                ).strip()
+            ),
+            "",
+        )
+
+        if not text:
+            text = "; ".join(
+                str(value)
+                for value in (
+                    getattr(
+                        requirement,
+                        "inputs",
+                        [],
+                    )
+                    or []
+                )
+            )
+
+        requirements.append({
+            "id": req_id,
+            "text": text,
+        })
+
+    # =========================================================
+    # 7. Build the frozen facts visible to Trial Case model.
+    # =========================================================
+    facts: dict[str, Any] = {
+        "version": 1,
+        "external_inputs": [],
+    }
+
+    for spec in plan.inputs.values():
+        target_requirements = (
+            requirements_by_file.get(
+                spec.target_file,
+                [],
+            )
+            or []
+        )
+
+        target_requirement_ids = {
+            str(
+                getattr(
+                    req,
+                    "id",
+                    "",
+                )
+                or ""
+            )
+            for req in target_requirements
+            if str(
+                getattr(
+                    req,
+                    "id",
+                    "",
+                )
+                or ""
+            ).strip()
+        }
+
+        platform_input: dict[
+            str,
+            Any,
+        ] = {
+            "name":
+                spec.name,
+            "shape":
+                spec.runtime_shape,
+            "item_shape":
+                spec.item_shape,
+            "provenance_source":
+                spec.provenance_source,
+            "required":
+                spec.required,
+            "nullable":
+                spec.nullable,
+            "default_available":
+                spec.default_available,
+            "default_value":
+                spec.default_value,
+            "required_paths":
+                list(
+                    spec.required_paths
+                ),
+            "optional_paths":
+                list(
+                    spec.optional_paths
+                ),
+            "consumed_paths":
+                list(
+                    spec.consumed_paths
+                ),
+            "min_items":
+                spec.min_items,
+            "max_items":
+                spec.max_items,
+        }
+
+        if (
+            spec.runtime_shape
+            in {
+                "file_path",
+                "list[file_path]",
+            }
+        ):
+            platform_input[
+                "file_contract"
+            ] = {
+                "allowed_formats":
+                    list(
+                        spec.allowed_formats
+                    ),
+                "min_items":
+                    spec.min_items,
+                "max_items":
+                    spec.max_items,
+                "homogeneous":
+                    spec.homogeneous_files,
+                "format_source":
+                    spec.file_format_source,
+            }
+
+        facts[
+            "external_inputs"
+        ].append({
+            "platform_input":
+                platform_input,
+            "target": {
+                "script":
+                    spec.target_file,
+                "input":
+                    spec.name,
+            },
+            "requirements": [
+                item
+                for item in requirements
+                if item["id"]
+                in target_requirement_ids
+            ],
+        })
+
+    logger.info(
+        "[Creator][E2E]"
+        "[trial_case_build_start] "
+        "plan_digest=%s "
+        "typed_input_specs=%s",
+        plan.digest,
+        json.dumps(
+            {
+                name:
+                    spec.shape
+                for name, spec
+                in sorted(
+                    candidates.items()
+                )
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+    )
+
+    # =========================================================
+    # 8. Model generates Trial Case.
+    #
+    # No deterministic semantic fallback.
+    # =========================================================
+    try:
+        generated = (
+            _build_e2e_trial_case(
+                facts,
+                requested_model=
+                    requested_model,
+            )
+        )
+
+    except Exception as exc:
+        logger.warning(
+            "[Creator][E2E]"
+            "[trial_case_generation_failed] "
+            "type=%s error=%s",
+            type(exc).__name__,
+            exc,
+        )
+
+        details = {
+            "error_type":
+                type(exc).__name__,
+            "error":
+                str(exc),
+            "plan_digest":
+                plan.digest,
+            "repair_owner":
+                "creator_e2e",
+            "skill_repair_allowed":
+                False,
+        }
+
+        if session is not None:
+            session.trial_case_prepared = False
+            session.input_case_plan_failure = (
+                "trial_case_generation_failed"
+            )
+            session.input_case_plan_failure_details = (
+                details
+            )
+
+        raise E2ECaseInfrastructureError(
+            "trial_case_generation_failed",
+            details=details,
+        ) from exc
+
+    if (
+        not isinstance(
+            generated,
+            dict,
+        )
+        or generated.get(
+            "status"
+        )
+        == "unsupported"
+        or generated.get(
+            "version"
+        )
+        != 1
+        or not isinstance(
+            generated.get(
+                "inputs"
+            ),
+            list,
+        )
+    ):
+        details = {
+            "reason":
+                (
+                    "model_returned_"
+                    "unsupported_or_invalid_case"
+                ),
+            "generated_shape":
+                _json_shape(
+                    generated
+                ),
+            "plan_digest":
+                plan.digest,
+            "repair_owner":
+                "creator_e2e",
+            "skill_repair_allowed":
+                False,
+        }
+
+        if session is not None:
+            session.trial_case_prepared = False
+            session.input_case_plan_failure = (
+                "trial_case_generation_failed"
+            )
+            session.input_case_plan_failure_details = (
+                details
+            )
+
+        raise E2ECaseInfrastructureError(
+            "trial_case_generation_failed",
+            details=details,
+        )
+
+    accepted = (
+        _canonicalize_e2e_trial_case_spec(
+            generated
+        )
+    )
+
+    review: dict[str, Any] = {}
+
+    for case_attempt in range(
+            MAX_E2E_CASE_REPAIR_ATTEMPTS + 1
+    ):
         review = _review_e2e_trial_case(
             facts=facts,
             trial_case=accepted,
@@ -3816,13 +4431,21 @@ def _prepare_e2e_trial_case(
             "[trial_case_review] %s",
             json.dumps(
                 {
-                    "passed": bool(
-                        review.get("passed")
-                    ),
-                    "issues": (
-                            review.get("issues")
-                            or []
-                    ),
+                    "attempt":
+                        case_attempt,
+                    "passed":
+                        bool(
+                            review.get(
+                                "passed"
+                            )
+                        ),
+                    "issues":
+                        (
+                                review.get(
+                                    "issues"
+                                )
+                                or []
+                        ),
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -3830,50 +4453,219 @@ def _prepare_e2e_trial_case(
             ),
         )
 
-        if review.get("passed") is not True:
-            if session is not None:
-                session.trial_case_prepared = True
-                session.input_case_plan_failure = (
-                    "trial_case_review_failed"
-                )
-                session.input_case_plan_failure_details = {
-                    "review": review,
-                    "plan_digest": plan.digest,
-                }
+        if review.get("passed") is True:
+            break
 
-            raise E2ECaseInfrastructureError(
-                "trial_case_review_failed",
-                details={
-                    "review": review,
-                    "plan_digest": plan.digest,
-                    "repair_owner": "creator_e2e",
-                    "skill_repair_allowed": False,
-                },
+        if (
+                case_attempt
+                >= MAX_E2E_CASE_REPAIR_ATTEMPTS
+        ):
+            break
+
+        try:
+            repaired = (
+                _repair_e2e_trial_case(
+                    facts=facts,
+                    previous_case=accepted,
+                    review=review,
+                    requested_model=
+                    requested_model,
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                "[Creator][E2E]"
+                "[trial_case_repair_failed] "
+                "attempt=%s type=%s error=%s",
+                case_attempt + 1,
+                type(exc).__name__,
+                exc,
+            )
+            break
+
+        if (
+                not isinstance(repaired, dict)
+                or repaired.get("version") != 1
+                or not isinstance(
+            repaired.get("inputs"),
+            list,
+        )
+        ):
+            logger.warning(
+                "[Creator][E2E]"
+                "[trial_case_repair_invalid] "
+                "attempt=%s",
+                case_attempt + 1,
+            )
+            break
+
+        next_case = (
+            _canonicalize_e2e_trial_case_spec(
+                repaired
+            )
+        )
+
+        # Stop pointless loops.
+        if (
+                _stable_json_hash(next_case)
+                == _stable_json_hash(accepted)
+        ):
+            logger.warning(
+                "[Creator][E2E]"
+                "[trial_case_repair_no_change] "
+                "attempt=%s",
+                case_attempt + 1,
+            )
+            break
+
+        accepted = next_case
+
+    if review.get("passed") is not True:
+        details = {
+            "review": review,
+            "plan_digest": plan.digest,
+            "repair_owner":
+                "creator_e2e",
+            "skill_repair_allowed":
+                False,
+        }
+
+        if session is not None:
+            session.trial_case_prepared = False
+            session.input_case_plan_failure = (
+                "trial_case_review_failed"
+            )
+            session.input_case_plan_failure_details = (
+                details
             )
 
-    digest = _stable_json_hash(accepted) if accepted is not None else ""
-    if session is not None:
-        session.trial_case, session.trial_case_digest, session.trial_case_prepared = accepted, digest, True
-        session.input_case_fixture_digests = {
-            item["name"]: _stable_json_hash(item["fixture"])
-            for item in (accepted or {}).get("inputs", [])
-        }
-    if accepted is not None:
-        logger.info(
-            "[Creator][E2E][trial_case_frozen] digest=%s fixtures=%s",
-            digest,
-            json.dumps({
-                item["name"]: {
-                    "shape": item["shape"],
-                    "fixture_kind": item["fixture"].get("kind", item["fixture"].get("content_kind")),
-                }
-                for item in accepted["inputs"]
-            }, sort_keys=True),
+        raise E2ECaseInfrastructureError(
+            "trial_case_review_failed",
+            details=details,
         )
-        logger.info("[Creator][E2E][input_case_frozen] %s", json.dumps({
-            "plan_digest": plan.digest, "case_digest": digest,
-            "fixture_digests": {item["name"]: _stable_json_hash(item["fixture"]) for item in accepted["inputs"]},
-        }, ensure_ascii=False, sort_keys=True))
+
+    # =========================================================
+    # 11. Freeze exactly the reviewed Case.
+    # =========================================================
+    digest = _stable_json_hash(
+        accepted
+    )
+
+    fixture_digests = {
+        str(
+            item.get(
+                "name"
+            )
+            or ""
+        ):
+            _stable_json_hash(
+                item.get(
+                    "fixture"
+                )
+            )
+        for item in (
+            accepted.get(
+                "inputs"
+            )
+            or []
+        )
+        if (
+            isinstance(
+                item,
+                dict,
+            )
+            and item.get(
+                "name"
+            )
+        )
+    }
+
+    if session is not None:
+        session.trial_case = accepted
+        session.trial_case_digest = digest
+        session.trial_case_prepared = True
+        session.input_case_plan_digest = (
+            plan.digest
+        )
+        session.input_case_plan_failure = ""
+        session.input_case_plan_failure_details = {}
+        session.input_case_fixture_digests = (
+            fixture_digests
+        )
+
+    logger.info(
+        "[Creator][E2E]"
+        "[trial_case_frozen] "
+        "plan_digest=%s "
+        "case_digest=%s "
+        "fixtures=%s",
+        plan.digest,
+        digest,
+        json.dumps(
+            {
+                item["name"]: {
+                    "shape":
+                        item.get(
+                            "shape"
+                        ),
+                    "fixture_kind":
+                        (
+                            (
+                                item.get(
+                                    "fixture"
+                                )
+                                or {}
+                            ).get(
+                                "kind"
+                            )
+                            or (
+                                item.get(
+                                    "fixture"
+                                )
+                                or {}
+                            ).get(
+                                "content_kind"
+                            )
+                        ),
+                }
+                for item in (
+                    accepted.get(
+                        "inputs"
+                    )
+                    or []
+                )
+                if (
+                    isinstance(
+                        item,
+                        dict,
+                    )
+                    and item.get(
+                        "name"
+                    )
+                )
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+    )
+
+    logger.info(
+        "[Creator][E2E]"
+        "[input_case_frozen] %s",
+        json.dumps(
+            {
+                "plan_digest":
+                    plan.digest,
+                "case_digest":
+                    digest,
+                "fixture_digests":
+                    fixture_digests,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+    )
+
     return accepted
 
 
@@ -4366,42 +5158,223 @@ def _count_matching_no_progress_attempts(e2e_session: CreatorE2ESession, *, repa
     return sum(1 for attempt in e2e_session.debug_attempts if attempt.get("result") == "no_progress" and attempt.get("repair_target") == repair_target and attempt.get("before_failure_identity") == before_failure_identity)
 
 
-def _e2e_candidate_improved(original_errors: list[str], new_errors: list[str], *, target_file: str) -> bool:
+def _e2e_candidate_improved(
+    original_errors: list[str],
+    new_errors: list[str],
+    *,
+    target_file: str,
+) -> bool:
+    """
+    Decide whether a localized E2E repair moved the real runtime breakpoint.
+
+    Progress is derived from observed execution state only.
+
+    Legacy pre-execution boundary flags such as fixture_valid /
+    argv_shape_valid are intentionally not used here.
+    """
+
     if not new_errors:
         return True
-    old_error, new_error = (original_errors or [""])[0], (new_errors or [""])[0]
-    old_structured, new_structured = _structured_failure_from_errors([old_error]), _structured_failure_from_errors([new_error])
-    # A later exception is not progress while the input boundary which feeds it
-    # remains invalid.  Otherwise AttributeError -> KeyError can retain a script
-    # patch that merely moves past malformed argv.
-    facts = new_structured.get("details") or {}
-    if any(facts.get(flag) is False for flag in (
-        "fixture_valid", "placeholder_resolved", "argv_shape_valid", "command_script_interface_aligned",
-    )):
-        return False
-    old_fs = ((old_structured.get("details") or {}).get("filesystem_trace") or {}) if old_structured else {}
-    new_fs = ((new_structured.get("details") or {}).get("filesystem_trace") or {}) if new_structured else {}
-    old_code, new_code = _failure_code_from_structured(old_structured), _failure_code_from_structured(new_structured)
-    is_artifact_failure = old_code.startswith("artifact_") or new_code.startswith("artifact_")
-    old_pos, new_pos = _e2e_failure_position(old_error), _e2e_failure_position(new_error)
-    if new_pos[0] == old_pos[0] and new_pos[1] < old_pos[1]:
-        return False
-    if old_pos == new_pos and is_artifact_failure:
-        return _artifact_runtime_state_improved(_artifact_runtime_state(old_fs), _artifact_runtime_state(new_fs))
-    before, after = _e2e_failure_identity(old_error, target_file=target_file), _e2e_failure_identity(new_error, target_file=target_file)
-    interface_markers = {"external_input_missing", "missing_placeholder", "argv_schema_error", "argv_guard", "runtime_interface", "command_interface", "runtime_binding"}
-    same_interface_boundary = (
-        before["target_file"] == after["target_file"]
-        and (before["layer"] in interface_markers or before["error_code"] in interface_markers)
-        and (after["layer"] in interface_markers or after["error_code"] in interface_markers)
-    )
-    if new_pos > old_pos and not same_interface_boundary:
-        return True
-    if (before["failed_step_index"], before["target_file"], before["layer"]) == (after["failed_step_index"], after["target_file"], after["layer"]):
-        return _e2e_breakpoint_changed(before, after)
-    old_target, new_target = _e2e_repair_target_from_errors(original_errors or []), _e2e_repair_target_from_errors(new_errors or [])
-    return bool(old_target == target_file and new_target and new_target != target_file)
 
+    old_error = (
+        original_errors
+        or [""]
+    )[0]
+
+    new_error = (
+        new_errors
+        or [""]
+    )[0]
+
+    old_structured = (
+        _structured_failure_from_errors(
+            [old_error]
+        )
+    )
+
+    new_structured = (
+        _structured_failure_from_errors(
+            [new_error]
+        )
+    )
+
+    old_fs = (
+        (
+            (
+                old_structured.get(
+                    "details"
+                )
+                or {}
+            ).get(
+                "filesystem_trace"
+            )
+            or {}
+        )
+        if old_structured
+        else {}
+    )
+
+    new_fs = (
+        (
+            (
+                new_structured.get(
+                    "details"
+                )
+                or {}
+            ).get(
+                "filesystem_trace"
+            )
+            or {}
+        )
+        if new_structured
+        else {}
+    )
+
+    old_code = (
+        _failure_code_from_structured(
+            old_structured
+        )
+    )
+
+    new_code = (
+        _failure_code_from_structured(
+            new_structured
+        )
+    )
+
+    is_artifact_failure = (
+        old_code.startswith(
+            "artifact_"
+        )
+        or new_code.startswith(
+            "artifact_"
+        )
+    )
+
+    old_pos = _e2e_failure_position(
+        old_error
+    )
+
+    new_pos = _e2e_failure_position(
+        new_error
+    )
+
+    # Moving backwards in the same workflow step is not progress.
+    if (
+        new_pos[0] == old_pos[0]
+        and new_pos[1] < old_pos[1]
+    ):
+        return False
+
+    if (
+        old_pos == new_pos
+        and is_artifact_failure
+    ):
+        return (
+            _artifact_runtime_state_improved(
+                _artifact_runtime_state(
+                    old_fs
+                ),
+                _artifact_runtime_state(
+                    new_fs
+                ),
+            )
+        )
+
+    before = _e2e_failure_identity(
+        old_error,
+        target_file=target_file,
+    )
+
+    after = _e2e_failure_identity(
+        new_error,
+        target_file=target_file,
+    )
+
+    interface_markers = {
+        "external_input_missing",
+        "missing_placeholder",
+        "argv_schema_error",
+        "argv_guard",
+        "runtime_interface",
+        "command_interface",
+        "runtime_binding",
+    }
+
+    same_interface_boundary = (
+        before["target_file"]
+        == after["target_file"]
+        and (
+            before["layer"]
+            in interface_markers
+            or before["error_code"]
+            in interface_markers
+        )
+        and (
+            after["layer"]
+            in interface_markers
+            or after["error_code"]
+            in interface_markers
+        )
+    )
+
+    # A later real execution layer is progress unless we are merely moving
+    # around inside the same unresolved interface boundary.
+    if (
+        new_pos > old_pos
+        and not same_interface_boundary
+    ):
+        return True
+
+    if (
+        (
+            before[
+                "failed_step_index"
+            ],
+            before[
+                "target_file"
+            ],
+            before[
+                "layer"
+            ],
+        )
+        ==
+        (
+            after[
+                "failed_step_index"
+            ],
+            after[
+                "target_file"
+            ],
+            after[
+                "layer"
+            ],
+        )
+    ):
+        return _e2e_breakpoint_changed(
+            before,
+            after,
+        )
+
+    old_target = (
+        _e2e_repair_target_from_errors(
+            original_errors
+            or []
+        )
+    )
+
+    new_target = (
+        _e2e_repair_target_from_errors(
+            new_errors
+            or []
+        )
+    )
+
+    return bool(
+        old_target == target_file
+        and new_target
+        and new_target != target_file
+    )
 
 _RUNTIME_SENTINEL_RE = re.compile(r"__RUNTIME_INPUT_[A-Z0-9_]*__")
 
@@ -4413,44 +5386,137 @@ def _e2e_candidate_invariant_veto(
     original_errors: list[str] | None = None,
     new_errors: list[str] | None = None,
 ) -> list[str]:
-    """Return frozen-boundary regressions which veto progress comparison."""
-    reasons: list[str] = []
-    before_sentinels = set(_RUNTIME_SENTINEL_RE.findall(original_content or ""))
-    after_sentinels = set(_RUNTIME_SENTINEL_RE.findall(candidate_content or ""))
-    if after_sentinels - before_sentinels:
-        reasons.append("introduced_runtime_sentinel")
-    before_structured = _structured_failure_from_errors(original_errors or [])
-    structured = _structured_failure_from_errors(new_errors or [])
-    before_details = before_structured.get("details") or {}
-    details = structured.get("details") or {}
+    """
+    Reject only genuine frozen-boundary regressions.
 
-    def invariant_value(source: dict[str, Any], *keys: str) -> Any:
+    Do not use legacy pre-execution semantic/shape verdict flags here.
+    Runtime wiring quality is proven by the next real E2E execution.
+    """
+
+    reasons: list[str] = []
+
+    # A localized repair must not introduce synthetic runtime sentinels that
+    # were not present in the original implementation.
+    before_sentinels = set(
+        _RUNTIME_SENTINEL_RE.findall(
+            original_content
+            or ""
+        )
+    )
+
+    after_sentinels = set(
+        _RUNTIME_SENTINEL_RE.findall(
+            candidate_content
+            or ""
+        )
+    )
+
+    if (
+        after_sentinels
+        - before_sentinels
+    ):
+        reasons.append(
+            "introduced_runtime_sentinel"
+        )
+
+    before_structured = (
+        _structured_failure_from_errors(
+            original_errors
+            or []
+        )
+    )
+
+    after_structured = (
+        _structured_failure_from_errors(
+            new_errors
+            or []
+        )
+    )
+
+    before_details = (
+        before_structured.get(
+            "details"
+        )
+        or {}
+    )
+
+    after_details = (
+        after_structured.get(
+            "details"
+        )
+        or {}
+    )
+
+    def invariant_value(
+        source: dict[str, Any],
+        *keys: str,
+    ) -> Any:
         for key in keys:
             if key in source:
                 return source[key]
-        frozen = source.get("frozen_invariants") or {}
+
+        frozen = (
+            source.get(
+                "frozen_invariants"
+            )
+            or {}
+        )
+
         for key in keys:
             if key in frozen:
                 return frozen[key]
+
         return None
 
-    before_provenance = invariant_value(before_details, "frozen_provenance", "value_provenance")
-    after_provenance = invariant_value(details, "frozen_provenance", "value_provenance")
-    if before_provenance is not None and after_provenance is not None and before_provenance != after_provenance:
-        reasons.append("frozen_provenance_changed")
-    before_argv = invariant_value(before_details, "frozen_argv_interface", "argv_interface")
-    after_argv = invariant_value(details, "frozen_argv_interface", "argv_interface")
-    if before_argv is not None and after_argv is not None and before_argv != after_argv:
-        reasons.append("frozen_argv_interface_changed")
-    checks = {
-        "fixture_valid": "input_fixture_gate_regressed",
-        "placeholder_resolved": "runtime_required_root_missing",
-        "argv_shape_valid": "symbolic_argv_shape_regressed",
-        "command_script_interface_aligned": "frozen_argv_interface_drift",
-    }
-    for flag, reason in checks.items():
-        if details.get(flag) is False:
-            reasons.append(reason)
+    # Provenance is frozen authority.  A repair cannot silently replace
+    # upstream/external data with a literal/default or another producer.
+    before_provenance = invariant_value(
+        before_details,
+        "frozen_provenance",
+        "value_provenance",
+    )
+
+    after_provenance = invariant_value(
+        after_details,
+        "frozen_provenance",
+        "value_provenance",
+    )
+
+    if (
+        before_provenance
+        is not None
+        and after_provenance
+        is not None
+        and before_provenance
+        != after_provenance
+    ):
+        reasons.append(
+            "frozen_provenance_changed"
+        )
+
+    # Likewise, an implementation repair cannot rewrite the frozen argv
+    # interface merely to make the current candidate pass.
+    before_argv = invariant_value(
+        before_details,
+        "frozen_argv_interface",
+        "argv_interface",
+    )
+
+    after_argv = invariant_value(
+        after_details,
+        "frozen_argv_interface",
+        "argv_interface",
+    )
+
+    if (
+        before_argv is not None
+        and after_argv is not None
+        and before_argv != after_argv
+    ):
+        reasons.append(
+            "frozen_argv_interface_changed"
+        )
+
     return reasons
 
 def _e2e_repair_state_from_errors(errors: list[str], *, resolved_failures: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -5742,6 +6808,160 @@ def _validate_e2e_command_static(
 
     return entry
 
+def _seed_initial_e2e_payload(
+    commands: list[E2EWorkflowCommand],
+    *,
+    external_context: dict[str, Any] | None = None,
+    skill_dir: Path | None = None,
+    requirements_by_file: dict[str, list[RequirementItem]] | None = None,
+    skill_plan_entries: dict[str, SkillPlanEntry] | None = None,
+    trial_case: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Build the initial E2E runtime payload only from authoritative sources:
+
+    1. real non-empty external_context values;
+    2. reviewed/frozen Trial Case fixtures;
+    3. frozen/default values.
+
+    Do not invent additional synthetic business values here.
+    """
+
+    payload: dict[str, Any] = {}
+
+    # ---------------------------------------------------------
+    # 1. Keep actual non-empty external values.
+    # Empty platform envelope placeholders such as [] / {}
+    # are not treated as authoritative E2E test values.
+    # ---------------------------------------------------------
+    if isinstance(external_context, dict):
+        for key, value in external_context.items():
+            if _json_value_non_empty(value):
+                payload[str(key)] = copy.deepcopy(value)
+
+    # ---------------------------------------------------------
+    # 2. Materialize exactly the reviewed Trial Case.
+    # ---------------------------------------------------------
+    trial_inputs = {
+        str(item.get("name") or ""): item
+        for item in (
+            (trial_case or {}).get("inputs")
+            or []
+        )
+        if (
+            isinstance(item, dict)
+            and str(item.get("name") or "").strip()
+        )
+    }
+
+    if skill_dir is not None:
+        for name, item in trial_inputs.items():
+            # Real external input wins.
+            if _json_value_non_empty(
+                payload.get(name)
+            ):
+                continue
+
+            try:
+                payload[name] = (
+                    _materialize_e2e_trial_fixture(
+                        item,
+                        skill_dir=skill_dir,
+                    )
+                )
+            except Exception as exc:
+                raise E2ECaseInfrastructureError(
+                    "trial_case_materialization_failed",
+                    details={
+                        "input": name,
+                        "error_type":
+                            type(exc).__name__,
+                        "error": str(exc),
+                        "repair_owner":
+                            "creator_e2e",
+                        "skill_repair_allowed":
+                            False,
+                    },
+                ) from exc
+
+    # ---------------------------------------------------------
+    # 3. Fill only frozen/default values.
+    # No generic sample fallback.
+    # ---------------------------------------------------------
+    typed_specs = (
+        _collect_e2e_typed_inputs_from_graph(
+            commands=commands,
+            requirements_by_file=(
+                requirements_by_file
+                or {}
+            ),
+            skill_plan_entries=(
+                skill_plan_entries
+                or {}
+            ),
+            skill_dir=skill_dir,
+        )
+    )
+
+    for spec in typed_specs:
+        if _json_value_non_empty(
+            payload.get(spec.name)
+        ):
+            continue
+
+        if spec.default_available:
+            payload[spec.name] = (
+                copy.deepcopy(
+                    spec.default_value
+                )
+            )
+            continue
+
+        entry = (
+            (skill_plan_entries or {})
+            .get(spec.target_file)
+        )
+
+        defaults = (
+            getattr(
+                entry,
+                "default_values",
+                {},
+            )
+            or {}
+        )
+
+        if spec.name in defaults:
+            payload[spec.name] = (
+                copy.deepcopy(
+                    defaults[spec.name]
+                )
+            )
+
+    logger.info(
+        "[Creator][E2E]"
+        "[initial_payload_seeded] %s",
+        json.dumps(
+            {
+                "keys": sorted(
+                    payload.keys()
+                ),
+                "shape":
+                    _json_object_shape(
+                        payload
+                    ),
+                "reviewed_trial_inputs":
+                    sorted(
+                        trial_inputs.keys()
+                    ),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        ),
+    )
+
+    return payload
 
 def _run_skill_workflow_e2e_once(
     skill_name: str,
@@ -6046,23 +7266,16 @@ def _run_skill_workflow_e2e_once(
                     typed_input_specs=typed_input_specs,
                 )
 
-                # Trial Case values are frozen input authority.  Validate them
-                # before the legacy sentinel compatibility materializer can
-                # conceal a malformed new-path fixture.
-                _validate_e2e_input_fixtures(
-                    command=command,
-                    payload=payload,
-                    rendered_payload=rendered_payload,
-                    typed_input_specs=typed_input_specs,
+                rendered_payload, runtime_literal_events = (
+                    _materialize_rendered_e2e_payload_runtime_literals(
+                        rendered_payload,
+                        skill_dir=trial_skill_dir,
+                        target_file=command.script_path,
+                        skill_md=trial_skill_md,
+                        script_content=content,
+                    )
                 )
 
-                rendered_payload, runtime_literal_events = _materialize_rendered_e2e_payload_runtime_literals(
-                    rendered_payload,
-                    skill_dir=trial_skill_dir,
-                    target_file=command.script_path,
-                    skill_md=trial_skill_md,
-                    script_content=content,
-                )
 
                 logger.info(
                     "[Creator][E2E][rendered_input_validation] %s",
@@ -6124,26 +7337,20 @@ def _run_skill_workflow_e2e_once(
                     script_content=content,
                     runtime_binding_trace=runtime_binding_trace,
                 )
-                if not (
-                    boundary_facts["fixture_valid"]
-                    and boundary_facts["placeholder_resolved"]
-                    and boundary_facts["argv_shape_valid"]
-                    and boundary_facts["command_script_interface_aligned"]
-                ):
-                    raise ValueError(_format_e2e_failure(E2EFailure(
-                        failed_step_index=command.ordinal,
-                        target_file="SKILL.md",
-                        target_region=f"workflow command {command.ordinal}",
-                        failed_command=command.raw_command,
-                        input_payload=payload_before,
-                        rendered_payload=rendered_payload,
-                        expected="A command payload aligned with the existing script argv interface",
-                        actual="Deterministic command/binding boundary is invalid",
-                        repair_instruction="Only fix this failed SKILL.md command; pass a whole collection placeholder directly without wrapping it in another list.",
-                        layer="command_binding",
-                        details={"failure_code": "command_binding_invalid", **boundary_facts},
-                    )))
 
+                logger.info(
+                    "[Creator][E2E][runtime_boundary_observation] %s",
+                    json.dumps(
+                        {
+                            "script": command.script_path,
+                            "step": command.ordinal,
+                            "facts": boundary_facts,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        default=str,
+                    ),
+                )
                 fs_before = snapshot_runtime_files(trial_skill_dir)
 
                 if entry.runtime == "python":
@@ -7222,16 +8429,6 @@ async def _repair_existing_file_for_e2e_failure(
         )
     )
 
-    boundary_invalid = any(
-        boundary_facts.get(flag) is False
-        for flag in (
-            "fixture_valid",
-            "placeholder_resolved",
-            "argv_shape_valid",
-            "command_script_interface_aligned",
-        )
-    )
-
     authority_target = str(
         repair_authority.get("target_file")
         or ""
@@ -7249,17 +8446,9 @@ async def _repair_existing_file_for_e2e_failure(
         repair_authority = {}
         authority_target = ""
 
-    deterministic_target = (
-            authority_target
-            or (
-                "SKILL.md"
-                if boundary_invalid
-                else ""
-            )
-    )
     # A rejected failure/target experiment is terminal for that pair.  Do this
     # before diagnosis so changing hypothesis prose cannot reopen it.
-    rejected_target = deterministic_target or target_path
+    rejected_target = target_path
 
     prior_no_progress_count = (
         _count_matching_no_progress_attempts(
@@ -7337,28 +8526,6 @@ async def _repair_existing_file_for_e2e_failure(
                     + _stable_json_hash(
                 repair_authority
             )
-            ),
-        }
-
-    elif deterministic_target:
-        diagnosis = {
-            "repair_target": "SKILL.md",
-            "symptom_file": target_path,
-            "root_cause_hypothesis": (
-                "Deterministic command/binding "
-                "boundary is invalid."
-            ),
-            "evidence": (
-                    boundary_facts.get("issues")
-                    or []
-            ),
-            "repair_instruction": (
-                "Only repair the failed SKILL.md "
-                "command boundary."
-            ),
-            "confidence": "deterministic",
-            "hypothesis_key": (
-                "deterministic-command-boundary"
             ),
         }
 

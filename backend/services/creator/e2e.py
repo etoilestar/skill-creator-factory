@@ -8843,8 +8843,15 @@ async def _repair_existing_file_for_e2e_failure(
     )
 
     e2e_entry_context: dict[str, Any] = {}
+    generated_script_source = ""
 
     if target_path.startswith("scripts/"):
+        script_path = e2e_session.workspace_dir / target_path
+        if script_path.is_file():
+            generated_script_source = script_path.read_text(
+                encoding="utf-8",
+                errors="replace",
+            )
         try:
             e2e_entry = (
                 _skill_plan_entry_for_file(
@@ -8853,13 +8860,7 @@ async def _repair_existing_file_for_e2e_failure(
                 )
             )
 
-            script_content = (
-                e2e_session.workspace_dir
-                / target_path
-            ).read_text(
-                encoding="utf-8",
-                errors="replace",
-            )
+            script_content = generated_script_source
 
             argv_schema: dict[str, Any] = {}
             run_args_analysis: dict[str, Any] = {}
@@ -9052,6 +9053,15 @@ async def _repair_existing_file_for_e2e_failure(
     elif target_path.startswith("scripts/"):
         target_rule = (
             "你正在修复一次真实 workflow E2E 试运行失败。\n"
+            "Before repairing generated code, compare the implementation with the declared input/output contracts.\n"
+            "Determine whether the failure is caused by a contract mismatch, implementation logic error, "
+            "or runtime/environment issue.\n"
+            "If the failure is caused by contract mismatch, modify the implementation to consume the declared "
+            "contract; do not add temporary conversions or defensive patches that hide the mismatch.\n"
+            "Fix the root cause instead of only removing the current traceback.\n"
+            "Repair should modify only the implementation related to the contract mismatch or runtime failure.\n"
+            "Do not redesign the Skill workflow, introduce new inputs, change interface semantics, or add "
+            "task-specific hard-coded rules.\n"
             "你正在验证一个调试假设，只修改指定 repair_target；不得修改其它文件、顺带重构或重新规划职责。\n"
             "只依据本轮结构化失败中的 failed_command、rendered_payload、"
             "stdout、stderr、return_code、失败层和已成功前序 trace 定位问题。\n"
@@ -9177,6 +9187,39 @@ async def _repair_existing_file_for_e2e_failure(
         "repair_authority": repair_authority,
 
         "debug_diagnosis": diagnosis,
+
+        # Keep the complete evidence set adjacent in the repair payload so the
+        # code model can classify contract mismatches before editing source.
+        "repair_context": {
+            "traceback": (
+                structured_failure.get("stderr")
+                or ""
+            ),
+            "failed_command": (
+                structured_failure.get("failed_command")
+                or ""
+            ),
+            "generated_script_source": generated_script_source,
+            "input_schema": (
+                (e2e_entry_context.get("runtime_contract") or {}).get("input_schema")
+                or (e2e_entry_context.get("runtime_contract") or {}).get("argv_schema")
+                or e2e_entry_context.get("script_argv_schema")
+                or e2e_entry_context.get("inputs")
+                or {}
+            ),
+            "output_schema": (
+                (e2e_entry_context.get("runtime_contract") or {}).get("output_schema")
+                or (e2e_entry_context.get("runtime_contract") or {}).get("stdout_schema")
+                or e2e_entry_context.get("outputs")
+                or {}
+            ),
+            "tool_function_output_schema": read_only_callable_context or {},
+            "actual_runtime_payload": (
+                structured_failure.get("rendered_payload")
+                or structured_failure.get("input_payload")
+                or {}
+            ),
+        },
     }
 
     base_task_context = "\n".join([

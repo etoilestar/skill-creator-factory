@@ -96,6 +96,29 @@ def test_generation_prompt_includes_available_tool_import_path_and_function_name
     assert 'pdf_to_md_mineru' in text
 
 
+def test_generation_prompt_treats_declared_contract_types_as_authoritative():
+    messages = _build_script_generate_file_prompt_variant(
+        file_path='scripts/a.py',
+        skill_name='x',
+        purpose='transform input',
+        blueprint_text='',
+        role='generic_script',
+        skill_plan_entry={
+            'path': 'scripts/a.py',
+            'role': 'generic_script',
+            'runtime': 'python',
+            'inputs': ['record'],
+            'outputs': ['result'],
+        },
+        variant='standard',
+    )
+    text = '\n'.join(str(message.get('content') or '') for message in messages)
+    assert 'The contract schema is the only source of truth.' in text
+    assert 'object/map -> access fields by key' in text
+    assert 'list/array -> iterate or use valid indexing' in text
+    assert 'Do not assume a data structure that is not declared by the contract.' in text
+
+
 def test_gate_derives_pdf_helpers_only_from_function_manifest():
     from backend.services.creator.tool_pool_gate import gate_tool_request
 

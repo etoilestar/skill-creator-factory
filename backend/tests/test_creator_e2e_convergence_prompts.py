@@ -33,6 +33,19 @@ def test_repair_prompt_requires_provenance_and_allows_optional_omission():
     assert "The previous patch was rejected because it did not materially change" in source
 
 
+def test_repair_prompt_classifies_contract_failures_and_carries_contract_evidence():
+    source = Path("backend/services/creator/e2e.py").read_text(encoding="utf-8")
+    assert "compare the implementation with the declared input/output contracts" in source
+    assert "contract mismatch, implementation logic error" in source
+    assert "do not add temporary conversions or defensive patches" in source
+    assert '"generated_script_source": generated_script_source' in source
+    assert '"input_schema": (' in source
+    assert '"output_schema": (' in source
+    assert '"tool_function_output_schema": read_only_callable_context or {}' in source
+    assert '"actual_runtime_payload": (' in source
+    assert "Do not redesign the Skill workflow, introduce new inputs" in source
+
+
 def test_step_advance_within_same_interface_boundary_is_not_progress():
     before = _failure(step=0, layer="external_input_missing", code="external_input_missing", source="resolve_placeholder()", exception="KeyError")
     after = _failure(step=1, layer="argv_schema_error", code="argv_schema_error", source="strict_json_argv_guard()", exception="ValueError")

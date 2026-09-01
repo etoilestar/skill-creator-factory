@@ -2068,6 +2068,16 @@ def _build_script_generate_file_prompt_variant(
             "并向 stdout 输出一个 JSON object。"
         ),
         (
+            "Generated scripts must strictly follow the declared input/output contracts.\n"
+            "The contract schema is the only source of truth.\n"
+            "Do not infer data structures from variable names, task descriptions, examples, "
+            "or common programming assumptions.\n"
+            "Before accessing any input or external output, verify its declared type.\n"
+            "Access rules: object/map -> access fields by key; list/array -> iterate or use valid "
+            "indexing; scalar -> use directly.\n"
+            "Do not assume a data structure that is not declared by the contract."
+        ),
+        (
             "Python scripts/*.py 必须 import 并调用 "
             "strict_json_argv_guard；"
             "它用于声明脚本第一轮 argv 接口，"

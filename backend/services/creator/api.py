@@ -9217,6 +9217,21 @@ FunctionItems and ResponsibilityEdges will be bound in a second protocol binding
 
 The Blueprint must decompose the complete user goal exactly once into the minimum coherent set of executable FunctionItems. Each FunctionItem represents one atomic executable sub-goal. For every FunctionItem: purpose must state the concrete sub-goal completed by this FunctionItem; inputs must declare only data required from the platform or another FunctionItem; outputs must declare only data produced for the platform or another FunctionItem; the FunctionItem must have a distinct execution responsibility; do not create duplicate FunctionItems with equivalent responsibilities. Collectively, the FunctionItems must cover all executable parts of the complete user goal. Do not generate ResponsibilityEdges in the Blueprint. Do not create a second subsystem or grouping layer.
 
+SCRIPT-LEVEL FUNCTIONITEM CONTRACT
+
+FunctionItems represent complete executable scripts, not individual function
+calls. A script describes a task-level capability. Internal iteration,
+batching, repeated processing, and per-item handling must be implemented inside
+the script itself. When multiple homogeneous inputs exist, prefer
+collection-based inputs and outputs instead of creating repeated execution
+steps. Do not expose internal script loops as external interfaces.
+
+When defining script responsibilities, describe the responsibility of the
+complete script rather than a single-record utility. If a script naturally
+handles multiple similar items, define its input and output at the collection
+level. The Blueprint represents executable Skill modules, not low-level
+function calls.
+
 FUNCTIONITEM INPUT SEMANTICS
 
 A FunctionItem input represents one distinct semantic runtime value genuinely

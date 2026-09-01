@@ -608,6 +608,15 @@ For every runtime_source_required FunctionItem input choose the semantic source
 value. For every required platform output choose the frozen FunctionItem output.
 Record each choice in structured logical binding fields.
 
+SCRIPT-LEVEL ABSTRACTION
+The Interface Plan represents data flow between complete executable scripts.
+Do not model repeated execution of the same script. When a script processes
+multiple similar inputs internally, keep the Interface at the script boundary
+using its collection input and output ports. Only create separate Interfaces
+when the frozen script contract explicitly declares separate logical outputs or
+independently selectable receiving slots. Never expand an internal loop into
+per-item Interfaces.
+
 4. CURRENT AUTHORITY
 You, not the backend, own and choose the semantic producer using responsibilities, port
 descriptions and contracts, confirmed requirements, workflow semantics, and the
@@ -832,6 +841,11 @@ requirement, infer undeclared fields from experience, or change the original
 Interface semantics. In particular, an abstract file_outputs port may carry
 CSV, Markdown, or JSON files and does not require a separate csv_report output.
 An optional fields value does not imply a required fields.primary_key member.
+
+Check whether the Interface Plan exposes internal implementation details of a
+script. A valid Interface represents script-level data exchange, not internal
+loops, per-item handling, or repeated processing. Reuse of one collection port
+must not be interpreted as multiple executions or artificial per-item outputs.
 
 4. EVIDENCE STANDARD
 A structurally valid logical reference is not automatically semantically correct.
@@ -1094,6 +1108,10 @@ The previous plan failed deterministic acceptance. Reconstruct one complete
 corrected Interface Plan and resolve every supplied acceptance failure
 simultaneously. Facts describe invalid state; they do not prescribe a producer.
 Do not patch only visible wording. Return the complete corrected plan.
+Preserve script-level abstraction: do not split a script into execution
+instances, expose its internal loops, or create artificial per-item or
+intermediate Interfaces. Repair data lineage only over the frozen script-level
+logical ports.
 4. CURRENT AUTHORITY
 Modify only the Interface semantic layer. You may add or remove an Interface,
 revise a logical binding or source_path, and preserve correct bindings. You
@@ -1304,6 +1322,14 @@ legal member/input domains, and repair_scope.
 
 2. TASK
 You are repairing an existing Interface Plan.
+
+Preserve script-level abstraction while repairing it. Do not split one script
+into multiple execution instances, expand internal iteration into per-item
+transfers, or introduce artificial intermediate Interfaces. Improve data
+lineage between complete scripts. If the frozen script contract itself exposes
+an internal loop instead of a collection boundary, do not simulate a corrected
+contract in the Interface layer; retain the frozen port domain so the contract
+can be corrected by its owning upstream stage.
 
 Important constraints:
 1. Do not regenerate the whole interface plan.

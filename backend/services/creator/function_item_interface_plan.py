@@ -1502,15 +1502,22 @@ Do not rewrite the interface plan."""
                 )
             except InterfaceIntentPlanError:
                 return {"__invalid_transport__": text}
-        repair_patches = repair_result.get("patches", [])
+        if "patches" not in repair_result:
+            return {"__invalid_transport__": text}
+        repair_patches = repair_result["patches"]
         if not isinstance(repair_patches, list):
-            return repair_result
+            return {"__invalid_transport__": text}
         try:
-            return {"interfaces": apply_interface_patch(
+            patched_interfaces = apply_interface_patch(
                 current_interfaces, repair_patches,
-            )}
+            )
         except (AttributeError, KeyError, TypeError):
             return repair_result
+        logger.info(
+            "[Creator][interface_patch_apply] before=%s after=%s patches=%s",
+            len(current_interfaces), len(patched_interfaces), len(repair_patches),
+        )
+        return {"interfaces": patched_interfaces}
 
     async def evaluate_generator(candidate_object: Any) -> CandidateEvaluation:
         try:

@@ -4,6 +4,7 @@ import pytest
 from backend.services.creator.function_item_interface_plan import (
     CRITIC_SCHEMA, MULTIMODAL_INPUT_PROVENANCE_CONTRACT, PLATFORM_BOUNDARY_CONTRACT, InterfaceIntentPlanError, _compact_function_items,
     _interface_plan_prompt, build_graph_obligations_from_interfaces,
+    apply_interface_patch,
     build_interface_repair_scope, collect_interface_plan_validation_issues,
     canonical_logical_binding_signatures,
     existing_binding_references_valid,
@@ -12,6 +13,47 @@ from backend.services.creator.function_item_interface_plan import (
     plan_function_item_interfaces, review_interface_plan_semantically,
     validate_interface_intent_plan, validate_interface_repair_critic,
 )
+
+
+def test_apply_interface_patch_preserves_existing_interfaces():
+    current_interfaces = [
+        {
+            "interface_id": "I1",
+            "source_platform_input": "input_files",
+            "target_input": "input_files",
+        },
+        {
+            "interface_id": "I2",
+            "source_platform_input": "fields",
+            "target_input": "fields",
+        },
+        {
+            "interface_id": "I3",
+            "source_output": "file_outputs",
+            "target_platform_output": "file_outputs",
+        },
+    ]
+    patches = [
+        {
+            "interface_id": "I1",
+            "action": "modify",
+            "changes": {"source_path": ["0"]},
+        },
+        {
+            "action": "add",
+            "interface": {
+                "interface_id": "I4",
+                "source_platform_input": "input_files",
+                "source_path": ["1"],
+                "target_input": "input_files",
+            },
+        },
+    ]
+
+    result = apply_interface_patch(current_interfaces, patches)
+    ids = {item["interface_id"] for item in result}
+
+    assert {"I1", "I2", "I3", "I4"} <= ids
 
 
 @pytest.mark.parametrize("acceptance_facts", [
@@ -308,7 +350,11 @@ async def test_unknown_semantic_defect_runs_generic_repair_and_revalidation():
         reviewer_calls += 1
         payload = json.loads(messages[-1]["content"])
         return json.dumps({"diagnosis": "root cause", "required_postcondition": "correct binding semantics"} if "validation_issues" in payload else {"passed": True, "issues": []})
-    async def planner(_messages, _model): return json.dumps(repaired)
+    async def planner(_messages, _model):
+        return json.dumps({"patches": [{
+            "interface_id": "I1", "action": "modify",
+            "changes": {"source_path": ["value_x"]},
+        }]})
     result = await repair_interface_plan_semantically(original_user_goal="g", frozen_function_items=items, current_interface_plan=current, validation_issues=[issue], repair_scope=build_interface_repair_scope([issue]), platform_contract=platform(), planner_model="planner-test-model", model_call=planner, reviewer_model="reviewer-test-model", reviewer_model_call=reviewer)
     assert result == repaired and reviewer_calls == 2
 
@@ -347,7 +393,7 @@ async def test_graph_triggered_repair_requires_authoritative_graph_acceptance(
 
     async def generator(messages, _model):
         payloads.append(json.loads(messages[-1]["content"]))
-        return json.dumps(candidate)
+        return json.dumps({"patches": []})
 
     with pytest.raises(InterfaceIntentPlanError) as raised:
         await repair_interface_plan_semantically(
@@ -395,7 +441,7 @@ async def test_graph_triggered_repair_accepts_after_authoritative_graph_validati
         )
 
     async def generator(_messages, _model):
-        return json.dumps(candidate)
+        return json.dumps({"patches": []})
 
     result = await repair_interface_plan_semantically(
         original_user_goal="process an abstract payload", frozen_function_items=items,
@@ -432,7 +478,7 @@ async def test_interface_only_repair_does_not_run_graph_acceptance(monkeypatch):
         )
 
     async def generator(_messages, _model):
-        return json.dumps(candidate)
+        return json.dumps({"patches": []})
 
     assert await repair_interface_plan_semantically(
         original_user_goal="process an abstract payload", frozen_function_items=items,
@@ -517,7 +563,10 @@ async def test_generator_may_repair_declared_source_path():
 
     async def planner(messages, _model):
         generator_prompts.append(messages[0]["content"])
-        return json.dumps(repaired)
+        return json.dumps({"patches": [{
+            "interface_id": "I1", "action": "modify",
+            "changes": {"source_path": ["y"]},
+        }]})
 
     result = await repair_interface_plan_semantically(original_user_goal="g", frozen_function_items=items, current_interface_plan=current, validation_issues=[issue], repair_scope=build_interface_repair_scope([issue]), platform_contract=platform(), planner_model="planner-test-model", model_call=planner, reviewer_model="reviewer-test-model", reviewer_model_call=reviewer)
     assert result["interfaces"][0]["source_path"] == ["y"]
@@ -679,7 +728,11 @@ async def test_generator_schema_invalid_candidate_becomes_second_attempt_residua
              "affected_inputs": [{"target_member": "scripts/unit_a.py", "target_input": "slot_x"}],
              "evidence": {"observed": "value_x", "expected": "value_y"},
              "details": {}, "stage": "review", "path": "$", "interface_id": "I1"}
-    generator_responses = iter([invalid, repaired])
+    generator_responses = iter([
+        {"patches": [{"action": "add", "interface": invalid["interfaces"][0]}]},
+        {"patches": [{"interface_id": "I1", "action": "modify",
+                       "changes": {"source_path": ["value_x"]}}]},
+    ])
     generator_payloads = []
     critic_calls = reviewer_calls = 0
 
@@ -732,7 +785,9 @@ async def test_generator_schema_invalid_hard_stops_after_two_attempts():
     async def generator(_messages, _model):
         nonlocal generator_calls
         generator_calls += 1
-        return json.dumps(invalid)
+        return json.dumps({
+            "patches": [{"action": "add", "interface": invalid["interfaces"][0]}],
+        })
 
     with pytest.raises(InterfaceIntentPlanError) as raised:
         await repair_interface_plan_semantically(
@@ -760,7 +815,12 @@ async def test_generator_transport_repair_preserves_schema_residual_for_attempt_
              "affected_inputs": [{"target_member": "scripts/unit_a.py", "target_input": "slot_x"}],
              "evidence": {"observed": "value_x", "expected": "value_y"},
              "details": {}, "stage": "review", "path": "$", "interface_id": "I1"}
-    responses = iter(["not-json", json.dumps(invalid), json.dumps(repaired)])
+    responses = iter([
+        "not-json",
+        json.dumps({"patches": [{"action": "add", "interface": invalid["interfaces"][0]}]}),
+        json.dumps({"patches": [{"interface_id": "I1", "action": "modify",
+                                  "changes": {"source_path": ["value_x"]}}]}),
+    ])
     prompts = []
 
     async def critic_or_reviewer(messages, _model):

@@ -5131,20 +5131,23 @@ async def _repair_prepare_blueprint_protocol(
             )
         )
         logger.info(
-            "[Creator][blueprint_repair] attempt=%d issue_codes=%s issue_paths=%s",
+            "[Creator][blueprint_repair] phase=blueprint_repair attempt=%d issue_codes=%s issue_paths=%s",
             repair_index + 1, issue_codes, issue_paths,
         )
-        prompt = """当前任务类型=blueprint repair。
+        prompt = """当前阶段：blueprint_repair。
 
 你当前不是需求分析Agent。
 你不是Planner。
 你的唯一任务：根据 validation_errors 修复已有 Blueprint。
 
+用户需求已经确认。
+
 禁止：
-1. 重新询问用户需求；
-2. 生成 clarifying_questions；
-3. 修改用户目标；
-4. 重新设计 Skill。
+1. 重新分析用户需求；
+2. 输出需求澄清问题；
+3. 输出 clarifying_questions；
+4. 返回 needs_clarification；
+5. 修改用户目标。
 
 如果无法修复，返回 failed。不要返回 needs_clarification。
 
@@ -5274,13 +5277,21 @@ Creator 协议边界：
         for output_attempt in range(2):
             text = await complete_creator_role_once(
                 messages,
-                "planner", fallback_model=route.model,
+                "planner", fallback_model=route.model, stage="blueprint_repair",
             )
             try:
                 parsed = parse_structured_output(text, phase="blueprint_repair")
             except StructuredOutputError:
                 parsed = None
             if parsed is not None:
+                if (
+                    str(parsed.get("status") or "") == "needs_clarification"
+                    or "clarifying_questions" in parsed
+                ):
+                    parsed = {
+                        "status": "failed",
+                        "reason": "blueprint_repair_role_violation",
+                    }
                 parsed = validate_phase_status(parsed, phase="blueprint_repair")
                 status = str(parsed.get("status") or "")
                 if status == "ready" and set(parsed) == {"status", "internal_blueprint_text"}:

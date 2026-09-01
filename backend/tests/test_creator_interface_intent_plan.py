@@ -1026,3 +1026,21 @@ def test_prompts_define_structured_binding_and_canonical_input_semantics():
     source = inspect.getsource(api._generate_internal_blueprint_or_questions)
     assert "FUNCTIONITEM INPUT SEMANTICS" in source
     assert "upstream\nFunctionItem output" in source
+    assert "SCRIPT-LEVEL FUNCTIONITEM CONTRACT" in source
+    assert "collection-based inputs and outputs" in source
+    assert "Do not expose internal script loops as external interfaces" in source
+
+
+def test_interface_prompts_preserve_collection_level_script_boundaries():
+    import inspect
+    from backend.services.creator import function_item_interface_plan as module
+
+    interface_prompt = _interface_plan_prompt()
+    module_source = inspect.getsource(module)
+
+    assert "Do not model repeated execution of the same script" in interface_prompt
+    assert "using its collection input and output ports" in interface_prompt
+    assert "Never expand an internal loop into\nper-item Interfaces" in interface_prompt
+    assert "A valid Interface represents script-level data exchange" in module_source
+    assert "Do not split one script\ninto multiple execution instances" in module_source
+    assert "introduce artificial intermediate Interfaces" in module_source

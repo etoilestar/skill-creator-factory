@@ -823,6 +823,7 @@ Phase 2 的任务是：
    - `required_capabilities` 只能写业务运行需要的平台工具能力（如 text_generation、image_generation、pdf_generation、web_search、file_output）；不要写脚本基础执行、宿主调度、沙盒运行、确认流程、安全策略等 Creator/Kernel 平台协议能力。
    - `business_forbidden_capabilities` 只能写业务层禁止的工具能力；平台安全限制由 Creator/Kernel 内部管理，不能写进业务 SkillPlan。
    - `scripts/*` 的 role/capability 必须由你在 SkillPlan 中显式规划；Creator 后台不会根据业务词补 role/capability。
+   - 描述完整脚本的任务级职责，而不是单条记录或单次函数调用；脚本自然处理多个同类输入时，使用集合级 inputs/outputs，并把循环、批处理、重复处理和逐项处理保留在脚本内部，不要展开为外部接口或重复执行步骤。蓝图表示可执行 Skill 模块，而不是低层函数调用。
    - `references/*.md` 是辅助资料文件，后续必须有 metadata + body，但 reference 正文不要变成第二套 SkillPlan。
    - `assets/*` 只表示创建前已经存在且业务运行需要的静态上传/预置素材；没有静态资源需求时只在目录结构写“assets/ 无需创建”，不要生成 assets 文件计划项，也不要生成 source；每个真实 assets 文件计划必须显式声明 `source: user_upload` 或 `source: bundled`。PDF、图片、docx、html 等运行时产物不能放入 assets 或 Creator 文件计划，只能通过脚本 stdout 平台字段表达。
    - 必须包含 `### 宿主执行方式`，说明直接回答、需要脚本/命令、禁止隐式执行、执行后回答。需要脚本时，最终 SKILL.md 必须输出标准 ```bash fenced code block，命令直接调用 scripts/* 并传入 JSON object argv。

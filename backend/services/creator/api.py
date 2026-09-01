@@ -67,7 +67,7 @@ from .frozen_facts import (
     project_frozen_facts_to_summary,
 )
 from .model_gateway import creator_model_call
-from .protocol import parse_structured_output
+from .protocol import StructuredOutputError, parse_structured_output, validate_phase_status
 
 
 async def complete_creator_role_once(
@@ -289,6 +289,18 @@ def _tool_binding_log_summary(binding: dict[str, Any]) -> dict[str, Any]:
 
 class PreparePlanProtocolError(ValueError):
     """Planner prepare-plan structured transport failed validation."""
+
+
+class BlueprintRepairFailed(PreparePlanProtocolError):
+    """Blueprint repair ended with a structured, recoverable failure."""
+
+    def __init__(self, reason: str) -> None:
+        self.result = {
+            "phase": "blueprint_repair",
+            "status": "repair_failed",
+            "reason": str(reason or "blueprint_repair_failed"),
+        }
+        super().__init__(json.dumps(self.result, ensure_ascii=False))
 
 
 class RequirementOwnershipError(PreparePlanProtocolError):
@@ -4224,7 +4236,7 @@ def _required_file_plan_user_upload_asset_paths(plan_files: list[Any] | None, as
 
 MAX_PREPARE_BUSINESS_CLARIFICATION_ROUNDS = 2
 MAX_PREPARE_SUPPLEMENT_ROUNDS = 1
-MAX_PREPARE_BLUEPRINT_REPAIR_ROUNDS = 3
+MAX_PREPARE_BLUEPRINT_REPAIR_ROUNDS = 2
 
 _PREPARE_SUPPLEMENT_QUESTION = "以上创建要点是否还需要补充？A. 没有，按这些要点继续 B. 有，我补充说明"
 
@@ -5122,11 +5134,20 @@ async def _repair_prepare_blueprint_protocol(
             "[Creator][blueprint_repair] attempt=%d issue_codes=%s issue_paths=%s",
             repair_index + 1, issue_codes, issue_paths,
         )
-        prompt = (
-            load_kernel_creator_for_phase(
-                "prepare_plan"
-            )
-            + """
+        prompt = """当前任务类型=blueprint repair。
+
+你当前不是需求分析Agent。
+你不是Planner。
+你的唯一任务：根据 validation_errors 修复已有 Blueprint。
+
+禁止：
+1. 重新询问用户需求；
+2. 生成 clarifying_questions；
+3. 修改用户目标；
+4. 重新设计 Skill。
+
+如果无法修复，返回 failed。不要返回 needs_clarification。
+
 你只修复 internal_blueprint_text 的 Creator 硬协议问题。
 
 不要重新设计业务需求。
@@ -5137,9 +5158,11 @@ async def _repair_prepare_blueprint_protocol(
 
 只输出严格 JSON object：
 
-{
-  "internal_blueprint_text": "修复后的完整蓝图正文"
-}
+成功：
+{"status":"ready","internal_blueprint_text":"修复后的完整蓝图正文"}
+
+失败：
+{"status":"failed","reason":"无法修复的原因"}
 
 不要 Markdown 解释。
 
@@ -5213,7 +5236,6 @@ Creator 协议边界：
 
 具体工具选择由后续 Final Tool Planner 完成。
 """
-        )
 
         route = route_model(
             "creator_prepare_plan",
@@ -5224,8 +5246,7 @@ Creator 协议边界：
             ),
         )
 
-        text = await complete_creator_role_once(
-            [
+        messages = [
                 {
                     "role": "system",
                     "content": prompt,
@@ -5234,36 +5255,46 @@ Creator 协议边界：
                     "role": "user",
                     "content": json.dumps(
                         {
-                            "blueprint_text": repaired,
-
-                            "confirmed_user_context": {
-                                "original_user_request": request.user_request,
-                                "human_feedback": request.human_feedback,
-                                "conversation_history": request.conversation_history,
-                            },
-
-                            "protocol_errors": (
+                            "current_blueprint": repaired,
+                            "validation_errors": (
                                 current_errors
                             ),
-
-                            "remaining_issues_from_previous_repair": repeated_errors,
-                            "repair_directive": (
-                                "The listed issue remains unresolved; directly eliminate it and do not repeat an almost identical Blueprint."
-                                if repair_index and repeated_errors
-                                else "Fix the listed validator issues only."
-                            ),
+                            "required_schema": {
+                                "success": {"status": "ready", "internal_blueprint_text": "..."},
+                                "failure": {"status": "failed", "reason": "..."},
+                            },
                         },
                         ensure_ascii=False,
                         default=str,
                     ),
                 },
-            ],
-            "planner", fallback_model=route.model,
-        )
+            ]
 
-        data = _parse_prepare_plan_json(
-            text
-        )
+        data: dict[str, Any] | None = None
+        for output_attempt in range(2):
+            text = await complete_creator_role_once(
+                messages,
+                "planner", fallback_model=route.model,
+            )
+            try:
+                parsed = parse_structured_output(text, phase="blueprint_repair")
+            except StructuredOutputError:
+                parsed = None
+            if parsed is not None:
+                parsed = validate_phase_status(parsed, phase="blueprint_repair")
+                status = str(parsed.get("status") or "")
+                if status == "ready" and set(parsed) == {"status", "internal_blueprint_text"}:
+                    data = parsed
+                    break
+                if status == "failed" and set(parsed) == {"status", "reason"}:
+                    raise BlueprintRepairFailed(str(parsed.get("reason") or "blueprint_repair_failed"))
+            if output_attempt == 0:
+                messages = [*messages, {
+                    "role": "user",
+                    "content": "输出完整 internal_blueprint_text JSON：只允许 status=ready 和 internal_blueprint_text，不要解释。",
+                }]
+        if data is None:
+            raise BlueprintRepairFailed("invalid_structured_output")
 
         candidate = str(
             data.get(

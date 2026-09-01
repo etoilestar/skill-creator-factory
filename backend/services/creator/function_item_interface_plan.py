@@ -185,6 +185,18 @@ def _parse_object(text: str) -> dict[str, Any]:
     return value
 
 
+def normalize_interface_review_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Normalize reviewer transport wrappers without making semantic decisions."""
+    if "passed" in result:
+        return result
+
+    review_schema = result.get("review_schema")
+    if isinstance(review_schema, dict):
+        return review_schema
+
+    return result
+
+
 def _require_nonempty_string(value: dict[str, Any], key: str, code: str, path: str) -> str:
     raw = value.get(key)
     if not isinstance(raw, str) or not raw.strip():
@@ -746,32 +758,6 @@ def blocking_interface_review_issues(issues: list[dict[str, Any]]) -> list[dict[
     return [issue for issue in issues if issue.get("severity") == "blocking"]
 
 
-async def _reformat_interface_review_response(
-    *, raw_response: str, validation_error: InterfaceIntentPlanError,
-    reviewer_model: str, model_call: ModelCall,
-) -> dict[str, Any]:
-    prompt = """Repair only the JSON protocol shape.
-Preserve every semantic conclusion, message, affected reference, and evidence.
-Do not add, remove, merge, split, or reinterpret issues.
-Every issue must use the single supplied severity-and-code issue schema.
-Return only the corrected JSON object."""
-    payload = {
-        "review_schema": INTERFACE_REVIEW_SCHEMA,
-        "raw_response": raw_response,
-        "validation_error": {
-            "code": validation_error.code, "message": str(validation_error),
-            "details": validation_error.details,
-        },
-    }
-    logger.info("[Creator][interface_semantic_review_protocol_repair] attempt=1")
-    text = await model_call(
-        [{"role": "system", "content": prompt},
-         {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
-        reviewer_model,
-    )
-    return _parse_object(text)
-
-
 async def review_interface_plan_semantically(
     *, original_user_goal: str, frozen_function_items: list[dict[str, Any]],
     interface_plan: dict[str, Any], requirement_allocations: list[dict[str, Any]] | None,
@@ -876,6 +862,20 @@ target_input. Report a defect without proposing another path.
 Verify every affected Interface and logical input exists. passed=false exactly
 when at least one issue has severity=blocking. Warning/advisory issues are
 retained while passed remains true.
+Return the review result directly.
+
+Do not wrap the JSON object in additional keys.
+
+The output root object must contain:
+{
+  "passed": boolean,
+  "issues": []
+}
+
+Do not use:
+{
+  "review_schema": {...}
+}
 Return only strict JSON matching this schema:
 """ + mode_contract + """
 
@@ -894,35 +894,11 @@ Return only strict JSON matching this schema:
              {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
             reviewer_model,
         )
-    try:
-        issues = _validate_interface_review_response(
-            value=_parse_object(raw_response), interface_plan=interface_plan,
-            frozen_function_items=frozen_function_items,
-        )
-    except InterfaceIntentPlanError as original_exc:
-        try:
-            reformatted = await _reformat_interface_review_response(
-                raw_response=raw_response, validation_error=original_exc,
-                reviewer_model=reviewer_model, model_call=model_call,
-            )
-            issues = _validate_interface_review_response(
-                value=reformatted, interface_plan=interface_plan,
-                frozen_function_items=frozen_function_items,
-            )
-        except InterfaceIntentPlanError as repair_exc:
-            logger.info("[Creator][interface_semantic_review] result=failed error_code=%s", repair_exc.code)
-            raise InterfaceIntentPlanError(
-                "interface semantic review failed", code="interface_semantic_review_failed",
-                details={
-                    "review_attempts": 1, "protocol_repair_attempts": 1,
-                    "original_error": {"code": original_exc.code, "message": str(original_exc), "details": original_exc.details},
-                    "repair_error": {"code": repair_exc.code, "message": str(repair_exc), "details": repair_exc.details},
-                },
-            ) from repair_exc
-        logger.info("[Creator][interface_semantic_review_protocol_repair] attempt=1 result=success")
-    except Exception:
-        # Model transport failures remain transport failures, not protocol repair.
-        raise
+    review_result = normalize_interface_review_result(_parse_object(raw_response))
+    issues = _validate_interface_review_response(
+        value=review_result, interface_plan=interface_plan,
+        frozen_function_items=frozen_function_items,
+    )
     counts = {severity: sum(issue["severity"] == severity for issue in issues)
               for severity in INTERFACE_REVIEW_SEVERITIES}
     logger.info(

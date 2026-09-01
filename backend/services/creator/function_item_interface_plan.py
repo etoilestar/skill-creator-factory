@@ -482,6 +482,28 @@ def build_interface_repair_scope(
     }
 
 
+def apply_interface_patch(
+    current_interfaces: list[dict[str, Any]],
+    patches: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Apply minimal model-generated patches while keeping valid Interfaces."""
+    interface_map = {
+        interface["interface_id"]: dict(interface)
+        for interface in current_interfaces
+    }
+    for patch in patches:
+        action = patch.get("action")
+        if action == "modify":
+            interface_id = patch.get("interface_id")
+            if interface_id in interface_map:
+                interface_map[interface_id].update(patch.get("changes", {}))
+        elif action == "add":
+            interface = patch.get("interface")
+            if interface:
+                interface_map[interface["interface_id"]] = dict(interface)
+    return list(interface_map.values())
+
+
 def validate_interface_repair_scope(
     *, before: dict[str, Any], after: dict[str, Any], repair_scope: dict[str, Any]
 ) -> None:
@@ -1305,6 +1327,16 @@ feedback, one validated Critic diagnosis, legal Interface schema,
 legal member/input domains, and repair_scope.
 
 2. TASK
+You are repairing an existing Interface Plan.
+
+Important constraints:
+1. Do not regenerate the whole interface plan.
+2. Preserve existing valid interfaces.
+3. Do not remove existing interface_ids.
+4. Only modify interfaces related to reviewer issues.
+5. Add missing interfaces when required.
+6. Return minimal patches only.
+
 Repair the Interface Plan so all supplied blocking facts are resolved simultaneously.
 
 3. SEMANTIC RESPONSIBILITY
@@ -1331,7 +1363,8 @@ The Critic is not edit authority; independently choose the actual repair.
 - Do not infer relationships from filenames or matching field names alone.
 - Do not invent platform inputs merely to close the graph.
 - Preserve unrelated logical bindings. Do not change an unrelated semantic source/receiving-slot identity unless necessary for the complete corrected plan.
-- Record order, Interface IDs, and goal wording are not semantic preservation requirements.
+- Existing Interface IDs must be preserved. Record order and goal wording are not
+  semantic preservation requirements.
 - Repeated member pairs are allowed when transfers are independent.
 - One Interface remains independently bindable to one graph edge.
 - Revise Interface structure as necessary within the editable Interface layer.
@@ -1353,8 +1386,11 @@ are unchanged, no source was selected by names alone, unrelated Interfaces are
 unchanged, and the result differs meaningfully from the failed plan.
 
 8. OUTPUT CONTRACT
-Return only the complete Interface Plan JSON matching interface_schema. Do not
-include explanations, Markdown, comments, or hidden reasoning.
+Return only strict JSON in this form:
+{{"patches":[{{"interface_id":"I1","action":"modify","changes":{{...}}}},
+{{"action":"add","interface":{{...complete Interface fields...}}}}]}}
+Do not return a complete Interface Plan. Do not include explanations, Markdown,
+comments, or hidden reasoning.
 """
     payload = {
         "system_goal": original_user_goal,
@@ -1427,30 +1463,61 @@ Return only strict JSON matching critic_schema."""
 
     async def propose_generator(previous_candidate: Any, feedback: dict[str, Any]) -> Any:
         nonlocal generator_transport_repair_used
+        current_interfaces = (
+            previous_candidate.get("interfaces", [])
+            if isinstance(previous_candidate, dict) else []
+        )
         attempt_payload = {
             **payload,
             "current_interface_plan": previous_candidate,
             "previous_candidate": previous_candidate,
             "refinement_feedback": feedback,
+            "current_interfaces": current_interfaces,
+            "issues": feedback.get("acceptance_facts", validation_issues),
+            "instruction": "Return minimal repair patches only",
         }
+        attempt_prompt = prompt
+        if feedback.get("attempt", 1) > 1:
+            attempt_prompt += """
+
+Previous repair did not pass validation.
+Keep previous valid interfaces.
+Only provide additional minimal patches.
+Do not rewrite the interface plan."""
         text = await model_call(
-            [{"role": "system", "content": prompt},
+            [{"role": "system", "content": attempt_prompt},
              {"role": "user", "content": json.dumps(attempt_payload, ensure_ascii=False, default=str)}],
             planner_model,
         )
         try:
-            return _parse_object(text)
+            repair_result = _parse_object(text)
         except InterfaceIntentPlanError as parse_exc:
             if generator_transport_repair_used:
                 return {"__invalid_transport__": text}
             generator_transport_repair_used = True
             try:
-                return await _reformat_interface_plan_response(
+                repair_result = await _reformat_interface_plan_response(
                     raw_response=text, validation_error=parse_exc,
                     planner_model=planner_model, model_call=model_call,
                 )
             except InterfaceIntentPlanError:
                 return {"__invalid_transport__": text}
+        if "patches" not in repair_result:
+            return {"__invalid_transport__": text}
+        repair_patches = repair_result["patches"]
+        if not isinstance(repair_patches, list):
+            return {"__invalid_transport__": text}
+        try:
+            patched_interfaces = apply_interface_patch(
+                current_interfaces, repair_patches,
+            )
+        except (AttributeError, KeyError, TypeError):
+            return repair_result
+        logger.info(
+            "[Creator][interface_patch_apply] before=%s after=%s patches=%s",
+            len(current_interfaces), len(patched_interfaces), len(repair_patches),
+        )
+        return {"interfaces": patched_interfaces}
 
     async def evaluate_generator(candidate_object: Any) -> CandidateEvaluation:
         try:

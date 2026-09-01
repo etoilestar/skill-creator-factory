@@ -67,6 +67,7 @@ from .frozen_facts import (
     project_frozen_facts_to_summary,
 )
 from .model_gateway import creator_model_call
+from .protocol import parse_structured_output
 
 
 async def complete_creator_role_once(
@@ -4054,20 +4055,7 @@ def _read_prepare_existing_skill_context(skill_name: str | None) -> dict[str, An
 
 
 def _parse_prepare_plan_json(raw: str) -> dict[str, Any]:
-    text = str(raw or "").strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE).strip()
-        text = re.sub(r"\s*```$", "", text).strip()
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-        if not match:
-            raise ValueError("prepare-plan model did not return JSON")
-        data = json.loads(match.group(0))
-    if not isinstance(data, dict):
-        raise ValueError("prepare-plan JSON must be an object")
-    return data
+    return parse_structured_output(raw, phase="requirement_analysis")
 
 
 def _strip_prepare_summary_risks(summary: PreparePlanReviewSummary) -> PreparePlanReviewSummary:

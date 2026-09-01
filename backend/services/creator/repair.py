@@ -3,12 +3,16 @@
 from .common import *  # noqa: F403
 from collections.abc import Mapping, Sequence
 from .model_gateway import creator_model_call
+from .protocol import REPAIR_PHASE_CONSTRAINT, parse_structured_output
 
 
 async def complete_creator_role_once(messages, role, *, fallback_model, stage="creator"):
     """Injectable repair seam that retains production role-profile routing."""
+    # Append so existing stage-specific system prompts retain their established
+    # position while every repair call still receives the lifecycle constraint.
+    constrained = [*messages, {"role": "system", "content": REPAIR_PHASE_CONSTRAINT}]
     return await creator_model_call(
-        messages, role=role, fallback_model=fallback_model, stage=stage,
+        constrained, role=role, fallback_model=fallback_model, stage="creator_repair",
         model_call=complete_chat_once,
     )
 
@@ -3213,18 +3217,11 @@ async def _repair_generated_file_with_feedback(
     return candidate
 
 def _parse_validator_json_object(text: str) -> dict | None:
-    stripped = (text or "").strip()
-    if stripped.startswith("```json"):
-        stripped = stripped[7:].strip()
-    if stripped.startswith("```"):
-        stripped = stripped[3:].strip()
-    if stripped.endswith("```"):
-        stripped = stripped[:-3].strip()
     try:
-        data = json.loads(stripped)
-    except json.JSONDecodeError:
+        data = parse_structured_output(text, phase="skill_repair")
+    except ValueError:
         return None
-    return data if isinstance(data, dict) else None
+    return data
 
 
 def _deterministic_failed_check_ids(failed_checks_text: str) -> set[str]:

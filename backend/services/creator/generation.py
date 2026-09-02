@@ -6,6 +6,54 @@ from .e2e import *  # noqa: F403
 from .repair import *  # noqa: F403
 from ..platform_io_contract import get_platform_output_sink
 
+_RUNTIME_BINDING_AUTHORITY_PROMPT = """## Runtime Binding Authority
+
+The runtime input contract has already been resolved by the platform.
+
+Inputs defined in SkillPlan/runtime_contract/input_binding are actual runtime ports.
+They are not suggestions, descriptions, or placeholders for redesign.
+
+The platform is responsible for:
+- constructing runtime inputs
+- resolving input bindings
+- passing values into the generated skill
+
+The generated script is only responsible for consuming these inputs and implementing business logic.
+
+Do not redesign the runtime interface.
+
+Do not:
+- wrap existing inputs into another object
+- create request/options/config wrapper objects
+- introduce a second input schema
+- rename existing runtime inputs
+- add an adapter layer for invocation
+
+The generated implementation must directly consume the declared runtime inputs according to their declared types.
+
+The runtime contract is the source of truth.
+
+The generated script is a component executed inside an existing runtime framework.
+
+You are implementing the component logic, not designing the caller protocol.
+
+Do not recreate framework-level transport, invocation, or input handling logic inside the generated skill.
+"""
+
+_SKILL_MD_RUNTIME_BINDING_PROMPT = """The execution environment already provides runtime inputs.
+
+SKILL.md should describe how the skill uses existing inputs.
+
+It should not describe a new invocation protocol.
+
+Do not introduce:
+- custom JSON request bodies
+- wrapper parameters
+- alternative input formats
+
+The documented execution flow must match the existing runtime contract.
+"""
+
 def _is_valid_normalized_script_source(file_path: str, content: str) -> bool:
     """Return whether content is safe to accept as the requested raw script.
 
@@ -1312,6 +1360,34 @@ def _script_local_contract_payload(
     prompt_runtime_contract = dict(plan_entry.runtime_contract or {})
     prompt_runtime_contract["tool_binding_summary"] = dict(prompt_tool_binding_summary)
 
+    # This is a prompt-only projection, not a SkillPlan/schema mutation.  Show
+    # the code model that the planned ports and their bindings are resolved so
+    # a short ``inputs`` list cannot be mistaken for an invitation to invent a
+    # second caller protocol.
+    declared_bindings = list(plan_entry.input_binding or []) or list(
+        plan_entry.command_arg_bindings or []
+    )
+    binding_by_name = {
+        str(item.get("argv_key") or item.get("name") or item.get("to_field") or ""): item
+        for item in declared_bindings
+        if isinstance(item, dict)
+    }
+    runtime_input_ports = []
+    for raw_input in canonical_contract.inputs:
+        input_name = str(raw_input.get("name") if isinstance(raw_input, dict) else raw_input)
+        binding = binding_by_name.get(input_name, {})
+        declared_type = (
+            binding.get("value_type")
+            or binding.get("type")
+            or (raw_input.get("type") if isinstance(raw_input, dict) else None)
+            or "unspecified"
+        )
+        runtime_input_ports.append({
+            "name": input_name,
+            "type": declared_type,
+            "binding_status": "resolved",
+        })
+
     return {
         "file_path": file_path,
         "runtime": plan_entry.runtime,
@@ -1369,6 +1445,11 @@ def _script_local_contract_payload(
         "runtime_contract": (
             prompt_runtime_contract
         ),
+        "runtime_binding_context": {
+            "inputs": runtime_input_ports,
+            "input_binding": declared_bindings,
+            "authority": "SkillPlan/runtime_contract/input_binding",
+        },
         "command_argv_contract": (
             command_argv_contract
         ),
@@ -2077,6 +2158,7 @@ def _build_script_generate_file_prompt_variant(
             "indexing; scalar -> use directly.\n"
             "Do not assume a data structure that is not declared by the contract."
         ),
+        _RUNTIME_BINDING_AUTHORITY_PROMPT,
         (
             "Python scripts/*.py 必须 import 并调用 "
             "strict_json_argv_guard；"
@@ -2542,6 +2624,7 @@ def _build_generate_file_prompt(
             "- it is valid to say that scripts read, use, consult, follow, or reference it;\n"
             "- do not expose Creator-stage generation/materialization details unless they are independently part of the runtime user contract.\n"
             "Creation-stage facts remain in FilePlan / Creator UI. SKILL.md consumes the finalized runtime resource environment.\n"
+            f"{_SKILL_MD_RUNTIME_BINDING_PROMPT}\n"
             f"{_SKILL_MD_MARKDOWN_EXECUTION_GUIDE}\n\n"
             "已生成脚本输入 JSON 上下文：\n"
             f"{script_argv_context or '当前未读取到已生成脚本的 strict_json_argv_guard schema；按当前可用的脚本计划、run_args_analysis 和 function_execution_context 事实生成第一版 command，避免编造无来源字段。'}\n\n"

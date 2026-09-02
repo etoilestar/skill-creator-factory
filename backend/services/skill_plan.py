@@ -348,7 +348,32 @@ _ALLOWED_FUNCTION_ITEM_FIELDS = {
     "required_capabilities",
     "constraints",
     "default_values",
+    "responsibility_semantics",
 }
+
+_RESPONSIBILITY_SEMANTIC_FIELDS = {
+    "capabilities", "constraints", "expected_behaviors", "verification_points"
+}
+
+
+def _normalize_responsibility_semantics(value: object, *, source: str, index: int) -> dict[str, list[str]]:
+    """Validate semantic transport without interpreting or enriching its content."""
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        raise ValueError(f"{source}.function_items[{index}].responsibility_semantics must be an object")
+    unknown = set(value) - _RESPONSIBILITY_SEMANTIC_FIELDS
+    if unknown:
+        raise ValueError(
+            f"{source}.function_items[{index}].responsibility_semantics has unknown fields: {sorted(unknown)}"
+        )
+    return {
+        field_name: _normalize_string_array(
+            value.get(field_name, []), source=source, index=index,
+            field=f"responsibility_semantics.{field_name}",
+        )
+        for field_name in _RESPONSIBILITY_SEMANTIC_FIELDS
+    }
 
 
 
@@ -412,7 +437,12 @@ def normalize_structured_function_items(raw_items: object, *, source: str = "pla
     normalized: list[dict[str, object]] = []
     seen_targets: set[str] = set()
     invalid: list[dict[str, object]] = []
-    required = set(_ALLOWED_FUNCTION_ITEM_FIELDS) - {"default_values", "must_do", "must_not_do"}
+    # responsibility_semantics is optional only for persisted pre-contract
+    # graphs; every newly planned FunctionItem is required by the planner
+    # protocol to emit it.
+    required = set(_ALLOWED_FUNCTION_ITEM_FIELDS) - {
+        "default_values", "must_do", "must_not_do", "responsibility_semantics"
+    }
     for index, item in enumerate(raw_items):
         if not isinstance(item, dict):
             invalid.append({"index": index, "type": type(item).__name__})
@@ -450,6 +480,9 @@ def normalize_structured_function_items(raw_items: object, *, source: str = "pla
             inputs = _normalize_port_array(item.get("inputs"), source=source, index=index, field="inputs")
             outputs = _normalize_port_array(item.get("outputs"), source=source, index=index, field="outputs")
             required_capabilities = _normalize_string_array(item.get("required_capabilities"), source=source, index=index, field="required_capabilities")
+            responsibility_semantics = _normalize_responsibility_semantics(
+                item.get("responsibility_semantics"), source=source, index=index
+            )
         except ValueError as exc:
             invalid.append({"index": index, "error": str(exc)})
             continue
@@ -479,7 +512,7 @@ def normalize_structured_function_items(raw_items: object, *, source: str = "pla
             invalid.append({"index": index, "field": "constraints"})
             continue
         seen_targets.add(target)
-        normalized.append({
+        normalized_item = {
             "target_file": target,
             "role": role,
             "purpose": purpose.strip(),
@@ -488,7 +521,13 @@ def normalize_structured_function_items(raw_items: object, *, source: str = "pla
             "required_capabilities": required_capabilities,
             "constraints": [dict(constraint) for constraint in constraints],
             "default_values": dict(default_values),
-        })
+        }
+        # Preserve the legacy wire shape when reading an old graph. Newly
+        # planned graphs carry the field explicitly; no synthetic semantics are
+        # added during normalization.
+        if "responsibility_semantics" in item:
+            normalized_item["responsibility_semantics"] = responsibility_semantics
+        normalized.append(normalized_item)
     if invalid:
         raise ValueError(f"{source}.function_items contains invalid function items: {invalid}")
     return normalized

@@ -6508,6 +6508,7 @@ def _build_responsibility_graph_construction_context(
                     "node": item["target_file"],
                     "inputs": list(item["inputs"]),
                     "outputs": list(item["outputs"]),
+                    "responsibility_semantics": dict(item.get("responsibility_semantics") or {}),
                 }
                 frozen_defaults = dict(item.get("default_values") or {})
                 if frozen_defaults:
@@ -6524,6 +6525,7 @@ def _build_responsibility_graph_construction_context(
                 "node": entry.path,
                 "inputs": list(entry.inputs),
                 "outputs": list(entry.outputs),
+                "responsibility_semantics": {},
             }
             if entry.default_values:
                 node_contract["frozen_defaults"] = dict(entry.default_values)
@@ -6654,6 +6656,18 @@ def _frozen_function_items_from_blueprint(
             "required_capabilities": list(entry.required_capabilities),
             "constraints": list(entry.constraints),
             "default_values": dict(entry.default_values),
+            "responsibility_semantics": {
+                "capabilities": list(entry.must_do or entry.required_capabilities),
+                "constraints": [
+                    str(value.get("name") or value.get("value") or "").strip()
+                    for value in entry.constraints if isinstance(value, dict)
+                    if str(value.get("name") or value.get("value") or "").strip()
+                ] + list(entry.must_not_do),
+                "expected_behaviors": list(entry.must_do),
+                "verification_points": [
+                    f"Verify implementation covers: {value}" for value in entry.must_do
+                ],
+            },
         }
         for entry in (parsed.skill_plan.files if parsed.skill_plan else [])
         if entry.path in allowed
@@ -9216,6 +9230,16 @@ Do not decide which files can become graph nodes beyond declaring the FilePlan i
 FunctionItems and ResponsibilityEdges will be bound in a second protocol binding pass by the same Blueprint Planner after the backend freezes the exact executable target domain from this FilePlan.
 
 The Blueprint must decompose the complete user goal exactly once into the minimum coherent set of executable FunctionItems. Each FunctionItem represents one atomic executable sub-goal. For every FunctionItem: purpose must state the concrete sub-goal completed by this FunctionItem; inputs must declare only data required from the platform or another FunctionItem; outputs must declare only data produced for the platform or another FunctionItem; the FunctionItem must have a distinct execution responsibility; do not create duplicate FunctionItems with equivalent responsibilities. Collectively, the FunctionItems must cover all executable parts of the complete user goal. Do not generate ResponsibilityEdges in the Blueprint. Do not create a second subsystem or grouping layer.
+
+The Responsibility Graph is an authoritative execution contract.
+SkillPlan must only decompose responsibilities into files and implementation steps.
+Do not reinterpret user intent, replace confirmed behaviors, simplify semantic
+constraints, or introduce alternative workflows. Preserve all responsibility
+semantics. Every FunctionItem must include responsibility_semantics with exactly
+capabilities, constraints, expected_behaviors, and verification_points. Extract
+these only from, in priority order: user-confirmed content, constraints already
+fixed by the Blueprint, and requirement analysis. Do not supplement them with
+common assumptions or new business goals.
 
 SCRIPT-LEVEL FUNCTIONITEM CONTRACT
 

@@ -59,6 +59,23 @@ The generated command must consume the resolved runtime interface, not create a 
 The documented execution flow must match the existing runtime contract.
 """
 
+_EXECUTION_SEMANTIC_CONTRACT_PROMPT = """The upstream responsibility semantics are authoritative.
+
+Generated code is an implementation of the responsibility contract.
+
+Do not:
+- implement only the task name
+- replace explicit behavior with common assumptions
+- remove constraints for simplicity
+- create undeclared dependencies
+
+The implementation must satisfy:
+1. declared inputs
+2. declared outputs
+3. responsibility semantics
+4. verification expectations
+"""
+
 def _is_valid_normalized_script_source(file_path: str, content: str) -> bool:
     """Return whether content is safe to accept as the requested raw script.
 
@@ -1327,6 +1344,14 @@ def _script_local_contract_payload(
             "function_item"
         ] = local_function_item
 
+    semantics = local_function_item.get("responsibility_semantics")
+    if not isinstance(semantics, dict):
+        semantics = {}
+    function_execution_context["semantics"] = {
+        key: list(semantics.get(key) or [])
+        for key in ("capabilities", "constraints", "expected_behaviors", "verification_points")
+    }
+
     projection_gaps = (
         _bound_callable_tool_contract_projection_gaps(
             tool_binding_summary
@@ -2169,6 +2194,7 @@ def _build_script_generate_file_prompt_variant(
             "the implementation must not redefine the runtime contract."
         ),
         _RUNTIME_BINDING_AUTHORITY_PROMPT,
+        _EXECUTION_SEMANTIC_CONTRACT_PROMPT,
         (
             "Python scripts/*.py 必须 import 并调用 "
             "strict_json_argv_guard；"

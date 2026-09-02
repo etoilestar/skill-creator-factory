@@ -130,6 +130,7 @@ If it is the user's runtime free-form instruction, use the platform contract's
 canonical free-form-request representation. If it is runtime-uploaded file or
 multimodal content, use the runtime-file representation. If the required value is supplied through a structured parameter source,
 use the structured parameter source declared by the platform contract.
+A FunctionItem may consume multiple different source families simultaneously.
 
 Do not infer that a FunctionItem input is a structured parameter only because
 of its name or shape.source_path only selects a nested value that already exists in the declared
@@ -685,7 +686,10 @@ def _interface_plan_prompt() -> str:
 
 1. AUTHORITATIVE FACTS
 The payload contains confirmed requirements, frozen FunctionItems and their
-logical input/output contracts, runtime_source_required facts, and the platform
+logical input/output contracts, Logical port contracts include semantic type constraints.
+When creating Interface bindings, preserve the declared type and cardinality
+of the logical ports.Do not change a single-value logical input into a different structural form
+unless the FunctionItem contract explicitly declares that structure.runtime_source_required facts, and the platform
 logical input/output contract. These facts are authoritative.
 
 Logical ports are declared FunctionItem/platform input or output names. Opaque
@@ -933,7 +937,8 @@ Do not repeat those deterministic checks.
 Do not trust the Planner conclusion. Independently determine whether the complete
 Interface Plan faithfully realizes confirmed requirements over frozen logical
 ports. For every transfer, decide whether its declared semantic source can
-faithfully satisfy its declared receiving slot, whether source_path selects the
+faithfully satisfy its declared receiving slot, The review must consider the declared logical port type and cardinality
+constraints when evaluating whether a transfer is valid.whether source_path selects the
 intended semantic platform value, and whether selected final platform results
 semantically satisfy the requested output. Do not search for predefined error
 categories and do not propose a repair.

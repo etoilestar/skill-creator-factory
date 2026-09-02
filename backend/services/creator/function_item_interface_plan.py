@@ -74,6 +74,47 @@ Do not route a FunctionItem-produced intermediate semantic value through
 the platform merely so another FunctionItem can consume it.
 
 Do not choose Interface kind from field-name similarity."""
+
+PLATFORM_OUTPUT_MAPPING_CONTRACT = """PLATFORM OUTPUT MAPPING CONTRACT
+
+FunctionItem outputs and platform outputs belong to different semantic layers.
+
+A member output name does not need to be identical to a platform output name.
+
+A different name does not imply compatibility.
+
+The reviewer must verify:
+- the produced value type/meaning
+- the declared platform output contract
+- the user requested result
+
+Name similarity or name difference alone is not evidence.
+
+member_to_platform represents semantic transfer:
+
+FunctionItem output
+        ->
+platform output slot
+
+The reviewer must judge whether the produced semantic value satisfies the
+platform output contract.
+
+Valid example:
+
+A FunctionItem output may have a different name from a platform output slot.
+
+Example:
+
+source_output:
+internal_result
+
+target_platform_output:
+external_result
+
+Do not reject a binding only because source_output and target_platform_output
+have different names.
+"""
+
 RUNTIME_INPUT_PROVENANCE_CONTRACT = """RUNTIME INPUT PROVENANCE CONTRACT
 
 A normal logical FunctionItem input represents one runtime receiving slot.
@@ -87,10 +128,12 @@ For each FunctionItem receiving slot, independently determine the semantic
 value required by that slot and where that value actually originates.
 If it is the user's runtime free-form instruction, use the platform contract's
 canonical free-form-request representation. If it is runtime-uploaded file or
-multimodal content, use the runtime-file representation. If the required value
-is a Skill-specific structured parameter, select the platform contract's
-structured-parameter source and represent any nested parameter using the
-existing source_path protocol. The parameter must already be declared by the
+multimodal content, use the runtime-file representation. If the required value is supplied through a structured parameter source,
+use the structured parameter source declared by the platform contract.
+
+Do not infer that a FunctionItem input is a structured parameter only because
+of its name or shape.source_path only selects a nested value that already exists in the declared
+platform input hierarchy.source_path never creates a new hierarchy or container. The parameter must already be declared by the
 current Skill and must not be invented merely to close coverage.
 If another FunctionItem produces the value, use member_to_member.
 A FunctionItem may consume multiple different source families simultaneously.
@@ -122,6 +165,94 @@ Use source_path=[] when the entire selected top-level platform source value is t
 Use a non-empty source_path only when the semantic source value is nested inside the selected top-level platform source.
 Never omit source_path.
 Do not repeat source_platform_input inside source_path merely to satisfy the schema."""
+
+PLATFORM_INPUT_HIERARCHY_CONTRACT = """PLATFORM INPUT HIERARCHY CONTRACT
+
+Platform input hierarchy is frozen by the upstream Blueprint and runtime contract.
+
+Interface Planner consumes the existing platform input structure.
+It does not redesign, normalize, reorganize, or introduce a new input hierarchy.
+
+A platform input binding must preserve the exact hierarchy declared by the
+upstream platform contract.
+
+For a top-level platform input:
+
+- source_platform_input must reference that declared top-level input.
+- source_path describes only a nested value inside that selected top-level input.
+- source_path must not be used to create an implicit parent container or move
+  the input into another namespace.
+
+Do not infer additional nesting from:
+- target FunctionItem input names
+- semantic similarity between names
+- common parameter grouping patterns
+- expected convenience structures
+
+Only use nested source paths when the upstream platform contract explicitly
+declares that nested structure.
+
+Examples:
+
+Valid:
+
+Platform contract declares:
+
+input:
+  user_parameter
+
+Interface:
+
+source_platform_input:
+  user_parameter
+
+source_path:
+  []
+
+
+Valid:
+
+Platform contract declares:
+
+input:
+  request_context:
+    user_parameter
+
+Interface:
+
+source_platform_input:
+  request_context
+
+source_path:
+  [
+    "user_parameter"
+  ]
+
+
+Invalid:
+
+Platform contract declares:
+
+input:
+  user_parameter
+
+Interface:
+
+source_platform_input:
+  request_context
+
+source_path:
+  [
+    "user_parameter"
+  ]
+
+because request_context.user_parameter is not declared by the upstream
+platform contract.
+
+The Interface Planner may select existing platform sources and nested values,
+but must not invent or transform the platform input hierarchy.
+"""
+
 REFINEMENT_FEEDBACK_CONTRACT = """REFINEMENT FEEDBACK CONTRACT
 
 The previous candidate did not satisfy all acceptance facts. The backend reports
@@ -183,18 +314,6 @@ def _parse_object(text: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise InterfaceIntentPlanError("interface plan must be a JSON object", code="invalid_interface_plan_protocol", details={"path": "$"})
     return value
-
-
-def normalize_interface_review_result(result: dict[str, Any]) -> dict[str, Any]:
-    """Normalize reviewer transport wrappers without making semantic decisions."""
-    if "passed" in result:
-        return result
-
-    review_schema = result.get("review_schema")
-    if isinstance(review_schema, dict):
-        return review_schema
-
-    return result
 
 
 def _require_nonempty_string(value: dict[str, Any], key: str, code: str, path: str) -> str:
@@ -494,28 +613,6 @@ def build_interface_repair_scope(
     }
 
 
-def apply_interface_patch(
-    current_interfaces: list[dict[str, Any]],
-    patches: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Apply minimal model-generated patches while keeping valid Interfaces."""
-    interface_map = {
-        interface["interface_id"]: dict(interface)
-        for interface in current_interfaces
-    }
-    for patch in patches:
-        action = patch.get("action")
-        if action == "modify":
-            interface_id = patch.get("interface_id")
-            if interface_id in interface_map:
-                interface_map[interface_id].update(patch.get("changes", {}))
-        elif action == "add":
-            interface = patch.get("interface")
-            if interface:
-                interface_map[interface["interface_id"]] = dict(interface)
-    return list(interface_map.values())
-
-
 def validate_interface_repair_scope(
     *, before: dict[str, Any], after: dict[str, Any], repair_scope: dict[str, Any]
 ) -> None:
@@ -572,15 +669,19 @@ def build_graph_obligations_from_interfaces(*, interface_plan: dict[str, Any]) -
 def _interface_plan_prompt() -> str:
     return f"""{AUTHORITY_CONTRACT}
 
-{PLATFORM_OUTPUT_CONTRACT}
+    {PLATFORM_OUTPUT_CONTRACT}
 
-{PLATFORM_BOUNDARY_CONTRACT}
+    {PLATFORM_OUTPUT_MAPPING_CONTRACT}
 
-{RUNTIME_INPUT_PROVENANCE_CONTRACT}
+    {PLATFORM_BOUNDARY_CONTRACT}
 
-{MULTIMODAL_INPUT_PROVENANCE_CONTRACT}
+    {PLATFORM_INPUT_HIERARCHY_CONTRACT}
 
-{SOURCE_PATH_CONTRACT}
+    {RUNTIME_INPUT_PROVENANCE_CONTRACT}
+
+    {MULTIMODAL_INPUT_PROVENANCE_CONTRACT}
+
+    {SOURCE_PATH_CONTRACT}
 
 1. AUTHORITATIVE FACTS
 The payload contains confirmed requirements, frozen FunctionItems and their
@@ -607,15 +708,6 @@ Produce a complete semantic Interface Plan over frozen logical ports.
 For every runtime_source_required FunctionItem input choose the semantic source
 value. For every required platform output choose the frozen FunctionItem output.
 Record each choice in structured logical binding fields.
-
-SCRIPT-LEVEL ABSTRACTION
-The Interface Plan represents data flow between complete executable scripts.
-Do not model repeated execution of the same script. When a script processes
-multiple similar inputs internally, keep the Interface at the script boundary
-using its collection input and output ports. Only create separate Interfaces
-when the frozen script contract explicitly declares separate logical outputs or
-independently selectable receiving slots. Never expand an internal loop into
-per-item Interfaces.
 
 4. CURRENT AUTHORITY
 You, not the backend, own and choose the semantic producer using responsibilities, port
@@ -695,29 +787,16 @@ Return strict parseable JSON only."""
     return _parse_object(text)
 
 
-INTERFACE_REVIEW_SEVERITIES = {"blocking", "warning", "advisory"}
-INTERFACE_REVIEW_ISSUE_FIELDS = {"severity", "code", "message", "affected_interfaces", "affected_inputs", "evidence"}
-INTERFACE_REVIEW_SCHEMA = {
-    "passed": "boolean",
-    "issues": [{
-        "severity": "blocking | warning | advisory", "code": "string",
-        "message": "string", "affected_interfaces": ["string"],
-        "affected_inputs": [{"target_member": "string", "target_input": "string"}],
-        "evidence": {"observed": "any", "expected": "any"},
-    }],
-}
+INTERFACE_REVIEW_ISSUE_FIELDS = {"message", "affected_interfaces", "affected_inputs", "evidence"}
+INTERFACE_REVIEW_SCHEMA = {"passed": "boolean", "issues": [{"message": "string", "affected_interfaces": ["string"], "affected_inputs": [{"target_member": "string", "target_input": "string"}], "evidence": {"observed": "any", "expected": "any"}}]}
 
 
 def normalize_interface_review_issue(raw_issue: dict[str, Any], frozen_function_items: list[dict[str, Any]], current_interface_plan: dict[str, Any], *, path: str = "$.issues[]") -> dict[str, Any]:
     """Validate a free-form semantic defect envelope and logical references."""
     if not isinstance(raw_issue, dict) or set(raw_issue) != INTERFACE_REVIEW_ISSUE_FIELDS:
         _raise("semantic review issue has invalid shape", "invalid_interface_semantic_review_protocol", path=path)
-    severity, code = raw_issue["severity"], raw_issue["code"]
     message, interface_ids, affected_inputs, evidence = raw_issue["message"], raw_issue["affected_interfaces"], raw_issue["affected_inputs"], raw_issue["evidence"]
-    if (severity not in INTERFACE_REVIEW_SEVERITIES or not isinstance(code, str) or not code.strip()
-            or not isinstance(message, str) or not message.strip() or not isinstance(interface_ids, list)
-            or not isinstance(affected_inputs, list) or not isinstance(evidence, dict)
-            or set(evidence) != {"observed", "expected"}):
+    if not isinstance(message, str) or not message.strip() or not isinstance(interface_ids, list) or not isinstance(affected_inputs, list) or not isinstance(evidence, dict) or set(evidence) != {"observed", "expected"}:
         _raise("semantic review issue is not auditable", "invalid_interface_semantic_review_protocol", path=path)
     known_interfaces = {str(value.get("interface_id") or "") for value in current_interface_plan.get("interfaces") or []}
     inputs = {item["target_file"]: {value["name"] for value in item["inputs"]} for item in _compact_function_items(frozen_function_items)}
@@ -728,7 +807,7 @@ def normalize_interface_review_issue(raw_issue: dict[str, Any], frozen_function_
         if not isinstance(value, dict) or set(value) != {"target_member", "target_input"} or value.get("target_input") not in inputs.get(value.get("target_member"), set()):
             _raise("review issue references an unknown logical input", "invalid_interface_semantic_review_reference", path=f"{path}.affected_inputs[{index}]")
         normalized_inputs.append(dict(value))
-    envelope = {"severity": severity, "code": code.strip(), "message": message.strip(), "affected_interfaces": list(interface_ids), "affected_inputs": normalized_inputs, "evidence": dict(evidence)}
+    envelope = {"message": message.strip(), "affected_interfaces": list(interface_ids), "affected_inputs": normalized_inputs, "evidence": dict(evidence)}
     return {**envelope, "stage": "interface_semantic_review", "path": path, "interface_id": interface_ids[0] if interface_ids else "", "details": envelope}
 
 
@@ -757,14 +836,35 @@ def _validate_interface_review_response(
         normalize_interface_review_issue(raw, frozen_function_items, interface_plan, path=f"$.issues[{index}]")
         for index, raw in enumerate(value["issues"])
     ]
-    if value["passed"] != (not any(issue["severity"] == "blocking" for issue in issues)):
+    if value["passed"] != (not issues):
         _raise("semantic review passed flag contradicts issues", "invalid_interface_semantic_review_protocol", path="$.passed")
     return issues
 
 
-def blocking_interface_review_issues(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Return only findings that may block the plan or trigger repair."""
-    return [issue for issue in issues if issue.get("severity") == "blocking"]
+async def _reformat_interface_review_response(
+    *, raw_response: str, validation_error: InterfaceIntentPlanError,
+    reviewer_model: str, model_call: ModelCall,
+) -> dict[str, Any]:
+    prompt = """Repair only the JSON protocol shape.
+Preserve every semantic conclusion, message, affected reference, and evidence.
+Do not add, remove, merge, split, or reinterpret issues.
+Every issue must use the single supplied taxonomy-free issue schema.
+Return only the corrected JSON object."""
+    payload = {
+        "review_schema": INTERFACE_REVIEW_SCHEMA,
+        "raw_response": raw_response,
+        "validation_error": {
+            "code": validation_error.code, "message": str(validation_error),
+            "details": validation_error.details,
+        },
+    }
+    logger.info("[Creator][interface_semantic_review_protocol_repair] attempt=1")
+    text = await model_call(
+        [{"role": "system", "content": prompt},
+         {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
+        reviewer_model,
+    )
+    return _parse_object(text)
 
 
 async def review_interface_plan_semantically(
@@ -802,13 +902,19 @@ A plausible goal cannot make an incorrect structured source/target binding valid
 """
     prompt = AUTHORITY_CONTRACT + """
 
-""" + PLATFORM_OUTPUT_CONTRACT + """
+    """ + PLATFORM_OUTPUT_CONTRACT + """
 
-""" + PLATFORM_BOUNDARY_CONTRACT + """
+    """ + PLATFORM_OUTPUT_MAPPING_CONTRACT + """
 
-""" + RUNTIME_INPUT_PROVENANCE_CONTRACT + """
+    """ + PLATFORM_BOUNDARY_CONTRACT + """
 
-""" + SOURCE_PATH_CONTRACT + """
+    """ + PLATFORM_INPUT_HIERARCHY_CONTRACT + """
+
+    """ + RUNTIME_INPUT_PROVENANCE_CONTRACT + """
+
+    """ + MULTIMODAL_INPUT_PROVENANCE_CONTRACT + """
+
+    """ + SOURCE_PATH_CONTRACT + """
 
 1. AUTHORITATIVE FACTS
 The payload contains confirmed requirements, frozen FunctionItem responsibilities
@@ -832,37 +938,11 @@ intended semantic platform value, and whether selected final platform results
 semantically satisfy the requested output. Do not search for predefined error
 categories and do not propose a repair.
 
-SCOPE BOUNDARY
-Review only whether the Interface Plan violates the frozen requirements,
-frozen Blueprint/FunctionItems, or frozen platform/interface contract in the
-payload. Never add an input or output absent from the Blueprint, split an
-existing abstract output, promote an implementation detail into an Interface
-requirement, infer undeclared fields from experience, or change the original
-Interface semantics. In particular, an abstract file_outputs port may carry
-CSV, Markdown, or JSON files and does not require a separate csv_report output.
-An optional fields value does not imply a required fields.primary_key member.
-
-Check whether the Interface Plan exposes internal implementation details of a
-script. A valid Interface represents script-level data exchange, not internal
-loops, per-item handling, or repeated processing. Reuse of one collection port
-must not be interpreted as multiple executions or artificial per-item outputs.
-
 4. EVIDENCE STANDARD
 A structurally valid logical reference is not automatically semantically correct.
 A different valid design is not a defect. Report only a concrete defect in this
-plan, supported by observed and expected facts. Evidence may come only from the
-frozen requirements, frozen Blueprint/FunctionItems, and frozen platform or
-Interface schema in the payload. Do not use inferred best practices, tool
-implementation habits, file/directory naming conventions, or undeclared fields.
-An issue is not a record that a fact was reviewed.
-
-SEVERITY
-Use blocking only when an Interface references a nonexistent input, a
-Blueprint-required output is wholly absent, the data flow cannot connect, or
-parameter types cannot match. These remain blocking even when a plausible
-implementation workaround exists. Use warning for clarity suggestions such as
-more explicit output naming, file-format documentation, or field documentation.
-Use advisory for implementation, filename, or directory-layout suggestions.
+plan, supported by observed and expected facts. An issue is not a record that a
+fact was reviewed.
 
 5. AUTHORITY LIMIT
 Do not select opaque Graph endpoint IDs, generate edges, change Interface records,
@@ -873,23 +953,8 @@ declared, evaluate whether that nested platform value can semantically satisfy
 target_input. Report a defect without proposing another path.
 
 6. OUTPUT CONTRACT
-Verify every affected Interface and logical input exists. passed=false exactly
-when at least one issue has severity=blocking. Warning/advisory issues are
-retained while passed remains true.
-Return the review result directly.
-
-Do not wrap the JSON object in additional keys.
-
-The output root object must contain:
-{
-  "passed": boolean,
-  "issues": []
-}
-
-Do not use:
-{
-  "review_schema": {...}
-}
+Verify every affected Interface and logical input exists. passed=true exactly
+when issues is empty.
 Return only strict JSON matching this schema:
 """ + mode_contract + """
 
@@ -908,18 +973,36 @@ Return only strict JSON matching this schema:
              {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
             reviewer_model,
         )
-    review_result = normalize_interface_review_result(_parse_object(raw_response))
-    issues = _validate_interface_review_response(
-        value=review_result, interface_plan=interface_plan,
-        frozen_function_items=frozen_function_items,
-    )
-    counts = {severity: sum(issue["severity"] == severity for issue in issues)
-              for severity in INTERFACE_REVIEW_SEVERITIES}
-    logger.info(
-        "[Creator][interface_review] phase=interface_review result=%s blocking_issue_count=%d warning_issue_count=%d advisory_issue_count=%d",
-        "failed" if counts["blocking"] else "passed", counts["blocking"],
-        counts["warning"], counts["advisory"],
-    )
+    try:
+        issues = _validate_interface_review_response(
+            value=_parse_object(raw_response), interface_plan=interface_plan,
+            frozen_function_items=frozen_function_items,
+        )
+    except InterfaceIntentPlanError as original_exc:
+        try:
+            reformatted = await _reformat_interface_review_response(
+                raw_response=raw_response, validation_error=original_exc,
+                reviewer_model=reviewer_model, model_call=model_call,
+            )
+            issues = _validate_interface_review_response(
+                value=reformatted, interface_plan=interface_plan,
+                frozen_function_items=frozen_function_items,
+            )
+        except InterfaceIntentPlanError as repair_exc:
+            logger.info("[Creator][interface_semantic_review] result=failed error_code=%s", repair_exc.code)
+            raise InterfaceIntentPlanError(
+                "interface semantic review failed", code="interface_semantic_review_failed",
+                details={
+                    "review_attempts": 1, "protocol_repair_attempts": 1,
+                    "original_error": {"code": original_exc.code, "message": str(original_exc), "details": original_exc.details},
+                    "repair_error": {"code": repair_exc.code, "message": str(repair_exc), "details": repair_exc.details},
+                },
+            ) from repair_exc
+        logger.info("[Creator][interface_semantic_review_protocol_repair] attempt=1 result=success")
+    except Exception:
+        # Model transport failures remain transport failures, not protocol repair.
+        raise
+    logger.info("[Creator][interface_semantic_review] result=%s issue_count=%d", "passed" if not issues else "issues_found", len(issues))
     return issues
 
 
@@ -1008,9 +1091,7 @@ async def _audit_existing_bindings_fail_open(
             exc.code,
         )
         return [], False
-    facts = _existing_binding_acceptance_facts(
-        blocking_interface_review_issues(issues), interface_plan
-    )
+    facts = _existing_binding_acceptance_facts(issues, interface_plan)
     logger.info(
         "[Creator][existing_binding_semantic_review] semantic_audit_available=true issue_count=%d acceptance_fact_count=%d",
         len(issues), len(facts),
@@ -1089,13 +1170,17 @@ async def plan_function_item_interfaces(*, original_user_goal: str, frozen_funct
                  ))
         correction_prompt = f"""{AUTHORITY_CONTRACT}
 
-{PLATFORM_OUTPUT_CONTRACT}
+        {PLATFORM_OUTPUT_CONTRACT}
 
-{PLATFORM_BOUNDARY_CONTRACT}
+        {PLATFORM_OUTPUT_MAPPING_CONTRACT}
 
-{RUNTIME_INPUT_PROVENANCE_CONTRACT}
+        {PLATFORM_BOUNDARY_CONTRACT}
 
-{SOURCE_PATH_CONTRACT}
+        {PLATFORM_INPUT_HIERARCHY_CONTRACT}
+
+        {RUNTIME_INPUT_PROVENANCE_CONTRACT}
+
+        {SOURCE_PATH_CONTRACT}
 
 INTERFACE PLAN CORRECTION
 1. AUTHORITATIVE FACTS
@@ -1108,10 +1193,6 @@ The previous plan failed deterministic acceptance. Reconstruct one complete
 corrected Interface Plan and resolve every supplied acceptance failure
 simultaneously. Facts describe invalid state; they do not prescribe a producer.
 Do not patch only visible wording. Return the complete corrected plan.
-Preserve script-level abstraction: do not split a script into execution
-instances, expose its internal loops, or create artificial per-item or
-intermediate Interfaces. Repair data lineage only over the frozen script-level
-logical ports.
 4. CURRENT AUTHORITY
 Modify only the Interface semantic layer. You may add or remove an Interface,
 revise a logical binding or source_path, and preserve correct bindings. You
@@ -1219,9 +1300,7 @@ Return strict JSON matching INTERFACE_SCHEMA only."""
             reviewer_model=reviewer_model,
             model_call=reviewer_model_call or model_call,
         )
-    combined_issues = merge_interface_validation_issues(
-        blocking_interface_review_issues(review_issues)
-    )
+    combined_issues = merge_interface_validation_issues(review_issues)
     logger.info(
         "[Creator][interface_validation] stage=initial deterministic_issue_count=%d review_issue_count=%d combined_issue_count=%d repairable=%s",
         len(deterministic_issues), len(review_issues), len(combined_issues), bool(combined_issues),
@@ -1278,7 +1357,13 @@ async def repair_interface_plan_semantically(
 
 {RUNTIME_INPUT_PROVENANCE_CONTRACT}
 
+{PLATFORM_OUTPUT_MAPPING_CONTRACT}
+
 {SOURCE_PATH_CONTRACT}
+
+{PLATFORM_INPUT_HIERARCHY_CONTRACT}
+
+{MULTIMODAL_INPUT_PROVENANCE_CONTRACT}
 
 1. AUTHORITATIVE FACTS
 The payload contains the failed complete Interface Plan; frozen FunctionItems
@@ -1314,6 +1399,12 @@ Return only {{"diagnosis":"...","required_postcondition":"..."}}."""
 
 {SOURCE_PATH_CONTRACT}
 
+{PLATFORM_INPUT_HIERARCHY_CONTRACT}
+
+{PLATFORM_OUTPUT_MAPPING_CONTRACT}
+
+{MULTIMODAL_INPUT_PROVENANCE_CONTRACT}
+
 1. AUTHORITATIVE FACTS
 The payload contains the complete failed Interface Plan, frozen FunctionItems,
 requirements and platform contract, blocking issues, deterministic Graph
@@ -1321,24 +1412,6 @@ feedback, one validated Critic diagnosis, legal Interface schema,
 legal member/input domains, and repair_scope.
 
 2. TASK
-You are repairing an existing Interface Plan.
-
-Preserve script-level abstraction while repairing it. Do not split one script
-into multiple execution instances, expand internal iteration into per-item
-transfers, or introduce artificial intermediate Interfaces. Improve data
-lineage between complete scripts. If the frozen script contract itself exposes
-an internal loop instead of a collection boundary, do not simulate a corrected
-contract in the Interface layer; retain the frozen port domain so the contract
-can be corrected by its owning upstream stage.
-
-Important constraints:
-1. Do not regenerate the whole interface plan.
-2. Preserve existing valid interfaces.
-3. Do not remove existing interface_ids.
-4. Only modify interfaces related to reviewer issues.
-5. Add missing interfaces when required.
-6. Return minimal patches only.
-
 Repair the Interface Plan so all supplied blocking facts are resolved simultaneously.
 
 3. SEMANTIC RESPONSIBILITY
@@ -1365,8 +1438,7 @@ The Critic is not edit authority; independently choose the actual repair.
 - Do not infer relationships from filenames or matching field names alone.
 - Do not invent platform inputs merely to close the graph.
 - Preserve unrelated logical bindings. Do not change an unrelated semantic source/receiving-slot identity unless necessary for the complete corrected plan.
-- Existing Interface IDs must be preserved. Record order and goal wording are not
-  semantic preservation requirements.
+- Record order, Interface IDs, and goal wording are not semantic preservation requirements.
 - Repeated member pairs are allowed when transfers are independent.
 - One Interface remains independently bindable to one graph edge.
 - Revise Interface structure as necessary within the editable Interface layer.
@@ -1388,11 +1460,8 @@ are unchanged, no source was selected by names alone, unrelated Interfaces are
 unchanged, and the result differs meaningfully from the failed plan.
 
 8. OUTPUT CONTRACT
-Return only strict JSON in this form:
-{{"patches":[{{"interface_id":"I1","action":"modify","changes":{{...}}}},
-{{"action":"add","interface":{{...complete Interface fields...}}}}]}}
-Do not return a complete Interface Plan. Do not include explanations, Markdown,
-comments, or hidden reasoning.
+Return only the complete Interface Plan JSON matching interface_schema. Do not
+include explanations, Markdown, comments, or hidden reasoning.
 """
     payload = {
         "system_goal": original_user_goal,
@@ -1465,61 +1534,30 @@ Return only strict JSON matching critic_schema."""
 
     async def propose_generator(previous_candidate: Any, feedback: dict[str, Any]) -> Any:
         nonlocal generator_transport_repair_used
-        current_interfaces = (
-            previous_candidate.get("interfaces", [])
-            if isinstance(previous_candidate, dict) else []
-        )
         attempt_payload = {
             **payload,
             "current_interface_plan": previous_candidate,
             "previous_candidate": previous_candidate,
             "refinement_feedback": feedback,
-            "current_interfaces": current_interfaces,
-            "issues": feedback.get("acceptance_facts", validation_issues),
-            "instruction": "Return minimal repair patches only",
         }
-        attempt_prompt = prompt
-        if feedback.get("attempt", 1) > 1:
-            attempt_prompt += """
-
-Previous repair did not pass validation.
-Keep previous valid interfaces.
-Only provide additional minimal patches.
-Do not rewrite the interface plan."""
         text = await model_call(
-            [{"role": "system", "content": attempt_prompt},
+            [{"role": "system", "content": prompt},
              {"role": "user", "content": json.dumps(attempt_payload, ensure_ascii=False, default=str)}],
             planner_model,
         )
         try:
-            repair_result = _parse_object(text)
+            return _parse_object(text)
         except InterfaceIntentPlanError as parse_exc:
             if generator_transport_repair_used:
                 return {"__invalid_transport__": text}
             generator_transport_repair_used = True
             try:
-                repair_result = await _reformat_interface_plan_response(
+                return await _reformat_interface_plan_response(
                     raw_response=text, validation_error=parse_exc,
                     planner_model=planner_model, model_call=model_call,
                 )
             except InterfaceIntentPlanError:
                 return {"__invalid_transport__": text}
-        if "patches" not in repair_result:
-            return {"__invalid_transport__": text}
-        repair_patches = repair_result["patches"]
-        if not isinstance(repair_patches, list):
-            return {"__invalid_transport__": text}
-        try:
-            patched_interfaces = apply_interface_patch(
-                current_interfaces, repair_patches,
-            )
-        except (AttributeError, KeyError, TypeError):
-            return repair_result
-        logger.info(
-            "[Creator][interface_patch_apply] before=%s after=%s patches=%s",
-            len(current_interfaces), len(patched_interfaces), len(repair_patches),
-        )
-        return {"interfaces": patched_interfaces}
 
     async def evaluate_generator(candidate_object: Any) -> CandidateEvaluation:
         try:
@@ -1552,8 +1590,7 @@ Do not rewrite the interface plan."""
                 model_call=reviewer_model_call or model_call,
             )
         graph_issues: list[dict[str, Any]] = []
-        blocking_review_issues = blocking_interface_review_issues(review_issues)
-        if not remaining and not blocking_review_issues and repair_stage == "graph_expansion_feedback":
+        if not remaining and not review_issues and repair_stage == "graph_expansion_feedback":
             # Local import avoids the module cycle: graph expansion consumes Interface helpers.
             from .responsibility_graph_expansion import (
                 validate_responsibility_graph_candidate,
@@ -1572,7 +1609,7 @@ Do not rewrite the interface plan."""
                     "stage": "graph_validation",
                 }]
         residual = merge_interface_validation_issues(
-            remaining, blocking_review_issues, graph_issues,
+            remaining, review_issues, graph_issues,
         )
         return CandidateEvaluation(
             accepted=not residual, candidate=candidate,

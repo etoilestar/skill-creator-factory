@@ -92,6 +92,33 @@ def test_script_generation_prompt_contains_platform_io_bans_and_helper_filename_
     assert "filename=full_path" in text
 
 
+def test_script_generation_prompt_declares_runtime_binding_authority_and_ports():
+    text = _prompt_text(_build_script_generate_file_prompt_variant(
+        file_path="scripts/report.py",
+        skill_name="demo",
+        purpose="create report",
+        blueprint_text="",
+        role="generic_script",
+        skill_plan_entry={
+            "path": "scripts/report.py",
+            "role": "generic_script",
+            "runtime": "python",
+            "inputs": ["input_files", "fields"],
+            "input_binding": [
+                {"argv_key": "input_files", "value_type": "file_list"},
+                {"argv_key": "fields", "value_type": "object"},
+            ],
+        },
+        variant="standard",
+    ))
+    assert "## Runtime Binding Authority" in text
+    assert "not designing the caller protocol" in text
+    assert "wrap existing inputs into another object" in text
+    assert '"name": "input_files"' in text
+    assert '"type": "file_list"' in text
+    assert '"binding_status": "resolved"' in text
+
+
 def test_skill_md_prompt_requires_role_inputs_outputs_action_schema():
     text = _prompt_text(_build_generate_file_prompt(
         file_path="SKILL.md",
@@ -121,6 +148,9 @@ def test_skill_md_prompt_preserves_frozen_binding_authority():
     assert "FIRST-ROUND BINDING AUTHORITY" in text
     assert "available_sources may be considered only for unresolved_target_keys" in text
     assert "Frozen Interface / Graph > command_alignment_snapshot" in text
+    assert "The execution environment already provides runtime inputs" in text
+    assert "It should not describe a new invocation protocol" in text
+    assert "custom JSON request bodies" in text
 
 
 @pytest.mark.parametrize("bad_new", [

@@ -40,13 +40,26 @@ No later stage may silently revise an upstream frozen fact outside its declared 
 PLATFORM_OUTPUT_CONTRACT = """PLATFORM OUTPUT CONTRACT
 
 final_output_fields defines the legal platform-output domain.
-required_final_output_fields, when explicitly present, defines the platform
-outputs that this Skill must produce.
-Do not treat every legal final_output_field as required.
-When no explicit required_final_output_fields are supplied, use the confirmed
-user requirements and Blueprint semantics to determine which legal final
-outputs are semantically required.
-Every selected platform output must belong to final_output_fields."""
+
+Platform output field names are canonical contract identifiers, not natural
+language descriptions.
+
+The Interface Planner must select an existing platform output field exactly.
+It must not rename, refine, generalize, specialize, or replace a platform output
+field according to the content format, presentation style, or implementation
+detail.
+
+For example:
+- a textual result does not create a new "markdown" platform output;
+- a document-like result does not create a new "report" platform output;
+- a generated artifact does not create a new output slot.
+
+A FunctionItem output name and a platform output name belong to different
+semantic layers. Their names may differ, but the target_platform_output must
+always be selected from the declared platform output contract.
+
+Every selected platform output must belong to final_output_fields.
+"""
 PLATFORM_BOUNDARY_CONTRACT = """PLATFORM BOUNDARY CONTRACT
 
 Platform logical inputs are semantic values supplied by the host at or
@@ -79,7 +92,13 @@ PLATFORM_OUTPUT_MAPPING_CONTRACT = """PLATFORM OUTPUT MAPPING CONTRACT
 
 FunctionItem outputs and platform outputs belong to different semantic layers.
 
-A member output name does not need to be identical to a platform output name.
+A member output name does not need to be identical to a platform output name,
+but the platform output side is always restricted to the declared platform
+output contract.
+
+The planner may map an internal output to an existing platform output slot.
+It may never create a new platform output slot because the internal output has
+a particular representation or format.
 
 A different name does not imply compatibility.
 
@@ -764,6 +783,20 @@ semantically required platform output: (3) identify the member_to_platform
 Interface that produces it. Do not return until every required receiving slot
 and required final result is accounted for. The coverage ledger is internal
 verification only. Do not output the ledger.
+
+OUTPUT FIELD IDENTITY CHECK
+
+Before returning:
+For every member_to_platform Interface:
+
+1. Identify the semantic value produced by the FunctionItem.
+2. Identify the existing platform output field that represents the required
+external result.
+3. Verify target_platform_output is copied from the platform contract exactly.
+
+Do not output a descriptive label as target_platform_output.
+Do not output a format name, file format name, or presentation name unless it
+is explicitly declared as a platform output field.
 
 7. OUTPUT CONTRACT
 Return only strict JSON matching this schema:

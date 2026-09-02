@@ -46,10 +46,15 @@ SKILL.md should describe how the skill uses existing inputs.
 
 It should not describe a new invocation protocol.
 
-Do not introduce:
-- custom JSON request bodies
-- wrapper parameters
-- alternative input formats
+The command block is a runtime binding declaration.
+
+It maps existing platform/runtime values into the script entry contract.
+
+It must preserve the value boundary and semantic meaning defined by the upstream runtime contract.
+
+Do not reinterpret, reconstruct, or redesign runtime inputs inside the command block.
+
+The generated command must consume the resolved runtime interface, not create a new caller interface.
 
 The documented execution flow must match the existing runtime contract.
 """
@@ -2592,7 +2597,10 @@ def _build_generate_file_prompt(
             "10c. 普通字符串只允许用于明确的 literal_default、runtime_constant、reference_file、asset_file 或脚本默认值；输入值如果是动态值，应能从平台 input envelope、责任图谱 incoming edge 或前序 stdout 解析。\n"
             "11. 若需要数值默认值，直接写固定 JSON 数字；不要把动态数值 placeholder 裸露在 JSON 中。\n"
             "12. 批量处理、列表处理或多文件处理应由对应脚本内部完成，SKILL.md 静态说明中不展开自然语言循环。\n"
-            "13. 列表或对象字段必须通过整值占位符传递；不要写成由无来源拆分字段拼接的列表。\n"
+            "13. Command block 中的输入 JSON 只负责表达已存在 runtime binding 到脚本入口的传递关系。\n"
+            "placeholder 表示 runtime contract 中某个已解析输入的完整绑定结果，而不是待拼接的文本片段或待重新设计的数据结构。\n"
+            "生成 command 时必须保持 runtime contract 定义的数据边界，不得通过新增包装层、重新组织字段层级或构造新的中间协议改变输入语义。\n"
+            "Command block 不负责定义新的输入 schema；任何输入结构设计都必须来自已有 SkillPlan/runtime_contract/script contract。\n"
             "14. 如果 authoritative / declared SkillPlan paths 中存在 references/**，SKILL.md 正文必须在“参考资料/资源”小节明确引用每个已确认 reference，并说明何时读取。\n"
             "15. 不要在输出内容的外侧套 ``` 代码块，但 SKILL.md 正文内部必须按需包含标准 ```bash fenced code block。\n"
             "16. 禁止只写隐式执行描述；必须写明可执行 fenced block。\n"

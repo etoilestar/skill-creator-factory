@@ -59,23 +59,6 @@ The generated command must consume the resolved runtime interface, not create a 
 The documented execution flow must match the existing runtime contract.
 """
 
-_EXECUTION_SEMANTIC_CONTRACT_PROMPT = """The upstream responsibility semantics are authoritative.
-
-Generated code is an implementation of the responsibility contract.
-
-Do not:
-- implement only the task name
-- replace explicit behavior with common assumptions
-- remove constraints for simplicity
-- create undeclared dependencies
-
-The implementation must satisfy:
-1. declared inputs
-2. declared outputs
-3. responsibility semantics
-4. verification expectations
-"""
-
 def _is_valid_normalized_script_source(file_path: str, content: str) -> bool:
     """Return whether content is safe to accept as the requested raw script.
 
@@ -871,7 +854,219 @@ def _script_responsibility_requirements_payload(
 
     return payload
 
+def _build_interface_semantics(
+    *,
+    plan_entry: SkillPlanEntry,
+    canonical_contract: Any,
+    function_execution_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Build prompt-visible runtime interface semantics.
 
+    This is NOT a new contract.
+    It only projects existing:
+    - SkillPlan inputs/outputs
+    - runtime bindings
+    - ResponsibilityGraph edges
+
+    into a semantic view for code generation.
+
+    No business keywords are inferred.
+    No filename/role matching is performed.
+    """
+
+    context = (
+        function_execution_context
+        if isinstance(function_execution_context, dict)
+        else {}
+    )
+
+    input_bindings = {}
+
+    bindings = (
+            getattr(plan_entry, "input_binding", None)
+            or getattr(plan_entry, "command_arg_bindings", None)
+            or (
+                plan_entry.runtime_contract.get("input_binding")
+                if isinstance(plan_entry.runtime_contract, dict)
+                else None
+            )
+            or []
+    )
+
+    for item in bindings:
+        if not isinstance(item, dict):
+            continue
+
+        key = (
+            item.get("argv_key")
+            or item.get("name")
+            or item.get("to_field")
+        )
+
+        if key:
+            input_bindings[str(key)] = item
+
+
+    inputs = []
+
+    for raw_input in (
+        canonical_contract.inputs
+        or []
+    ):
+        if isinstance(raw_input, dict):
+            name = str(
+                raw_input.get("name")
+                or ""
+            )
+            schema = dict(raw_input)
+        else:
+            name = str(raw_input)
+            schema = {
+                "name": name
+            }
+
+        if not name:
+            continue
+
+        binding = input_bindings.get(
+            name,
+            {}
+        )
+
+        inputs.append(
+            {
+                "name": name,
+                "type": (
+                    binding.get("value_type")
+                    or binding.get("type")
+                    or schema.get("type")
+                    or "unknown"
+                ),
+                "required": (
+                    binding.get("required")
+                    if "required" in binding
+                    else True
+                ),
+                "source": {
+                    "kind": (
+                        binding.get("source_kind")
+                        or "runtime_binding"
+                    ),
+                    "ref": (
+                        binding.get("source")
+                        or binding.get("from_field")
+                        or ""
+                    ),
+                },
+                "schema": schema,
+            }
+        )
+
+
+    outputs = []
+
+    outgoing_edges = (
+        context.get("outgoing_edges")
+        if isinstance(
+            context.get("outgoing_edges"),
+            list,
+        )
+        else []
+    )
+
+
+    downstream = {}
+
+    for edge in outgoing_edges:
+        if not isinstance(edge, dict):
+            continue
+
+        source = (
+            edge.get("from_output")
+            or ""
+        )
+
+        target = (
+            edge.get("to_node")
+            or ""
+        )
+
+        if source:
+            downstream.setdefault(
+                str(source),
+                [],
+            ).append(
+                str(target)
+            )
+
+
+    for raw_output in (
+        canonical_contract.outputs
+        or []
+    ):
+
+        if isinstance(raw_output, dict):
+            name = str(
+                raw_output.get("name")
+                or ""
+            )
+            schema = dict(raw_output)
+
+        else:
+            name = str(raw_output)
+            schema = {
+                "name": name
+            }
+
+        if not name:
+            continue
+
+
+        outputs.append(
+            {
+                "name": name,
+                "type": (
+                    schema.get("type")
+                    or "unknown"
+                ),
+                "consumer": (
+                    downstream.get(name)
+                    or [
+                        "platform_output"
+                    ]
+                ),
+                "schema": schema,
+            }
+        )
+
+
+    return {
+        "purpose": (
+            getattr(
+                plan_entry,
+                "purpose",
+                ""
+            )
+            or ""
+        ),
+
+        "inputs": inputs,
+
+        "outputs": outputs,
+
+        "authority": [
+            "SkillPlan.input_binding",
+            "canonical_contract",
+            "ResponsibilityGraph edges",
+        ],
+
+        "rule": (
+            "Field names describe runtime ports. "
+            "Semantic meaning comes from bindings "
+            "and graph edges, not names."
+        ),
+    }
 
 def _tool_function_card_from_available_tool(tool: dict[str, Any]) -> str:
     function_name = str(tool.get("function_name") or "").strip()
@@ -1245,6 +1440,7 @@ def _script_local_contract_payload(
             stdout_schema,
         )
     )
+
     responsibility_requirements = (
         _script_responsibility_requirements_payload(
             file_path=file_path,
@@ -1313,6 +1509,12 @@ def _script_local_contract_payload(
         )
     else:
         function_execution_context = dict(function_execution_context)
+
+    interface_semantics = _build_interface_semantics(
+        plan_entry=plan_entry,
+        canonical_contract=canonical_contract,
+        function_execution_context=function_execution_context,
+    )
     platform_contract = build_platform_io_contract()
 
     stdout_schema = _project_terminal_sink_schema_to_stdout(
@@ -1343,14 +1545,6 @@ def _script_local_contract_payload(
         function_execution_context[
             "function_item"
         ] = local_function_item
-
-    semantics = local_function_item.get("responsibility_semantics")
-    if not isinstance(semantics, dict):
-        semantics = {}
-    function_execution_context["semantics"] = {
-        key: list(semantics.get(key) or [])
-        for key in ("capabilities", "constraints", "expected_behaviors", "verification_points")
-    }
 
     projection_gaps = (
         _bound_callable_tool_contract_projection_gaps(
@@ -1414,6 +1608,8 @@ def _script_local_contract_payload(
         )
         runtime_input_ports.append({
             "name": input_name,
+            "declared_schema": raw_input,
+            "binding": binding,
             "type": declared_type,
             "binding_status": "resolved",
         })
@@ -1425,11 +1621,16 @@ def _script_local_contract_payload(
         "script_goal": purpose,
         "inputs": canonical_contract.inputs,
         "outputs": canonical_contract.outputs,
+        "interface_semantics": interface_semantics,
         "responsibility_requirements": (
             responsibility_requirements
         ),
         "function_item_graph_context": function_execution_context,
         "function_execution_context": function_execution_context,
+        "functional_requirements": canonical_contract.functional_requirements,
+        "side_effects": canonical_contract.side_effects,
+        "upstream_dependencies": canonical_contract.upstream_dependencies,
+        "downstream_consumers": canonical_contract.downstream_consumers,
         "available_tools": available_tools,
         "resolved_tools": resolved_tools,
         "tool_function_cards": (
@@ -2179,6 +2380,28 @@ def _build_script_generate_file_prompt_variant(
             "并向 stdout 输出一个 JSON object。"
         ),
         (
+            """
+            CURRENT SCRIPT RESPONSIBILITY CONTRACT
+            
+            Before writing code, freeze the responsibility boundary.
+            
+            The only authority for what this script should implement is:
+            
+            1. FunctionItem.must_do
+            2. FunctionItem.constraints
+            3. Incoming ResponsibilityEdges
+            4. Outgoing ResponsibilityEdges
+            
+            Do not expand responsibility because:
+            - tool exists
+            - capability exists
+            - blueprint mentions related actions
+            - filename suggests another role
+            
+            Every generated line of business logic must serve current FunctionItem.
+            """
+        ),
+        (
             "Generated scripts must strictly follow the declared input/output contracts.\n"
             "The contract schema is the only source of truth.\n"
             "Do not infer data structures from variable names, task descriptions, examples, "
@@ -2193,8 +2416,29 @@ def _build_script_generate_file_prompt_variant(
             "The implementation should adapt its internal logic to the runtime contract;"
             "the implementation must not redefine the runtime contract."
         ),
+        (
+            """
+            INTERFACE SEMANTICS AUTHORITY
+        
+            interface_semantics is the semantic projection of the runtime interface.
+        
+            When implementing inputs:
+            1. Use interface_semantics.inputs to understand where runtime values come from.
+            2. Do not infer meaning from field names.
+            3. Do not create synthetic runtime values.
+            4. Do not replace runtime-bound inputs with demo files, placeholders, examples,
+               or locally generated samples.
+        
+            When implementing outputs:
+            1. Use interface_semantics.outputs to understand downstream responsibility.
+            2. The output object must preserve the declared output contract.
+            3. Do not rename fields or create alternative output schemas.
+        
+            interface_semantics explains the existing runtime contract.
+            It does not authorize redesigning the contract.
+            """
+        ),
         _RUNTIME_BINDING_AUTHORITY_PROMPT,
-        _EXECUTION_SEMANTIC_CONTRACT_PROMPT,
         (
             "Python scripts/*.py 必须 import 并调用 "
             "strict_json_argv_guard；"

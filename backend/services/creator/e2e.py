@@ -1114,7 +1114,6 @@ def _normalize_e2e_placeholder_expr(expr: str) -> str:
     parsed = parse_placeholder_expr(expr)
     return parsed.dotted if parsed else str(expr or "").strip()
 
-
 def _canonical_e2e_shape(raw: Any) -> str:
     text = str(raw or "").strip().lower()
     text = text.replace("array", "list").replace("path", "file_path")
@@ -1146,6 +1145,30 @@ def _canonical_e2e_shape(raw: Any) -> str:
     if text in {"str", "string", "text", "scalar"}:
         return "string"
     return text
+
+def _resolve_e2e_runtime_shape(spec: E2ETypedInputSpec) -> str:
+    """
+    Resolve runtime input shape.
+
+    Higher confidence sources should override fallback inference.
+    """
+
+    candidates = [
+        getattr(spec, "argv_schema_shape", None),
+        getattr(spec, "platform_io_shape", None),
+        getattr(spec, "graph_declared_shape", None),
+        getattr(spec, "skill_plan_declared_shape", None),
+        spec.shape,
+    ]
+
+    for value in candidates:
+        if value:
+            normalized = _canonical_e2e_shape(value)
+
+            if normalized and normalized != "string":
+                return normalized
+
+    return _canonical_e2e_shape(spec.shape or "string")
 
 
 def _shape_item_shape(shape: str) -> str:
@@ -1382,9 +1405,24 @@ def _collect_e2e_typed_inputs_from_graph(
         for expr in _placeholder_exprs_from_value(command.argv_template):
             normalized = _normalize_e2e_placeholder_expr(expr)
             root = _placeholder_root(normalized)
-            if root:
+
+            # placeholder 只能补充未知输入
+            # 不允许覆盖 requirement_graph / contract 已定义的类型
+            if root and root not in specs:
                 shape = "list" if _e2e_placeholder_uses_index(normalized) else "string"
-                _put_typed_spec(specs, E2ETypedInputSpec(name=root, shape=shape, item_shape=_shape_item_shape(shape), required=True, source="placeholder", target_file=command.script_path, confidence="low"))
+
+                _put_typed_spec(
+                    specs,
+                    E2ETypedInputSpec(
+                        name=root,
+                        shape=shape,
+                        item_shape=_shape_item_shape(shape),
+                        required=True,
+                        source="placeholder",
+                        target_file=command.script_path,
+                        confidence="low",
+                    ),
+                )
             if root:
                 path = normalized[len(root):].lstrip(".")
                 indexes = [int(value) for value in re.findall(r"(?:^|\.)(\d+)(?:\.|$)", normalized)]
@@ -1924,7 +1962,7 @@ def _materialize_e2e_sample_value(
     *,
     skill_dir: Path | None,
 ) -> Any:
-    shape = _canonical_e2e_shape(spec.shape)
+    shape = _resolve_e2e_runtime_shape(spec)
     skill_md = _read_e2e_skill_md_for_samples(skill_dir)
     script_content = _read_e2e_script_for_samples(skill_dir, spec.target_file)
 

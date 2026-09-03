@@ -575,6 +575,58 @@ def validate_interface_intent_plan(*, plan: dict[str, Any], function_items: list
     )
     return {"interfaces": normalized}
 
+def generate_provenance_candidates(
+    *,
+    target_member: str,
+    target_input: str,
+    compact_function_items: list[dict[str, Any]],
+    platform_inputs: set[str],
+) -> list[dict[str, Any]]:
+    """
+    Generate possible semantic provenance candidates.
+
+    This function only discovers possible sources.
+    It never decides the final Interface.
+
+    Semantic selection remains owned by Interface Planner.
+    """
+
+    candidates: list[dict[str, Any]] = []
+
+    # Candidate 1:
+    # external platform inputs
+    for source in sorted(platform_inputs):
+        candidates.append(
+            {
+                "kind": "platform_to_member",
+                "source_platform_input": source,
+                "source_path": [],
+                "target_member": target_member,
+                "target_input": target_input,
+                "evidence": "declared platform input source",
+            }
+        )
+
+    # Candidate 2:
+    # outputs from frozen FunctionItems
+    for item in compact_function_items:
+        source_member = item["target_file"]
+
+        for output in item.get("outputs", []):
+            output_name = output["name"]
+
+            candidates.append(
+                {
+                    "kind": "member_to_member",
+                    "source_member": source_member,
+                    "source_output": output_name,
+                    "target_member": target_member,
+                    "target_input": target_input,
+                    "evidence": "declared FunctionItem output source",
+                }
+            )
+
+    return candidates
 
 def collect_interface_plan_validation_issues(
     *, plan: dict[str, Any], function_items: list[dict[str, Any]],
@@ -630,6 +682,13 @@ def collect_interface_plan_validation_issues(
             if target not in platform_outputs: issue("unknown_platform_logical_output", f"{path}.target_platform_output", iid, target, sorted(platform_outputs))
             else: covered_platform.add(target)
     for member, slot in sorted(required_slots - covered_slots):
+        candidates = generate_provenance_candidates(
+            target_member=member,
+            target_input=slot,
+            compact_function_items=compact,
+            platform_inputs=platform_inputs,
+        )
+
         issue(
             "uncovered_required_logical_input",
             "$.interfaces",
@@ -637,11 +696,15 @@ def collect_interface_plan_validation_issues(
             {
                 "target_member": member,
                 "target_input": slot,
+
+                "provenance_candidates": candidates,
+
                 "repair_constraint": {
                     "type": "missing_receiving_slot_binding",
                     "target_member": member,
                     "target_input": slot,
-                    "required_action": "establish_one_valid_semantic_provenance",
+                    "required_action":
+                        "establish_one_valid_semantic_provenance",
                 },
             },
             "at least one Interface"
@@ -1545,7 +1608,18 @@ INTERFACE_SCHEMA and the shared contracts above define the protocol.
 3. CURRENT TASK
 The previous plan failed deterministic acceptance. Reconstruct one complete
 corrected Interface Plan and resolve every supplied acceptance failure
-simultaneously. Facts describe invalid state; they do not prescribe a producer.
+simultaneously. Facts describe invalid state.
+
+When validation facts contain provenance_candidates,
+they represent backend-discovered possible semantic origins.
+
+They are not final decisions.
+
+Evaluate these candidates semantically and choose the source
+that actually provides the required value.
+
+Do not ignore available provenance candidates.
+Do not invent a source outside the declared candidate domain.
 Do not patch only visible wording. Return the complete corrected plan.
 4. CURRENT AUTHORITY
 Modify only the Interface semantic layer. You may add or remove an Interface,
@@ -1780,6 +1854,12 @@ When validation_issues contain repair_constraint:
 - do not reinterpret the obligation;
 - determine only the missing semantic provenance.
 
+When validation_issues contain provenance_candidates:
+
+- treat them as legal provenance search results;
+- select a candidate only when it satisfies the FunctionItem contract;
+- if none is semantically valid, reconstruct from authoritative upstream facts;
+- do not solve missing coverage by renaming ports or inventing new platform inputs.
 The backend defines what contract obligation is missing.
 The Generator decides how the semantic binding satisfies it.
 The Critic is authoritative only for diagnosis and required_postcondition. Any concrete Interface ID, edit operation, patch wording, source choice, or target choice appearing incidentally in Critic text is non-authoritative. Independently determine the repair from upstream facts and validation evidence. Prefer the smallest coherent SEMANTIC change that fully satisfies all acceptance facts. Completeness and correctness take priority over minimizing edits. 

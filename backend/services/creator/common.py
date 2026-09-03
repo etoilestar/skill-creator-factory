@@ -222,6 +222,34 @@ class RequirementConstraint(BaseModel):
     evidence_policy: dict[str, Any] = Field(default_factory=dict)
 
 
+class ResponsibilitySemantics(BaseModel):
+    """Execution-semantic contract attached to one responsibility node.
+
+    These are deliberately open natural-language lists.  They transport facts
+    already decided upstream; they are not a vocabulary of business rules.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    capabilities: list[str] = Field(default_factory=list)
+    constraints: list[str] = Field(default_factory=list)
+    expected_behaviors: list[str] = Field(default_factory=list)
+    verification_points: list[str] = Field(default_factory=list)
+
+    @field_validator("capabilities", "constraints", "expected_behaviors", "verification_points", mode="before")
+    @classmethod
+    def _normalize_semantic_list(cls, value: Any) -> list[str]:
+        if value in (None, ""):
+            return []
+        values = value if isinstance(value, list) else [value]
+        result: list[str] = []
+        for raw in values:
+            text = str(raw or "").strip()
+            if text and text not in result:
+                result.append(text)
+        return result
+
+
 class FunctionItem(BaseModel):
     """Compact per-script executable function item.
 
@@ -261,6 +289,7 @@ class FunctionItem(BaseModel):
     optional_tools: list[str] = Field(default_factory=list)
     must_do: list[str] = Field(default_factory=list)
     must_not_do: list[str] = Field(default_factory=list)
+    responsibility_semantics: ResponsibilitySemantics = Field(default_factory=ResponsibilitySemantics)
     constraints: list[RequirementConstraint] = Field(default_factory=list, exclude=True)
     evidence_policy: dict[str, Any] = Field(default_factory=dict, exclude=True)
 
@@ -356,6 +385,7 @@ def function_item_prompt_payload(item: Any) -> dict[str, Any]:
     if requirement is None:
         return {"value": str(item)}
     payload = requirement.model_dump(mode="json")
+    payload["responsibility_semantics"] = requirement.responsibility_semantics.model_dump(mode="json")
     payload["constraints"] = [
         constraint.model_dump(mode="json")
         for constraint in requirement.constraints

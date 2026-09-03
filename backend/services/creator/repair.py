@@ -2501,6 +2501,10 @@ async def _request_and_apply_repair_patch(
             "如果 validator 解释与 Traceback 冲突，"
             "以 Traceback 为准。"
             "不要修改与 Traceback 无关的位置。"
+            " Before repairing runtime failures, check whether the implementation "
+            "violates the upstream responsibility contract. Do not fix failures by "
+            "removing required behaviors or replacing the intended behavior with a "
+            "simpler assumption. Repair should restore contract compliance."
         )
 
     argv_probe_note = ""
@@ -5115,6 +5119,10 @@ async def _run_script_responsibility_review(
             "content": (
                 "你是 Creator 第一轮单脚本职责审查模型，只输出严格 JSON object。\n\n"
 
+                "Responsibility Graph semantics are the authoritative execution contract. "
+                "Review only whether the generated implementation realizes that contract; do not add business requirements. "
+                "Classify semantic violations as missing_capability, violated_constraint, output_mismatch, or undeclared_assumption.\n\n"
+
                 "你只判断当前 scripts/** 源码是否覆盖自身负责的语义任务；也就是只判断当前脚本是否完成自身职责、是否完成 purpose 短合同表达的职责。"
                 "不要判断其它文件、workflow、字段名、审美或充分性细节；不要求固定字段名。\n\n"
 
@@ -5179,6 +5187,8 @@ async def _run_script_responsibility_review(
 
                 "返回 JSON object：\n"
                 "{\n"
+                "  \"semantic_consistent\": true|false,\n"
+                "  \"violations\": [{\"type\": \"missing_capability|violated_constraint|output_mismatch|undeclared_assumption\", \"evidence\": \"...\"}],\n"
                 "  \"passed\": true|false,\n"
                 "  \"blocking_issues\": [\n"
                 "    {\n"

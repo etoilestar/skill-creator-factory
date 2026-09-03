@@ -172,7 +172,26 @@ RUNTIME_INPUT_PROVENANCE_CONTRACT = """RUNTIME INPUT PROVENANCE CONTRACT
 A normal logical FunctionItem input represents one runtime receiving slot.
 In the current execution contract, one receiving slot has one runtime
 provenance. The same source output may fan out to multiple different receiving
-slots. Multiple independent sources must not target the same logical input."""
+slots. Multiple independent sources must not target the same logical input.
+
+RUNTIME SLOT IDENTITY RULE
+
+Each FunctionItem input declaration is an independent contract.
+
+Coverage is evaluated by:
+
+(target_member, target_input)
+
+not by input name or semantic value.
+
+If multiple FunctionItems declare the same input name,
+each FunctionItem requires an independent binding.
+
+Do not assume:
+- caller input propagation;
+- shared runtime state;
+- implicit inheritance;
+- execution order provides input availability."""
 MULTIMODAL_INPUT_PROVENANCE_CONTRACT = """MULTIMODAL INPUT PROVENANCE CONTRACT
 
 No platform input source is universally required.
@@ -611,9 +630,37 @@ def collect_interface_plan_validation_issues(
             if target not in platform_outputs: issue("unknown_platform_logical_output", f"{path}.target_platform_output", iid, target, sorted(platform_outputs))
             else: covered_platform.add(target)
     for member, slot in sorted(required_slots - covered_slots):
-        issue("uncovered_required_logical_input", "$.interfaces", "", {"target_member": member, "target_input": slot}, "at least one Interface")
+        issue(
+            "uncovered_required_logical_input",
+            "$.interfaces",
+            "",
+            {
+                "target_member": member,
+                "target_input": slot,
+                "repair_constraint": {
+                    "type": "missing_receiving_slot_binding",
+                    "target_member": member,
+                    "target_input": slot,
+                    "required_action": "establish_one_valid_semantic_provenance",
+                },
+            },
+            "at least one Interface"
+        )
     for output in sorted(required_platform_outputs - covered_platform):
-        issue("uncovered_required_platform_output", "$.interfaces", "", {"target_platform_output": output}, "at least one Interface")
+        issue(
+            "uncovered_required_platform_output",
+            "$.interfaces",
+            "",
+            {
+                "target_platform_output": output,
+                "repair_constraint": {
+                    "type": "missing_terminal_output_binding",
+                    "target_platform_output": output,
+                    "required_action": "establish_one_valid_member_to_platform_binding",
+                },
+            },
+            "at least one Interface"
+        )
     if not required_platform_outputs and not covered_platform:
         issue("missing_platform_terminal", "$.interfaces", "", {}, "at least one legal member_to_platform Interface")
     logger.info("[Creator][interface_closure] runtime_required_slot_count=%d covered_required_slot_count=%d uncovered_required_slots=%s required_platform_output_count=%d covered_platform_output_count=%d",
@@ -682,6 +729,55 @@ def validate_interface_repair_scope(
     if before_list and not after_list:
         _raise("repair cannot erase the complete Interface Plan", "interface_repair_scope_error", path="$.interfaces")
 
+def interface_receiving_slot_identity(interface: dict[str, Any]) -> tuple[str, str] | None:
+    """
+    Return the logical receiving slot satisfied by an Interface.
+
+    Receiving slot identity is:
+        (target_member, target_input)
+
+    This is a contract identity, independent of:
+    - business domain
+    - input name
+    - data type
+    - implementation detail
+    """
+    kind = interface.get("kind")
+
+    if kind in {
+        "platform_to_member",
+        "member_to_member",
+    }:
+        target_member = str(interface.get("target_member") or "").strip()
+        target_input = str(interface.get("target_input") or "").strip()
+
+        if target_member and target_input:
+            return (
+                target_member,
+                target_input,
+            )
+
+    return None
+
+
+def interface_receiving_slot_signature(
+    plan: dict[str, Any]
+) -> tuple[tuple[str, str], ...]:
+    """
+    Semantic signature of covered receiving slots.
+
+    Used by refinement to distinguish:
+    same-looking interface plans that still
+    miss different contractual obligations.
+    """
+    slots = []
+
+    for interface in plan.get("interfaces") or []:
+        slot = interface_receiving_slot_identity(interface)
+        if slot:
+            slots.append(slot)
+
+    return tuple(sorted(set(slots), key=repr))
 
 def canonical_logical_binding_signatures(plan: dict[str, Any]) -> tuple[tuple[Any, ...], ...]:
     """Return a multiplicity-preserving semantic identity, ignoring presentation."""
@@ -1532,7 +1628,10 @@ Return strict JSON matching INTERFACE_SCHEMA only."""
                 stage="interface_plan_correction", initial_candidate=parsed,
                 initial_evaluation=initial_evaluation, propose=propose_correction,
                 evaluate=evaluate_correction,
-                semantic_signature=lambda value: canonical_logical_binding_signatures(value)
+                semantic_signature=lambda value: (
+                    canonical_logical_binding_signatures(value),
+                    interface_receiving_slot_signature(value),
+                )
                 if isinstance(value, dict) and "interfaces" in value else value,
                 max_attempts=2,
             )
@@ -1673,11 +1772,28 @@ legal member/input domains, and repair_scope.
 Repair the Interface Plan so all supplied blocking facts are resolved simultaneously.
 
 3. SEMANTIC RESPONSIBILITY
-The Critic is authoritative only for diagnosis and required_postcondition. Any concrete Interface ID, edit operation, patch wording, source choice, or target choice appearing incidentally in Critic text is non-authoritative. Independently determine the repair from upstream facts and validation evidence. Prefer the smallest coherent SEMANTIC change that fully satisfies all acceptance facts. Completeness and correctness take priority over minimizing edits. You decide whether
-an Interface is added, revised, separated into multiple transfers, removed, or
-preserved, and which semantic source supplies each receiving slot. Use all
-requirements, frozen FunctionItems, Interface goals, platform contract, and
-graph facts.
+Deterministic repair constraints are contractual obligations.
+
+When validation_issues contain repair_constraint:
+
+- treat the constraint as a required postcondition;
+- do not reinterpret the obligation;
+- determine only the missing semantic provenance.
+
+The backend defines what contract obligation is missing.
+The Generator decides how the semantic binding satisfies it.
+The Critic is authoritative only for diagnosis and required_postcondition. Any concrete Interface ID, edit operation, patch wording, source choice, or target choice appearing incidentally in Critic text is non-authoritative. Independently determine the repair from upstream facts and validation evidence. Prefer the smallest coherent SEMANTIC change that fully satisfies all acceptance facts. Completeness and correctness take priority over minimizing edits. 
+For deterministic closure failures:
+
+Prefer satisfying missing contractual obligations.
+
+When the issue type is:
+- uncovered_required_logical_input
+- uncovered_required_platform_output
+
+the repair MUST preserve all valid existing bindings and add the minimum required semantic binding.
+
+Do not redesign existing Interface topology unless an existing binding is proven semantically invalid.
 
 4. AUTHORITY PRIORITY
 1. confirmed user requirements
@@ -1944,7 +2060,10 @@ Return only strict JSON matching critic_schema."""
                 acceptance_facts=validation_issues, semantic_comparable=True,
             ),
             propose=propose_generator, evaluate=evaluate_generator,
-            semantic_signature=lambda value: canonical_logical_binding_signatures(value)
+            semantic_signature=lambda value: (
+                canonical_logical_binding_signatures(value),
+                interface_receiving_slot_signature(value),
+            )
             if isinstance(value, dict) and "interfaces" in value else value,
             max_attempts=2,
         )

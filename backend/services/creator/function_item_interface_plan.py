@@ -92,37 +92,68 @@ PLATFORM_OUTPUT_MAPPING_CONTRACT = """PLATFORM OUTPUT MAPPING CONTRACT
 
 FunctionItem outputs and platform outputs belong to different semantic layers.
 
-A member output name does not need to be identical to a platform output name,
-but the platform output side is always restricted to the declared platform
-output contract.
+FunctionItem outputs are internal logical ports produced inside the Skill.
 
-The planner may map an internal output to an existing platform output slot.
-It may never create a new platform output slot because the internal output has
-a particular representation or format.
+Platform outputs are external boundary ports exposed to the host.
 
-A different name does not imply compatibility.
+They are different namespaces.
 
-The reviewer must verify:
-- the produced value type/meaning
-- the declared platform output contract
-- the user requested result
+A member output name MUST NOT automatically become a platform output name.
 
-Name similarity or name difference alone is not evidence.
-
-member_to_platform represents semantic transfer:
+A member_to_platform Interface must satisfy:
 
 FunctionItem output
         ->
-platform output slot
+existing platform output field
 
-The reviewer must judge whether the produced semantic value satisfies the
-platform output contract.
+
+The planner MUST follow this order:
+
+1. Identify the semantic value produced by source_member.source_output.
+
+2. Read the declared platform output contract.
+
+3. Select target_platform_output ONLY from the declared platform output fields.
+
+4. Verify the selected platform output semantically represents the produced value.
+
+
+Forbidden:
+
+Do not copy source_output into target_platform_output only because names are identical.
+
+Invalid example:
+
+source_member:
+scripts/main.py
+
+source_output:
+file_outputs
+
+target_platform_output:
+file_outputs
+
+
+This is invalid unless the platform contract explicitly declares:
+
+final_output_fields:
+[
+    "file_outputs"
+]
+
+
+Do not create new platform outputs because:
+- the internal output is a file;
+- the internal output is a report;
+- the internal output is markdown;
+- the internal output is a document;
+- the internal output has a convenient name.
+
+If no declared platform output can represent the internal result, the Interface Plan is invalid.
+
+A different name does not imply incompatibility.
 
 Valid example:
-
-A FunctionItem output may have a different name from a platform output slot.
-
-Example:
 
 source_output:
 internal_result
@@ -130,8 +161,10 @@ internal_result
 target_platform_output:
 external_result
 
-Do not reject a binding only because source_output and target_platform_output
-have different names.
+
+The reviewer evaluates semantic compatibility only after deterministic
+validation has established that target_platform_output belongs to the declared
+platform contract.
 """
 
 RUNTIME_INPUT_PROVENANCE_CONTRACT = """RUNTIME INPUT PROVENANCE CONTRACT
@@ -824,27 +857,98 @@ Return strict parseable JSON only."""
     return _parse_object(text)
 
 
-INTERFACE_REVIEW_ISSUE_FIELDS = {"message", "affected_interfaces", "affected_inputs", "evidence"}
-INTERFACE_REVIEW_SCHEMA = {"passed": "boolean", "issues": [{"message": "string", "affected_interfaces": ["string"], "affected_inputs": [{"target_member": "string", "target_input": "string"}], "evidence": {"observed": "any", "expected": "any"}}]}
-
+INTERFACE_REVIEW_ISSUE_FIELDS = {
+    "message",
+    "affected_interfaces",
+    "affected_inputs",
+    "affected_outputs",
+    "evidence"
+}
+INTERFACE_REVIEW_SCHEMA = {
+    "passed": "boolean",
+    "issues": [
+        {
+            "message": "string",
+            "affected_interfaces": ["string"],
+            "affected_inputs": [
+                {
+                    "target_member": "string",
+                    "target_input": "string"
+                }
+            ],
+            "affected_outputs": [
+                {
+                    "source_member": "string",
+                    "source_output": "string",
+                    "target_platform_output": "string"
+                }
+            ],
+            "evidence": {
+                "observed": "any",
+                "expected": "any"
+            }
+        }
+    ]
+}
 
 def normalize_interface_review_issue(raw_issue: dict[str, Any], frozen_function_items: list[dict[str, Any]], current_interface_plan: dict[str, Any], *, path: str = "$.issues[]") -> dict[str, Any]:
     """Validate a free-form semantic defect envelope and logical references."""
     if not isinstance(raw_issue, dict) or set(raw_issue) != INTERFACE_REVIEW_ISSUE_FIELDS:
         _raise("semantic review issue has invalid shape", "invalid_interface_semantic_review_protocol", path=path)
-    message, interface_ids, affected_inputs, evidence = raw_issue["message"], raw_issue["affected_interfaces"], raw_issue["affected_inputs"], raw_issue["evidence"]
-    if not isinstance(message, str) or not message.strip() or not isinstance(interface_ids, list) or not isinstance(affected_inputs, list) or not isinstance(evidence, dict) or set(evidence) != {"observed", "expected"}:
+    message = raw_issue["message"]
+    interface_ids = raw_issue["affected_interfaces"]
+    affected_inputs = raw_issue["affected_inputs"]
+    affected_outputs = raw_issue["affected_outputs"]
+    evidence = raw_issue["evidence"]
+    if (
+            not isinstance(message, str)
+            or not message.strip()
+            or not isinstance(interface_ids, list)
+            or not isinstance(affected_inputs, list)
+            or not isinstance(affected_outputs, list)
+            or not isinstance(evidence, dict)
+    ):
         _raise("semantic review issue is not auditable", "invalid_interface_semantic_review_protocol", path=path)
     known_interfaces = {str(value.get("interface_id") or "") for value in current_interface_plan.get("interfaces") or []}
     inputs = {item["target_file"]: {value["name"] for value in item["inputs"]} for item in _compact_function_items(frozen_function_items)}
     if any(not isinstance(value, str) or value not in known_interfaces for value in interface_ids):
         _raise("review issue references an unknown Interface", "invalid_interface_semantic_review_reference", path=f"{path}.affected_interfaces")
     normalized_inputs = []
+    normalized_outputs = []
+
+    for index, value in enumerate(affected_outputs):
+        if not isinstance(value, dict):
+            _raise(
+                "review issue affected_outputs must be object",
+                "invalid_interface_semantic_review_reference",
+                path=f"{path}.affected_outputs[{index}]"
+            )
+
+        required = {
+            "source_member",
+            "source_output",
+            "target_platform_output",
+        }
+
+        if set(value) != required:
+            _raise(
+                "review issue references invalid affected output shape",
+                "invalid_interface_semantic_review_reference",
+                path=f"{path}.affected_outputs[{index}]"
+            )
+
+        normalized_outputs.append(dict(value))
     for index, value in enumerate(affected_inputs):
         if not isinstance(value, dict) or set(value) != {"target_member", "target_input"} or value.get("target_input") not in inputs.get(value.get("target_member"), set()):
             _raise("review issue references an unknown logical input", "invalid_interface_semantic_review_reference", path=f"{path}.affected_inputs[{index}]")
         normalized_inputs.append(dict(value))
-    envelope = {"message": message.strip(), "affected_interfaces": list(interface_ids), "affected_inputs": normalized_inputs, "evidence": dict(evidence)}
+    envelope = {
+        "message": message.strip(),
+        "affected_interfaces": list(interface_ids),
+        "affected_inputs": normalized_inputs,
+        "affected_outputs": normalized_outputs,
+        "evidence": dict(evidence)
+    }
     return {**envelope, "stage": "interface_semantic_review", "path": path, "interface_id": interface_ids[0] if interface_ids else "", "details": envelope}
 
 
@@ -953,50 +1057,166 @@ A plausible goal cannot make an incorrect structured source/target binding valid
 
     """ + SOURCE_PATH_CONTRACT + """
 
-1. AUTHORITATIVE FACTS
-The payload contains confirmed requirements, frozen FunctionItem responsibilities
-and logical port contracts, runtime_source_required facts, the platform logical
-contract, and the complete Interface Plan. Structured logical binding fields are
-part of the Interface semantic layer and are authoritative for transfer identity.
+    1. AUTHORITATIVE FACTS
 
-2. DETERMINISTIC VALIDITY PRECONDITION
-The backend has already established Interface protocol validity,
-logical-reference validity. In full mode it has also established
-runtime-required receiving-slot structural coverage, single-provenance validity,
-and legal platform terminal existence.
-Do not repeat those deterministic checks.
+    The payload contains:
 
-3. SEMANTIC REVIEW TASK
-Do not trust the Planner conclusion. Independently determine whether the complete
-Interface Plan faithfully realizes confirmed requirements over frozen logical
-ports. For every transfer, decide whether its declared semantic source can
-faithfully satisfy its declared receiving slot, The review must consider the declared logical port type and cardinality
-constraints when evaluating whether a transfer is valid.whether source_path selects the
-intended semantic platform value, and whether selected final platform results
-semantically satisfy the requested output. Do not search for predefined error
-categories and do not propose a repair.
+    - confirmed user requirements
+    - frozen FunctionItems
+    - frozen logical input/output contracts
+    - runtime source facts
+    - immutable platform contract
+    - complete Interface Plan
 
-4. EVIDENCE STANDARD
-A structurally valid logical reference is not automatically semantically correct.
-A different valid design is not a defect. Report only a concrete defect in this
-plan, supported by observed and expected facts. An issue is not a record that a
-fact was reviewed.
+    These facts are authoritative.
 
-5. AUTHORITY LIMIT
-Do not select opaque Graph endpoint IDs, generate edges, change Interface records,
-or prescribe add/split/remove operations. The Interface
-stage declares logical FunctionItem/platform ports; it does not declare registry
-IDs, argv serialization, or runtime placeholder paths. When source_path is
-declared, evaluate whether that nested platform value can semantically satisfy
-target_input. Report a defect without proposing another path.
+    The Interface Plan declares semantic bindings between logical ports.
 
-6. OUTPUT CONTRACT
-Verify every affected Interface and logical input exists. passed=true exactly
-when issues is empty.
-Return only strict JSON matching this schema:
-""" + mode_contract + """
+    The reviewer does not redesign the system and does not replace upstream contracts.
 
-""" + json.dumps(INTERFACE_REVIEW_SCHEMA, ensure_ascii=False)
+
+    2. DETERMINISTIC VALIDITY PRECONDITION
+
+    The backend has already validated:
+
+    - Interface schema
+    - Interface kind correctness
+    - logical member references
+    - logical input existence
+    - logical output existence
+    - platform output identifier existence
+    - required structural coverage
+
+    Do NOT report deterministic validation failures as semantic defects.
+
+
+    3. PLATFORM OUTPUT IMMUTABILITY RULE
+
+    Platform output fields are external contract identifiers.
+
+    final_output_fields is the authoritative legal output domain.
+
+    The reviewer MUST NOT:
+
+    - rename platform output fields
+    - replace platform output fields
+    - prefer another output name
+    - judge whether an output field name is intuitive
+    - infer a better output field
+
+    Example:
+
+    Platform contract:
+
+    final_output_fields:
+    [
+        "file_outputs",
+        "text"
+    ]
+
+
+    Interface:
+
+    source_output:
+    file_outputs
+
+    target_platform_output:
+    file_outputs
+
+
+    This is a valid binding if the semantic value matches.
+
+    The reviewer MUST NOT suggest:
+
+    file_outputs -> file_paths
+
+    unless the platform contract explicitly defines file_paths as the target contract field.
+
+
+    4. SEMANTIC REVIEW TASK
+
+    Only review semantic compatibility.
+
+    For every Interface:
+
+    Check:
+
+    A. Does the declared source produce the semantic value required by the target?
+
+    B. Does the receiving logical port accept that semantic value?
+
+    C. Does the Interface kind match the actual provenance?
+
+    D. Does source_path select the intended semantic value when used?
+
+
+    Do NOT check:
+
+    - whether a field name looks natural
+    - whether another field name would be clearer
+    - whether another design would be preferred
+    - whether a valid contract field should be renamed
+
+
+    5. OUTPUT BOUNDARY REVIEW
+
+    For member_to_platform:
+
+    Evaluate:
+
+    source_member.source_output
+            ->
+    target_platform_output
+
+
+    The reviewer checks semantic compatibility only.
+
+    The reviewer does NOT reinterpret:
+
+    source_output names.
+
+    The reviewer does NOT create new platform outputs.
+
+    The reviewer does NOT replace declared platform outputs.
+
+
+    6. ISSUE EVIDENCE STANDARD
+
+    Only report a defect when:
+
+    - the Interface is structurally valid;
+    - the referenced ports exist;
+    - a concrete semantic mismatch exists.
+
+    A different possible design is not a defect.
+
+    A preferred naming style is not a defect.
+
+    A valid alternative mapping is not a defect.
+
+
+    7. AUTHORITY LIMIT
+
+    The reviewer MUST NOT:
+
+    - modify Interface records;
+    - generate repaired plans;
+    - propose edits;
+    - select different sources;
+    - select different targets;
+    - create Graph edges;
+    - use opaque endpoint IDs.
+
+    The reviewer only returns semantic diagnostics.
+
+
+    8. OUTPUT CONTRACT
+
+    passed=true exactly when issues is empty.
+
+    Return only strict JSON:
+
+    """ + json.dumps(INTERFACE_REVIEW_SCHEMA, ensure_ascii=False)
     payload = {
         "system_goal": original_user_goal,
         "function_items": _compact_function_items(frozen_function_items),
@@ -1469,7 +1689,52 @@ graph facts.
 7. previous Interface Plan
 
 5. CRITIC AUTHORITY
-The Critic is not edit authority; independently choose the actual repair.
+
+The Critic provides only a diagnosis hypothesis and a required postcondition.
+
+The Critic does NOT override:
+
+- confirmed requirements
+- frozen FunctionItems
+- logical port contracts
+- platform contract
+- final_output_fields
+- Interface schema
+
+
+If Critic diagnosis conflicts with any frozen contract,
+the frozen contract always wins.
+
+Contract Identifier Preservation Rule:
+
+The repair generator MUST preserve all identifiers declared by upstream
+contracts.
+
+This includes:
+
+- platform output fields
+- FunctionItem logical inputs
+- FunctionItem logical outputs
+- Interface source references
+- Interface target references
+
+
+A repair MUST NOT rename, replace, normalize, generalize, or specialize a
+declared identifier only because another identifier appears semantically similar
+or more descriptive.
+
+
+If a Critic diagnosis conflicts with an upstream contract identifier:
+
+- the upstream contract is authoritative;
+- the Critic diagnosis is considered incomplete or incorrect;
+- the repair must preserve the declared identifier and repair only the actual
+  invalid relationship.
+
+
+The Generator independently determines the repair based on authoritative facts.
+
+Do not mechanically execute Critic wording.
 
 6. ACCEPTANCE CONDITIONS
 - Do not modify FunctionItems or add fields outside the Interface schema.
@@ -1490,12 +1755,29 @@ The Critic is not edit authority; independently choose the actual repair.
   and platform-input semantics.
 
 7. SELF-CHECK
-A valid repair must change logical binding semantics whenever blocking facts require it. Changing only goal wording, Interface IDs, or record order is not semantic progress.
-Silently verify every repair diagnosis is satisfied and every issue is addressed, every required
-non-default input and required platform output has an atomic intended transfer,
-no independent inputs are bundled, repeated pairs remain legal, FunctionItems
-are unchanged, no source was selected by names alone, unrelated Interfaces are
-unchanged, and the result differs meaningfully from the failed plan.
+
+Before returning:
+
+Verify:
+
+1. Every required receiving slot has one correct semantic source.
+
+2. Every member_to_platform Interface uses a platform output declared by the
+platform contract.
+
+3. Platform output identifiers are preserved exactly.
+
+4. No FunctionItem responsibility or logical port is modified.
+
+5. No repair is based only on field-name similarity.
+
+6. No repair changes a valid binding because another name appears clearer.
+
+7. Every blocking semantic issue is actually resolved.
+
+Returning the previous invalid plan is forbidden.
+
+Returning a renamed equivalent without semantic improvement is forbidden.
 
 8. OUTPUT CONTRACT
 Return only the complete Interface Plan JSON matching interface_schema. Do not

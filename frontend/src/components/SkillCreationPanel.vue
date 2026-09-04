@@ -31,6 +31,20 @@
       <span class="progress-label">{{ doneCount }}/{{ localFiles.length }} 文件已完成</span>
     </div>
 
+    <div class="generation-stages" aria-label="Skill 生成阶段">
+      <div v-for="item in generationStages" :key="item.label" :class="item.status">
+        <span>{{ statusIcon(item.status) }}</span><strong>{{ item.label }}</strong>
+      </div>
+    </div>
+
+    <details class="file-tree-panel">
+      <summary>文件结构与摘要 <span>{{ localFiles.length }} 项</span></summary>
+      <div v-for="file in localFiles" :key="`tree-${file.path}`" class="tree-row">
+        <code>{{ treePrefix(file.path) }}{{ file.path }}</code>
+        <span>{{ file.purpose || file.role || '待生成' }}</span>
+      </div>
+    </details>
+
     <!-- Warnings from blueprint parser -->
     <div v-if="visibleWarnings.length" class="warnings">
       <div v-for="(w, i) in visibleWarnings" :key="i" class="warning-item">⚠️ {{ warningMessage(w) }}</div>
@@ -233,6 +247,42 @@
       v-if="phase === 'validating' || phase === 'packaging' || phase === 'complete' || phase === 'failed'"
       class="post-status"
     >
+      <section class="runtime-panel">
+        <div class="runtime-heading">
+          <div><small>E2E RUNTIME</small><h3>{{ runtimeTitle }}</h3></div>
+          <span class="runtime-badge" :class="runtimeStatus">{{ runtimeStatusText }}</span>
+        </div>
+        <div v-if="runtimeSteps.length" class="runtime-steps">
+          <article v-for="(step, index) in runtimeSteps" :key="`${step.id}-${index}`" :class="step.status">
+            <span class="step-number">{{ index + 1 }}</span>
+            <div>
+              <strong>Step {{ index + 1 }}/{{ runtimeSteps.length }} · {{ step.script }}</strong>
+              <p v-if="step.input">输入：{{ step.input }}</p>
+              <p v-if="step.output">输出：{{ step.output }}</p>
+              <p v-if="step.files">文件变化：{{ step.files }}</p>
+              <span>{{ statusText(step.status) }}</span>
+            </div>
+          </article>
+        </div>
+        <p v-else class="runtime-waiting">正在准备运行环境与执行计划…</p>
+
+        <div v-if="friendlyFailure" class="friendly-error">
+          <strong>运行失败</strong>
+          <p><b>原因：</b>{{ friendlyFailure.reason }}</p>
+          <p v-if="friendlyFailure.impact"><b>影响：</b>{{ friendlyFailure.impact }}</p>
+        </div>
+        <div v-if="repairSummaries.length" class="repair-summary">
+          <h4>系统自动修复</h4>
+          <div v-for="(repair, index) in repairSummaries" :key="index">
+            <span>{{ repair.status === 'success' ? '✓' : '●' }}</span>
+            <div><strong>{{ repair.title }}</strong><p>{{ repair.detail }}</p></div>
+          </div>
+        </div>
+        <details v-if="technicalDetails" class="technical-details">
+          <summary>展开查看详细错误</summary>
+          <pre>{{ technicalDetails }}</pre>
+        </details>
+      </section>
       <div
         class="post-item"
         :class="{ success: validateResult?.success, fail: validateResult && !validateResult.success }"
@@ -244,40 +294,6 @@
               : '⏳ 严格端到端校验中…'
           }}
         </span>
-        <pre v-if="validateResult?.message" class="post-detail">{{ validateResult.message }}</pre>
-        <div v-if="validateResult?.repair_events?.length" class="post-detail repair-events">
-          <div v-for="(event, idx) in validateResult.repair_events" :key="idx" class="repair-event">
-            <strong>{{ event.phase || 'e2e_repair' }}</strong>
-            <span v-if="event.e2e_session_id"> · session {{ event.e2e_session_id }}</span>
-            <span v-if="event.target_file"> · {{ event.target_file }}</span>
-            <span v-if="event.current_step || event.step_index"> · step {{ event.current_step || event.step_index }}<span v-if="event.total_steps">/{{ event.total_steps }}</span></span>
-            <span v-if="event.status"> · status {{ event.status }}</span>
-            <span v-if="event.failure_layer"> · layer {{ event.failure_layer }}</span>
-            <span v-if="event.resume_from_step"> · 从第 {{ event.resume_from_step }} 步继续</span>
-            <span v-if="Array.isArray(event.reused_checkpoints)"> · 复用 checkpoint: {{ event.reused_checkpoints.join(', ') || '无' }}</span>
-            <span v-if="Array.isArray(event.invalidated_checkpoints)"> · 失效 checkpoint: {{ event.invalidated_checkpoints.join(', ') || '无' }}</span>
-            <span v-if="event.reused_venv !== undefined"> · {{ event.reused_venv ? '复用 venv' : '准备 venv' }}</span>
-            <span v-if="event.type === 'hard_format_requires_full_rewrite' || event.patch_status === 'hard_format_failed'">
-              · hard format requires full rewrite
-            </span>
-            <span v-else-if="event.patch_status"> · patch {{ event.patch_status }}</span>
-            <span v-if="event.format_rewrite_status"> · format rewrite {{ event.format_rewrite_status }}</span>
-            <span v-if="event.rerun_status"> · rerun {{ event.rerun_status }}</span>
-            <span v-if="event.next_target"> · next {{ event.next_target }}</span>
-            <pre v-if="event.failure_summary" class="post-detail">{{ event.failure_summary }}</pre>
-            <pre v-if="event.rendered_payload_summary" class="post-detail">payload: {{ event.rendered_payload_summary }}</pre>
-            <pre v-if="event.trace_summary" class="post-detail">trace: {{ event.trace_summary }}</pre>
-            <pre v-if="event.stdout_summary || event.stderr_summary" class="post-detail">stdout: {{ event.stdout_summary || '' }}
-stderr: {{ event.stderr_summary || '' }}</pre>
-            <pre v-if="event.diff_excerpt" class="post-detail">{{ event.diff_excerpt }}</pre>
-            <pre v-if="event.rejection_reason && event.patch_status !== 'parse_failed'" class="post-detail">rejection: {{ event.rejection_reason }}</pre>
-            <pre v-if="event.patch_status === 'parse_failed'" class="post-detail">parser_error: {{ event.parser_error || event.rejection_reason || 'unknown' }}
-diff_extraction_attempted: {{ Boolean(event.diff_extraction_attempted) }}
-old_lines_new_lines_fallback_attempted: {{ Boolean(event.old_lines_new_lines_fallback_attempted) }}
-last_output_excerpt:
-{{ event.last_output_excerpt || '' }}</pre>
-          </div>
-        </div>
       </div>
 
       <div
@@ -511,6 +527,63 @@ const progressPercent = computed(() => {
   return Math.round((doneCount.value / total) * 100)
 })
 
+const generationStages = computed(() => {
+  const files = localFiles.value
+  const statusFor = predicate => {
+    const group = files.filter(predicate)
+    if (!group.length) return 'success'
+    if (group.some(file => file.status === 'error')) return 'failed'
+    if (group.every(file => ['done', 'skipped'].includes(file.status))) return 'success'
+    if (group.some(file => ['generating', 'writing', 'preview'].includes(file.status))) return 'running'
+    return phase.value === 'running' ? 'running' : 'pending'
+  }
+  return [
+    { label: '创建目录', status: skillInitialized.value ? 'success' : (phase.value === 'running' ? 'running' : 'pending') },
+    { label: '生成 SKILL.md', status: statusFor(file => file.path === 'SKILL.md') },
+    { label: '生成脚本文件', status: statusFor(file => file.path.startsWith('scripts/')) },
+    { label: '生成依赖配置', status: statusFor(file => /(^|\/)(requirements|pyproject|package|environment)/i.test(file.path)) },
+  ]
+})
+
+const runtimeEvents = computed(() => Array.isArray(validateResult.value?.runtime_trace)
+  ? validateResult.value.runtime_trace
+  : (Array.isArray(validateResult.value?.repair_events) ? validateResult.value.repair_events : []))
+
+const runtimeSteps = computed(() => runtimeEvents.value
+  .filter(event => event && (event.current_step || event.step_index || event.step_id || event.script_path || event.target_file))
+  .map((event, index) => ({
+    id: event.step_id || event.current_step || event.step_index || index,
+    script: event.script_path || event.target_file || event.step_id || `执行步骤 ${event.current_step || event.step_index || index + 1}`,
+    input: summaryValue(event.input_summary || event.inputs || event.rendered_payload_summary),
+    output: summaryValue(event.output_summary || event.outputs || event.artifact),
+    files: summaryValue(event.file_changes || event.changed_files || event.invalidated_checkpoints),
+    status: normalizeRuntimeStatus(event.status || event.rerun_status || event.patch_status),
+  })))
+
+const runtimeStatus = computed(() => phase.value === 'validating' ? 'running' : (validateResult.value?.success ? 'success' : (validateResult.value ? 'failed' : 'pending')))
+const runtimeStatusText = computed(() => statusText(runtimeStatus.value))
+const runtimeTitle = computed(() => runtimeStatus.value === 'running' ? 'Runtime 执行中' : (runtimeStatus.value === 'success' ? 'Runtime 验证完成' : (runtimeStatus.value === 'failed' ? 'Runtime 验证未通过' : '等待 Runtime')))
+const friendlyFailure = computed(() => {
+  if (runtimeStatus.value !== 'failed') return null
+  const event = [...runtimeEvents.value].reverse().find(item => item?.failure_summary || item?.reason || item?.message)
+  return {
+    reason: conciseText(event?.failure_summary || event?.reason || validateResult.value?.message || '执行结果未满足验证要求'),
+    impact: event?.target_file ? `${event.target_file} 对应步骤无法继续` : (event?.step_id ? `${event.step_id} 步骤无法继续` : ''),
+  }
+})
+const repairSummaries = computed(() => runtimeEvents.value
+  .filter(event => event && (event.patch_status || event.repair_result || event.resume_from_step || /repair/i.test(String(event.phase || event.type || ''))))
+  .map(event => ({
+    title: event.target_file ? `修复 ${event.target_file}` : '调整执行约束与文件',
+    detail: conciseText(event.repair_result || event.failure_summary || event.next_target || (event.resume_from_step ? `从第 ${event.resume_from_step} 步继续验证` : '已提交修复并重新验证')),
+    status: ['success', 'accepted', 'applied', 'passed'].includes(String(event.patch_status || event.status || '').toLowerCase()) ? 'success' : 'running',
+  })).slice(0, 8))
+const technicalDetails = computed(() => {
+  if (runtimeStatus.value !== 'failed') return ''
+  const details = runtimeEvents.value.flatMap(event => [event?.trace_summary, event?.stdout_summary, event?.stderr_summary, event?.diff_excerpt, event?.rejection_reason]).filter(Boolean)
+  return details.join('\n\n') || String(validateResult.value?.message || '')
+})
+
 const packageDownloadUrl = computed(() => {
   if (!packageResult.value?.path) return '#'
   const name = localSkillName.value
@@ -530,9 +603,31 @@ function statusIcon(status) {
     done:       '✅',
     skipped:    '⏭',
     error:      '❌',
+    success:    '✓',
+    failed:     '×',
+    running:    '●',
   }
   return icons[status] ?? '⬜'
 }
+
+function statusText(status) { return ({ pending: '等待中', running: '运行中', success: '成功', failed: '失败' })[status] || '等待中' }
+function normalizeRuntimeStatus(status) {
+  const value = String(status || '').toLowerCase()
+  if (['success', 'passed', 'complete', 'completed', 'accepted', 'applied'].includes(value)) return 'success'
+  if (['failed', 'error', 'rejected', 'parse_failed', 'hard_format_failed'].includes(value)) return 'failed'
+  if (['running', 'started', 'retrying', 'pending'].includes(value)) return value === 'pending' ? 'pending' : 'running'
+  return 'pending'
+}
+function summaryValue(value) {
+  if (Array.isArray(value)) return value.map(item => typeof item === 'object' ? (item.path || item.name || item.id) : item).filter(Boolean).slice(0, 5).join('、')
+  if (value && typeof value === 'object') return Object.entries(value).slice(0, 5).map(([key, item]) => `${key}: ${typeof item === 'object' ? '[结构化数据]' : item}`).join('；')
+  return conciseText(value)
+}
+function conciseText(value) {
+  const text = String(value || '').replace(/Traceback[\s\S]*/i, '').replace(/\s+/g, ' ').trim()
+  return text.length > 240 ? `${text.slice(0, 240)}…` : text
+}
+function treePrefix(path) { return path.includes('/') ? '├── ' : '└── ' }
 
 function formatBytes(n) {
   if (!n) return '0 B'
@@ -1231,6 +1326,19 @@ function openInSandbox() {
   color: #fff;
   pointer-events: none;
 }
+.generation-stages { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin: 12px 0; }
+.generation-stages > div { display: flex; align-items: center; gap: 6px; padding: 8px; border: 1px solid #3b4654; border-radius: 8px; color: #94a3b8; font-size: 12px; }
+.generation-stages .running { border-color: #3b82f6; color: #93c5fd; }.generation-stages .success { border-color: #166534; color: #86efac; }.generation-stages .failed { border-color: #991b1b; color: #fca5a5; }
+.file-tree-panel { margin-bottom: 12px; padding: 10px; border: 1px solid #374151; border-radius: 10px; background: #191f27; }
+.file-tree-panel summary { cursor: pointer; font-weight: 700; }.file-tree-panel summary span { color: #94a3b8; font-size: 11px; }
+.tree-row { display: grid; grid-template-columns: minmax(180px, .8fr) 1fr; gap: 12px; padding: 7px 3px; border-bottom: 1px solid #29313d; }.tree-row:last-child { border-bottom: 0; }.tree-row code { color: #93c5fd; }.tree-row span { color: #94a3b8; font-size: 12px; }
+.runtime-panel { margin-bottom: 12px; padding: 16px; border: 1px solid #334155; border-radius: 12px; background: #151b24; }
+.runtime-heading { display: flex; align-items: center; justify-content: space-between; }.runtime-heading small { color: #60a5fa; font-size: 9px; font-weight: 800; letter-spacing: .16em; }.runtime-heading h3 { margin: 3px 0 0; font-size: 16px; }
+.runtime-badge { padding: 4px 9px; border-radius: 999px; background: #334155; font-size: 11px; }.runtime-badge.running { background: #1e3a8a; color: #bfdbfe; }.runtime-badge.success { background: #14532d; color: #bbf7d0; }.runtime-badge.failed { background: #7f1d1d; color: #fecaca; }
+.runtime-steps { display: grid; gap: 8px; margin-top: 14px; }.runtime-steps article { display: flex; gap: 10px; padding: 10px; border-left: 3px solid #475569; border-radius: 6px; background: #202936; }.runtime-steps article.success { border-color: #22c55e; }.runtime-steps article.failed { border-color: #ef4444; }.runtime-steps article.running { border-color: #3b82f6; }.step-number { display: grid; flex: 0 0 24px; height: 24px; place-items: center; border-radius: 50%; background: #334155; font-size: 11px; }.runtime-steps strong { font-family: monospace; font-size: 12px; }.runtime-steps p { margin: 5px 0; color: #aab6c5; font-size: 11px; }.runtime-steps article > div > span { color: #94a3b8; font-size: 11px; }
+.runtime-waiting { padding: 14px 0 2px; color: #94a3b8; }.friendly-error { margin-top: 14px; padding: 12px; border: 1px solid #7f1d1d; border-radius: 8px; background: #2a171b; }.friendly-error > strong { color: #fca5a5; }.friendly-error p { margin: 7px 0 0; line-height: 1.55; }
+.repair-summary { margin-top: 14px; }.repair-summary h4 { margin: 0 0 8px; }.repair-summary > div { display: flex; gap: 8px; padding: 8px; border-radius: 6px; background: #1e293b; }.repair-summary p { margin: 3px 0 0; color: #aab6c5; font-size: 11px; }.technical-details { margin-top: 12px; color: #94a3b8; }.technical-details summary { cursor: pointer; }.technical-details pre { max-height: 240px; overflow: auto; white-space: pre-wrap; color: #aab6c5; font-size: 11px; }
+@media (max-width: 760px) { .generation-stages { grid-template-columns: 1fr 1fr; }.tree-row { grid-template-columns: 1fr; gap: 3px; } }
 
 /* Warnings */
 .warnings { margin-bottom: 10px; }

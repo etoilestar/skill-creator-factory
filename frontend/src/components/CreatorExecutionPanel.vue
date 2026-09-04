@@ -12,6 +12,13 @@
         <ThinkingPanel :thoughts="thoughts" content-only />
       </section>
       <section v-else-if="localActiveTab === 'graph'" class="execution-tab-panel graph-panel">
+        <div class="graph-summary">
+          <div><strong>{{ nodes.length }}</strong><span>功能节点</span></div>
+          <div><strong>{{ inputCount }}</strong><span>输入合同</span></div>
+          <div><strong>{{ outputCount }}</strong><span>输出 / 产物</span></div>
+          <div><strong>{{ edges.length }}</strong><span>数据流 / 调用</span></div>
+        </div>
+        <div class="graph-legend"><span>● 功能节点</span><span>→ 数据流向与调用关系</span></div>
         <CreatorResponsibilityGraph :nodes="nodes" :edges="edges" />
       </section>
       <section v-else class="execution-tab-panel tools-panel">
@@ -48,7 +55,7 @@
 </template>
 
 <script setup>
-import { ref, watch } from 'vue'
+import { ref, watch, computed } from 'vue'
 import ThinkingPanel from './ThinkingPanel.vue'
 import CreatorResponsibilityGraph from './CreatorResponsibilityGraph.vue'
 
@@ -65,6 +72,8 @@ const props = defineProps({
 const emit = defineEmits(['update:activeTab'])
 const tabs = [{ key: 'process', label: '过程' }, { key: 'graph', label: '责任图谱' }, { key: 'tools', label: '工具' }]
 const localActiveTab = ref(props.activeTab || 'process')
+const inputCount = computed(() => props.nodes.reduce((count, node) => count + (Array.isArray(node.inputs) ? node.inputs.length : 0), 0))
+const outputCount = computed(() => props.nodes.reduce((count, node) => count + (Array.isArray(node.outputs) ? node.outputs.length : 0), 0))
 function setTab(tab) { localActiveTab.value = tab; emit('update:activeTab', tab) }
 function basename(path) { return String(path || '').split('/').pop() || String(path || '') }
 watch(() => props.activeTab, tab => { if (tab && tab !== localActiveTab.value) localActiveTab.value = tab })
@@ -81,6 +90,7 @@ watch(() => props.activeTab, tab => { if (tab && tab !== localActiveTab.value) l
 .execution-current-status { display: flex; align-items: center; gap: 8px; margin: 10px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface2, #f8fafc); font-size: 13px; }
 .status-spinner { width: 14px; height: 14px; border: 2px solid currentColor; border-top-color: transparent; border-radius: 50%; animation: spin .8s linear infinite; opacity: .7; }
 .graph-panel { padding: 10px; overflow: hidden; }
+.graph-summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-bottom: 8px; }.graph-summary div { padding: 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface2, #f8fafc); }.graph-summary strong, .graph-summary span { display: block; }.graph-summary strong { color: #2563eb; font-size: 16px; }.graph-summary span { margin-top: 2px; color: var(--text-muted); font-size: 10px; }.graph-legend { display: flex; gap: 12px; margin-bottom: 8px; color: var(--text-muted); font-size: 11px; }
 .tools-panel { padding: 12px; }
 .creator-tool-grid, .binding-grid { display: grid; gap: 10px; }
 .creator-tool-card, .binding-card { padding: 12px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface2, #f8fafc); }

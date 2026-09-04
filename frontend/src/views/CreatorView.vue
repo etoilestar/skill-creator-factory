@@ -18,15 +18,17 @@
       </button>
     </div>
 
-    <RuntimeTimeline v-if="messages.length || streaming || creationPlan" :stages="creatorStages" />
-
     <div class="content-area">
-      <CreatorEventStream :events="creatorEvents" />
+      <CreatorEventStream class="creator-event-stream" :events="summaryEvents" />
       <!-- Main chat column -->
       <div class="messages-column">
         <div class="messages" ref="messagesEl">
           <div v-if="messages.length === 0" class="empty">
             <p>说明你想创建或修改什么 Skill。信息足够时会直接生成创建要点和文件清单；只有真正缺少阻塞信息时才会追问。</p>
+          </div>
+          <div v-if="artifactEvents.length || graphPlanningActive" class="live-process-area">
+            <CreatorGraphProgress :events="artifactEvents" :nodes="planningNodes" :edges="planningEdges" />
+            <CreatorE2EProgress :events="artifactEvents" />
           </div>
           <template v-for="(msg, i) in messages" :key="i">
             <!-- action result card -->
@@ -219,7 +221,7 @@
           </div>
           <CreatorExecutionPanel
             v-model:active-tab="activeExecutionTab"
-            :thoughts="thoughts"
+            :events="detailEvents"
             :nodes="planningNodes"
             :edges="planningEdges"
             :tool-rows="toolPlanningRows"
@@ -239,8 +241,10 @@ import { streamPrepareCreationPlan, buildClarificationQuickActions, uploadCreato
 import ChatBubble from '../components/ChatBubble.vue'
 import SkillCreationPanel from '../components/SkillCreationPanel.vue'
 import CreatorExecutionPanel from '../components/CreatorExecutionPanel.vue'
-import RuntimeTimeline from '../components/RuntimeTimeline.vue'
 import CreatorEventStream from '../components/CreatorEventStream.vue'
+import CreatorGraphProgress from '../components/CreatorGraphProgress.vue'
+import CreatorE2EProgress from '../components/CreatorE2EProgress.vue'
+import { useCreatorEventStream } from '../composables/useCreatorEventStream.js'
 
 // ---------------------------------------------------------------------------
 // State
@@ -287,6 +291,7 @@ const quickActions = ref([])
 
 // Thinking panel state
 const thoughts = ref([])
+const { summaryEvents, detailEvents, artifactEvents, receive: receiveCreatorEvent, clear: clearCreatorEvents } = useCreatorEventStream()
 const showThoughts = ref(false)
 const activeExecutionTab = ref('process')
 const executionPanelHasUpdate = ref(false)
@@ -640,14 +645,13 @@ function safeExecutionContent(content) {
   return ''
 }
 
-function appendExecutionBlock({ step, label, detail = '', content = '' } = {}) {
-  thoughts.value.push({
-    step: String(step || 'execution'),
-    label: String(label || '执行步骤'),
-    detail: String(detail || ''),
-    content: safeExecutionContent(content),
-    time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
-  })
+function appendExecutionBlock({ step, label, detail = '', content = '', publish = true } = {}) {
+  const executionEvent = {
+    step: String(step || 'execution'), label: String(label || '执行步骤'), detail: String(detail || ''),
+    content: safeExecutionContent(content), time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+  }
+  thoughts.value.push(executionEvent)
+  if (publish) receiveCreatorEvent(executionEvent)
   markExecutionPanelUpdated('process')
 }
 
@@ -917,6 +921,7 @@ async function send() {
     const plan = await streamPrepareCreationPlan(
       payload,
       event => {
+        receiveCreatorEvent(event)
         if (event.event === 'planner_convergence_review') {
           appendExecutionBlock({
             step: 'planner_convergence_review',
@@ -1254,6 +1259,7 @@ async function send() {
 // ---------------------------------------------------------------------------
 
 function onCreationExecutionEvent(event) {
+  receiveCreatorEvent(event)
   const phase = String(event?.phase || '')
   if (phase === 'file_generation_start' || phase.startsWith('file_')) {
     creationRuntimeStatus.value = 'running'
@@ -1267,6 +1273,7 @@ function onCreationExecutionEvent(event) {
     label: event?.label || '创建执行事件',
     detail: event?.detail || event?.filePath || '',
     content: event?.content || [],
+    publish: false,
   })
 }
 
@@ -1316,6 +1323,7 @@ function clearChat() {
   currentStatus.value = null
 
   thoughts.value = []
+  clearCreatorEvents()
   creationRuntimeStatus.value = 'pending'
   creationRuntimeDetail.value = '等待 Skill 文件生成'
 
@@ -1372,7 +1380,7 @@ function clearChat() {
 
 <style scoped>
 .creator {
-  --thinking-sidebar-width: clamp(460px, 42vw, 720px);
+  --thinking-sidebar-width: 320px;
   --thinking-sidebar-mobile-height: 65vh;
   --thinking-breakpoint: 900px;
 
@@ -1441,7 +1449,8 @@ function clearChat() {
   border-color: #bfdbfe;
 }
 
-/* Main two-column layout */
+.live-process-area { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-bottom: 4px; }
+/* Main three-column layout */
 .content-area {
   flex: 1;
   display: flex;
@@ -1706,6 +1715,7 @@ function clearChat() {
 /* On narrow viewports, sidebar stacks below the chat */
 @media (max-width: 900px) {
   .content-area { flex-direction: column; }
+  .live-process-area { grid-template-columns: 1fr; }
 
   .thinking-sidebar {
     width: 100%;

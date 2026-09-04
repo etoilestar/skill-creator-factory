@@ -9,10 +9,10 @@
           <span class="status-spinner"></span>
           <span>{{ currentStatus.message }}</span>
         </div>
-        <ThinkingPanel :thoughts="thoughts" content-only />
+        <div v-if="events.length" class="detail-list"><article v-for="event in events" :key="event.id" :class="event.level"><header><span>{{ stageLabel(event.stage) }}</span><time>{{ formatTime(event.timestamp) }}</time></header><strong>{{ event.title }}</strong><p v-if="event.message">{{ event.message }}</p><dl v-if="details(event).length"><template v-for="row in details(event)" :key="row[0]"><dt>{{ row[0] }}</dt><dd>{{ row[1] }}</dd></template></dl></article></div><p v-else class="execution-empty">等待详细执行事件…</p>
       </section>
       <section v-else-if="localActiveTab === 'graph'" class="execution-tab-panel graph-panel">
-        <GraphGenerationPanel :nodes="nodes" :edges="edges" :events="thoughts" :streaming="streaming" />
+        <GraphGenerationPanel :nodes="nodes" :edges="edges" :events="events" :streaming="streaming" />
         <div class="graph-summary">
           <div><strong>{{ nodes.length }}</strong><span>功能节点</span></div>
           <div><strong>{{ inputCount }}</strong><span>输入合同</span></div>
@@ -58,12 +58,11 @@
 
 <script setup>
 import { ref, watch, computed } from 'vue'
-import ThinkingPanel from './ThinkingPanel.vue'
 import CreatorResponsibilityGraph from './CreatorResponsibilityGraph.vue'
 import GraphGenerationPanel from './GraphGenerationPanel.vue'
 
 const props = defineProps({
-  thoughts: { type: Array, default: () => [] },
+  events: { type: Array, default: () => [] },
   nodes: { type: Array, default: () => [] },
   edges: { type: Array, default: () => [] },
   toolRows: { type: Array, default: () => [] },
@@ -73,6 +72,9 @@ const props = defineProps({
   activeTab: { type: String, default: 'process' },
 })
 const emit = defineEmits(['update:activeTab'])
+const stageLabel = stage => ({ requirement: '需求', blueprint: '蓝图', graph: '图谱', generation: '生成', e2e: 'E2E', repair: '修复' })[stage] || stage
+const formatTime = value => value ? new Date(value).toLocaleTimeString('zh-CN', { hour12: false }) : '--:--:--'
+const details = event => Object.entries({ ...event.detail, ...event.payload }).filter(([key, value]) => !['event','type','phase','step','label','title','message','detail','payload'].includes(key) && value !== undefined && value !== null && value !== '').slice(0, 8).map(([key,value]) => [key, typeof value === 'object' ? JSON.stringify(value) : String(value)])
 const tabs = [{ key: 'process', label: '过程' }, { key: 'graph', label: '责任图谱' }, { key: 'tools', label: '工具' }]
 const localActiveTab = ref(props.activeTab || 'process')
 const inputCount = computed(() => props.nodes.reduce((count, node) => count + (Array.isArray(node.inputs) ? node.inputs.length : 0), 0))
@@ -90,6 +92,7 @@ watch(() => props.activeTab, tab => { if (tab && tab !== localActiveTab.value) l
 .execution-content { flex: 1; min-height: 0; overflow: hidden; }
 .execution-tab-panel { height: 100%; min-height: 0; overflow: auto; }
 .process-panel { display: flex; flex-direction: column; }
+.detail-list { padding: 10px; display: grid; gap: 8px; } .detail-list article { padding: 10px; border: 1px solid var(--border); border-left: 3px solid #60a5fa; border-radius: 8px; background: var(--surface2); } .detail-list article.warning { border-left-color: #f59e0b; } .detail-list article.error { border-left-color: #ef4444; } .detail-list header { display:flex; justify-content:space-between; margin-bottom:5px; color:var(--text-muted); font-size:10px; } .detail-list strong { font-size:12px; } .detail-list p { margin:4px 0; font-size:11px; line-height:1.45; } .detail-list dl { display:grid; grid-template-columns:auto 1fr; gap:3px 8px; margin:7px 0 0; font-size:10px; } .detail-list dt { color:var(--text-muted); } .detail-list dd { margin:0; word-break:break-word; }
 .execution-current-status { display: flex; align-items: center; gap: 8px; margin: 10px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface2, #f8fafc); font-size: 13px; }
 .status-spinner { width: 14px; height: 14px; border: 2px solid currentColor; border-top-color: transparent; border-radius: 50%; animation: spin .8s linear infinite; opacity: .7; }
 .graph-panel { display: flex; flex-direction: column; padding: 10px; overflow: hidden; }

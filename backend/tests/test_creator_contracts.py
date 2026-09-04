@@ -1988,3 +1988,44 @@ def test_command_block_json_protocol_empty_schema_preserves_existing_keys_and_al
         script_path="scripts/generate_story.py",
         arg_protocol={"expected_arg_mode": "argparse_flags", "requires_json_argv": False},
     )
+
+@pytest.mark.asyncio
+async def test_skill_md_command_placeholder_is_not_revalidated_against_graph_contract(monkeypatch):
+    """Markdown review must not treat rendered placeholder spelling as interface authority."""
+    from backend.services.creator import contracts
+
+    async def semantic_review(**kwargs):
+        return {
+            "passed": True,
+            "required_script_paths": ["scripts/main.py"],
+            "required_reference_paths": [],
+            "required_asset_paths": [],
+            "reviewers": {},
+            "issues": [],
+            "repair_suggestions": "",
+        }
+
+    monkeypatch.setattr(contracts, "_review_skill_md_blueprint_intent_with_model", semantic_review)
+    content = """---
+name: demo
+description: demo
+---
+
+```bash
+python scripts/main.py '{"primary_key_field":"{{fields.primary_key_field}}"}'
+```
+"""
+    review = await contracts._validate_skill_md_blueprint_alignment(
+        skill_name="demo",
+        content=content,
+        blueprint_text="",
+        skill_plan_entry={"inputs": ["fields.primary_key_field"]},
+        requirement_graph={
+            "interface_contract": {
+                "primary_key_field": "fields.primary_key_field",
+            },
+        },
+        model="unit-test",
+    )
+
+    assert review["passed"] is True

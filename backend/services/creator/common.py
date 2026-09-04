@@ -521,17 +521,29 @@ def graph_interface_contract(graph: Any) -> dict[str, Any]:
 
 
 def project_script_interface_contract(graph: Any, target_file: str) -> dict[str, Any]:
-    """Project argv, stdout and runtime bindings; never infer new semantics."""
+    """Project a member interface and its separate platform bindings.
+
+    ``stdout_schema`` is deliberately keyed only by FunctionItem output ports.
+    An edge's target is a platform envelope field, not a replacement name for
+    the member port.  Terminal fan-in therefore lives in
+    ``platform_output_mapping`` and must never collapse stdout properties.
+    """
     contract = graph_interface_contract(graph)
     inputs = [p for p in contract["input_ports"] if p["consumer"] == target_file]
     outputs = [p for p in contract["output_ports"] if p["producer"] == target_file]
     bindings = [e for e in contract["edge_mappings"] if e["consumer"] == target_file or e["producer"] == target_file]
     properties = {p["name"]: {"type": "array" if str(p["type"]).startswith("list[") else p["type"], "x-graph-type": p["type"], "x-shape": p["shape"]} for p in inputs}
     stdout_properties = {p["name"]: {"type": "array" if str(p["type"]).startswith("list[") else p["type"], "x-graph-type": p["type"], "x-shape": p["shape"]} for p in outputs}
+    platform_output_mapping: dict[str, list[str]] = {}
+    for edge in bindings:
+        if edge["producer"] != target_file or edge["consumer"] != "platform_output_node":
+            continue
+        platform_output_mapping.setdefault(edge["consumer_port"], []).append(edge["producer_port"])
     return {
         "argv_schema": {"type": "object", "properties": properties, "required": [p["name"] for p in inputs if p["required"]], "additionalProperties": False},
         "stdout_schema": {"type": "object", "properties": stdout_properties, "required": [p["name"] for p in outputs if p["required"]], "additionalProperties": False},
         "runtime_binding": bindings,
+        "platform_output_mapping": platform_output_mapping,
         "command_payload": {p["name"]: "{{" + p["name"] + "}}" for p in inputs},
     }
 
@@ -539,7 +551,34 @@ def project_script_interface_contract(graph: Any, target_file: str) -> dict[str,
 def validate_graph_interface_projection(graph: Any, target_file: str, derived: dict[str, Any]) -> None:
     """Fail generation when a downstream contract differs from its graph projection."""
     expected = project_script_interface_contract(graph, target_file)
-    for key in ("argv_schema", "stdout_schema", "runtime_binding"):
+    expected_stdout_fields = set(expected["stdout_schema"]["properties"])
+    observed_stdout = derived.get("stdout_schema")
+    observed_properties = (
+        observed_stdout.get("properties")
+        if isinstance(observed_stdout, dict) and isinstance(observed_stdout.get("properties"), dict)
+        else {}
+    )
+    observed_stdout_fields = set(observed_properties)
+    for platform_field, member_outputs in expected["platform_output_mapping"].items():
+        distinct_outputs = set(member_outputs)
+        if (
+            len(distinct_outputs) > 1
+            and platform_field in observed_stdout_fields
+            and not distinct_outputs.issubset(observed_stdout_fields)
+        ):
+            raise ResponsibilityGraphValidationError(
+                "multiple graph output ports project to the same stdout field",
+                code="graph_interface_projection_mismatch",
+                details={
+                    "target_file": target_file,
+                    "projection": "stdout_schema",
+                    "stdout_field": platform_field,
+                    "graph_output_ports": sorted(distinct_outputs),
+                    "expected_stdout_fields": sorted(expected_stdout_fields),
+                    "observed_stdout_fields": sorted(observed_stdout_fields),
+                },
+            )
+    for key in ("argv_schema", "stdout_schema", "runtime_binding", "platform_output_mapping"):
         if derived.get(key) != expected[key]:
             raise ResponsibilityGraphValidationError(
                 f"derived {key} does not equal ResponsibilityGraph Interface Contract",

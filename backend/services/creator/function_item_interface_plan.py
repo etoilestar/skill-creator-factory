@@ -199,14 +199,15 @@ For each FunctionItem receiving slot, independently determine the semantic
 value required by that slot and where that value actually originates.
 If it is the user's runtime free-form instruction, use the platform contract's
 canonical free-form-request representation. If it is runtime-uploaded file or
-multimodal content, use the runtime-file representation. If the required value is supplied through a structured parameter source,
-use the structured parameter source declared by the platform contract.
+multimodal content, use the runtime-file representation. Business inputs are
+declared as independent top-level semantic source slots in the platform contract.
 A FunctionItem may consume multiple different source families simultaneously.
 
-Do not infer that a FunctionItem input is a structured parameter only because
-of its name or shape.source_path only selects a nested value that already exists in the declared
-platform input hierarchy.source_path never creates a new hierarchy or container. The parameter must already be declared by the
-current Skill and must not be invented merely to close coverage.
+Do not infer a wrapper or nested structure from a FunctionItem input's name or
+shape. source_path only selects a nested value that already exists in the
+declared platform input hierarchy; it never creates a new hierarchy or
+container. Every platform source must already be declared by the current Skill
+and must not be invented merely to close coverage.
 If another FunctionItem produces the value, use member_to_member.
 A FunctionItem may consume multiple different source families simultaneously.
 
@@ -232,7 +233,9 @@ SOURCE_PATH_CONTRACT = """SOURCE PATH CONTRACT
 
 Every platform_to_member Interface MUST explicitly contain source_path.
 source_platform_input identifies the selected top-level platform source slot.
-source_path is relative to that selected top-level source slot.
+source_path is relative to that selected top-level source slot. It only selects
+a nested value that already exists inside the declared platform input; it never
+creates a new input hierarchy.
 Use source_path=[] when the entire selected top-level platform source value is transferred.
 Use a non-empty source_path only when the semantic source value is nested inside the selected top-level platform source.
 Never omit source_path.
@@ -241,6 +244,12 @@ Do not repeat source_platform_input inside source_path merely to satisfy the sch
 PLATFORM_INPUT_HIERARCHY_CONTRACT = """PLATFORM INPUT HIERARCHY CONTRACT
 
 Platform input hierarchy is frozen by the upstream Blueprint and runtime contract.
+
+Platform inputs are flat semantic slots. Each declared top-level platform input
+is an independent source slot. Bind a declared business input directly: for
+example, source_platform_input="primary_key" with source_path=[] is valid when
+primary_key is declared. Do not instead bind source_platform_input="fields" with
+source_path=["primary_key"].
 
 Interface Planner consumes the existing platform input structure.
 It does not redesign, normalize, reorganize, or introduce a new input hierarchy.
@@ -260,6 +269,9 @@ Do not infer additional nesting from:
 - semantic similarity between names
 - common parameter grouping patterns
 - expected convenience structures
+
+Do not create synthetic containers such as fields, parameters, request, or
+config unless that exact container is explicitly declared as a platform input.
 
 Only use nested source paths when the upstream platform contract explicitly
 declares that nested structure.

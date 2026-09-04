@@ -6428,13 +6428,10 @@ can report that upstream replanning is required.
 
 A repair must preserve full declared-input provenance. Never repair an invalid
 platform source merely by deleting the edge while leaving its FunctionItem input
-unresolved. For a dynamic runtime parameter, bind through the supplied
-preferred_structured_input_root with exactly one platform_parameter_binding
-constraint containing explicit source_key, required, and an explicit default
-when required is false. A platform_parameter_binding is required only when
-selecting a dynamic child parameter; a whole structured input root may be passed
-directly without that constraint. Creation-time fixed configuration is an
-upstream Blueprint decision. Do not remove an input during localized graph repair.
+unresolved. Bind each dynamic runtime input directly from its declared top-level
+platform input; do not create a synthetic fields/parameters/request/config
+container. Creation-time fixed configuration is an upstream Blueprint decision.
+Do not remove an input during localized graph repair.
 If a FunctionItem input has an explicit frozen/default value, it is locally
 resolved. Do not create a platform_input_node edge for it and do not externalize
 it merely to satisfy graph closure.
@@ -6465,7 +6462,6 @@ Return only strict JSON:
         "platform_boundary_contract": {
             "input_fields": platform_boundary["input_envelope_fields"],
             "final_output_fields": platform_boundary["final_output_fields"],
-            "preferred_structured_input_root": platform_boundary["preferred_structured_input_root"],
         },
     }
     text = await complete_creator_role_once(
@@ -6580,7 +6576,6 @@ def _build_responsibility_graph_construction_context(
         "node_contracts": node_contracts,
         "platform_input_contract": {
             "input_fields": list(platform_boundary["input_envelope_fields"]),
-            "preferred_structured_input_root": platform_boundary["preferred_structured_input_root"],
         },
         "platform_output_contract": {
             "final_output_fields": platform_output_names(platform_contract),

@@ -439,6 +439,132 @@ def _sanitize_generated_file_content(
 
     return sanitized
 
+
+def _platform_skill_md_command_sections(
+    *,
+    skill_name: str,
+    blueprint_text: str,
+    responsibility_graph: Any = None,
+) -> list[str]:
+    """Build SKILL.md command sections from platform-owned interface facts.
+
+    The model is deliberately not involved in this operation.  Script argv keys
+    come from the generated script guard/read contract, while values come from
+    frozen graph bindings, SkillPlan bindings, or frozen defaults.  An
+    unresolved required argv is an upstream planning error rather than an
+    invitation for the SKILL.md writer to guess a value.
+    """
+    parsed = parse_blueprint([{"role": "assistant", "content": blueprint_text}])
+    entries = [
+        entry for entry in (parsed.skill_plan.files if parsed.skill_plan else [])
+        if getattr(entry, "file_type", "") == "script"
+    ]
+    skill_dir = settings.skills_path / skill_name
+    sections: list[str] = []
+
+    for entry in entries:
+        script_path = str(entry.path).replace("\\", "/")
+        script_file = skill_dir / script_path
+        if not script_file.is_file():
+            # Generation order can legitimately place SKILL.md before a script.
+            # In that case the frozen SkillPlan remains the only available
+            # upstream contract; never fall back to model-authored commands.
+            command = render_script_command_from_skill_plan(entry)
+        else:
+            source = script_file.read_text(encoding="utf-8")
+            function_context = build_function_execution_context(
+                graph=responsibility_graph,
+                target_file=script_path,
+            )
+            planned_command = render_script_command_from_skill_plan(entry)
+            snapshot = build_command_alignment_snapshot(
+                script_path=script_path,
+                script_content=source,
+                command=planned_command,
+                function_execution_context=function_context,
+                script_defaults=dict(getattr(entry, "default_values", {}) or {}),
+            )
+            planned_signature = _command_signature(planned_command, script_path) or {}
+            planned_payload = planned_signature.get("json_payload") or {}
+            if not isinstance(planned_payload, dict):
+                planned_payload = {}
+
+            confirmed = dict(snapshot.get("confirmed_bindings") or {})
+            defaults = dict(snapshot.get("frozen_defaults") or {})
+            required = set(snapshot.get("required_target_keys") or [])
+            payload: dict[str, Any] = {}
+            for key in snapshot.get("target_keys") or []:
+                if key in confirmed:
+                    payload[key] = "{{" + str(confirmed[key]) + "}}"
+                elif key in defaults:
+                    payload[key] = defaults[key]
+                elif key in planned_payload:
+                    # command_args/input_binding is frozen by the upstream
+                    # SkillPlan.  Preserve its native JSON value verbatim.
+                    payload[key] = planned_payload[key]
+                elif key in required:
+                    raise ValueError(
+                        f"upstream command binding missing for {script_path}: {key}"
+                    )
+            runner = {
+                "python": "python",
+                "node": "node",
+                "bash": "bash",
+                "shell": "bash",
+            }.get(str(entry.runtime), "python")
+            encoded_payload = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            command = f"{runner} {script_path} '{encoded_payload}'"
+
+        role = str(getattr(entry, "role", "") or "script")
+        inputs = ", ".join(str(value) for value in (getattr(entry, "inputs", []) or [])) or "无"
+        outputs = ", ".join(str(value) for value in (getattr(entry, "outputs", []) or [])) or "无"
+        sections.append(
+            f"### `{script_path}`\n\n"
+            f"- role: `{role}`\n"
+            f"- inputs: {inputs}\n"
+            f"- outputs: {outputs}\n\n"
+            "```bash\n"
+            f"{command}\n"
+            "```"
+        )
+    return sections
+
+
+def _materialize_platform_skill_md_commands(
+    content: str,
+    *,
+    skill_name: str,
+    blueprint_text: str,
+    responsibility_graph: Any = None,
+) -> str:
+    """Replace every model-authored script command with backend output."""
+    text = str(content or "").strip()
+    start_marker = "<!-- platform-command-blocks:start -->"
+    end_marker = "<!-- platform-command-blocks:end -->"
+    text = re.sub(
+        re.escape(start_marker) + r".*?" + re.escape(end_marker),
+        "",
+        text,
+        flags=re.DOTALL,
+    ).strip()
+    blocks = parse_skill_md_bash_command_blocks(text)
+    for block in reversed(blocks):
+        text = text[:block.start] + text[block.end:]
+    sections = _platform_skill_md_command_sections(
+        skill_name=skill_name,
+        blueprint_text=blueprint_text,
+        responsibility_graph=responsibility_graph,
+    )
+    if not sections:
+        return text.strip()
+    generated = (
+        f"{start_marker}\n"
+        "## 运行命令\n\n"
+        + "\n\n".join(sections)
+        + f"\n{end_marker}"
+    )
+    return text.rstrip() + "\n\n" + generated + "\n"
+
 def _strip_outer_markdown_fence_for_skill_md(content: str) -> str:
     """Strip only one outer markdown fence around a whole SKILL.md file.
 
@@ -3395,8 +3521,8 @@ def _build_generate_file_prompt(
             "description: <一句话说明本 Skill 的用途>\n"
             "---\n"
             "3. frontmatter 闭合后，输出 Skill 的核心执行说明（普通 Markdown 正文）。\n"
-            "4. SKILL.md 第一轮只生成静态可解析的使用说明、资源说明和脚本命令块；command 映射必须在第一轮根据脚本探针与责任图谱形成可执行闭环，不能把明确 dataflow 错误留给第二轮 E2E。\n"
-            "5. 如果蓝图包含 scripts/ 资源，SKILL.md 正文必须为每个真实 scripts/ 路径提供一个标准、独立、无缩进的 ```bash fenced code block。\n"
+            "4. SKILL.md 第一轮只生成静态可解析的使用说明和资源说明。不要生成 scripts/ 的 command block；后台平台会根据上游 SkillPlan、责任图谱和脚本 argv 合同直接生成并写入这些 block。\n"
+            "5. 如果蓝图包含 scripts/ 资源，只描述调用顺序、职责和输入输出语义，不要自行编写或猜测 ```bash fenced code block。\n"
             "6. 每个 bash fenced code block 内只能有一条脚本命令；命令必须直接调用 scripts/ 路径。脚本路径后必须紧跟一个完整的输入 JSON object，并使用一对 ASCII 单引号包裹整个 JSON object，使其在 shell 中作为脚本路径后的第一个位置参数传入；JSON object 内部的字段名和字符串值必须继续使用标准 JSON 双引号。该输入 JSON 对应 Python 脚本中的 `sys.argv[1]`。\n"
             "6a. 每个 scripts/*.py command block 附近必须写普通 Markdown action schema 声明：role、inputs、outputs；这些是使用说明，不是运行时 hard schema。\n"
             "6b. 输入 JSON key 必须使用对应脚本真实 strict_json_argv_guard schema 中的字段；如果 guard 不完整，再以 run_args_analysis 和 function_execution_context/function_item_graph_context 为事实依据补足，不能自行编造业务字段或别名。\n"
@@ -3437,8 +3563,8 @@ def _build_generate_file_prompt(
             "Command block only maps existing runtime bindings."
             "It does not design, normalize, or adapt a new input schema.\n"
             "14. 如果 authoritative / declared SkillPlan paths 中存在 references/**，SKILL.md 正文必须在“参考资料/资源”小节明确引用每个已确认 reference，并说明何时读取。\n"
-            "15. 不要在输出内容的外侧套 ``` 代码块，但 SKILL.md 正文内部必须按需包含标准 ```bash fenced code block。\n"
-            "16. 禁止只写隐式执行描述；必须写明可执行 fenced block。\n"
+            "15. 不要在输出内容的外侧套 ``` 代码块；也不要输出 ```bash fenced code block，命令区由后台统一追加。\n"
+            "16. 正文应说明执行时机与调用顺序，但不得自行拼装可执行命令。\n"
             "17. 禁止复制 Creator 界面流程、确认清单、点击开始创建/开始生成、系统将自动创建文件等平台创建流程文案。\n"
             "18. 以下宿主 Markdown 执行说明是内部写作约束，只能转化为面向使用者的 Skill 说明，不要逐字复制这些约束或标题。\n"
             "19. 命令中的 JSON key 是当前脚本读取的输入字段；strict_json_argv_schema、run_args_analysis 和 function_execution_context 是生成 command 映射的事实依据，不只是建议参考。\n"

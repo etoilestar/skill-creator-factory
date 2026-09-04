@@ -1,6 +1,8 @@
 import copy
+from types import SimpleNamespace
 
 from backend.services.creator.generation import (
+    _materialize_platform_skill_md_commands,
     _normalize_generated_file_content,
     _script_local_contract_payload,
     build_available_tool_context,
@@ -57,6 +59,53 @@ def test_reference_normalization_leaves_incomplete_outer_wrapper_for_validator()
 def test_script_and_skill_normalization_behaviors_remain_path_specific():
     assert _normalize_generated_file_content("scripts/a.py", "```python\nprint('ok')\n```") == "print('ok')"
     assert _normalize_generated_file_content("SKILL.md", "```markdown\n# Skill\n```") == "# Skill"
+
+
+def test_platform_materializes_skill_md_commands_from_upstream_facts(monkeypatch, tmp_path):
+    from backend.services.creator import generation
+
+    entry = _entry(
+        command_template="python scripts/main.py '{\"payload\":\"{{input}}\",\"limit\":3}'",
+    )
+    monkeypatch.setattr(
+        generation,
+        "parse_blueprint",
+        lambda _messages: SimpleNamespace(skill_plan=SimpleNamespace(files=[entry])),
+    )
+    monkeypatch.setattr(generation.settings, "skills_path", tmp_path)
+    script_dir = tmp_path / "demo" / "scripts"
+    script_dir.mkdir(parents=True)
+    (script_dir / "main.py").write_text("print('ok')\n", encoding="utf-8")
+    monkeypatch.setattr(generation, "build_function_execution_context", lambda **_kw: {})
+    monkeypatch.setattr(
+        generation,
+        "build_command_alignment_snapshot",
+        lambda **_kw: {
+            "target_keys": ["payload", "limit"],
+            "required_target_keys": ["payload"],
+            "confirmed_bindings": {"payload": "input"},
+            "frozen_defaults": {"limit": 3},
+        },
+    )
+
+    authored = "# Demo\n\n```bash\npython scripts/main.py '{\"wrong\":true}'\n```\n"
+    result = _materialize_platform_skill_md_commands(
+        authored,
+        skill_name="demo",
+        blueprint_text="ignored",
+        responsibility_graph={},
+    )
+
+    assert '"wrong"' not in result
+    assert result.count("```bash") == 1
+    assert "python scripts/main.py '{\"payload\":\"{{input}}\",\"limit\":3}'" in result
+    assert "## 运行命令" in result
+    assert _materialize_platform_skill_md_commands(
+        result,
+        skill_name="demo",
+        blueprint_text="ignored",
+        responsibility_graph={},
+    ) == result
 
 
 def test_required_resources_project_declared_dependencies_only_for_current_script():

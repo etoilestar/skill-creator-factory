@@ -14492,10 +14492,22 @@ def _classify_skill_md_repair_scope(
     stage_error: FileGenerationStageError,
 ) -> str:
     """Classify first-round SKILL.md repair routing before any full rewrite checks."""
-    if _single_skill_md_command_block_failure(getattr(stage_error, "original", None)) is not None:
+    original = getattr(stage_error, "original", None)
+    if isinstance(original, ContractValidationError):
+        failures = [result for result in original.results if not getattr(result, "passed", False)]
+        if failures and all(
+            str(getattr(result, "id", "") or "").startswith(
+                ("skill_md.script_command", "skill_md.command_block", "command_block")
+            )
+            for result in failures
+        ):
+            return "deterministic_command"
+
+    # Compatibility for legacy/non-renderer callers. New deterministic command
+    # validation is classified above and must never reach this model repair path.
+    if _single_skill_md_command_block_failure(original) is not None:
         return "command_block"
 
-    original = getattr(stage_error, "original", None)
     results: list[Any] = []
     if isinstance(original, ContractValidationError):
         results = [result for result in original.results if not getattr(result, "passed", False)]
@@ -15643,6 +15655,16 @@ async def generate_file(request: GenerateFileRequest):
                     if request.file_path == "SKILL.md"
                     else ""
                 )
+                if skill_md_repair_scope == "deterministic_command":
+                    yield _file_done_error_sse(
+                        file_path=request.file_path,
+                        role=request.role,
+                        error=deterministic_error,
+                        error_type="deterministic_command_artifact_invalid",
+                        content=candidate or "",
+                        recoverable=True,
+                    )
+                    return
                 if (
                     is_generation_format_error(stage_error)
                     or stage_error.source == "python_compile"

@@ -565,6 +565,109 @@ def _materialize_platform_skill_md_commands(
     )
     return text.rstrip() + "\n\n" + generated + "\n"
 
+
+def _validate_platform_command_payload_shape(
+    *,
+    script_path: str,
+    payload: Any,
+    argv_schema: Any,
+) -> None:
+    """Validate one generated payload without resolving runtime placeholders.
+
+    A whole-value ``{{source}}`` placeholder is intentionally represented as a
+    JSON string in SKILL.md, but the host replaces it *after* JSON parsing and
+    therefore preserves the source's native type.  Wrapping that placeholder in
+    a list/object, or embedding it in a larger string, would destroy that
+    property and is rejected here before SKILL.md reaches E2E.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError(f"platform command payload for {script_path} must be a JSON object")
+
+    schema = _normalize_block_review_argv_schema(argv_schema)
+    required = set(schema["required_keys"])
+    allowed = set(schema["allowed_keys"])
+    expected_types = dict(schema["expected_types"])
+    missing = sorted(required - set(payload))
+    extra = sorted(set(payload) - allowed) if allowed else []
+    if missing:
+        raise ValueError(f"platform command payload for {script_path} misses required keys: {missing}")
+    if extra:
+        raise ValueError(f"platform command payload for {script_path} has unknown keys: {extra}")
+
+    for key, value in payload.items():
+        expected = str(expected_types.get(str(key)) or "")
+        if _whole_value_placeholder_source(value):
+            # The runtime substitutes the complete value, preserving list,
+            # object, scalar, and null shapes rather than stringifying them.
+            continue
+        if _contains_placeholder_syntax(value):
+            if expected and not _json_type_matches("", expected):
+                raise ValueError(
+                    f"platform command payload {script_path}.{key} embeds a placeholder "
+                    f"as string but expects {expected}"
+                )
+            continue
+
+        expected_parts = {part for part in re.split(r"[|,]", expected.lower()) if part}
+        expects_list = bool(expected_parts & {"array", "list"})
+        expects_object = bool(expected_parts & {"object", "dict", "mapping"})
+        if expects_list and isinstance(value, list) and len(value) == 1:
+            nested = value[0]
+            if _whole_value_placeholder_source(nested) or isinstance(nested, (list, dict)):
+                raise ValueError(
+                    f"platform command payload {script_path}.{key} wraps a list value in another list"
+                )
+        if expects_object and isinstance(value, dict):
+            if any(_whole_value_placeholder_source(item) for item in value.values()):
+                raise ValueError(
+                    f"platform command payload {script_path}.{key} wraps an object placeholder"
+                )
+        if expected and not _json_type_matches(value, expected):
+            raise ValueError(
+                f"platform command payload {script_path}.{key} has invalid JSON shape; "
+                f"expected {expected}, got {type(value).__name__}"
+            )
+
+
+def _validate_materialized_platform_skill_md_commands(
+    content: str,
+    *,
+    skill_name: str,
+    blueprint_text: str,
+) -> None:
+    """Parse and shape-check every platform-generated SKILL.md command."""
+    parsed = parse_blueprint([{"role": "assistant", "content": blueprint_text}])
+    entries = [
+        entry for entry in (parsed.skill_plan.files if parsed.skill_plan else [])
+        if getattr(entry, "file_type", "") == "script"
+    ]
+    blocks = parse_skill_md_bash_command_blocks(content)
+    blocks_by_path: dict[str, list[Any]] = {}
+    for block in blocks:
+        if block.script_path:
+            blocks_by_path.setdefault(block.script_path, []).append(block)
+
+    for entry in entries:
+        script_path = str(entry.path).replace("\\", "/")
+        matching = blocks_by_path.get(script_path, [])
+        if len(matching) != 1:
+            raise ValueError(
+                f"platform command materialization expected one block for {script_path}, got {len(matching)}"
+            )
+        signature = _command_signature(matching[0].content, script_path) or {}
+        payload = signature.get("json_payload")
+        script_file = settings.skills_path / skill_name / script_path
+        if not script_file.is_file():
+            raise ValueError(f"cannot validate platform command; script is missing: {script_path}")
+        argv_schema = extract_python_strict_argv_schema(
+            script_file.read_text(encoding="utf-8")
+        ) if script_path.endswith(".py") else {}
+        _validate_platform_command_payload_shape(
+            script_path=script_path,
+            payload=payload,
+            argv_schema=argv_schema,
+        )
+
 def _strip_outer_markdown_fence_for_skill_md(content: str) -> str:
     """Strip only one outer markdown fence around a whole SKILL.md file.
 

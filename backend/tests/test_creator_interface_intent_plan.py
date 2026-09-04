@@ -216,6 +216,52 @@ def test_interface_schema_has_explicit_logical_bindings():
     assert obligations[1]["target_platform_output"] == "text"
 
 
+@pytest.mark.asyncio
+async def test_planner_serializes_structured_output_to_existing_text_sink():
+    items = [item(
+        "scripts/unit_a.py", [],
+        [{"port_id": "report_json", "description": "structured report", "contract": {"type": "object"}}],
+    )]
+    planned = {"interfaces": [m2p("I1", "scripts/unit_a.py", "report_json")]}
+
+    async def planner(_messages, _model):
+        return json.dumps(planned)
+
+    async def reviewer(messages, _model):
+        payload = json.loads(messages[-1]["content"])
+        edge = payload["current_interface_plan"]["interfaces"][0]
+        assert edge["target_platform_output"] == "text"
+        assert edge["transform"] == "json_serialize"
+        assert "Do not report that mapping as a type mismatch" in messages[0]["content"]
+        return json.dumps({"passed": True, "issues": []})
+
+    result = await plan_function_item_interfaces(
+        original_user_goal="produce a report", frozen_function_items=items,
+        platform_contract=platform(), planner_model="planner", model_call=planner,
+        reviewer_model="reviewer", reviewer_model_call=reviewer,
+    )
+
+    assert result["interfaces"][0] == {
+        **planned["interfaces"][0], "transform": "json_serialize",
+    }
+    assert collect_interface_plan_validation_issues(
+        plan=result, function_items=items, platform_contract=platform(),
+    ) == []
+
+
+def test_structured_output_to_text_requires_declared_serializer():
+    items = [item("scripts/unit_a.py", [], [{
+        "port_id": "report_json", "contract": {"type": "object"},
+    }])]
+    plan = {"interfaces": [m2p("I1", "scripts/unit_a.py", "report_json")]}
+
+    issues = collect_interface_plan_validation_issues(
+        plan=plan, function_items=items, platform_contract=platform(),
+    )
+
+    assert [issue["code"] for issue in issues] == ["incompatible_platform_output_type"]
+
+
 def test_canonical_binding_signature_ignores_goal_id_and_order_but_not_binding():
     before = {"interfaces": [p2m("I1", "scripts/unit_a.py"), m2p("I2", "scripts/unit_a.py")]}
     presentation_only = json.loads(json.dumps(before))

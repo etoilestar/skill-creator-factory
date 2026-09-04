@@ -12,6 +12,7 @@
         <ThinkingPanel :thoughts="thoughts" content-only />
       </section>
       <section v-else-if="localActiveTab === 'graph'" class="execution-tab-panel graph-panel">
+        <GraphGenerationPanel :nodes="nodes" :edges="edges" :events="thoughts" :streaming="streaming" />
         <div class="graph-summary">
           <div><strong>{{ nodes.length }}</strong><span>功能节点</span></div>
           <div><strong>{{ inputCount }}</strong><span>输入合同</span></div>
@@ -59,6 +60,7 @@
 import { ref, watch, computed } from 'vue'
 import ThinkingPanel from './ThinkingPanel.vue'
 import CreatorResponsibilityGraph from './CreatorResponsibilityGraph.vue'
+import GraphGenerationPanel from './GraphGenerationPanel.vue'
 
 const props = defineProps({
   thoughts: { type: Array, default: () => [] },
@@ -90,9 +92,10 @@ watch(() => props.activeTab, tab => { if (tab && tab !== localActiveTab.value) l
 .process-panel { display: flex; flex-direction: column; }
 .execution-current-status { display: flex; align-items: center; gap: 8px; margin: 10px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface2, #f8fafc); font-size: 13px; }
 .status-spinner { width: 14px; height: 14px; border: 2px solid currentColor; border-top-color: transparent; border-radius: 50%; animation: spin .8s linear infinite; opacity: .7; }
-.graph-panel { padding: 10px; overflow: hidden; }
+.graph-panel { display: flex; flex-direction: column; padding: 10px; overflow: hidden; }
 .graph-summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-bottom: 8px; }.graph-summary div { padding: 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface2, #f8fafc); }.graph-summary strong, .graph-summary span { display: block; }.graph-summary strong { color: #2563eb; font-size: 16px; }.graph-summary span { margin-top: 2px; color: var(--text-muted); font-size: 10px; }.graph-legend { display: flex; gap: 12px; margin-bottom: 8px; color: var(--text-muted); font-size: 11px; }
 .graph-note { margin: 0 0 8px; color: var(--text-muted); font-size: 10px; line-height: 1.4; }
+.graph-panel :deep(.creator-responsibility-graph-wrap) { flex: 1; min-height: 320px; }
 .tools-panel { padding: 12px; }
 .creator-tool-grid, .binding-grid { display: grid; gap: 10px; }
 .creator-tool-card, .binding-card { padding: 12px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface2, #f8fafc); }

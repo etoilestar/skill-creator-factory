@@ -317,28 +317,36 @@ def test_optional_input_may_keep_a_valid_binding_and_prompt_assigns_semantic_aut
     prompt = _interface_plan_prompt()
     assert MULTIMODAL_INPUT_PROVENANCE_CONTRACT in prompt
     assert "receiver-local interface identity" in prompt
-    assert "structured-parameter source" in prompt
-    assert "existing source_path protocol" in prompt
-    assert "parameter must already be declared" in prompt
+    assert "independent top-level semantic source slots" in prompt
+    assert "source_path is relative" in prompt
+    assert "platform source must already be declared" in prompt
 
 
-def test_structured_parameter_uses_top_level_source_and_nested_source_path():
+def test_declared_business_input_is_bound_as_a_flat_top_level_source():
     plan = {"interfaces": [
-        {**p2m("I1", "scripts/unit_a.py", "arbitrary_name", "fields"), "source_path": ["declared_param"]},
+        p2m("I1", "scripts/unit_a.py", "primary_key", "primary_key"),
         m2p("I2", "scripts/unit_a.py"),
     ]}
     contract = {"platform_skill_boundary": {
-        "input_envelope_fields": ["fields"],
-        "input_source_semantics": {
-            "structured_parameters": {"canonical": "fields", "globally_required": False},
-        },
+        "input_envelope_fields": ["input_files", "primary_key"],
         "final_output_fields": ["text"], "required_final_output_fields": ["text"],
     }}
     assert collect_interface_plan_validation_issues(
         plan=plan,
-        function_items=[item("scripts/unit_a.py", ["arbitrary_name"], ["result_z"])],
+        function_items=[item("scripts/unit_a.py", ["primary_key"], ["result_z"])],
         platform_contract=contract,
     ) == []
+
+    invalid = {"interfaces": [
+        {**p2m("I1", "scripts/unit_a.py", "primary_key", "fields"), "source_path": ["primary_key"]},
+        m2p("I2", "scripts/unit_a.py"),
+    ]}
+    issues = collect_interface_plan_validation_issues(
+        plan=invalid,
+        function_items=[item("scripts/unit_a.py", ["primary_key"], ["result_z"])],
+        platform_contract=contract,
+    )
+    assert any(issue["code"] == "unknown_platform_logical_input" for issue in issues)
 
 
 def test_unclassified_input_envelope_source_remains_legal():

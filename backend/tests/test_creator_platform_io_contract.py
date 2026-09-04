@@ -34,10 +34,10 @@ def test_platform_io_contract_declares_output_dir_final_outputs_dir():
     assert "Do not append 'outputs' to OUTPUT_DIR" in prompt
 
 
-def test_platform_input_source_families_are_optional_and_wire_fields_are_unchanged():
+def test_platform_input_source_families_are_optional_and_have_no_structured_wrapper():
     boundary = build_platform_io_contract()["platform_skill_boundary"]
     assert boundary["input_envelope_fields"] == [
-        "user_request", "input", "text", "payload", "fields", "options",
+        "user_request", "input", "text", "payload", "options",
         "input_files", "files", "resources",
     ]
     semantics = boundary["input_source_semantics"]
@@ -48,13 +48,15 @@ def test_platform_input_source_families_are_optional_and_wire_fields_are_unchang
     }
     assert semantics["runtime_files"]["canonical"] == "input_files"
     assert semantics["runtime_files"]["representations"] == ["input_files", "files"]
-    assert semantics["structured_parameters"]["canonical"] == "fields"
+    assert "structured_parameters" not in semantics
+    assert "preferred_structured_input_root" not in boundary
     assert all(not family["globally_required"] for family in semantics.values())
 
     prompt = platform_io_contract_prompt_text()
     assert "PLATFORM INPUT SEMANTICS" in prompt
     assert "No platform input source is globally required" in prompt
     assert "DESCRIPTIVE, NOT A CLOSED WHITELIST" in prompt
+    assert "there is no default structured-parameter wrapper" in prompt
 
 
 def test_requirement_graph_injects_and_normalize_overrides_platform_io_contract():

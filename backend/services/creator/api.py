@@ -14089,20 +14089,10 @@ _MARKDOWN_FORMAT_ERROR_TEXT_MARKERS = (
 _SKILL_MD_BODY_FORMAT_REQUIREMENTS = """SKILL.md body_region 格式硬要求：
 1. 只输出 Markdown 正文，不输出 YAML frontmatter。
 2. 所有 fenced code block 必须完整闭合。
-3. 每个真实 scripts/*.py 必须有一个独立、无缩进的 ```bash fenced code block。
-4. 每个 ```bash block 内只能包含一条真实 shell 命令。
-5. ```bash block 内禁止出现多条命令、说明文字、列表、注释、JSON 配置对象或伪命令对象。
-6. 命令必须直接调用真实 scripts/*.py 路径。
-7. 默认命令格式是：python scripts/<file>.py '<JSON object>'，脚本路径后直接传入一个完整、shell-quoted 的 JSON object 位置参数。
-8. 该 JSON object 是输入 JSON，必须作为脚本路径后的第一个位置参数传入，对应 Python 脚本中的 `sys.argv[1]`。
-9. 动态 placeholder 必须作为 JSON 字符串值出现。
-10. 禁止在 ```bash block 内放 runtime/entrypoint/输入 JSON 伪配置对象。
-11. 禁止在 ```bash block 内放 runner/script/输入 JSON 伪命令对象。
-12. 不要把输入 JSON 理解为 --argv 等命令行选项；除非当前脚本源码明确实现，否则禁止新增这类调用参数。
-13. 不要新增额外调用参数或把输入 JSON 改写成命令行选项。
-14. compact_requirement_graph 只是职责上下文，不是命令块格式。
-15. 不得把 compact_requirement_graph 条目复制成 JSON block。
-16. 不得把 runtime、target_file、inputs、outputs 这些图谱字段原样写成 bash block 内容。"""
+3. 只编写用户可读的使用、参数、输出和资源说明。
+4. 禁止生成或修复 bash command block、执行命令、argv JSON 和 placeholder。
+5. command block 由平台在模型返回后从 Graph/SkillPlan/Script Contract 确定性注入。
+"""
 
 _REFERENCE_MD_BODY_FORMAT_REQUIREMENTS = """references/*.md body_region 格式硬要求：
 references/*.md 是参考资料正文，不是执行步骤。
@@ -14111,21 +14101,6 @@ references/*.md 是参考资料正文，不是执行步骤。
 不得把 reference 写成 workflow 执行入口。
 如需展示命令形态，只能使用 ```text 或普通说明。
 所有 fenced block 必须完整闭合。"""
-
-_SKILL_MD_COMMAND_TEMPLATE_SEMANTIC_RULES = """SKILL.md bash command block 语义规则：
-1. bash command block 是运行模板，不是示例调用。
-2. requirement_graph / workflow_allocation 的 inputs/outputs 是强语义参考，不是字段名硬合同；输入字段可以与图谱字段不逐字一致。
-3. 生成输入 JSON 时必须先语义理解图谱中的输入、输出和依赖关系。
-4. 输入字段和值必须语义上可追踪到用户输入、上游脚本 stdout、当前脚本配置或蓝图明确常量。
-5. 不得为了让命令看起来完整而编造无来源字面值或占位参数。
-6. 不得把示例调用、示例值或说明性样例写进 bash command block。
-7. 不得把下游脚本输入写成无来源字面值；应语义上来自上游 stdout，字段名可由第二轮 E2E 对齐。
-8. 不得把用户输入写成字面值；应引用平台输入 placeholder 或传入通用 payload。
-9. 如果不确定具体字段名，优先使用通用 user_request/input/payload，由脚本解析。
-10. 第一轮只判断是否语义可追踪、是否明显示例调用、是否明显无来源占位、是否完全脱离图谱 IO 语义。
-11. 第一轮不得要求输入字段必须逐字等于 graph.inputs，也不得要求 placeholder 必须逐字等于 graph.outputs。
-12. compact_requirement_graph 只是职责上下文，不是命令块 JSON schema；不得把条目机械复制成 JSON block。"""
-
 
 def _is_markdown_creator_file(file_path: str) -> bool:
     return (
@@ -14142,7 +14117,7 @@ def _markdown_format_requirements_for_prompt(file_path: str, region: str) -> str
             "不得输出正文；不得输出未闭合 fence；不得写 workflow/inputs/outputs/runtime_contract 等内部合同字段。"
         )
     if file_path == "SKILL.md":
-        return f"{_SKILL_MD_BODY_FORMAT_REQUIREMENTS}\n\n{_SKILL_MD_COMMAND_TEMPLATE_SEMANTIC_RULES}"
+        return _SKILL_MD_BODY_FORMAT_REQUIREMENTS
     if file_path.startswith("references/"):
         return _REFERENCE_MD_BODY_FORMAT_REQUIREMENTS
     return (
@@ -14502,11 +14477,6 @@ def _classify_skill_md_repair_scope(
             for result in failures
         ):
             return "deterministic_command"
-
-    # Compatibility for legacy/non-renderer callers. New deterministic command
-    # validation is classified above and must never reach this model repair path.
-    if _single_skill_md_command_block_failure(original) is not None:
-        return "command_block"
 
     results: list[Any] = []
     if isinstance(original, ContractValidationError):
@@ -14918,11 +14888,10 @@ def _build_markdown_initial_region_prompt(
     if file_path == "SKILL.md":
         body_rules = (
             f"{_SKILL_MD_BODY_FORMAT_REQUIREMENTS}\n\n"
-            f"{_SKILL_MD_COMMAND_TEMPLATE_SEMANTIC_RULES}\n\n"
             "SKILL.md body 必须基于 blueprint_text、compact requirement_graph、workflow_allocation_summary、"
             "final_outputs 以及 references/assets 路径写最终用户说明。\n"
             "应包含：Skill 用途；用户需要提供什么；高层执行流程；每个真实脚本的自然语言职责说明；"
-            "每个真实脚本的 bash 命令块；references 的只读参考角色；assets 的上传/静态素材角色；"
+            "references/assets 的运行时语义角色；"
             "最终产物；注意事项。\n"
             "不要写 Creator 创建流程、点击开始创建、已通过 E2E、系统将自动生成文件、Runtime Contract JSON、"
             "ToolSlot/implementation_strategy/capability cards、reference 正文全文、脚本源码解释、validator/repair 日志。"

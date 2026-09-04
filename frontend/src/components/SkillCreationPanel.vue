@@ -377,13 +377,14 @@ const props = defineProps({
 const emit = defineEmits(['creation-complete', 'creation-error', 'execution-event'])
 
 
-function emitExecutionEvent({ phase, label, detail = '', content = [], filePath = '' } = {}) {
+function emitExecutionEvent({ phase, label, detail = '', content = [], filePath = '', payload = {} } = {}) {
   emit('execution-event', {
     phase,
     label,
     detail,
     content: Array.isArray(content) ? content.filter(item => typeof item === 'string') : (typeof content === 'string' ? content : ''),
     filePath,
+    payload,
   })
 }
 
@@ -1248,13 +1249,13 @@ async function runPostValidationAndPackaging() {
   }
 
   if (!validateResult.value?.success) {
-    emitExecutionEvent({ phase: 'e2e_failed', label: 'E2E 失败', detail: validateResult.value?.message || '严格端到端校验失败', content: [] })
+    emitExecutionEvent({ phase: 'e2e_failed', label: 'E2E 失败', detail: validateResult.value?.message || '严格端到端校验失败', content: [], payload: validateResult.value || {} })
     phase.value = 'failed'
     emit('creation-error', validateResult.value?.message || '严格端到端校验失败，已停止打包。')
     return
   }
 
-  emitExecutionEvent({ phase: 'e2e_success', label: 'E2E 成功', detail: '严格端到端校验通过', content: [] })
+  emitExecutionEvent({ phase: 'e2e_success', label: 'E2E 成功', detail: '严格端到端校验通过', content: [], payload: validateResult.value || {} })
 
   phase.value = 'packaging'
   emitExecutionEvent({ phase: 'package_start', label: '开始打包', detail: localSkillName.value, content: [] })

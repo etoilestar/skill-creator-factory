@@ -14,7 +14,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from ..skill_plan import GraphValidationError, normalize_structured_function_items
-from ..platform_io_contract import platform_output_names
+from ..platform_io_contract import get_platform_output_sink, platform_output_names
 from .bounded_refinement import (
     BoundedRefinementFailed,
     CandidateEvaluation,
@@ -342,17 +342,26 @@ win over the previous candidate. Minimize edits only among candidates that fully
 satisfy all acceptance facts. Never preserve invalid or incomplete semantic state
 merely to minimize changes."""
 INTERFACE_KINDS = {"platform_to_member", "member_to_member", "member_to_platform"}
+MEMBER_TO_PLATFORM_TRANSFORMS = {"json_serialize"}
 _DANGEROUS_PATH_PARTS = {"__proto__", "prototype", "constructor"}
 INTERFACE_FIELDS = {
     "platform_to_member": {"interface_id", "kind", "source_platform_input", "source_path", "target_member", "target_input", "goal"},
     "member_to_member": {"interface_id", "kind", "source_member", "source_output", "target_member", "target_input", "goal"},
     "member_to_platform": {"interface_id", "kind", "source_member", "source_output", "target_platform_output", "goal"},
 }
+OPTIONAL_INTERFACE_FIELDS = {
+    "platform_to_member": set(),
+    "member_to_member": set(),
+    "member_to_platform": {"transform"},
+}
 INTERFACE_SCHEMA: dict[str, Any] = {
     "type": "object", "additionalProperties": False, "required": ["interfaces"],
     "properties": {"interfaces": {"type": "array", "items": {"oneOf": [
         {"type": "object", "additionalProperties": False, "required": sorted(fields),
-         "properties": {key: ({"const": kind} if key == "kind" else {"type": "array", "items": {"type": "string", "minLength": 1}} if key == "source_path" else {"type": "string", "minLength": 1}) for key in fields}}
+         "properties": {
+             **{key: ({"const": kind} if key == "kind" else {"type": "array", "items": {"type": "string", "minLength": 1}} if key == "source_path" else {"type": "string", "minLength": 1}) for key in fields},
+             **({"transform": {"enum": sorted(MEMBER_TO_PLATFORM_TRANSFORMS)}} if kind == "member_to_platform" else {}),
+         }}
         for kind, fields in INTERFACE_FIELDS.items()
     ]}}},
 }
@@ -496,7 +505,7 @@ def validate_interface_plan_protocol(plan: dict[str, Any]) -> dict[str, Any]:
         if kind not in INTERFACE_KINDS:
             _raise("interface kind is invalid", "invalid_interface_kind", path=f"{path}.kind")
         expected = INTERFACE_FIELDS[kind]
-        if set(raw) != expected:
+        if not expected <= set(raw) <= expected | OPTIONAL_INTERFACE_FIELDS[kind]:
             _raise("interface fields do not match kind schema", "invalid_interface_protocol", path=path,
                    expected=sorted(expected), observed=sorted(raw))
         interface_id = _require_nonempty_string(raw, "interface_id", "invalid_interface_protocol", f"{path}.interface_id")
@@ -506,6 +515,8 @@ def validate_interface_plan_protocol(plan: dict[str, Any]) -> dict[str, Any]:
         _require_nonempty_string(raw, "goal", "invalid_interface_protocol", f"{path}.goal")
         for field in expected - {"interface_id", "kind", "goal", "source_path"}:
             _require_nonempty_string(raw, field, "invalid_interface_protocol", f"{path}.{field}")
+        if kind == "member_to_platform" and "transform" in raw and raw["transform"] not in MEMBER_TO_PLATFORM_TRANSFORMS:
+            _raise("member_to_platform transform is invalid", "invalid_interface_transform", path=f"{path}.transform")
         if kind == "platform_to_member":
             source_path = raw.get("source_path")
             if not isinstance(source_path, list) or any(not isinstance(part, str) or not part or part.lower() in _DANGEROUS_PATH_PARTS for part in source_path):
@@ -537,7 +548,7 @@ def validate_interface_intent_plan(*, plan: dict[str, Any], function_items: list
         if kind not in INTERFACE_KINDS:
             _raise("interface kind is invalid", "invalid_interface_kind", path=f"{path}.kind")
         expected = INTERFACE_FIELDS[kind]
-        if set(raw_interface) != expected:
+        if not expected <= set(raw_interface) <= expected | OPTIONAL_INTERFACE_FIELDS[kind]:
             _raise("interface fields do not match kind schema", "invalid_interface_protocol", path=path, expected=sorted(expected), observed=sorted(raw_interface))
         interface_id = _require_nonempty_string(raw_interface, "interface_id", "invalid_interface_protocol", f"{path}.interface_id")
         if interface_id in seen_ids:
@@ -545,6 +556,8 @@ def validate_interface_intent_plan(*, plan: dict[str, Any], function_items: list
         seen_ids.add(interface_id)
         _require_nonempty_string(raw_interface, "goal", "invalid_interface_protocol", f"{path}.goal")
         interface = dict(raw_interface)
+        if kind == "member_to_platform" and "transform" in interface and interface["transform"] not in MEMBER_TO_PLATFORM_TRANSFORMS:
+            _raise("member_to_platform transform is invalid", "invalid_interface_transform", path=f"{path}.transform")
         if kind in {"member_to_member", "member_to_platform"}:
             source = _require_nonempty_string(raw_interface, "source_member", "invalid_interface_member", f"{path}.source_member")
             if source not in frozen_targets:
@@ -628,6 +641,28 @@ def generate_provenance_candidates(
 
     return candidates
 
+
+def supplement_member_to_platform_transforms(
+    *, plan: dict[str, Any], function_items: list[dict[str, Any]],
+    platform_contract: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Add the canonical serializer when a planner maps structured JSON to text."""
+    output_types = {
+        (item["target_file"], output["name"]): output["contract"].get("type")
+        for item in _compact_function_items(function_items)
+        for output in item["outputs"]
+    }
+    normalized = {"interfaces": [dict(interface) for interface in plan.get("interfaces") or []]}
+    for interface in normalized["interfaces"]:
+        if interface.get("kind") != "member_to_platform" or "transform" in interface:
+            continue
+        source_type = output_types.get((interface.get("source_member"), interface.get("source_output")))
+        sink = get_platform_output_sink(platform_contract, str(interface.get("target_platform_output") or ""))
+        target_type = (sink or {}).get("value_schema", {}).get("type")
+        if source_type in {"array", "object"} and target_type == "string":
+            interface["transform"] = "json_serialize"
+    return normalized
+
 def collect_interface_plan_validation_issues(
     *, plan: dict[str, Any], function_items: list[dict[str, Any]],
     platform_contract: dict[str, Any] | None = None,
@@ -636,6 +671,7 @@ def collect_interface_plan_validation_issues(
     compact = _compact_function_items(function_items)
     inputs = {item["target_file"]: {value["name"] for value in item["inputs"]} for item in compact}
     outputs = {item["target_file"]: {value["name"] for value in item["outputs"]} for item in compact}
+    output_types = {(item["target_file"], value["name"]): value["contract"].get("type") for item in compact for value in item["outputs"]}
     required_slots = {(item["target_file"], value["name"]) for item in compact for value in item["inputs"] if value["runtime_source_required"]}
     boundary = (platform_contract or {}).get("platform_skill_boundary", platform_contract or {})
     platform_inputs = {_compact_port_id(value) for value in boundary.get("input_envelope_fields") or []}
@@ -680,7 +716,29 @@ def collect_interface_plan_validation_issues(
             source, output, target = interface["source_member"], interface["source_output"], interface["target_platform_output"]
             if source not in outputs or output not in outputs.get(source, set()): issue("unknown_interface_logical_output", f"{path}.source_output", iid, output, sorted(outputs.get(source, set())))
             if target not in platform_outputs: issue("unknown_platform_logical_output", f"{path}.target_platform_output", iid, target, sorted(platform_outputs))
-            else: covered_platform.add(target)
+            else:
+                covered_platform.add(target)
+                source_type = output_types.get((source, output))
+                sink = get_platform_output_sink(platform_contract, target)
+                target_type = (sink or {}).get("value_schema", {}).get("type")
+                transform = interface.get("transform")
+                serializer_compatible = (
+                    source_type in {"array", "object"}
+                    and target_type == "string"
+                    and transform == "json_serialize"
+                )
+                if transform and not serializer_compatible:
+                    issue(
+                        "incompatible_platform_output_transform", f"{path}.transform", iid,
+                        {"source_type": source_type, "target_type": target_type, "transform": transform},
+                        "json_serialize applies only to array/object -> string",
+                    )
+                elif source_type and target_type and source_type != target_type and not serializer_compatible:
+                    issue(
+                        "incompatible_platform_output_type", path, iid,
+                        {"source_type": source_type, "target_type": target_type, "transform": transform},
+                        "matching types or array/object -> string with transform=json_serialize",
+                    )
     for member, slot in sorted(required_slots - covered_slots):
         candidates = generate_provenance_candidates(
             target_member=member,
@@ -852,7 +910,7 @@ def canonical_logical_binding_signatures(plan: dict[str, Any]) -> tuple[tuple[An
         elif kind == "member_to_member":
             signature = (kind, value.get("source_member"), value.get("source_output"), value.get("target_member"), value.get("target_input"))
         elif kind == "member_to_platform":
-            signature = (kind, value.get("source_member"), value.get("source_output"), value.get("target_platform_output"))
+            signature = (kind, value.get("source_member"), value.get("source_output"), value.get("target_platform_output"), value.get("transform"))
         else:
             signature = (str(kind), json.dumps(value, sort_keys=True, default=str))
         signatures.append(signature)
@@ -913,7 +971,9 @@ source_path, target_member, target_input, goal.
 member_to_member always contains: interface_id, kind, source_member,
 source_output, target_member, target_input, goal.
 member_to_platform always contains: interface_id, kind, source_member,
-source_output, target_platform_output, goal.
+source_output, target_platform_output, goal, and may contain transform.
+When an array or object output is mapped to the text or markdown string sink,
+set transform=json_serialize. Never invent another platform output for structured data.
 This wire contract and INTERFACE_SCHEMA describe the same protocol. Do not omit
 a required field because its value is empty-like; source_path=[] is the explicit
 representation of whole-slot platform binding.
@@ -1327,6 +1387,11 @@ A plausible goal cannot make an incorrect structured source/target binding valid
             ->
     target_platform_output
 
+    A declared transform is part of this compatibility check. json_serialize
+    makes an array/object source compatible with a string-valued text or
+    markdown sink. Do not report that mapping as a type mismatch. Without the
+    serializer, a direct structured-to-string mapping is incompatible.
+
 
     The reviewer checks semantic compatibility only.
 
@@ -1549,6 +1614,11 @@ async def plan_function_item_interfaces(*, original_user_goal: str, frozen_funct
             planner_model=planner_model, model_call=model_call,
         )
         logger.info("[Creator][interface_protocol_repair] attempt=1 result=transport_parseable")
+    if isinstance(transport, dict) and isinstance(transport.get("interfaces"), list):
+        transport = supplement_member_to_platform_transforms(
+            plan=transport, function_items=frozen_function_items,
+            platform_contract=platform_contract,
+        )
     protocol_issue: InterfaceIntentPlanError | None = None
     try:
         parsed = validate_interface_plan_protocol(transport)
@@ -1658,6 +1728,11 @@ Return strict JSON matching INTERFACE_SCHEMA only."""
                 return {"__invalid_transport__": corrected_text}
 
         async def evaluate_correction(candidate_object: Any) -> CandidateEvaluation:
+            if isinstance(candidate_object, dict) and isinstance(candidate_object.get("interfaces"), list):
+                candidate_object = supplement_member_to_platform_transforms(
+                    plan=candidate_object, function_items=frozen_function_items,
+                    platform_contract=platform_contract,
+                )
             try:
                 candidate = validate_interface_plan_protocol(candidate_object)
             except InterfaceIntentPlanError as exc:

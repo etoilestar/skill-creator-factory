@@ -7,7 +7,6 @@ from backend.services.creator.generation import (
     _normalize_generated_file_content,
     _script_local_contract_payload,
     _validate_materialized_platform_skill_md_commands,
-    _validate_platform_command_payload_shape,
     build_available_tool_context,
 )
 from backend.services.creator.contracts import detect_markdown_hard_format_failures
@@ -101,6 +100,8 @@ def test_platform_materializes_skill_md_commands_from_upstream_facts(monkeypatch
 
     assert '"wrong"' not in result
     assert result.count("```bash") == 1
+    assert result.count("<!-- generated_by=contract_renderer -->") == 1
+    assert "<!-- generated_by=contract_renderer -->\n```bash" in result
     assert "python scripts/main.py '{\"payload\":\"{{input}}\",\"limit\":3}'" in result
     assert "## 运行命令" in result
     assert _materialize_platform_skill_md_commands(
@@ -109,67 +110,42 @@ def test_platform_materializes_skill_md_commands_from_upstream_facts(monkeypatch
         blueprint_text="ignored",
         responsibility_graph={},
     ) == result
-    monkeypatch.setattr(
-        generation,
-        "extract_python_strict_argv_schema",
-        lambda _source: {
-            "allowed_keys": ["payload", "limit"],
-            "required_keys": ["payload"],
-            "expected_types": {"payload": "object", "limit": "integer"},
-        },
-    )
     _validate_materialized_platform_skill_md_commands(
         result,
         skill_name="demo",
         blueprint_text="ignored",
     )
-
-
-@pytest.mark.parametrize(
-    ("payload", "schema", "error"),
-    [
-        (
-            {"items": ["{{input_items}}"]},
-            {"allowed_keys": ["items"], "required_keys": ["items"], "expected_types": {"items": "list"}},
-            "wraps a list value",
-        ),
-        (
-            {"config": '{"enabled":true}'},
-            {"allowed_keys": ["config"], "required_keys": ["config"], "expected_types": {"config": "object"}},
-            "invalid JSON shape",
-        ),
-        (
-            {},
-            {"allowed_keys": ["required_input"], "required_keys": ["required_input"]},
-            "misses required keys",
-        ),
-        (
-            {"items": "prefix-{{input_items}}"},
-            {"allowed_keys": ["items"], "required_keys": ["items"], "expected_types": {"items": "list"}},
-            "embeds a placeholder as string",
-        ),
-    ],
-)
-def test_platform_command_shape_validator_rejects_contract_drift(payload, schema, error):
-    with pytest.raises(ValueError, match=error):
-        _validate_platform_command_payload_shape(
-            script_path="scripts/main.py",
-            payload=payload,
-            argv_schema=schema,
+    with pytest.raises(ValueError, match="missing renderer ownership metadata"):
+        _validate_materialized_platform_skill_md_commands(
+            result.replace("<!-- generated_by=contract_renderer -->\n", ""),
+            skill_name="demo",
+            blueprint_text="ignored",
         )
 
 
-@pytest.mark.parametrize("expected_type", ["list", "object", "string", "integer"])
-def test_platform_command_shape_validator_preserves_whole_placeholder_type(expected_type):
-    _validate_platform_command_payload_shape(
-        script_path="scripts/main.py",
-        payload={"value": "{{upstream_value}}"},
-        argv_schema={
-            "allowed_keys": ["value"],
-            "required_keys": ["value"],
-            "expected_types": {"value": expected_type},
-        },
+def test_platform_replaces_model_authored_renderer_ownership_marker(monkeypatch):
+    from backend.services.creator import generation
+
+    entry = _entry(command_template="python scripts/main.py '{}'")
+    monkeypatch.setattr(
+        generation,
+        "parse_blueprint",
+        lambda _messages: SimpleNamespace(skill_plan=SimpleNamespace(files=[entry])),
     )
+
+    authored = (
+        "# Demo\n\n<!-- generated_by=contract_renderer -->\n"
+        "```bash\npython scripts/fake.py '{}'\n```\n"
+    )
+    result = _materialize_platform_skill_md_commands(
+        authored,
+        skill_name="demo",
+        blueprint_text="ignored",
+    )
+
+    assert "scripts/fake.py" not in result
+    assert result.count("<!-- generated_by=contract_renderer -->") == 1
+    assert "<!-- generated_by=contract_renderer -->\n```bash\npython scripts/main.py '{}'" in result
 
 
 def test_required_resources_project_declared_dependencies_only_for_current_script():

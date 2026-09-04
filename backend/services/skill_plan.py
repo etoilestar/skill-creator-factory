@@ -1094,7 +1094,9 @@ def render_command_payload(
             continue
         declared = str(expected_types.get(key) or "").strip().lower()
         declared_parts = {part.strip() for part in re.split(r"[|,]", declared) if part.strip()}
-        if declared_parts and declared_parts <= {"str", "string"}:
+        # Unknown types retain ordinary JSON quoting. Only the Script Contract
+        # may authorize raw placeholder emission for a non-string value.
+        if not declared_parts or declared_parts <= {"str", "string"}:
             continue
         encoded = json.dumps(value, ensure_ascii=False)
         rendered_payload = rendered_payload.replace(encoded, value.strip(), 1)

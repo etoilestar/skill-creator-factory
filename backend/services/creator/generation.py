@@ -857,6 +857,82 @@ def _script_responsibility_requirements_payload(
 
     return payload
 
+def _build_capability_guidance(
+    function_execution_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """
+    Build prompt-visible capability guidance.
+
+    Capability declarations are hints for implementation choice.
+    They are not execution requirements.
+
+    This projection intentionally does not modify
+    FunctionItem or SkillPlan contracts.
+    """
+
+    context = (
+        function_execution_context
+        if isinstance(function_execution_context, dict)
+        else {}
+    )
+
+    function_item = context.get(
+        "function_item",
+        {}
+    )
+
+    if not isinstance(function_item, dict):
+        function_item = {}
+
+    capabilities = (
+            function_item.get(
+                "required_capabilities",
+                []
+            )
+            or []
+    )
+
+    capability_names = [
+        str(item).strip()
+        for item in capabilities
+        if str(item).strip()
+    ]
+
+    return {
+        "declared_capabilities": capability_names,
+
+        "semantic_role": (
+            "implementation_hint"
+        ),
+
+        "interpretation": (
+            "Capabilities describe available "
+            "implementation directions. "
+            "They do not define mandatory "
+            "tool execution."
+        ),
+
+        "rules": [
+            (
+                "A capability declaration does not "
+                "create an additional responsibility."
+            ),
+            (
+                "A capability declaration does not "
+                "require invoking a matching tool."
+            ),
+            (
+                "Use a tool only when its function "
+                "contract directly contributes to "
+                "the current FunctionItem responsibility."
+            ),
+            (
+                "Do not add external calls only "
+                "because a capability name exists."
+            ),
+        ],
+    }
+
 def _build_interface_semantics(
     *,
     plan_entry: SkillPlanEntry,
@@ -2071,7 +2147,11 @@ def _script_local_contract_payload(
             "type": declared_type,
             "binding_status": "resolved",
         })
-
+    capability_guidance = (
+        _build_capability_guidance(
+            function_execution_context
+        )
+    )
     return {
         "file_path": file_path,
         "runtime": plan_entry.runtime,
@@ -2084,6 +2164,7 @@ def _script_local_contract_payload(
             responsibility_requirements
         ),
         "function_item_graph_context": function_execution_context,
+        "capability_guidance": capability_guidance,
         "function_execution_context": function_execution_context,
         "functional_requirements": canonical_contract.functional_requirements,
         "side_effects": canonical_contract.side_effects,
@@ -2144,21 +2225,17 @@ def _script_local_contract_payload(
         ),
         "runtime_envelope": {
             "description": (
-                "Creator/Skill runtime may provide "
-                "a generic JSON argv envelope. "
-                "Scripts should read the inputs "
-                "required by their own guard/run "
-                "contract and may receive external "
-                "values from the runtime envelope."
+                "Runtime envelope is only the external transport layer. "
+                "It is not a script input schema and must never appear "
+                "as an additional wrapper in SKILL.md command JSON."
             ),
-            "generic_fields": [
-                "payload",
-                "user_request",
-                "fields",
-                "options",
-                "input_files",
-                "files",
-                "resources",
+
+            "generic_fields": [],
+
+            "rules": [
+                "Do not generate payload/data/options/request wrappers.",
+                "Only pass values required by strict_json_argv_schema.",
+                "Preserve declared JSON value boundaries."
             ],
             "smoke_note": (
                 "Smoke inputs may include real "
@@ -2176,55 +2253,50 @@ def _script_local_contract_payload(
                 "available_tools to satisfy the "
                 "current script responsibility."
             ),
+
             (
                 "available_tools and Current File "
                 "Tool Binding describe the callable "
-                "tools currently authorized for the "
-                "current Skill."
+                "tools authorized for the current Skill."
             ),
+
             (
-                "available_tools is only the current allowed tool index. "
-                "Read import_path, signature, input_schema, output_schema, "
-                "return_contract, examples, and common_mistakes from resolved_tools, "
-                "tool_function_cards, and tool_snippets before composing a call."
+                "Available tools are implementation "
+                "candidates, not mandatory execution "
+                "requirements. A tool should only be "
+                "invoked when using that capability is "
+                "necessary or materially improves the "
+                "implementation required by the "
+                "responsibility contract."
             ),
+
             (
-                "Do not use tools outside the available_tools index. Do not use "
-                "parameters or return fields that are not declared in resolved_tools."
+                "Do not call a tool only because the "
+                "capability appears in FunctionItem, "
+                "required_capabilities, or available_tools."
             ),
+
             (
-                "Treat available tools as candidates only after responsibility_requirements are understood."
+                "Capability declarations describe "
+                "possible implementation capabilities. "
+                "They do not override must_do, "
+                "must_not_do, output contracts, runtime "
+                "contracts, or deterministic local logic."
             ),
+
             (
-                "Standard-library or allowed local "
-                "implementation may be used only for "
-                "deterministic local transformations "
-                "that do not replace a required model "
-                "or external-effect capability with "
-                "placeholder behavior."
+                "Deterministic local implementation, "
+                "standard library usage, or existing "
+                "runtime logic is valid when it satisfies "
+                "the responsibility contract."
             ),
+
             (
-                "Never replace an available model "
-                "generation or artifact-producing "
-                "tool with a fixed template, fake "
-                "path, simulated result, or filename "
-                "string."
-            ),
-            (
-                "Core inputs must participate in the "
-                "produced business result or artifact."
-            ),
-            (
-                "References and assets are runtime "
-                "resources, not Python dependency "
-                "declarations."
-            ),
-            (
-                "First-round generation implements "
-                "the current script; cross-step "
-                "execution alignment is verified "
-                "by E2E."
-            ),
+                "Never create fake implementations "
+                "when the responsibility contract "
+                "explicitly requires an external "
+                "capability or tool behavior."
+            )
         ],
         "implementation_resolution": {
             "mode": (
@@ -2375,8 +2447,23 @@ def _existing_script_argv_context_for_skill_md(
 
         items.append({
             "script_path": script_path,
+
             "command_alignment_snapshot": snapshot,
+
             "strict_json_argv_schema": schema,
+
+            "argv_value_boundary_contract": {
+                "authority": "strict_json_argv_schema",
+                "rules": [
+                    "argv key names must match exactly",
+                    "argv JSON value types must match exactly",
+                    "array values must remain JSON arrays",
+                    "object values must remain JSON objects",
+                    "scalar values must remain scalar",
+                    "no wrapper objects are allowed",
+                    "no adapter fields such as data/items/files/value are allowed unless declared in schema"
+                ]
+            },
             "run_args_analysis": run_analysis,
             "function_execution_context": function_execution_context,
             "declared_prior_stdout_fields": declared_prior_stdout_by_path.get(script_path, []),
@@ -3318,7 +3405,8 @@ def _build_generate_file_prompt(
             "FIRST-ROUND BINDING AUTHORITY\n"
             "When command_alignment_snapshot.confirmed_bindings contains a binding for an argv key, preserve that exact source identity. Do not select or reinterpret another platform source for that target. available_sources may be considered only for unresolved_target_keys. Raw Blueprint runtime prose or command examples must not override frozen Interface / Graph bindings. Generation implements upstream planning; it does not create another dataflow plan.\n"
             "Authority order: Frozen Interface / Graph > command_alignment_snapshot > actual script argv contract > descriptive Blueprint runtime prose/example. First round does not need to prove runtime success, but it must preserve every already-known upstream binding. E2E verifies execution correctness; it does not justify redesigning a frozen binding.\n"
-            "6c. 输入字段是脚本入口接口字段，不是平台字段白名单；输入值必须绑定到平台输入、责任图谱 incoming edge、已排序前序 stdout、reference/assets、literal_default、runtime_constant 或脚本默认值中的真实来源。\n"
+            "6c. 输入字段是脚本入口接口字段，不是平台字段白名单；输入值必须绑定到平台输入、责任图谱 incoming edge、已排序前序 stdout、reference/assets、literal_default、runtime_constant 或脚本默认值中的真实来源。"
+            "The command JSON key itself must never represent a container for another schema.\n"
             "6d. 不要为同一语义输入同时编造多个别名字段；选定一个输入字段后，command block、输入 JSON 说明和正文说明要一致。\n"
             "6e. 必填动态参数不能写成普通示例字符串、字段名字符串或只重复参数名的字符串；动态值必须使用 `{{...}}` placeholder，并且 placeholder 根节点必须存在于允许来源。\n"
             "7. 第一条脚本命令的动态输入只能引用 platform input envelope 中确定存在的来源，或明确的 literal_default、reference_file、asset_file、runtime_constant；不要引用尚未产生的中间 stdout 字段。\n"
@@ -3330,10 +3418,24 @@ def _build_generate_file_prompt(
             "10c. 普通字符串只允许用于明确的 literal_default、runtime_constant、reference_file、asset_file 或脚本默认值；输入值如果是动态值，应能从平台 input envelope、责任图谱 incoming edge 或前序 stdout 解析。\n"
             "11. 若需要数值默认值，直接写固定 JSON 数字；不要把动态数值 placeholder 裸露在 JSON 中。\n"
             "12. 批量处理、列表处理或多文件处理应由对应脚本内部完成，SKILL.md 静态说明中不展开自然语言循环。\n"
-            "13. Command block 中的输入 JSON 只负责表达已存在 runtime binding 到脚本入口的传递关系。\n"
-            "placeholder 表示 runtime contract 中某个已解析输入的完整绑定结果，而不是待拼接的文本片段或待重新设计的数据结构。\n"
-            "生成 command 时必须保持 runtime contract 定义的数据边界，不得通过新增包装层、重新组织字段层级或构造新的中间协议改变输入语义。\n"
-            "Command block 不负责定义新的输入 schema；任何输入结构设计都必须来自已有 SkillPlan/runtime_contract/script contract。\n"
+            "13. Command block input JSON is a direct serialization of strict_json_argv_schema."
+            "The JSON object passed after scripts/*.py must have exactly the same top-level keys as strict_json_argv_schema."
+            "The value boundary is immutable:"
+            "- list input -> JSON array"
+            "- object input -> JSON object"
+            "- scalar input -> JSON scalar"
+            "Never create additional wrappers:"
+            "- payload"
+            "- data"
+            "- fields"
+            "- options"
+            "- config"
+            "- request"
+            "- items"
+            "- value"
+            "A placeholder represents the complete runtime-resolved value of one declared argv field."
+            "Command block only maps existing runtime bindings."
+            "It does not design, normalize, or adapt a new input schema.\n"
             "14. 如果 authoritative / declared SkillPlan paths 中存在 references/**，SKILL.md 正文必须在“参考资料/资源”小节明确引用每个已确认 reference，并说明何时读取。\n"
             "15. 不要在输出内容的外侧套 ``` 代码块，但 SKILL.md 正文内部必须按需包含标准 ```bash fenced code block。\n"
             "16. 禁止只写隐式执行描述；必须写明可执行 fenced block。\n"
@@ -3395,7 +3497,9 @@ def _build_generate_file_prompt(
             f'你正在为 Skill 包 "{skill_name}" 生成单个脚本文件：{file_path}。\n\n'
             "只输出完整可运行源码本身；禁止 Markdown fence、解释、文件名标题或多文件输出。\n"
             "第一轮只修当前脚本；不要修改或重规划上下游链路，第二轮 E2E 才修整链路。\n"
-            "生成前只使用以下轻量上下文：script_goal、inputs、outputs、available_tools、resource_refs、output_contract、rules。\n"
+            "生成前必须严格基于以下上下文生成脚本："
+            "script_goal、inputs、outputs、available_tools、resource_refs、output_contract、rules、"
+            "upstream_data_contract、downstream_data_contract、responsibility_edges。"
             "统一按 script_composition 理解：根据功能目标组合 argv 输入、本地逻辑和 available_tools；available_tools 只做候选召回，不是最终裁决。\n"
             "工具/helper 如何组合不作为第一轮 hard gate；如 import/dependency、调用、stdout 或 artifact 失败，再修当前脚本。\n"
             "平台 IO 硬规则：OUTPUT_DIR 本身就是最终输出目录；禁止 OUTPUT_DIR/outputs；禁止 os.path.join(OUTPUT_DIR, \"outputs\") 或 os.path.join(output_dir, \"outputs\")；禁止 replace(\"/tmp/\", \"outputs/\")。\n"
@@ -3406,6 +3510,14 @@ def _build_generate_file_prompt(
             "轻量脚本上下文：\n"
             f"{json.dumps(local_contract, ensure_ascii=False, indent=2)}\n\n"
             f"固定脚本骨架（仅约束入口/JSON stdout；输出时补全为可运行源码）：\n{script_skeleton_text}"
+            "数据流闭环规则："
+            "1. 禁止在脚本中创建未声明的业务输入字段。"
+            "2. 禁止通过固定字段名猜测用户数据结构，例如 id、name、date 等。"
+            "3. 如果脚本需要某个业务参数，该参数必须来自："
+            "(a) 平台输入绑定；"
+            "(b) ResponsibilityGraph incoming edge；"
+            "(c) 用户明确输入。"
+            "4. 如果上述来源不存在，必须通过脚本逻辑自动推断，而不是硬编码默认字段。"
         )
 
     elif file_path.startswith("references/"):

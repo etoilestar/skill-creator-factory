@@ -21,6 +21,7 @@
     <RuntimeTimeline v-if="messages.length || streaming || creationPlan" :stages="creatorStages" />
 
     <div class="content-area">
+      <CreatorEventStream :events="creatorEvents" />
       <!-- Main chat column -->
       <div class="messages-column">
         <div class="messages" ref="messagesEl">
@@ -239,6 +240,7 @@ import ChatBubble from '../components/ChatBubble.vue'
 import SkillCreationPanel from '../components/SkillCreationPanel.vue'
 import CreatorExecutionPanel from '../components/CreatorExecutionPanel.vue'
 import RuntimeTimeline from '../components/RuntimeTimeline.vue'
+import CreatorEventStream from '../components/CreatorEventStream.vue'
 
 // ---------------------------------------------------------------------------
 // State
@@ -644,9 +646,16 @@ function appendExecutionBlock({ step, label, detail = '', content = '' } = {}) {
     label: String(label || '执行步骤'),
     detail: String(detail || ''),
     content: safeExecutionContent(content),
+    time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
   })
   markExecutionPanelUpdated('process')
 }
+
+const creatorEvents = computed(() => thoughts.value.map((event, index) => ({
+  ...event,
+  id: `${event.step}-${index}`,
+  level: /fail|error/i.test(event.step) ? 'failed' : (/start|draft|output/i.test(event.step) ? 'running' : (/warning|repair/i.test(event.step) ? 'warning' : 'success')),
+})))
 
 function summarizeFiles(files) {
   return (Array.isArray(files) ? files : [])

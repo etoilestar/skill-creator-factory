@@ -3,6 +3,7 @@
     <div v-if="!hasGraph" class="graph-empty">当前 Skill 没有可执行脚本责任图谱</div>
     <template v-else>
       <div class="creator-responsibility-graph">
+        <button class="fit-view-button" type="button" title="将全部节点适配到窗口" @click="fitGraph">适配窗口</button>
         <VueFlow
           :nodes="flowNodes"
           :edges="flowEdges"
@@ -121,12 +122,16 @@ async function refreshGraph() {
   await nextTick(); fitView({ padding: 0.18, duration: 250 })
 }
 function handleNodeClick(event) { selectedNode.value = event.node }
+function fitGraph() { fitView({ padding: 0.22, duration: 250 }) }
 watch(() => [props.nodes, props.edges], refreshGraph, { deep: true, immediate: true })
 </script>
 
 <style scoped>
-.creator-responsibility-graph-wrap { position: relative; height: 100%; min-height: 520px; display: flex; flex-direction: column; }
-.creator-responsibility-graph { width: 100%; height: 100%; min-height: 520px; border: 1px solid var(--border); border-radius: 12px; overflow: hidden; background: #f8fafc; }
+.creator-responsibility-graph-wrap { position: relative; width: 100%; height: 100%; min-height: 520px; display: flex; flex-direction: column; overflow: hidden; }
+.creator-responsibility-graph { position: relative; width: 100%; height: 100%; min-height: 520px; border: 1px solid var(--border); border-radius: 12px; overflow: hidden; background: #f8fafc; contain: layout paint; }
+.creator-responsibility-graph :deep(.vue-flow), .creator-responsibility-graph :deep(.vue-flow__viewport), .creator-responsibility-graph :deep(svg) { width: 100%; height: 100%; }
+.creator-responsibility-graph :deep(.vue-flow__edge-textbg) { fill: #fff; fill-opacity: .9; }.creator-responsibility-graph :deep(.vue-flow__edge-text) { font-size: 10px; }
+.fit-view-button { position: absolute; z-index: 6; top: 10px; right: 10px; padding: 6px 9px; border: 1px solid #cbd5e1; border-radius: 7px; background: rgb(255 255 255 / 92%); color: #334155; cursor: pointer; font-size: 11px; box-shadow: 0 2px 8px rgb(15 23 42 / 10%); }
 .graph-empty { margin: auto; padding: 24px; color: var(--text-muted); text-align: center; }
 .node-detail-drawer { position: absolute; right: 14px; bottom: 14px; width: min(340px, calc(100% - 28px)); max-height: 48%; overflow: auto; padding: 14px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface, #fff); box-shadow: 0 18px 50px rgba(15,23,42,.18); font-size: 12px; z-index: 5; }
 .node-detail-drawer h4 { margin: 0 28px 10px 0; }

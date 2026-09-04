@@ -252,11 +252,20 @@
           <div><small>E2E RUNTIME</small><h3>{{ runtimeTitle }}</h3></div>
           <span class="runtime-badge" :class="runtimeStatus">{{ runtimeStatusText }}</span>
         </div>
-        <div v-if="runtimeSteps.length" class="runtime-steps">
-          <article v-for="(step, index) in runtimeSteps" :key="`${step.id}-${index}`" :class="step.status">
-            <span class="step-number">{{ index + 1 }}</span>
+        <div v-if="currentRuntimeStep" class="runtime-current">
+          <small>当前唯一运行步骤</small>
+          <strong>Step {{ currentRuntimeStep.index + 1 }}/{{ runtimeSteps.length || 1 }} · {{ currentRuntimeStep.script }}</strong>
+          <p v-if="currentRuntimeStep.input"><b>输入：</b>{{ currentRuntimeStep.input }}</p>
+          <p v-if="currentRuntimeStep.output"><b>输出：</b>{{ currentRuntimeStep.output }}</p>
+          <p v-if="currentRuntimeStep.duration"><b>耗时：</b>{{ currentRuntimeStep.duration }}</p>
+          <span>● running</span>
+        </div>
+        <div v-if="historyRuntimeSteps.length" class="runtime-steps">
+          <h4>历史步骤</h4>
+          <article v-for="step in historyRuntimeSteps" :key="`${step.id}-${step.index}`" :class="step.status">
+            <span class="step-number">{{ step.index + 1 }}</span>
             <div>
-              <strong>Step {{ index + 1 }}/{{ runtimeSteps.length }} · {{ step.script }}</strong>
+              <strong>Step {{ step.index + 1 }}/{{ runtimeSteps.length }} · {{ step.script }}</strong>
               <p v-if="step.input">输入：{{ step.input }}</p>
               <p v-if="step.output">输出：{{ step.output }}</p>
               <p v-if="step.files">文件变化：{{ step.files }}</p>
@@ -270,8 +279,10 @@
 
         <div v-if="friendlyFailure" class="friendly-error">
           <strong>运行失败</strong>
+          <p v-if="friendlyFailure.step"><b>步骤：</b>{{ friendlyFailure.step }}</p>
           <p><b>原因：</b>{{ friendlyFailure.reason }}</p>
           <p v-if="friendlyFailure.impact"><b>影响：</b>{{ friendlyFailure.impact }}</p>
+          <p><b>修复：</b>{{ repairSummaries.length ? '正在尝试自动修复' : '等待自动修复建议' }}</p>
         </div>
         <div v-if="repairSummaries.length" class="repair-summary">
           <h4>系统自动修复</h4>
@@ -564,8 +575,12 @@ const runtimeSteps = computed(() => runtimeEvents.value
     input: summaryValue(event.input_summary || event.inputs || event.rendered_payload_summary),
     output: summaryValue(event.output_summary || event.outputs || event.artifact),
     files: summaryValue(event.file_changes || event.changed_files || event.invalidated_checkpoints),
+    duration: summaryValue(event.duration || event.duration_ms || event.elapsed_ms),
     status: normalizeRuntimeStatus(event.status || event.rerun_status || event.patch_status),
+    index,
   })))
+const currentRuntimeStep = computed(() => runtimeSteps.value.find(step => step.status === 'running') || (runtimeStatus.value === 'running' ? runtimeSteps.value.at(-1) : null))
+const historyRuntimeSteps = computed(() => runtimeSteps.value.filter(step => step !== currentRuntimeStep.value))
 
 const runtimeStatus = computed(() => phase.value === 'validating' ? 'running' : (validateResult.value?.success ? 'success' : (validateResult.value ? 'failed' : 'pending')))
 const runtimeStatusText = computed(() => statusText(runtimeStatus.value))
@@ -574,6 +589,7 @@ const friendlyFailure = computed(() => {
   if (runtimeStatus.value !== 'failed') return null
   const event = [...runtimeEvents.value].reverse().find(item => item?.failure_summary || item?.reason || item?.message)
   return {
+    step: event?.target_file || event?.step_id || event?.failed_step || '',
     reason: conciseText(event?.failure_summary || event?.reason || validateResult.value?.message || '执行结果未满足验证要求'),
     impact: event?.target_file ? `${event.target_file} 对应步骤无法继续` : (event?.step_id ? `${event.step_id} 步骤无法继续` : ''),
   }
@@ -1365,6 +1381,8 @@ function openInSandbox() {
 .runtime-panel { margin-bottom: 12px; padding: 16px; border: 1px solid #334155; border-radius: 12px; background: #151b24; }
 .runtime-heading { display: flex; align-items: center; justify-content: space-between; }.runtime-heading small { color: #60a5fa; font-size: 9px; font-weight: 800; letter-spacing: .16em; }.runtime-heading h3 { margin: 3px 0 0; font-size: 16px; }
 .runtime-badge { padding: 4px 9px; border-radius: 999px; background: #334155; font-size: 11px; }.runtime-badge.running { background: #1e3a8a; color: #bfdbfe; }.runtime-badge.success { background: #14532d; color: #bbf7d0; }.runtime-badge.failed { background: #7f1d1d; color: #fecaca; }
+.runtime-current { display: grid; gap: 6px; margin-top: 14px; padding: 14px; border: 1px solid #2563eb; border-radius: 10px; background: #17233a; }.runtime-current small { color: #93c5fd; font-weight: 700; }.runtime-current strong { font-family: monospace; }.runtime-current p { margin: 0; color: #cbd5e1; font-size: 11px; }.runtime-current > span { color: #60a5fa; font-size: 11px; }
+.runtime-steps > h4 { margin: 4px 0; color: #94a3b8; font-size: 11px; text-transform: uppercase; }
 .runtime-steps { display: grid; gap: 8px; margin-top: 14px; }.runtime-steps article { display: flex; gap: 10px; padding: 10px; border-left: 3px solid #475569; border-radius: 6px; background: #202936; }.runtime-steps article.success { border-color: #22c55e; }.runtime-steps article.failed { border-color: #ef4444; }.runtime-steps article.running { border-color: #3b82f6; }.step-number { display: grid; flex: 0 0 24px; height: 24px; place-items: center; border-radius: 50%; background: #334155; font-size: 11px; }.runtime-steps strong { font-family: monospace; font-size: 12px; }.runtime-steps p { margin: 5px 0; color: #aab6c5; font-size: 11px; }.runtime-steps article > div > span { color: #94a3b8; font-size: 11px; }
 .runtime-waiting { padding: 14px 0 2px; color: #94a3b8; }.friendly-error { margin-top: 14px; padding: 12px; border: 1px solid #7f1d1d; border-radius: 8px; background: #2a171b; }.friendly-error > strong { color: #fca5a5; }.friendly-error p { margin: 7px 0 0; line-height: 1.55; }
 .repair-summary { margin-top: 14px; }.repair-summary h4 { margin: 0 0 8px; }.repair-summary > div { display: flex; gap: 8px; padding: 8px; border-radius: 6px; background: #1e293b; }.repair-summary p { margin: 3px 0 0; color: #aab6c5; font-size: 11px; }.technical-details { margin-top: 12px; color: #94a3b8; }.technical-details summary { cursor: pointer; }.technical-details pre { max-height: 240px; overflow: auto; white-space: pre-wrap; color: #aab6c5; font-size: 11px; }

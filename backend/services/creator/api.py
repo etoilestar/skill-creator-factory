@@ -15326,6 +15326,19 @@ async def generate_file(request: GenerateFileRequest):
                     purpose=request.purpose,
                 )
 
+                if request.file_path == "SKILL.md":
+                    candidate = _materialize_platform_skill_md_commands(
+                        candidate,
+                        skill_name=skill_name,
+                        blueprint_text=request.blueprint_text,
+                        responsibility_graph=request.requirement_graph,
+                    )
+                    _validate_materialized_platform_skill_md_commands(
+                        candidate,
+                        skill_name=skill_name,
+                        blueprint_text=request.blueprint_text,
+                    )
+
                 content = candidate
 
                 last_import_guard_result: Any = None

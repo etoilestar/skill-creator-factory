@@ -2412,6 +2412,7 @@ def _script_local_contract_payload(
                 "argv_schema": command_argv_contract["argv_schema"],
                 "stdout_schema": stdout_schema,
                 "runtime_binding": graph_projection["runtime_binding"],
+                "platform_output_mapping": graph_projection["platform_output_mapping"],
             },
         )
     return {

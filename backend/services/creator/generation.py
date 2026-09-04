@@ -510,14 +510,12 @@ def _platform_skill_md_command_sections(
                     raise ValueError(
                         f"upstream command binding missing for {script_path}: {key}"
                     )
-            runner = {
-                "python": "python",
-                "node": "node",
-                "bash": "bash",
-                "shell": "bash",
-            }.get(str(entry.runtime), "python")
-            encoded_payload = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-            command = f"{runner} {script_path} '{encoded_payload}'"
+            command = render_command_payload(
+                script_path,
+                str(entry.runtime),
+                payload,
+                dict(snapshot.get("actual_argv_schema", {}).get("expected_types", {}) or {}),
+            )
 
         role = str(getattr(entry, "role", "") or "script")
         inputs = ", ".join(str(value) for value in (getattr(entry, "inputs", []) or [])) or "无"
@@ -3615,26 +3613,6 @@ def _build_generate_file_prompt(
         skill_plan_entry=skill_plan_entry,
     )
 
-    skill_md_contract_text = generated_file_contract_text if file_path == "SKILL.md" else ""
-    skill_md_e2e_authoring_guide = (
-        _build_skill_md_e2e_authoring_guide(blueprint_text)
-        if file_path == "SKILL.md"
-        else ""
-    )
-
-    script_argv_context = (
-        _existing_script_argv_context_for_skill_md(
-            skill_name=skill_name,
-            declared_paths=declared_paths,
-            blueprint_text=blueprint_text,
-            conversation_history=conversation_history,
-            responsibility_graph=responsibility_graph,
-            e2e_verified_bindings_by_script=e2e_verified_bindings_by_script,
-        )
-        if file_path == "SKILL.md"
-        else ""
-    )
-
     script_skeleton_text = (
         _script_generation_skeleton(
             file_path,
@@ -3649,103 +3627,24 @@ def _build_generate_file_prompt(
 
     if file_path == "SKILL.md":
         instruction = (
-            f'你正在为 Skill 包 "{skill_name}" 生成 SKILL.md 文件。\n\n'
-            "要求：\n"
-            "1. 只输出 SKILL.md 的文件内容，不要任何解释，不要 Markdown 代码块包裹。\n"
-            "2. 文件必须以 YAML frontmatter 开始，格式严格如下（冒号后有一个空格）：\n"
+            f'你正在为 Skill 包 "{skill_name}" 生成 SKILL.md 的语义文档。\n\n'
+            "只输出单个 SKILL.md 文件内容，不要解释或外层 Markdown fence。\n"
+            "文件必须以仅含 name 与 description 的 YAML frontmatter 开始：\n"
             "---\n"
             f"name: {skill_name}\n"
             "description: <一句话说明本 Skill 的用途>\n"
-            "---\n"
-            "3. frontmatter 闭合后，输出 Skill 的核心执行说明（普通 Markdown 正文）。\n"
-            "4. SKILL.md 第一轮只生成静态可解析的使用说明和资源说明。不要生成 scripts/ 的 command block；后台平台会根据上游 SkillPlan、责任图谱和脚本 argv 合同直接生成并写入这些 block。\n"
-            "5. 如果蓝图包含 scripts/ 资源，只描述调用顺序、职责和输入输出语义，不要自行编写或猜测 ```bash fenced code block。\n"
-            "6. 每个 bash fenced code block 内只能有一条脚本命令；命令必须直接调用 scripts/ 路径。脚本路径后必须紧跟一个完整的输入 JSON object，并使用一对 ASCII 单引号包裹整个 JSON object，使其在 shell 中作为脚本路径后的第一个位置参数传入；JSON object 内部的字段名和字符串值必须继续使用标准 JSON 双引号。该输入 JSON 对应 Python 脚本中的 `sys.argv[1]`。\n"
-            "6a. 每个 scripts/*.py command block 附近必须写普通 Markdown action schema 声明：role、inputs、outputs；这些是使用说明，不是运行时 hard schema。\n"
-            "6b. 输入 JSON key 必须使用对应脚本真实 strict_json_argv_guard schema 中的字段；如果 guard 不完整，再以 run_args_analysis 和 function_execution_context/function_item_graph_context 为事实依据补足，不能自行编造业务字段或别名。\n"
-            "6b-1. actual_argv_schema 是 argv key identity 的唯一 authority；必须逐字复制 key，不得根据 role、purpose 或蓝图 prose 重命名。confirmed_bindings/exact incoming Graph provenance 与 frozen_defaults 只决定这些 key 的 value。\n"
-            "6b-2. frozen_defaults 中的值必须按原生 JSON 类型直接序列化；不得改为 fields/options placeholder。confirmed_bindings 必须使用该 target key 对应的精确 source，不得换用另一个可用字段。\n"
-            "FIRST-ROUND BINDING AUTHORITY\n"
-            "When command_alignment_snapshot.confirmed_bindings contains a binding for an argv key, preserve that exact source identity. Do not select or reinterpret another platform source for that target. available_sources may be considered only for unresolved_target_keys. Raw Blueprint runtime prose or command examples must not override frozen Interface / Graph bindings. Generation implements upstream planning; it does not create another dataflow plan.\n"
-            "Authority order: Frozen Interface / Graph > command_alignment_snapshot > actual script argv contract > descriptive Blueprint runtime prose/example. First round does not need to prove runtime success, but it must preserve every already-known upstream binding. E2E verifies execution correctness; it does not justify redesigning a frozen binding.\n"
-            "6c. 输入字段是脚本入口接口字段，不是平台字段白名单；输入值必须绑定到平台输入、责任图谱 incoming edge、已排序前序 stdout、reference/assets、literal_default、runtime_constant 或脚本默认值中的真实来源。"
-            "The command JSON key itself must never represent a container for another schema.\n"
-            "6d. 不要为同一语义输入同时编造多个别名字段；选定一个输入字段后，command block、输入 JSON 说明和正文说明要一致。\n"
-            "6e. 必填动态参数不能写成普通示例字符串、字段名字符串或只重复参数名的字符串；动态值必须使用 `{{...}}` placeholder，并且 placeholder 根节点必须存在于允许来源。\n"
-            "7. 第一条脚本命令的动态输入只能引用 platform input envelope 中确定存在的来源，或明确的 literal_default、reference_file、asset_file、runtime_constant；不要引用尚未产生的中间 stdout 字段。\n"
-            "8. 如果 Skill 需要业务字段，第一条命令应把平台输入 envelope 中的真实占位符传给脚本，由脚本自行解析；不要在第一轮固定无来源中间字段名。\n"
-            "9. 后续命令需要使用上游结果时，必须引用责任图谱 incoming edge 或前序 stdout 中真实存在的字段；不得使用普通字段名字符串冒充流转，也不得引用未在平台输入或前序 stdout 中出现的 placeholder 根节点。\n"
-            "10. 输入 JSON 必须是标准 JSON；动态值必须作为 JSON 字符串值出现。运行时输入文件 sentinel 只可用于真实平台运行时文件输入；当责任图谱已声明输入来自前序 stdout 时，禁止改写为运行时输入文件 sentinel。reference/assets 文件使用普通相对路径字符串，模型名使用运行时常量字符串。\n"
-            "10a. 每个核心执行命令附近必须写 **输入 JSON 说明**；这是提示词级映射说明，不是硬校验 schema。对每个输入字段说明 type、source_kind、source、required、default（如有）。\n"
-            "10b. source_kind 只能用通用类别：platform_input、previous_stdout、reference_file、asset_file、literal_default、runtime_constant、script_default。\n"
-            "10c. 普通字符串只允许用于明确的 literal_default、runtime_constant、reference_file、asset_file 或脚本默认值；输入值如果是动态值，应能从平台 input envelope、责任图谱 incoming edge 或前序 stdout 解析。\n"
-            "11. 若需要数值默认值，直接写固定 JSON 数字；不要把动态数值 placeholder 裸露在 JSON 中。\n"
-            "12. 批量处理、列表处理或多文件处理应由对应脚本内部完成，SKILL.md 静态说明中不展开自然语言循环。\n"
-            "13. Command block input JSON is a direct serialization of strict_json_argv_schema."
-            "The JSON object passed after scripts/*.py must have exactly the same top-level keys as strict_json_argv_schema."
-            "The value boundary is immutable:"
-            "- list input -> JSON array"
-            "- object input -> JSON object"
-            "- scalar input -> JSON scalar"
-            "Never create additional wrappers:"
-            "- payload"
-            "- data"
-            "- fields"
-            "- options"
-            "- config"
-            "- request"
-            "- items"
-            "- value"
-            "A placeholder represents the complete runtime-resolved value of one declared argv field."
-            "Command block only maps existing runtime bindings."
-            "It does not design, normalize, or adapt a new input schema.\n"
-            "14. 如果 authoritative / declared SkillPlan paths 中存在 references/**，SKILL.md 正文必须在“参考资料/资源”小节明确引用每个已确认 reference，并说明何时读取。\n"
-            "15. 不要在输出内容的外侧套 ``` 代码块；也不要输出 ```bash fenced code block，命令区由后台统一追加。\n"
-            "16. 正文应说明执行时机与调用顺序，但不得自行拼装可执行命令。\n"
-            "17. 禁止复制 Creator 界面流程、确认清单、点击开始创建/开始生成、系统将自动创建文件等平台创建流程文案。\n"
-            "18. 以下宿主 Markdown 执行说明是内部写作约束，只能转化为面向使用者的 Skill 说明，不要逐字复制这些约束或标题。\n"
-            "19. 命令中的 JSON key 是当前脚本读取的输入字段；strict_json_argv_schema、run_args_analysis 和 function_execution_context 是生成 command 映射的事实依据，不只是建议参考。\n"
-            "20. 不要在第一轮为下游脚本固定无来源中间字段名；placeholder 来源只能来自平台输入、责任图谱 incoming edge、前序 stdout 或明确静态来源。\n"
-            "21. 第一轮不要求声明最终 stdout 字段闭环；但每个 command JSON value 的来源闭环必须按脚本探针和责任图谱成立，脚本 stdout 与平台标准输出字段由第二轮 E2E 真实执行验证。\n"
-            "22. SKILL.md 必须覆盖蓝图真实规划的任务、真实脚本路径、资源使用、脚本调用顺序（如有）和最终产物类型；不要固定特定中间字段。\n"
-            "23. 真实 Skill 文件 identity 已由 authoritative / declared SkillPlan paths 确认。Blueprint prose 只解释已确认文件的职责；不得从 prose、workflow、资源清单或示例重新发现实际文件。\n"
-            "24. 如果蓝图在禁止隐式执行、示例、反例、例如、比如等语境中提到某个 scripts/*.py、references/*.md 或 assets/*，它只是解释性示例，不应进入最终 SKILL.md，除非它同时出现在目录结构或 SkillPlan path 中。\n"
-            "25. 不要为了满足格式而新增蓝图外脚本；只为蓝图真实规划脚本提供命令块。\n"
-            "SKILL.MD DOWNSTREAM FILE AUTHORITY\n"
-            "你不是 Blueprint/FilePlan Planner。Blueprint 已完成文件规划，SKILL.md 只能消费最终 confirmed structured SkillPlan 中的文件 identity。Authority 顺序为：(1) authoritative / declared SkillPlan paths，(2) 已确认文件的 Blueprint responsibility description，(3) 其他 Blueprint prose；第 3 类只帮助理解业务语义，不能创建 file identity。\n"
-            "SkillPlan 中没有的 references/** 或 assets/** 不得新增；prose 中出现资源路径不代表合法 Skill 文件，也不能覆盖 structured SkillPlan。不得为补全 workflow 而创建资源，不得重新决定 source=user_upload / bundled，只描述已确认资源的使用方式。confirmed reference 应说明何时读取并如何指导，confirmed asset 应说明静态素材用途；不得把 reference 写成用户必须上传，也不得把 asset 写成 Creator 自动生成。\n"
-            "RESOURCE CREATION BOUNDARY\n"
-            "references/** and assets/** represent externally declared Skill resources, not a storage location for internal reasoning or implementation details.\n"
-            "Do not create new resource files for heuristics, rules, mappings, schemas, decision tables, examples, templates, or algorithm descriptions.\n"
-            "If a behavior requires internal rules, validation logic, matching strategies, or processing procedures, describe the behavior in SKILL.md or implement it inside the declared script files.\n"
-            "Only reference a resource path when that exact path exists in authoritative / declared SkillPlan paths.\n"
-            "Do not infer a resource file from the existence of a concept, algorithm, or processing step.\n"
-            "SKILL.MD RUNTIME RESOURCE VIEW\n"
-            "SKILL.md describes the runtime behavior of the completed Skill.\n"
-            "Creation-stage materialization metadata is not part of the runtime user instructions and must not be promoted into SKILL.md prose.\n"
-            "For a confirmed assets/** resource:\n"
-            "- describe only what the already-present static resource is used for at runtime;\n"
-            "- do not describe source=user_upload;\n"
-            "- do not describe source=bundled;\n"
-            "- do not instruct the user to upload, provide, include, or materialize the asset;\n"
-            "- do not explain who supplied the asset;\n"
-            "- do not describe Creator-stage upload/materialization workflow.\n"
-            "By the time the completed Skill runs, an authorized asset is already present in the Skill resource environment.\n"
-            "For a confirmed references/** resource:\n"
-            "- describe its runtime semantic purpose;\n"
-            "- it is valid to say that scripts read, use, consult, follow, or reference it;\n"
-            "- do not expose Creator-stage generation/materialization details unless they are independently part of the runtime user contract.\n"
-            "Creation-stage facts remain in FilePlan / Creator UI. SKILL.md consumes the finalized runtime resource environment.\n"
-            f"{_SKILL_MD_RUNTIME_BINDING_PROMPT}\n"
-            f"{_SKILL_MD_MARKDOWN_EXECUTION_GUIDE}\n\n"
-            "已生成脚本输入 JSON 上下文：\n"
-            f"{script_argv_context or '当前未读取到已生成脚本的 strict_json_argv_guard schema；按当前可用的脚本计划、run_args_analysis 和 function_execution_context 事实生成第一版 command，避免编造无来源字段。'}\n\n"
-            "以下 SKILL.md first-round static authoring guide 约束静态格式、平台边界和 command value 来源闭环；明确 dataflow 映射必须在第一轮按脚本探针和责任图谱成立：\n"
-            f"{skill_md_e2e_authoring_guide}\n\n"
-            "生成前请先隐式检查以下合同，最终输出必须逐项满足；如果合同要求内部 ```bash block，必须在 SKILL.md 正文中写出该 block：\n"
-            f"{skill_md_contract_text}\n\n"
-            f"蓝图声明的文件路径（必须覆盖对应 scripts/references 要求）：\n{declared_paths_text}\n\n"
-            f"以下是已确认的蓝图（已移除 Creator UI 确认文案），你的内容必须与此一致：\n\n{clean_blueprint_text}"
+            "---\n\n"
+            "LLM 只负责用户可读的语义内容：使用说明、参数含义、输出说明、"
+            "脚本职责与调用顺序，以及已声明 references/assets 的用途。\n"
+            "禁止生成、复制或修复任何 bash/shell fenced block、python/node/bash 执行命令、"
+            "argv JSON、placeholder 或参数拼接示例。命令区是平台根据 Graph Contract、"
+            "SkillPlan 与 Script Contract 生成的编译产物，会在模型返回后确定性注入。\n"
+            "可以在自然语言中提及已声明脚本路径，但不要描述命令行拼装方式。\n"
+            "不要复制 Creator 创建流程、内部合同、确认清单或平台实现细节。\n"
+            "只使用 authoritative SkillPlan 已声明的文件，不要从 prose 或示例发明文件。\n\n"
+            "Markdown 结构要完整：frontmatter 后至少包含一个正文标题和可执行流程说明。\n\n"
+            f"蓝图声明的文件路径：\n{declared_paths_text}\n\n"
+            f"已确认蓝图：\n\n{clean_blueprint_text}"
         )
 
     elif file_path.startswith("scripts/"):

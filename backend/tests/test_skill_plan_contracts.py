@@ -1978,6 +1978,50 @@ def test_runtime_schema_uses_actual_keys_graph_source_and_typed_frozen_default()
     assert "story_text" not in command and "fields.arg_B" not in command
 
 
+def test_runtime_schema_preserves_object_and_array_placeholder_values():
+    from backend.services.skill_plan import SkillPlanEntry, render_script_command_from_runtime_schema
+
+    entry = SkillPlanEntry(
+        path="scripts/test.py",
+        file_type="script",
+        role="worker",
+        purpose="verify",
+        runtime="python",
+        command_arg_bindings=[
+            {"argv_key": "fields", "value_template": "{{fields}}"},
+            {"argv_key": "input_files", "value_template": "{{input_files}}"},
+        ],
+    )
+
+    command = render_script_command_from_runtime_schema(entry, {
+        "allowed_keys": ["fields", "input_files"],
+        "required_keys": ["fields", "input_files"],
+        "expected_types": {"fields": "object", "input_files": "array"},
+    })
+
+    assert command == "python scripts/test.py '{\"fields\":{{fields}},\"input_files\":{{input_files}}}'"
+    assert '"{{fields}}"' not in command
+    assert '["{{input_files}}"]' not in command
+
+
+def test_skill_md_prompt_assigns_command_ownership_to_renderer():
+    from backend.routers.creator import _build_generate_file_prompt
+
+    messages = _build_generate_file_prompt(
+        "SKILL.md",
+        "compiled-command-skill",
+        "Document the workflow.",
+        "- path: `SKILL.md`\n  role: skill_overview",
+        [],
+    )
+    prompt = messages[-1]["content"]
+
+    assert "禁止生成、复制或修复任何 bash/shell fenced block" in prompt
+    assert "Graph Contract、SkillPlan 与 Script Contract" in prompt
+    assert "actual_argv_schema" not in prompt
+    assert "command_alignment_snapshot" not in prompt
+
+
 def test_runtime_schema_renders_subsequent_stdout_placeholders():
     from backend.services.skill_plan import SkillPlanEntry, render_script_command_from_runtime_schema
     first_stdout_field = "dynamic_stdout_field"

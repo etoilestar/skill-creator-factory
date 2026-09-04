@@ -1073,12 +1073,39 @@ def _command_args_from_runtime_contract(runtime_contract: dict[str, object] | No
     return {}
 
 
-def _render_command(path: str, runtime: Runtime | str, payload: dict[str, object]) -> str:
+def render_command_payload(
+    path: str,
+    runtime: Runtime | str,
+    payload: dict[str, object],
+    expected_types: dict[str, object] | None = None,
+) -> str:
+    """Compile a command payload while preserving contract value boundaries.
+
+    A placeholder denotes the complete value supplied by the runtime.  JSON
+    string fields therefore keep the placeholder quoted, while placeholders
+    for arrays, objects, numbers, booleans, and nulls are emitted as raw
+    template expressions.  This is a template compiler, not JSON serialization
+    of the eventual runtime value.
+    """
+    expected_types = expected_types or {}
     rendered_payload = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    for key, value in payload.items():
+        if not (isinstance(value, str) and re.fullmatch(r"\{\{\s*[^{}]+?\s*\}\}", value.strip())):
+            continue
+        declared = str(expected_types.get(key) or "").strip().lower()
+        declared_parts = {part.strip() for part in re.split(r"[|,]", declared) if part.strip()}
+        if declared_parts and declared_parts <= {"str", "string"}:
+            continue
+        encoded = json.dumps(value, ensure_ascii=False)
+        rendered_payload = rendered_payload.replace(encoded, value.strip(), 1)
     runner = _runner_for_runtime(runtime)  # type: ignore[arg-type]
     if runner:
         return f"{runner} {path} '{rendered_payload}'"
     return f"{path} '{rendered_payload}'"
+
+
+def _render_command(path: str, runtime: Runtime | str, payload: dict[str, object]) -> str:
+    return render_command_payload(path, runtime, payload)
 
 
 def command_template_for_entry(path: str, runtime: Runtime, inputs: list[str], runtime_contract: dict[str, object] | None = None) -> str:
@@ -1137,7 +1164,7 @@ def render_script_command_from_runtime_schema(
     if missing_bindings:
         raise MissingCommandArgBindingError(entry.path, missing_bindings)
 
-    return _render_command(entry.path, entry.runtime, payload)
+    return render_command_payload(entry.path, entry.runtime, payload, expected_types)
 
 
 def render_script_command_from_skill_plan(

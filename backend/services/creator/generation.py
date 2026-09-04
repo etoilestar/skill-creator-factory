@@ -11,6 +11,10 @@ from ..platform_io_contract import (
 
 _RUNTIME_BINDING_AUTHORITY_PROMPT = """## Runtime Binding Authority
 
+ResponsibilityGraph Interface Contract is the first and sole interface
+authority. Natural-language requirements, SKILL.md, examples, and source code
+must not be used to infer, rename, wrap, or redesign input/output fields.
+
 The runtime input contract has already been resolved by the platform.
 
 Inputs defined in SkillPlan/runtime_contract/input_binding are actual runtime ports.
@@ -2273,6 +2277,23 @@ def _script_local_contract_payload(
     else:
         function_execution_context = dict(function_execution_context)
 
+    # Interface fields are projected exclusively from the graph.  SkillPlan and
+    # source-code inspection remain implementation inputs, never competing
+    # interface authorities.
+    graph_projection = None
+    if responsibility_graph is not None:
+        graph_projection = project_script_interface_contract(
+            responsibility_graph, file_path,
+        )
+        stdout_schema = graph_projection["stdout_schema"]
+        command_argv_contract = {
+            "command_template": "python " + file_path + " '" + json.dumps(graph_projection["command_payload"], ensure_ascii=False, separators=(",", ":")) + "'",
+            "argv_template": graph_projection["command_payload"],
+            "argv_keys": list(graph_projection["argv_schema"]["properties"]),
+            "argv_schema": graph_projection["argv_schema"],
+            "source": "responsibility_graph_interface_contract",
+        }
+
     interface_semantics = _build_interface_semantics(
         plan_entry=plan_entry,
         canonical_contract=canonical_contract,
@@ -2280,11 +2301,12 @@ def _script_local_contract_payload(
     )
     platform_contract = build_platform_io_contract()
 
-    stdout_schema = _project_terminal_sink_schema_to_stdout(
-        stdout_schema,
-        function_execution_context=function_execution_context,
-        platform_contract=platform_contract,
-    )
+    if graph_projection is None:
+        stdout_schema = _project_terminal_sink_schema_to_stdout(
+            stdout_schema,
+            function_execution_context=function_execution_context,
+            platform_contract=platform_contract,
+        )
     local_function_item = function_execution_context.get(
         "function_item"
     )
@@ -2360,7 +2382,8 @@ def _script_local_contract_payload(
         if isinstance(item, dict)
     }
     runtime_input_ports = []
-    for raw_input in canonical_contract.inputs:
+    graph_inputs = ([p for p in graph_interface_contract(responsibility_graph)["input_ports"] if p["consumer"] == file_path] if graph_projection is not None else canonical_contract.inputs)
+    for raw_input in graph_inputs:
         input_name = str(raw_input.get("name") if isinstance(raw_input, dict) else raw_input)
         binding = binding_by_name.get(input_name, {})
         declared_type = (
@@ -2381,13 +2404,23 @@ def _script_local_contract_payload(
             function_execution_context
         )
     )
+    if graph_projection is not None:
+        validate_graph_interface_projection(
+            responsibility_graph,
+            file_path,
+            {
+                "argv_schema": command_argv_contract["argv_schema"],
+                "stdout_schema": stdout_schema,
+                "runtime_binding": graph_projection["runtime_binding"],
+            },
+        )
     return {
         "file_path": file_path,
         "runtime": plan_entry.runtime,
         "language": plan_entry.language,
         "script_goal": purpose,
-        "inputs": canonical_contract.inputs,
-        "outputs": canonical_contract.outputs,
+        "inputs": graph_inputs if graph_projection is not None else canonical_contract.inputs,
+        "outputs": ([p for p in graph_interface_contract(responsibility_graph)["output_ports"] if p["producer"] == file_path] if graph_projection is not None else canonical_contract.outputs),
         "interface_semantics": interface_semantics,
         "responsibility_requirements": (
             responsibility_requirements
@@ -2446,8 +2479,8 @@ def _script_local_contract_payload(
         ),
         "runtime_binding_context": {
             "inputs": runtime_input_ports,
-            "input_binding": declared_bindings,
-            "authority": "SkillPlan/runtime_contract/input_binding",
+            "input_binding": graph_projection["runtime_binding"] if graph_projection is not None else declared_bindings,
+            "authority": "ResponsibilityGraph Interface Contract" if graph_projection is not None else "SkillPlan/runtime_contract/input_binding",
         },
         "command_argv_contract": (
             command_argv_contract

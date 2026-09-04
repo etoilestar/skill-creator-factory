@@ -281,9 +281,9 @@ class FunctionItem(BaseModel):
     # before E2E reloads the graph.
     requirement: str = ""
     text: str = ""
-    inputs: list[str] = Field(default_factory=list)
+    inputs: list[Any] = Field(default_factory=list)
     default_values: dict[str, Any] = Field(default_factory=dict)
-    outputs: list[str] = Field(default_factory=list)
+    outputs: list[Any] = Field(default_factory=list)
     depends_on: list[str] = Field(default_factory=list)
     required_tools: list[str] = Field(default_factory=list)
     optional_tools: list[str] = Field(default_factory=list)
@@ -321,13 +321,22 @@ class FunctionItem(BaseModel):
             merged["must_do"] = values
         return merged
 
-    @field_validator("inputs", "outputs", "depends_on", "required_tools", "optional_tools", "must_do", "must_not_do", mode="before")
+    @field_validator("depends_on", "required_tools", "optional_tools", "must_do", "must_not_do", mode="before")
     @classmethod
     def _coerce_string_list(cls, value: Any) -> list[str]:
         if value in (None, ""):
             return []
         raw = value if isinstance(value, list) else [value]
         return [str(item).strip() for item in raw if str(item or "").strip()]
+
+    @field_validator("inputs", "outputs", mode="before")
+    @classmethod
+    def _preserve_port_contracts(cls, value: Any) -> list[Any]:
+        """Preserve structured port type/shape facts instead of stringifying them."""
+        if value in (None, ""):
+            return []
+        raw = value if isinstance(value, list) else [value]
+        return [dict(item) if isinstance(item, dict) else str(item).strip() for item in raw if isinstance(item, dict) or str(item or "").strip()]
 
 
     @field_validator("constraints", mode="before")
@@ -393,9 +402,8 @@ def function_item_prompt_payload(item: Any) -> dict[str, Any]:
     return payload
 
 class ResponsibilityGraph(BaseModel):
-    # ResponsibilityGraph inputs/outputs are recommended shared vocabulary for SKILL.md
-    # and scripts to converge on field names. They are not a field-level hard
-    # validation contract; real closure is verified by E2E execution.
+    # FunctionItem ports and edge mappings are the Creator-wide interface
+    # contract. Every argv/stdout/command/runtime projection is read-only.
     # External wire shape still serializes function items under requirements.
     requirements: list[FunctionItem] = Field(default_factory=list)
 
@@ -462,9 +470,82 @@ def _normalize_dataflow_edges(raw_edges: Any) -> list[dict[str, Any]]:
             "purpose": str(raw.get("purpose") or "").strip(),
             "constraints": constraints,
         }
+        mapping = raw.get("mapping") if isinstance(raw.get("mapping"), dict) else {}
+        edge.update({
+            "producer": edge["from_node"], "producer_port": edge["from_output"],
+            "consumer": edge["to_node"], "consumer_port": edge["to_input"],
+            "mapping": {
+                "source": edge["from_output"], "target": edge["to_input"],
+                "type": str(mapping.get("type") or "unknown"),
+                "conversion": str(mapping.get("conversion") or "identity"),
+            },
+        })
         if edge["from_node"] and edge["from_output"] and edge["to_node"] and edge["to_input"]:
             normalized.append(edge)
     return normalized
+
+
+def _graph_port(raw: Any, *, direction: str, node: str) -> dict[str, Any]:
+    value = dict(raw) if isinstance(raw, dict) else {"name": str(raw)}
+    contract = value.get("contract") if isinstance(value.get("contract"), dict) else {}
+    name = str(value.get("name") or value.get("port_id") or value.get("field") or "").strip()
+    type_name = str(value.get("type") or contract.get("type") or "unknown")
+    shape = value.get("shape", contract.get("shape", "list" if type_name.startswith("list[") else "scalar"))
+    port = {"name": name, "direction": direction, "type": type_name, "shape": shape, "required": bool(value.get("required", contract.get("required", True)))}
+    if direction == "input":
+        port.update({"source": value.get("source", contract.get("source", "graph_edge")), "consumer": node})
+    else:
+        port.update({"producer": node, "terminal": bool(value.get("terminal", contract.get("terminal", False)))})
+    return port
+
+
+def _port_name(raw: Any) -> str:
+    if isinstance(raw, dict):
+        return str(raw.get("name") or raw.get("port_id") or raw.get("field") or "").strip()
+    return str(raw or "").strip()
+
+
+def graph_interface_contract(graph: Any) -> dict[str, Any]:
+    """Return the sole, immutable interface contract carried by the graph."""
+    normalized = normalize_responsibility_graph(graph)
+    inputs, outputs = [], []
+    terminal = {(str(e.get("from_node")), str(e.get("from_output"))) for e in normalized.dataflow_edges if str(e.get("to_node")) == "platform_output_node"}
+    for item in normalized.function_items:
+        node = str(item.target_file)
+        inputs.extend(_graph_port(port, direction="input", node=node) for port in item.inputs)
+        for raw in item.outputs:
+            port = _graph_port(raw, direction="output", node=node)
+            port["terminal"] = (node, port["name"]) in terminal
+            outputs.append(port)
+    return {"input_ports": inputs, "output_ports": outputs, "edge_mappings": [dict(edge) for edge in normalized.dataflow_edges]}
+
+
+def project_script_interface_contract(graph: Any, target_file: str) -> dict[str, Any]:
+    """Project argv, stdout and runtime bindings; never infer new semantics."""
+    contract = graph_interface_contract(graph)
+    inputs = [p for p in contract["input_ports"] if p["consumer"] == target_file]
+    outputs = [p for p in contract["output_ports"] if p["producer"] == target_file]
+    bindings = [e for e in contract["edge_mappings"] if e["consumer"] == target_file or e["producer"] == target_file]
+    properties = {p["name"]: {"type": "array" if str(p["type"]).startswith("list[") else p["type"], "x-graph-type": p["type"], "x-shape": p["shape"]} for p in inputs}
+    stdout_properties = {p["name"]: {"type": "array" if str(p["type"]).startswith("list[") else p["type"], "x-graph-type": p["type"], "x-shape": p["shape"]} for p in outputs}
+    return {
+        "argv_schema": {"type": "object", "properties": properties, "required": [p["name"] for p in inputs if p["required"]], "additionalProperties": False},
+        "stdout_schema": {"type": "object", "properties": stdout_properties, "required": [p["name"] for p in outputs if p["required"]], "additionalProperties": False},
+        "runtime_binding": bindings,
+        "command_payload": {p["name"]: "{{" + p["name"] + "}}" for p in inputs},
+    }
+
+
+def validate_graph_interface_projection(graph: Any, target_file: str, derived: dict[str, Any]) -> None:
+    """Fail generation when a downstream contract differs from its graph projection."""
+    expected = project_script_interface_contract(graph, target_file)
+    for key in ("argv_schema", "stdout_schema", "runtime_binding"):
+        if derived.get(key) != expected[key]:
+            raise ResponsibilityGraphValidationError(
+                f"derived {key} does not equal ResponsibilityGraph Interface Contract",
+                code="graph_interface_projection_mismatch",
+                details={"target_file": target_file, "projection": key, "expected": expected[key], "observed": derived.get(key)},
+            )
 
 
 def function_item_graph_context(graph: Any, target_file: str) -> dict[str, Any]:
@@ -541,12 +622,12 @@ def _validate_responsibility_graph_edges(graph: ResponsibilityGraph, files: list
             details={"node": platform_output_id},
         )
     outputs_by_script: dict[str, set[str]] = {
-        str(item.target_file): {str(field) for field in (item.outputs or []) if str(field or "").strip()}
+        str(item.target_file): {_port_name(field) for field in (item.outputs or []) if _port_name(field)}
         for item in graph.requirements
         if is_python_function_item_target(str(item.target_file or ""))
     }
     inputs_by_script: dict[str, set[str]] = {
-        str(item.target_file): {str(field) for field in (item.inputs or []) if str(field or "").strip()}
+        str(item.target_file): {_port_name(field) for field in (item.inputs or []) if _port_name(field)}
         for item in graph.requirements
         if is_python_function_item_target(str(item.target_file or ""))
     }
@@ -706,9 +787,9 @@ def build_default_responsibility_graph(
                 target_file=str(raw_item.get("target_file") or "").strip(),
                 role=str(raw_item.get("role") or "").strip(),
                 purpose=purpose,
-                inputs=[str(value) for value in raw_item.get("inputs") or []],
+                inputs=[dict(value) if isinstance(value, dict) else str(value) for value in raw_item.get("inputs") or []],
                 default_values=dict(raw_item.get("default_values") or {}),
-                outputs=[str(value) for value in raw_item.get("outputs") or []],
+                outputs=[dict(value) if isinstance(value, dict) else str(value) for value in raw_item.get("outputs") or []],
                 required_tools=[str(value) for value in raw_item.get("required_capabilities") or []],
                 optional_tools=[],
                 must_do=[purpose] if purpose else [],

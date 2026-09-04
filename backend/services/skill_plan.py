@@ -534,7 +534,10 @@ def normalize_structured_function_items(raw_items: object, *, source: str = "pla
 
 
 
-_ALLOWED_RESPONSIBILITY_EDGE_FIELDS = {"from_node", "from_output", "to_node", "to_input", "purpose", "constraints"}
+_ALLOWED_RESPONSIBILITY_EDGE_FIELDS = {
+    "from_node", "from_output", "to_node", "to_input", "purpose", "constraints",
+    "producer", "producer_port", "consumer", "consumer_port", "mapping",
+}
 
 
 def normalize_structured_responsibility_edges(raw_edges: object, *, source: str = "planner") -> list[dict[str, object]]:
@@ -582,6 +585,16 @@ def normalize_structured_responsibility_edges(raw_edges: object, *, source: str 
             invalid.append({"index": index, "field": "constraints"})
             continue
         edge["constraints"] = [dict(c) for c in constraints]
+        mapping = edge.get("mapping")
+        if mapping is not None:
+            if not isinstance(mapping, dict) or mapping.get("source") != edge["from_output"] or mapping.get("target") != edge["to_input"] or not str(mapping.get("type") or "").strip():
+                invalid.append({"index": index, "field": "mapping", "reason": "mapping must exactly bind edge ports and declare type"})
+                continue
+            edge["mapping"] = dict(mapping)
+            edge["producer"] = edge["from_node"]
+            edge["producer_port"] = edge["from_output"]
+            edge["consumer"] = edge["to_node"]
+            edge["consumer_port"] = edge["to_input"]
         normalized.append(edge)
     if invalid:
         raise GraphValidationError(

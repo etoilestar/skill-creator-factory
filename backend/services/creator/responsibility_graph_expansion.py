@@ -85,8 +85,22 @@ def _output_can_bind_to_sink(
     return True
 
 
-def _edge(from_node: str, from_output: str, to_node: str, to_input: str, *, constraints: list[dict] | None = None) -> dict:
-    return {"from_node": from_node, "from_output": from_output, "to_node": to_node, "to_input": to_input, "purpose": _EDGE_PURPOSE, "constraints": list(constraints or [])}
+def _edge(from_node: str, from_output: str, to_node: str, to_input: str, *, constraints: list[dict] | None = None, value_type: str | None = None) -> dict:
+    """Materialize a binding without leaving field selection to runtime.
+
+    The legacy transport keys remain because the executor consumes them.  The
+    mapping is the immutable Graph Interface Contract projection of those same
+    endpoints, not a second interface decision.
+    """
+    mapping = {"source": from_output, "target": to_input, "type": value_type or "unknown", "conversion": "identity"}
+    return {
+        "from_node": from_node, "from_output": from_output,
+        "to_node": to_node, "to_input": to_input,
+        "producer": from_node, "producer_port": from_output,
+        "consumer": to_node, "consumer_port": to_input,
+        "mapping": mapping, "purpose": _EDGE_PURPOSE,
+        "constraints": list(constraints or []),
+    }
 
 
 
@@ -327,7 +341,7 @@ def _materialize_interface_obligation(*, obligation: dict, selection: dict, regi
         constraints = []
         if source_path:
             constraints.append({"type": "platform_parameter_binding", "source_key": ".".join(source_path), "source_path": source_path, "required": True})
-        return _edge(PLATFORM_INPUT_NODE, source["field"], target["target_file"], target["port_id"], constraints=constraints)
+        return _edge(PLATFORM_INPUT_NODE, source["field"], target["target_file"], target["port_id"], constraints=constraints, value_type=_definite_type(target.get("contract") or {}) or _definite_type(source.get("contract") or {}))
     if kind == "script_to_platform":
         source = next((value for value in registry["script_outputs"] if value["output_id"] == selection["source_id"] and value["target_file"] == obligation["source_member"]), None)
         target = next((value for value in registry["platform_outputs"] if value["slot_id"] == selection["target_id"]), None)
@@ -347,7 +361,7 @@ def _materialize_interface_obligation(*, obligation: dict, selection: dict, regi
             )
         if _types_conflict(source.get("contract") or {}, target.get("contract") or {}):
             raise ResponsibilityGraphExpansionError("selected endpoints have conflicting types", code="interface_endpoint_type_conflict")
-        return _edge(source["target_file"], source["port_id"], PLATFORM_OUTPUT_NODE, target["field"])
+        return _edge(source["target_file"], source["port_id"], PLATFORM_OUTPUT_NODE, target["field"], value_type=_definite_type(source.get("contract") or {}) or _definite_type(target.get("contract") or {}))
     source = next((value for value in registry["script_outputs"] if value["output_id"] == selection["source_id"] and value["target_file"] == obligation["source_member"]), None)
     target = next((value for value in registry["script_inputs"] if value["input_id"] == selection["target_id"] and value["target_file"] == obligation["target_member"]), None)
     if source is None or target is None:
@@ -358,7 +372,7 @@ def _materialize_interface_obligation(*, obligation: dict, selection: dict, regi
         raise ResponsibilityGraphExpansionError("selected source forms a directed cycle", code="responsibility_graph_cycle")
     if _types_conflict(source.get("contract") or {}, target.get("contract") or {}):
         raise ResponsibilityGraphExpansionError("selected endpoints have conflicting types", code="interface_endpoint_type_conflict")
-    return _edge(source["target_file"], source["port_id"], target["target_file"], target["port_id"])
+    return _edge(source["target_file"], source["port_id"], target["target_file"], target["port_id"], value_type=_definite_type(source.get("contract") or {}) or _definite_type(target.get("contract") or {}))
 
 
 def _resolve_declared_logical_binding(*, obligation: dict, registry: dict) -> dict:

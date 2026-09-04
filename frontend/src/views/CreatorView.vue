@@ -18,6 +18,8 @@
       </button>
     </div>
 
+    <RuntimeTimeline v-if="messages.length || streaming || creationPlan" :stages="creatorStages" />
+
     <div class="content-area">
       <!-- Main chat column -->
       <div class="messages-column">
@@ -69,6 +71,7 @@
               <li v-if="reviewSummary.goal"><strong>目标：</strong>{{ reviewSummary.goal }}</li>
               <li v-if="reviewSummary.input"><strong>输入：</strong>{{ reviewSummary.input }}</li>
               <li v-if="reviewSummary.output"><strong>输出：</strong>{{ reviewSummary.output }}</li>
+              <li v-if="requirementCapabilities.length"><strong>关键能力：</strong>{{ requirementCapabilities.join('、') }}</li>
               <li v-if="reviewSummary.workflow?.length"><strong>工作流：</strong>{{ reviewSummary.workflow.join(' → ') }}</li>
               <li v-if="reviewSummary.files_to_create_or_update?.length"><strong>文件：</strong>{{ reviewSummary.files_to_create_or_update.join('、') }}</li>
               <li v-if="reviewSummary.assets_to_upload?.length"><strong>需上传素材：</strong>{{ reviewSummary.assets_to_upload.join('、') }}</li>
@@ -235,6 +238,7 @@ import { streamPrepareCreationPlan, buildClarificationQuickActions, uploadCreato
 import ChatBubble from '../components/ChatBubble.vue'
 import SkillCreationPanel from '../components/SkillCreationPanel.vue'
 import CreatorExecutionPanel from '../components/CreatorExecutionPanel.vue'
+import RuntimeTimeline from '../components/RuntimeTimeline.vue'
 
 // ---------------------------------------------------------------------------
 // State
@@ -284,6 +288,8 @@ const thoughts = ref([])
 const showThoughts = ref(false)
 const activeExecutionTab = ref('process')
 const executionPanelHasUpdate = ref(false)
+const creationRuntimeStatus = ref('pending')
+const creationRuntimeDetail = ref('等待 Skill 文件生成')
 
 // Creation panel state
 const showCreationPanel = ref(false)
@@ -300,6 +306,27 @@ const reviewSummaryTitle = computed(() => {
   if (creationPlan.value) return '创建要点'
   if (reviewSummaryStage.value === 'supplement_confirmation') return '已根据补充内容更新的创建要点'
   return '已整理的创建要点'
+})
+const requirementCapabilities = computed(() => {
+  const direct = reviewSummary.value?.key_capabilities || reviewSummary.value?.capabilities
+  const graphCapabilities = planningNodes.value.flatMap(node => node.required_capabilities || [])
+  return [...new Set([...(Array.isArray(direct) ? direct : []), ...graphCapabilities].map(item => String(item || '').trim()).filter(Boolean))].slice(0, 10)
+})
+
+const creatorStages = computed(() => {
+  const hasSummary = Boolean(reviewSummary.value)
+  const hasBlueprint = Boolean(blueprintText.value)
+  const hasGraph = planningNodes.value.length > 0 && !graphPlanningActive.value
+  const hasFiles = Boolean(creationPlan.value)
+  const planningFailed = Boolean(recoverablePlanningFailure.value)
+  const requirementItems = [reviewSummary.value?.goal, reviewSummary.value?.input, reviewSummary.value?.output].filter(Boolean)
+  return [
+    { key: 'requirement', label: '需求解析', status: planningFailed ? 'failed' : (hasSummary ? 'success' : (streaming.value ? 'running' : 'pending')), detail: hasSummary ? '已识别目标与输入输出' : '提取任务目标、输入输出与能力点', items: requirementItems },
+    { key: 'blueprint', label: '蓝图生成', status: planningFailed ? 'failed' : (hasBlueprint ? 'success' : (streaming.value ? 'running' : 'pending')), detail: hasBlueprint ? (reviewSummary.value?.goal || '蓝图摘要已生成') : '等待结构化 Workflow', items: reviewSummary.value?.workflow || [] },
+    { key: 'graph', label: '图谱生成', status: planningFailed ? 'failed' : (hasGraph ? 'success' : (graphPlanningActive.value ? 'running' : 'pending')), detail: hasGraph ? `${planningNodes.value.length} 个节点 · ${planningEdges.value.length} 条关系` : '等待责任与合同关系', items: planningNodes.value.map(node => node.target_file) },
+    { key: 'skill', label: 'Skill 生成', status: creationRuntimeStatus.value === 'failed' ? 'failed' : (creationRuntimeStatus.value === 'running' ? 'running' : (['validating', 'success'].includes(creationRuntimeStatus.value) ? 'success' : 'pending')), detail: creationRuntimeDetail.value, items: creationPlan.value?.files?.map(file => file.path) || [] },
+    { key: 'runtime', label: 'E2E Runtime', status: creationRuntimeStatus.value === 'validating' ? 'running' : (creationRuntimeStatus.value === 'success' ? 'success' : (creationRuntimeStatus.value === 'failed' ? 'failed' : 'pending')), detail: creationRuntimeStatus.value === 'validating' ? '正在执行严格端到端验证' : (creationRuntimeStatus.value === 'success' ? '验证通过' : '等待文件生成完成'), items: [] },
+  ]
 })
 
 const displayFunctionItems = computed(() => (
@@ -1218,6 +1245,14 @@ async function send() {
 // ---------------------------------------------------------------------------
 
 function onCreationExecutionEvent(event) {
+  const phase = String(event?.phase || '')
+  if (phase === 'file_generation_start' || phase.startsWith('file_')) {
+    creationRuntimeStatus.value = 'running'
+    creationRuntimeDetail.value = event.detail || '正在生成 Skill 文件'
+  }
+  if (phase === 'e2e_start') creationRuntimeStatus.value = 'validating'
+  if (phase === 'e2e_success' || phase === 'package_complete') creationRuntimeStatus.value = 'success'
+  if (phase === 'e2e_failed' || phase === 'package_failed') creationRuntimeStatus.value = 'failed'
   appendExecutionBlock({
     step: event?.phase || 'creation_event',
     label: event?.label || '创建执行事件',
@@ -1227,6 +1262,8 @@ function onCreationExecutionEvent(event) {
 }
 
 function onCreationComplete({ skillName, validateResult, packageResult }) {
+  creationRuntimeStatus.value = 'success'
+  creationRuntimeDetail.value = 'Skill 已生成并通过 E2E 验证'
   appendExecutionBlock({ step: 'creation_complete', label: '创建完成', detail: `Skill ${skillName} 已创建完成`, content: ['可在沙盒模式下测试'] })
   messages.value.push({
     role: 'assistant',
@@ -1241,7 +1278,19 @@ function onCreationComplete({ skillName, validateResult, packageResult }) {
 }
 
 function onCreationError(errMsg) {
-  error.value = `Skill 创建未完成：${errMsg}`
+  creationRuntimeStatus.value = 'failed'
+  creationRuntimeDetail.value = '生成或验证未完成'
+  error.value = `Skill 创建未完成：${userFacingError(errMsg)}`
+}
+
+function userFacingError(value) {
+  const text = String(value || '')
+    .replace(/Traceback[\s\S]*/i, '')
+    .replace(/File "[^"]+", line \d+[\s\S]*/i, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!text) return '执行结果未满足验证要求，请查看 Runtime 面板中的原因与修复记录。'
+  return text.length > 180 ? `${text.slice(0, 180)}…（详细错误已折叠）` : text
 }
 
 // ---------------------------------------------------------------------------
@@ -1258,6 +1307,8 @@ function clearChat() {
   currentStatus.value = null
 
   thoughts.value = []
+  creationRuntimeStatus.value = 'pending'
+  creationRuntimeDetail.value = '等待 Skill 文件生成'
 
   showThoughts.value = false
 

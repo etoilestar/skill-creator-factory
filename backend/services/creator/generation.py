@@ -4,7 +4,10 @@ from .common import *  # noqa: F403
 from .contracts import *  # noqa: F403
 from .e2e import *  # noqa: F403
 from .repair import *  # noqa: F403
-from ..platform_io_contract import get_platform_output_sink
+from ..platform_io_contract import (
+    build_platform_io_contract,
+    get_platform_output_sink,
+)
 
 _RUNTIME_BINDING_AUTHORITY_PROMPT = """## Runtime Binding Authority
 
@@ -861,18 +864,21 @@ def _build_interface_semantics(
     function_execution_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
-    Build prompt-visible runtime interface semantics.
+    Build the prompt-visible runtime interface projection for code generation.
 
-    This is NOT a new contract.
-    It only projects existing:
+    This function does not create a new contract or redesign any interface.
+    It only projects already-authoritative facts from:
     - SkillPlan inputs/outputs
-    - runtime bindings
-    - ResponsibilityGraph edges
+    - runtime input bindings
+    - ResponsibilityGraph incoming/outgoing edges
+    - platform terminal sink schemas
 
-    into a semantic view for code generation.
+    The projection preserves two different facts:
+    - semantic/logical port identity
+    - concrete runtime representation required at the receiving boundary
 
-    No business keywords are inferred.
-    No filename/role matching is performed.
+    No business keywords, filename heuristics, or name-similarity inference
+    are used.
     """
 
     context = (
@@ -881,17 +887,153 @@ def _build_interface_semantics(
         else {}
     )
 
-    input_bindings = {}
+    platform_contract = build_platform_io_contract()
+
+    def _schema_type_values(schema: dict[str, Any]) -> set[str]:
+        """
+        Return explicitly declared JSON-schema type values.
+
+        This is representation-only normalization. It does not infer
+        semantic type from names or descriptions.
+        """
+        raw_type = schema.get("type")
+
+        if isinstance(raw_type, str):
+            value = raw_type.strip().lower()
+            return {value} if value else set()
+
+        if isinstance(raw_type, list):
+            return {
+                str(value).strip().lower()
+                for value in raw_type
+                if str(value or "").strip()
+            }
+
+        return set()
+
+    def _representation_facts(
+        schema: dict[str, Any],
+        *,
+        declared_type: Any = None,
+    ) -> dict[str, Any]:
+        """
+        Project generic representation facts without inventing structure.
+
+        Cardinality is derived only from explicit representation evidence:
+        JSON Schema array/items or an explicitly declared list/array type.
+        """
+
+        schema = dict(schema or {})
+        type_values = _schema_type_values(schema)
+
+        declared_type_text = str(
+            declared_type or ""
+        ).strip()
+
+        effective_type = (
+            declared_type_text
+            or (
+                next(iter(type_values))
+                if len(type_values) == 1
+                else ""
+            )
+            or "unknown"
+        )
+
+        normalized_declared_type = (
+            declared_type_text
+            .strip()
+            .lower()
+            .replace(" ", "")
+        )
+
+        explicit_many = (
+            "array" in type_values
+            or isinstance(schema.get("items"), dict)
+            or normalized_declared_type == "array"
+            or normalized_declared_type == "list"
+            or normalized_declared_type.startswith("array[")
+            or normalized_declared_type.startswith("list[")
+        )
+
+        has_known_single_type = bool(
+            (
+                type_values
+                - {
+                    "array",
+                    "null",
+                }
+            )
+            or (
+                normalized_declared_type
+                and normalized_declared_type
+                not in {
+                    "unknown",
+                    "unspecified",
+                    "array",
+                    "list",
+                }
+                and not normalized_declared_type.startswith(
+                    (
+                        "array[",
+                        "list[",
+                    )
+                )
+            )
+        )
+
+        if explicit_many:
+            cardinality = "many"
+        elif has_known_single_type:
+            cardinality = "single"
+        else:
+            cardinality = "unknown"
+
+        nullable = bool(
+            schema.get("nullable") is True
+            or "null" in type_values
+        )
+
+        item_schema = (
+            dict(schema.get("items"))
+            if isinstance(
+                schema.get("items"),
+                dict,
+            )
+            else {}
+        )
+
+        return {
+            "type": effective_type,
+            "cardinality": cardinality,
+            "nullable": nullable,
+            "item_schema": item_schema,
+        }
+
+    input_bindings: dict[str, dict[str, Any]] = {}
 
     bindings = (
-            getattr(plan_entry, "input_binding", None)
-            or getattr(plan_entry, "command_arg_bindings", None)
-            or (
-                plan_entry.runtime_contract.get("input_binding")
-                if isinstance(plan_entry.runtime_contract, dict)
-                else None
+        getattr(
+            plan_entry,
+            "input_binding",
+            None,
+        )
+        or getattr(
+            plan_entry,
+            "command_arg_bindings",
+            None,
+        )
+        or (
+            plan_entry.runtime_contract.get(
+                "input_binding"
             )
-            or []
+            if isinstance(
+                plan_entry.runtime_contract,
+                dict,
+            )
+            else None
+        )
+        or []
     )
 
     for item in bindings:
@@ -905,10 +1047,63 @@ def _build_interface_semantics(
         )
 
         if key:
-            input_bindings[str(key)] = item
+            input_bindings[
+                str(key)
+            ] = dict(item)
 
+    incoming_edges = [
+        dict(edge)
+        for edge in (
+            context.get("incoming_edges")
+            or []
+        )
+        if isinstance(edge, dict)
+    ]
 
-    inputs = []
+    outgoing_edges = [
+        dict(edge)
+        for edge in (
+            context.get("outgoing_edges")
+            or []
+        )
+        if isinstance(edge, dict)
+    ]
+
+    incoming_by_input: dict[
+        str,
+        list[dict[str, Any]],
+    ] = {}
+
+    for edge in incoming_edges:
+        target_input = str(
+            edge.get("to_input")
+            or ""
+        ).strip()
+
+        if target_input:
+            incoming_by_input.setdefault(
+                target_input,
+                [],
+            ).append(edge)
+
+    outgoing_by_output: dict[
+        str,
+        list[dict[str, Any]],
+    ] = {}
+
+    for edge in outgoing_edges:
+        source_output = str(
+            edge.get("from_output")
+            or ""
+        ).strip()
+
+        if source_output:
+            outgoing_by_output.setdefault(
+                source_output,
+                [],
+            ).append(edge)
+
+    inputs: list[dict[str, Any]] = []
 
     for raw_input in (
         canonical_contract.inputs
@@ -918,153 +1113,416 @@ def _build_interface_semantics(
             name = str(
                 raw_input.get("name")
                 or ""
-            )
+            ).strip()
             schema = dict(raw_input)
         else:
-            name = str(raw_input)
+            name = str(
+                raw_input
+                or ""
+            ).strip()
             schema = {
-                "name": name
+                "name": name,
             }
 
         if not name:
             continue
 
-        binding = input_bindings.get(
-            name,
-            {}
+        binding = dict(
+            input_bindings.get(
+                name,
+                {},
+            )
+        )
+
+        graph_edges = list(
+            incoming_by_input.get(
+                name,
+                [],
+            )
+        )
+
+        graph_sources: list[
+            dict[str, Any]
+        ] = []
+
+        for edge in graph_edges:
+            graph_sources.append(
+                {
+                    "from_node": str(
+                        edge.get(
+                            "from_node"
+                        )
+                        or ""
+                    ),
+                    "from_output": str(
+                        edge.get(
+                            "from_output"
+                        )
+                        or ""
+                    ),
+                    "to_input": str(
+                        edge.get(
+                            "to_input"
+                        )
+                        or ""
+                    ),
+                    "constraints": [
+                        dict(value)
+                        for value in (
+                            edge.get(
+                                "constraints"
+                            )
+                            or []
+                        )
+                        if isinstance(
+                            value,
+                            dict,
+                        )
+                    ],
+                }
+            )
+
+        declared_type = (
+            binding.get("value_type")
+            or binding.get("type")
+            or schema.get("type")
+        )
+
+        representation = (
+            _representation_facts(
+                schema,
+                declared_type=declared_type,
+            )
+        )
+
+        if "required" in binding:
+            required = bool(
+                binding.get("required")
+            )
+        elif isinstance(
+            schema.get("required"),
+            bool,
+        ):
+            required = bool(
+                schema.get("required")
+            )
+        else:
+            required = True
+
+        source_ref = (
+            binding.get("source")
+            or binding.get("from_field")
+            or ""
+        )
+
+        source_kind = (
+            binding.get("source_kind")
+            or (
+                "responsibility_graph"
+                if graph_sources
+                else "runtime_binding"
+            )
         )
 
         inputs.append(
             {
                 "name": name,
-                "type": (
-                    binding.get("value_type")
-                    or binding.get("type")
-                    or schema.get("type")
-                    or "unknown"
-                ),
-                "required": (
-                    binding.get("required")
-                    if "required" in binding
-                    else True
+                "type": representation[
+                    "type"
+                ],
+                "cardinality": representation[
+                    "cardinality"
+                ],
+                "nullable": representation[
+                    "nullable"
+                ],
+                "item_schema": representation[
+                    "item_schema"
+                ],
+                "required": required,
+                "binding_status": (
+                    "resolved"
+                    if binding
+                    or graph_sources
+                    else "unresolved"
                 ),
                 "source": {
-                    "kind": (
-                        binding.get("source_kind")
-                        or "runtime_binding"
-                    ),
-                    "ref": (
-                        binding.get("source")
-                        or binding.get("from_field")
+                    "kind": source_kind,
+                    "ref": str(
+                        source_ref
                         or ""
                     ),
+                    "graph_sources": (
+                        graph_sources
+                    ),
                 },
+                "binding": binding,
                 "schema": schema,
             }
         )
 
-
-    outputs = []
-
-    outgoing_edges = (
-        context.get("outgoing_edges")
-        if isinstance(
-            context.get("outgoing_edges"),
-            list,
-        )
-        else []
-    )
-
-
-    downstream = {}
-
-    for edge in outgoing_edges:
-        if not isinstance(edge, dict):
-            continue
-
-        source = (
-            edge.get("from_output")
-            or ""
-        )
-
-        target = (
-            edge.get("to_node")
-            or ""
-        )
-
-        if source:
-            downstream.setdefault(
-                str(source),
-                [],
-            ).append(
-                str(target)
-            )
-
+    outputs: list[dict[str, Any]] = []
 
     for raw_output in (
         canonical_contract.outputs
         or []
     ):
-
         if isinstance(raw_output, dict):
             name = str(
                 raw_output.get("name")
                 or ""
+            ).strip()
+            declared_schema = dict(
+                raw_output
             )
-            schema = dict(raw_output)
-
         else:
-            name = str(raw_output)
-            schema = {
-                "name": name
+            name = str(
+                raw_output
+                or ""
+            ).strip()
+            declared_schema = {
+                "name": name,
             }
 
         if not name:
             continue
 
+        edges = list(
+            outgoing_by_output.get(
+                name,
+                [],
+            )
+        )
+
+        downstream_contracts: list[
+            dict[str, Any]
+        ] = []
+
+        terminal_schemas: list[
+            dict[str, Any]
+        ] = []
+
+        consumers: list[str] = []
+
+        for edge in edges:
+            target_node = str(
+                edge.get("to_node")
+                or ""
+            ).strip()
+
+            target_input = str(
+                edge.get("to_input")
+                or ""
+            ).strip()
+
+            if (
+                target_node
+                and target_node
+                not in consumers
+            ):
+                consumers.append(
+                    target_node
+                )
+
+            downstream_contract: dict[
+                str,
+                Any,
+            ] = {
+                "target_node": target_node,
+                "target_input": target_input,
+                "constraints": [
+                    dict(value)
+                    for value in (
+                        edge.get(
+                            "constraints"
+                        )
+                        or []
+                    )
+                    if isinstance(
+                        value,
+                        dict,
+                    )
+                ],
+            }
+
+            if (
+                target_node
+                == "platform_output_node"
+                and target_input
+            ):
+                sink = (
+                    get_platform_output_sink(
+                        platform_contract,
+                        target_input,
+                    )
+                )
+
+                if isinstance(
+                    sink,
+                    dict,
+                ):
+                    value_schema = (
+                        sink.get(
+                            "value_schema"
+                        )
+                    )
+
+                    downstream_contract[
+                        "platform_sink"
+                    ] = {
+                        key: value
+                        for key, value
+                        in sink.items()
+                        if key
+                        != "value_schema"
+                    }
+
+                    if isinstance(
+                        value_schema,
+                        dict,
+                    ):
+                        projected_schema = dict(
+                            value_schema
+                        )
+
+                        downstream_contract[
+                            "value_schema"
+                        ] = projected_schema
+
+                        terminal_schemas.append(
+                            projected_schema
+                        )
+
+            downstream_contracts.append(
+                downstream_contract
+            )
+
+        runtime_schema = dict(
+            declared_schema
+        )
+
+        if terminal_schemas:
+            unique_terminal_schemas = {
+                json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                )
+                for value in terminal_schemas
+            }
+
+            # Do not choose between conflicting frozen terminal schemas.
+            # The deterministic contract validator/materializer owns that
+            # conflict. For one unambiguous terminal representation, expose
+            # it directly to the code model.
+            if (
+                len(
+                    unique_terminal_schemas
+                )
+                == 1
+            ):
+                terminal_schema = dict(
+                    terminal_schemas[0]
+                )
+
+                semantic_description = (
+                    declared_schema.get(
+                        "description"
+                    )
+                )
+
+                runtime_schema = {
+                    **runtime_schema,
+                    **terminal_schema,
+                }
+
+                if semantic_description:
+                    runtime_schema[
+                        "description"
+                    ] = (
+                        semantic_description
+                    )
+
+        representation = (
+            _representation_facts(
+                runtime_schema,
+                declared_type=runtime_schema.get(
+                    "type"
+                ),
+            )
+        )
 
         outputs.append(
             {
                 "name": name,
-                "type": (
-                    schema.get("type")
-                    or "unknown"
-                ),
+
+                # Concrete representation expected from this script.
+                "type": representation[
+                    "type"
+                ],
+                "cardinality": representation[
+                    "cardinality"
+                ],
+                "nullable": representation[
+                    "nullable"
+                ],
+                "item_schema": representation[
+                    "item_schema"
+                ],
+
+                # Compatibility field retained for existing prompt consumers.
                 "consumer": (
-                    downstream.get(name)
+                    consumers
                     or [
                         "platform_output"
                     ]
                 ),
-                "schema": schema,
+
+                # Full frozen downstream facts. These are the important
+                # addition: code generation no longer sees only a node name.
+                "downstream_contracts": (
+                    downstream_contracts
+                ),
+
+                "terminal_output": bool(
+                    terminal_schemas
+                ),
+
+                # Preserve both logical/semantic declaration and concrete
+                # receiving-boundary representation instead of conflating them.
+                "schema": declared_schema,
+                "runtime_schema": (
+                    runtime_schema
+                ),
             }
         )
-
 
     return {
         "purpose": (
             getattr(
                 plan_entry,
                 "purpose",
-                ""
+                "",
             )
             or ""
         ),
-
         "inputs": inputs,
-
         "outputs": outputs,
-
         "authority": [
             "SkillPlan.input_binding",
             "canonical_contract",
-            "ResponsibilityGraph edges",
+            "ResponsibilityGraph incoming_edges",
+            "ResponsibilityGraph outgoing_edges",
+            "platform output sink value_schema",
         ],
-
         "rule": (
-            "Field names describe runtime ports. "
-            "Semantic meaning comes from bindings "
-            "and graph edges, not names."
+            "Logical field names identify ports; they do not determine runtime "
+            "representation. Preserve the declared semantic value while satisfying "
+            "the concrete receiving-boundary schema. For terminal outputs, the "
+            "platform sink value_schema is the authoritative runtime representation. "
+            "Do not infer scalar/list/object structure from names, descriptions, "
+            "examples, or business conventions. Do not rename or redesign ports."
         ),
     }
 

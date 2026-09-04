@@ -5163,21 +5163,125 @@ def _e2e_failure_identity(error: str, *, target_file: str = "") -> dict[str, Any
     }
 
 
-def _e2e_breakpoint_changed(before: dict[str, Any], after: dict[str, Any]) -> bool:
-    """Return whether evidence shows a material new breakpoint, not noise."""
-    # A changed source expression is not a new breakpoint when the same
-    # operation still fails with the same category/exception/function.
-    stable_boundary = ("failed_step_index", "target_file", "layer", "error_code", "exception_type", "traceback_function")
-    if all(before.get(key) == after.get(key) for key in stable_boundary):
-        return False
-    structural_fields = ("exception_type", "traceback_function", "error_code", "target_region")
-    for key in structural_fields:
-        if before.get(key) and after.get(key) and before[key] != after[key]:
+def _e2e_breakpoint_changed(
+    before: dict[str, Any],
+    after: dict[str, Any],
+) -> bool:
+    """
+    Return whether runtime evidence moved to a materially different breakpoint.
+
+    A breakpoint is not identified only by:
+        step + file + layer + error category.
+
+    Within one execution boundary, multiple independent contractual slots may
+    fail sequentially. Repairing one slot and exposing another unresolved slot
+    is real progress and must not be rolled back merely because the script,
+    workflow step, layer, or error family stayed the same.
+
+    target_region is deterministic failure ownership evidence when present,
+    e.g.:
+        stdout.<field>
+        argv.<field>
+        workflow binding region
+        artifact return region
+
+    Volatile message/source-text changes alone are not progress.
+    """
+
+    stable_boundary_fields = (
+        "failed_step_index",
+        "target_file",
+        "layer",
+        "error_code",
+        "exception_type",
+        "traceback_function",
+    )
+
+    same_stable_boundary = all(
+        before.get(key)
+        == after.get(key)
+        for key in stable_boundary_fields
+    )
+
+    before_region = str(
+        before.get(
+            "target_region"
+        )
+        or ""
+    ).strip()
+
+    after_region = str(
+        after.get(
+            "target_region"
+        )
+        or ""
+    ).strip()
+
+    if same_stable_boundary:
+        # Same execution stage does not imply same contractual failure.
+        #
+        # If deterministic ownership moved from one concrete receiving/output
+        # region to another, the previous repair discharged one blocking
+        # obligation and revealed the next one. Keep that candidate.
+        if (
+            before_region
+            and after_region
+            and before_region
+            != after_region
+        ):
             return True
-    # Actual text is a fallback only when there is no stable structural evidence.
-    if any(before.get(key) or after.get(key) for key in structural_fields):
+
+        # No structural ownership movement. Changes in traceback/source text
+        # under the same boundary are treated as noise or the same unresolved
+        # breakpoint.
         return False
-    return bool(before.get("normalized_actual") and after.get("normalized_actual") and before["normalized_actual"] != after["normalized_actual"])
+
+    structural_fields = (
+        "exception_type",
+        "traceback_function",
+        "error_code",
+        "target_region",
+    )
+
+    for key in structural_fields:
+        before_value = before.get(
+            key
+        )
+        after_value = after.get(
+            key
+        )
+
+        if (
+            before_value
+            and after_value
+            and before_value
+            != after_value
+        ):
+            return True
+
+    # normalized_actual is only a fallback when there is no stable
+    # structural breakpoint evidence on either side.
+    if any(
+        before.get(key)
+        or after.get(key)
+        for key in structural_fields
+    ):
+        return False
+
+    return bool(
+        before.get(
+            "normalized_actual"
+        )
+        and after.get(
+            "normalized_actual"
+        )
+        and before[
+            "normalized_actual"
+        ]
+        != after[
+            "normalized_actual"
+        ]
+    )
 
 
 def _e2e_behavior_fingerprint(error: str, *, target_file: str) -> str:

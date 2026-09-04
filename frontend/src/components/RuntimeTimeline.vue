@@ -2,7 +2,7 @@
   <section class="runtime-timeline" aria-label="创建进度">
     <header>
       <div>
-        <p class="eyebrow">PROCESS OVERVIEW</p>
+        <p class="eyebrow">接口状态概览 · 非实时事件流</p>
         <h3>创建进度</h3>
       </div>
       <span class="status-pill" :class="activeStatus">{{ statusLabel(activeStatus) }}</span>

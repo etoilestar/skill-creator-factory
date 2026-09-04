@@ -264,7 +264,9 @@
             </div>
           </article>
         </div>
-        <p v-else class="runtime-waiting">正在准备运行环境与执行计划…</p>
+        <p v-else class="runtime-waiting">
+          {{ runtimeStatus === 'running' ? 'Runtime 请求执行中；当前接口未提供实时步骤事件，完成后将展示返回的执行摘要。' : '本次响应没有提供可展示的步骤记录。' }}
+        </p>
 
         <div v-if="friendlyFailure" class="friendly-error">
           <strong>运行失败</strong>
@@ -278,9 +280,14 @@
             <div><strong>{{ repair.title }}</strong><p>{{ repair.detail }}</p></div>
           </div>
         </div>
-        <details v-if="technicalDetails" class="technical-details">
+        <details v-if="diagnosticRows.length || technicalDetails" class="technical-details">
           <summary>展开查看详细错误</summary>
-          <pre>{{ technicalDetails }}</pre>
+          <dl v-if="diagnosticRows.length" class="diagnostic-metadata">
+            <template v-for="row in diagnosticRows" :key="row.label">
+              <dt>{{ row.label }}</dt><dd>{{ row.value }}</dd>
+            </template>
+          </dl>
+          <pre v-if="technicalDetails">{{ technicalDetails }}</pre>
         </details>
       </section>
       <div
@@ -302,7 +309,7 @@
         :class="{ success: packageResult?.success, fail: packageResult && !packageResult.success }"
       >
         <span>{{ packageResult.success ? '✅ 打包完成' : '❌ 打包失败' }}</span>
-        <pre v-if="packageResult?.message" class="post-detail">{{ packageResult.message }}</pre>
+        <span v-if="packageResult?.message" class="post-detail">{{ conciseText(packageResult.message) }}</span>
       </div>
     </div>
 
@@ -578,10 +585,33 @@ const repairSummaries = computed(() => runtimeEvents.value
     detail: conciseText(event.repair_result || event.failure_summary || event.next_target || (event.resume_from_step ? `从第 ${event.resume_from_step} 步继续验证` : '已提交修复并重新验证')),
     status: ['success', 'accepted', 'applied', 'passed'].includes(String(event.patch_status || event.status || '').toLowerCase()) ? 'success' : 'running',
   })).slice(0, 8))
+const diagnosticRows = computed(() => {
+  if (runtimeStatus.value !== 'failed') return []
+  const failure = [...runtimeEvents.value].reverse().find(event => event && (
+    event.failure_code || event.error_code || event.failure_layer || event.target_file ||
+    event.failed_step || event.step_id || event.current_step || event.step_index
+  )) || {}
+  return [
+    ['错误代码', failure.failure_code || failure.error_code || validateResult.value?.failure_code],
+    ['失败层级', failure.failure_layer || validateResult.value?.failure_layer],
+    ['目标文件', failure.target_file || validateResult.value?.target_file],
+    ['失败步骤', failure.failed_step || failure.step_id || failure.current_step || failure.step_index || validateResult.value?.failed_step],
+    ['修复阶段', failure.phase || failure.type],
+  ].filter(([, value]) => value !== undefined && value !== null && String(value).trim()).map(([label, value]) => ({ label, value: summaryValue(value) }))
+})
 const technicalDetails = computed(() => {
   if (runtimeStatus.value !== 'failed') return ''
-  const details = runtimeEvents.value.flatMap(event => [event?.trace_summary, event?.stdout_summary, event?.stderr_summary, event?.diff_excerpt, event?.rejection_reason]).filter(Boolean)
-  return details.join('\n\n') || String(validateResult.value?.message || '')
+  const details = runtimeEvents.value.flatMap(event => [
+    event?.failure_summary,
+    event?.trace_summary,
+    event?.stdout_summary,
+    event?.stderr_summary,
+    event?.diff_excerpt,
+    event?.rejection_reason,
+    event?.parser_error,
+    event?.last_output_excerpt,
+  ]).filter(Boolean)
+  return details.join('\n\n') || String(validateResult.value?.message || packageResult.value?.message || '')
 })
 
 const packageDownloadUrl = computed(() => {
@@ -1338,6 +1368,7 @@ function openInSandbox() {
 .runtime-steps { display: grid; gap: 8px; margin-top: 14px; }.runtime-steps article { display: flex; gap: 10px; padding: 10px; border-left: 3px solid #475569; border-radius: 6px; background: #202936; }.runtime-steps article.success { border-color: #22c55e; }.runtime-steps article.failed { border-color: #ef4444; }.runtime-steps article.running { border-color: #3b82f6; }.step-number { display: grid; flex: 0 0 24px; height: 24px; place-items: center; border-radius: 50%; background: #334155; font-size: 11px; }.runtime-steps strong { font-family: monospace; font-size: 12px; }.runtime-steps p { margin: 5px 0; color: #aab6c5; font-size: 11px; }.runtime-steps article > div > span { color: #94a3b8; font-size: 11px; }
 .runtime-waiting { padding: 14px 0 2px; color: #94a3b8; }.friendly-error { margin-top: 14px; padding: 12px; border: 1px solid #7f1d1d; border-radius: 8px; background: #2a171b; }.friendly-error > strong { color: #fca5a5; }.friendly-error p { margin: 7px 0 0; line-height: 1.55; }
 .repair-summary { margin-top: 14px; }.repair-summary h4 { margin: 0 0 8px; }.repair-summary > div { display: flex; gap: 8px; padding: 8px; border-radius: 6px; background: #1e293b; }.repair-summary p { margin: 3px 0 0; color: #aab6c5; font-size: 11px; }.technical-details { margin-top: 12px; color: #94a3b8; }.technical-details summary { cursor: pointer; }.technical-details pre { max-height: 240px; overflow: auto; white-space: pre-wrap; color: #aab6c5; font-size: 11px; }
+.diagnostic-metadata { display: grid; grid-template-columns: max-content 1fr; gap: 6px 12px; margin: 12px 0; padding: 10px; border-radius: 6px; background: #111827; font-size: 11px; }.diagnostic-metadata dt { color: #94a3b8; }.diagnostic-metadata dd { min-width: 0; margin: 0; overflow-wrap: anywhere; color: #e2e8f0; font-family: monospace; }
 @media (max-width: 760px) { .generation-stages { grid-template-columns: 1fr 1fr; }.tree-row { grid-template-columns: 1fr; gap: 3px; } }
 
 /* Warnings */

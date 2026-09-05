@@ -62,10 +62,19 @@ async def bounded_refine_candidate(
         digest = hashlib.sha256(
             json.dumps(semantic_signature(candidate), sort_keys=True, ensure_ascii=False, default=str).encode()
         ).hexdigest()[:16]
+        before_issue_codes = sorted({
+            str(fact.get("code")) for fact in evaluation.acceptance_facts
+            if fact.get("code")
+        })
+        after_issue_codes = sorted({
+            str(fact.get("code")) for fact in next_evaluation.acceptance_facts
+            if fact.get("code")
+        })
         logger.info(
-            "[Creator][refinement] stage=%s attempt=%d accepted=%s semantic_changed=%s acceptance_fact_count=%d candidate_digest=%s",
+            "[Creator][refinement] stage=%s attempt=%d accepted=%s semantic_changed=%s acceptance_fact_count=%d candidate_digest=%s before_issue_codes=%s after_issue_codes=%s",
             stage, attempt, next_evaluation.accepted, semantic_changed,
             len(next_evaluation.acceptance_facts), digest,
+            before_issue_codes, after_issue_codes,
         )
         if next_evaluation.accepted:
             return next_evaluation.candidate

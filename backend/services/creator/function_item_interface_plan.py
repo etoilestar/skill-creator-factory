@@ -474,6 +474,33 @@ INTERFACE_KINDS = {"platform_to_member", "member_to_member", "member_to_platform
 # than output field names, so the same adapter can be used with any compatible
 # platform output namespace.
 MEMBER_TO_PLATFORM_TRANSFORMS = frozenset(OUTPUT_TRANSFORM_REGISTRY)
+
+
+def _resolve_effective_interface_type(
+    *, source_type: str, transform: str | None,
+) -> str | None:
+    """Resolve the effective value type after a declared output transform."""
+    normalized_source = str(source_type or "").strip()
+    if not transform:
+        return normalized_source
+    adapter = OUTPUT_TRANSFORM_REGISTRY.get(transform)
+    if not adapter:
+        return None
+    accepted_types = adapter.get("input_types", ())
+    if isinstance(accepted_types, str):
+        accepted_types = (accepted_types,)
+    if normalized_source not in accepted_types:
+        return None
+    return str(adapter.get("result_type") or "").strip()
+
+
+REPAIRABLE_INTERFACE_ISSUES = frozenset({
+    "missing_source_binding",
+    "missing_target_binding",
+    "invalid_source_port",
+    "invalid_target_port",
+    "transform_missing",
+})
 _DANGEROUS_PATH_PARTS = {"__proto__", "prototype", "constructor"}
 INTERFACE_FIELDS = {
     "platform_to_member": {"interface_id", "kind", "source_platform_input", "source_path", "target_member", "target_input", "goal"},
@@ -653,7 +680,14 @@ def validate_interface_patch(
         if violations is not None and iid not in editable:
             raise InterfaceIntentPlanError("patch modifies a frozen valid interface", code="invalid_interface_patch_frozen_interface", details={"interface_id": iid})
     facts = build_runtime_binding_facts(function_items=function_items, platform_contract=platform_contract)
+    original_interface = plan
     candidate = apply_interface_patch(plan, patch, runtime_binding_facts=facts)
+    patched_interface = candidate
+    if original_interface == patched_interface:
+        raise InterfaceIntentPlanError(
+            "patch does not change the Interface Plan",
+            code="no_effective_patch", details={"path": "$.operations"},
+        )
     # Protocol/reference validation proves both source and target are existing
     # frozen ports before any candidate can enter refinement acceptance.
     validate_interface_intent_plan(plan=candidate, function_items=function_items)
@@ -1230,29 +1264,6 @@ def _canonical_semantic_type(value: str | None) -> str | None:
     return aliases.get(value, value)
 
 
-def _schema_matches(expected: dict[str, Any], actual: dict[str, Any]) -> bool:
-    """Match the structural subset declared by an adapter target contract."""
-    return all(
-        _schema_matches(value, actual.get(key, {}))
-        if isinstance(value, dict) and isinstance(actual.get(key), dict)
-        else actual.get(key) == value
-        for key, value in expected.items()
-    )
-
-
-def _adapter_matches(
-    adapter: dict[str, Any], *, source_schema: dict[str, Any], target_schema: dict[str, Any]
-) -> bool:
-    source_type = _schema_type(source_schema)
-    allowed_sources = adapter["input_types"]
-    if isinstance(allowed_sources, str):
-        allowed_sources = (allowed_sources,)
-    if source_type not in allowed_sources:
-        return False
-    target_semantic = _semantic_identity(target_schema) or _schema_type(target_schema)
-    return target_semantic == adapter["result_type"]
-
-
 def _semantic_identity(contract: dict[str, Any]) -> str:
     """Read a contract-declared semantic identity without consulting names."""
     for key in ("semantic_type", "semantic_value", "x-semantic-type"):
@@ -1283,10 +1294,16 @@ def semantic_provenance_compatibility(
         return False, "source and target semantic identities differ"
     source_type, target_type = _schema_type(source_schema), _schema_type(target_schema)
     if transform:
-        adapter = OUTPUT_TRANSFORM_REGISTRY.get(transform)
-        if adapter is None or not _adapter_matches(adapter, source_schema=source_schema, target_schema=target_schema):
-            return False, "transform is absent from the registry or violates its schema contract"
-    elif source_type and target_type and source_type != target_type:
+        effective_type = _resolve_effective_interface_type(
+            source_type=source_type or "", transform=transform,
+        )
+        if effective_type is None:
+            return False, "transform is invalid for source type"
+        effective_target = _semantic_identity(target_schema) or target_type
+        if effective_target and effective_type != effective_target:
+            return False, "transform result type does not match target type"
+        return True, "declared transform resolves source and target compatibility"
+    if source_type and target_type and source_type != target_type:
         return False, "source and target schemas differ without a declared transform"
     return True, "declared provenance contracts are compatible"
 
@@ -1400,30 +1417,45 @@ def collect_interface_plan_validation_issues(
                 transform = interface.get("transform")
                 source_type = _schema_type(source_schema)
                 target_type = (sink or {}).get("semantic_type") or _schema_type(target_schema)
-                adapter = OUTPUT_TRANSFORM_REGISTRY.get(transform) if transform else None
                 accepted_sources = set((sink or {}).get("accepted_source_types") or [])
                 allowed_transforms = set((sink or {}).get("allowed_transforms") or [])
                 source_semantic = _semantic_identity(source_schema) or source_type
-                result_type = adapter.get("result_type") if adapter else _canonical_semantic_type(source_semantic)
-                invalid_transform = bool(transform) and (
-                    adapter is None
-                    or transform not in allowed_transforms
-                    or source_semantic not in set(adapter.get("input_types") or ())
-                    or result_type != target_type
+                adapter = OUTPUT_TRANSFORM_REGISTRY.get(transform) if transform else None
+                effective_type = _resolve_effective_interface_type(
+                    source_type=source_semantic or "", transform=transform,
                 )
-                if invalid_transform:
+                result_type = effective_type if transform else _canonical_semantic_type(effective_type)
+                if transform and adapter is None:
+                    issue(
+                        "transform_unknown", f"{path}.transform", iid,
+                        {"source_type": source_semantic, "transform": transform, "result_type": result_type, "target_type": target_type},
+                        "transform must be registered", error_type="invalid_transform_error",
+                    )
+                elif transform and effective_type is None:
+                    issue(
+                        "transform_input_type_invalid", f"{path}.transform", iid,
+                        {"source_type": source_semantic, "transform": transform, "result_type": result_type, "target_type": target_type},
+                        "transform must accept the source type", error_type="invalid_transform_error",
+                    )
+                elif transform and effective_type != target_type:
                     issue(
                         "transform_result_type_mismatch", f"{path}.transform", iid,
                         {"source_type": source_semantic, "transform": transform, "result_type": result_type, "target_type": target_type},
-                        "source type, registered transform result type, and target contract must all match", error_type="invalid_transform_error",
+                        "transform result type must match the target contract", error_type="invalid_transform_error",
+                    )
+                elif transform and transform not in allowed_transforms:
+                    issue(
+                        "transform_unknown", f"{path}.transform", iid,
+                        {"source_type": source_semantic, "transform": transform, "result_type": result_type, "target_type": target_type},
+                        "transform must be allowed by the target contract", error_type="invalid_transform_error",
                     )
                 elif not transform and source_semantic and target_type and result_type != target_type:
                     issue(
-                        "incompatible_platform_output_type", path, iid,
+                        "transform_missing", path, iid,
                         {"source_type": source_semantic, "transform": None, "result_type": source_semantic, "target_type": target_type},
                         "direct output must already have the target semantic type; otherwise declare an allowed transform", error_type="schema_error",
                     )
-                elif source_semantic and source_semantic not in accepted_sources:
+                elif not transform and source_semantic and source_semantic not in accepted_sources:
                     issue(
                         "platform_output_source_type_rejected", path, iid,
                         {"source_type": source_semantic, "transform": transform, "result_type": result_type, "target_type": target_type},
@@ -2763,6 +2795,10 @@ operations are remove_interface, replace_source, and replace_transform. Do not
 return or regenerate the complete Interface Plan. This is a strict JSON-schema
 response: output exactly one {"operations": [...]} object and no prose. Keep
 the entire response concise and every reason at or below 200 characters.
+
+If no valid semantic patch exists, return empty operations. Do not repeat
+unchanged values. Do not create a patch that keeps the same source, target, or
+transform.
 """
     payload = {
         "system_goal": original_user_goal,

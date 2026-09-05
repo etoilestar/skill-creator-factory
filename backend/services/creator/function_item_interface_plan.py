@@ -40,6 +40,40 @@ Graph materialization deterministically resolves already-declared logical bindin
 Graph materialization does not reselect semantic business ports.
 Tool Planner owns concrete tool/helper binding.
 No later stage may silently revise an upstream frozen fact outside its declared authority."""
+INTERFACE_CONTRACT_SCOPE_CONTRACT = """The FunctionItem contract is already frozen.
+
+Interface Planner MUST NOT:
+- create new FunctionItems
+- modify FunctionItem inputs
+- modify FunctionItem outputs
+- reinterpret business responsibility
+
+Interface Planner ONLY creates connections:
+
+source port
+    ->
+target port
+
+Allowed decisions:
+
+1. source platform input
+2. source member output
+3. target member input
+4. target platform output
+5. explicit transform
+
+The planner must not infer new semantics.
+"""
+VALID_INTERFACE_FREEZE_CONTRACT = """Interfaces without validation errors are immutable.
+
+Repair MUST NOT:
+- reorder them
+- rename them
+- change their source
+- change their target
+
+Repair may only modify interfaces listed in violations.
+"""
 PLATFORM_OUTPUT_CONTRACT = """PLATFORM OUTPUT CONTRACT
 
 final_output_fields defines the legal platform-output domain.
@@ -468,13 +502,16 @@ INTERFACE_PATCH_SCHEMA: dict[str, Any] = {
     "properties": {"operations": {"type": "array", "items": {
         "type": "object", "required": ["op", "interface_id", "reason"],
         "properties": {
-            "op": {"enum": ["remove_interface", "replace_source", "replace_transform"]},
+            "op": {"enum": ["remove_interface", "replace_source", "replace_target", "replace_transform"]},
             "interface_id": {"type": "string", "minLength": 1},
             "reason": {"type": "string", "minLength": 1, "maxLength": 200},
             "source_platform_input": {"type": "string", "minLength": 1},
             "source_path": {"type": "array", "items": {"type": "string"}},
             "source_member": {"type": "string", "minLength": 1},
             "source_output": {"type": "string", "minLength": 1},
+            "target_member": {"type": "string", "minLength": 1},
+            "target_input": {"type": "string", "minLength": 1},
+            "target_platform_output": {"type": "string", "minLength": 1},
             "transform": {"type": ["string", "null"]},
         }, "additionalProperties": False,
     }}},
@@ -516,12 +553,13 @@ def validate_interface_patch_protocol(patch: Any) -> dict[str, Any]:
         if not isinstance(operation, dict) or not common <= set(operation):
             raise InterfaceIntentPlanError("patch operation fields are invalid", code="invalid_interface_patch", details={"path": path})
         op = operation.get("op")
-        if op not in {"remove_interface", "replace_source", "replace_transform"}:
+        if op not in {"remove_interface", "replace_source", "replace_target", "replace_transform"}:
             raise InterfaceIntentPlanError("patch operation is unsupported", code="invalid_interface_patch", details={"path": f"{path}.op"})
         allowed_fields = {
             "remove_interface": common,
             "replace_transform": common | {"transform"},
             "replace_source": common | {"source_platform_input", "source_path", "source_member", "source_output"},
+            "replace_target": common | {"target_member", "target_input", "target_platform_output"},
         }[op]
         if not set(operation) <= allowed_fields:
             raise InterfaceIntentPlanError("patch operation contains fields invalid for op", code="invalid_interface_patch", details={"path": path})
@@ -532,6 +570,11 @@ def validate_interface_patch_protocol(patch: Any) -> dict[str, Any]:
             member_source = "source_member" in operation and "source_output" in operation
             if platform_source == member_source:
                 raise InterfaceIntentPlanError("replace_source must contain exactly one source shape", code="invalid_interface_patch", details={"path": path})
+        if op == "replace_target":
+            member_target = "target_member" in operation and "target_input" in operation
+            platform_target = "target_platform_output" in operation
+            if member_target == platform_target:
+                raise InterfaceIntentPlanError("replace_target must contain exactly one target shape", code="invalid_interface_patch", details={"path": path})
         if not isinstance(operation.get("interface_id"), str) or not operation["interface_id"].strip():
             raise InterfaceIntentPlanError("patch interface_id is invalid", code="invalid_interface_patch", details={"path": f"{path}.interface_id"})
         reason = operation.get("reason")
@@ -582,9 +625,47 @@ def apply_interface_patch(
         elif op == "replace_transform":
             if operation.get("transform") is None: current.pop("transform", None)
             else: current["transform"] = operation["transform"]
+        elif op == "replace_target":
+            if "target_platform_output" in operation:
+                current.pop("target_member", None); current.pop("target_input", None)
+                current.update(kind="member_to_platform", target_platform_output=operation["target_platform_output"])
+            else:
+                current.pop("target_platform_output", None); current.pop("transform", None)
+                current.update(target_member=operation["target_member"], target_input=operation["target_input"])
         else:
             raise InterfaceIntentPlanError("unsupported interface patch operation", code="invalid_interface_patch", details={"op": op})
     return interfaces if legacy_list else {"interfaces": interfaces}
+
+
+def validate_interface_patch(
+    *, plan: dict[str, Any], patch: dict[str, Any], function_items: list[dict[str, Any]],
+    platform_contract: dict[str, Any] | None = None,
+    violations: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Validate and apply an edge patch atomically against frozen endpoint slots."""
+    patch = validate_interface_patch_protocol(patch)
+    before = {str(v.get("interface_id") or ""): v for v in plan.get("interfaces") or []}
+    editable = {str(v.get("interface_id") or "") for v in (violations or []) if v.get("interface_id")}
+    for operation in patch["operations"]:
+        iid = operation["interface_id"]
+        if iid not in before:
+            raise InterfaceIntentPlanError("patch references unknown interface", code="invalid_interface_patch", details={"interface_id": iid})
+        if violations is not None and iid not in editable:
+            raise InterfaceIntentPlanError("patch modifies a frozen valid interface", code="invalid_interface_patch_frozen_interface", details={"interface_id": iid})
+    facts = build_runtime_binding_facts(function_items=function_items, platform_contract=platform_contract)
+    candidate = apply_interface_patch(plan, patch, runtime_binding_facts=facts)
+    # Protocol/reference validation proves both source and target are existing
+    # frozen ports before any candidate can enter refinement acceptance.
+    validate_interface_intent_plan(plan=candidate, function_items=function_items)
+    blocking = collect_interface_plan_validation_issues(
+        plan=candidate, function_items=function_items, platform_contract=platform_contract,
+    )
+    if blocking:
+        raise InterfaceIntentPlanError(
+            "interface patch does not preserve deterministic closure",
+            code="invalid_interface_patch_closure", details={"issues": blocking},
+        )
+    return candidate
 
 
 CANONICAL_INTERFACE_CONTRACT_RULE = """CANONICAL INTERFACE CONTRACT
@@ -877,6 +958,40 @@ def _compact_function_items(function_items: list[dict[str, Any]]) -> list[dict[s
             }
         )
     return compact_items
+
+
+def build_frozen_interface_slots(
+    *, function_items: list[dict[str, Any]], platform_contract: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Project the frozen contracts into the only endpoint domain a planner may use."""
+    compact = _compact_function_items(function_items)
+    boundary = (platform_contract or {}).get("platform_skill_boundary", platform_contract or {})
+    input_schemas = boundary.get("input_schemas") if isinstance(boundary.get("input_schemas"), dict) else {}
+    output_sinks = boundary.get("output_sinks") if isinstance(boundary.get("output_sinks"), dict) else {}
+    return {
+        "members": {
+            item["target_file"]: {
+                "inputs": [{"name": port["name"], "type": _schema_type(port["contract"])} for port in item["inputs"]],
+                "outputs": [{"name": port["name"], "type": _schema_type(port["contract"])} for port in item["outputs"]],
+            }
+            for item in compact
+        },
+        "platform_ports": {
+            "inputs": [
+                {"name": name, "type": _schema_type(dict(input_schemas.get(name) or {}))}
+                for name in sorted({_compact_port_id(v) for v in boundary.get("input_envelope_fields") or []})
+            ],
+            "outputs": [
+                {"name": name, "type": (output_sinks.get(name) or {}).get("semantic_type")}
+                for name in sorted(platform_output_names(platform_contract))
+            ],
+        },
+    }
+
+
+def runtime_slot_key(member: str, slot_name: str) -> tuple[str, str]:
+    """Return the single canonical identity for a runtime receiving slot."""
+    return (str(member), str(slot_name))
 
 
 def validate_interface_plan_protocol(plan: dict[str, Any]) -> dict[str, Any]:
@@ -1187,7 +1302,7 @@ def collect_interface_plan_validation_issues(
     input_ports = {(item["target_file"], value["name"]): value for item in compact for value in item["inputs"]}
     output_ports = {(item["target_file"], value["name"]): value for item in compact for value in item["outputs"]}
     member_order = {item["target_file"]: index for index, item in enumerate(compact)}
-    required_slots = {(member, name) for (member, name), value in input_ports.items()
+    required_slots = {runtime_slot_key(member, name) for (member, name), value in input_ports.items()
                       if value["role"] in {"required_runtime_input", "derived_input"}}
     boundary = (platform_contract or {}).get("platform_skill_boundary", platform_contract or {})
     platform_inputs = {_compact_port_id(value) for value in boundary.get("input_envelope_fields") or []}
@@ -1215,10 +1330,10 @@ def collect_interface_plan_validation_issues(
         issue("invalid_required_platform_output", "$.platform_contract.required_final_output_fields", "", sorted(invalid_required_outputs), sorted(platform_outputs))
 
     def record_source(member: str, slot: str, source: str) -> None:
-        slot_sources.setdefault((member, slot), []).append(source)
+        slot_sources.setdefault(runtime_slot_key(member, slot), []).append(source)
 
     def cover(member: str, slot: str, path: str, iid: str) -> None:
-        valid_bindings.setdefault((member, slot), []).append((path, iid))
+        valid_bindings.setdefault(runtime_slot_key(member, slot), []).append((path, iid))
 
     for index, interface in enumerate(plan.get("interfaces") or []):
         path, iid, kind = f"$.interfaces[{index}]", str(interface.get("interface_id") or ""), interface.get("kind")
@@ -1239,7 +1354,7 @@ def collect_interface_plan_validation_issues(
                     source_origin="platform_input", target_role=target_port["role"], target_schema=target_port["contract"],
                 )
                 if not compatible:
-                    binding_failures.setdefault((target, slot), []).append({
+                    binding_failures.setdefault(runtime_slot_key(target, slot), []).append({
                         "interface_id": iid,
                         "status": "binding_not_found" if reason.startswith("source is absent") else "provenance_error",
                         "actual_source": {"source_platform_input": source,
@@ -1326,8 +1441,8 @@ def collect_interface_plan_validation_issues(
                 "observed_value": distinct_sources, "expected_constraint": "exactly one valid runtime source",
             })
             continue
-        if len(valid_bindings.get((member, slot), [])) == 1:
-            covered_slots.add((member, slot))
+        if len(valid_bindings.get(runtime_slot_key(member, slot), [])) == 1:
+            covered_slots.add(runtime_slot_key(member, slot))
 
     for member, slot in sorted(required_slots - covered_slots):
         candidates = generate_provenance_candidates(
@@ -1337,7 +1452,7 @@ def collect_interface_plan_validation_issues(
             platform_inputs=platform_inputs,
         )
 
-        target_port = input_ports[(member, slot)]
+        target_port = input_ports[runtime_slot_key(member, slot)]
         if target_port["role"] == "derived_input":
             candidates = [candidate for candidate in candidates if candidate["kind"] == "member_to_member"]
         candidate_ids = [
@@ -1346,7 +1461,7 @@ def collect_interface_plan_validation_issues(
             if value.get("target_member") == member and value.get("target_input") == slot
         ]
         expected_sources = binding_facts.get(member, {}).get(slot, {}).get("allowed_sources") or []
-        failures = binding_failures.get((member, slot), [])
+        failures = binding_failures.get(runtime_slot_key(member, slot), [])
         closure_failure = {
             "slot": f"{member}.{slot}",
             "status": failures[0]["status"] if failures else "interface_not_found",
@@ -1393,6 +1508,32 @@ def collect_interface_plan_validation_issues(
         )
     if not required_platform_outputs and not covered_platform:
         issue("missing_platform_terminal", "$.interfaces", "", {}, "at least one legal member_to_platform Interface")
+    # Keep the established aggregate codes for callers while also exposing the
+    # edge-addressable diagnostic consumed by patch repair.  An invalid edge is
+    # never reported without its immutable interface identifier.
+    by_id = {str(value.get("interface_id") or ""): value for value in plan.get("interfaces") or []}
+    edge_issues: list[dict[str, Any]] = []
+    for value in issues:
+        iid = str(value.get("interface_id") or "")
+        if not iid:
+            continue
+        interface = by_id.get(iid, {})
+        if interface.get("kind") == "platform_to_member":
+            source = {"platform_input": interface.get("source_platform_input"), "source_path": interface.get("source_path", [])}
+        else:
+            source = {"member": interface.get("source_member"), "output": interface.get("source_output")}
+        target = ({"platform_output": interface.get("target_platform_output")}
+                  if interface.get("kind") == "member_to_platform" else
+                  {"member": interface.get("target_member"), "input": interface.get("target_input")})
+        edge_issues.append({
+            "code": "interface_binding_invalid", "stage": "interface_plan_validation",
+            "interface_id": iid, "source": source, "target": target,
+            "reason": value["code"], "expected": value.get("expected_constraint"),
+            "error_type": value.get("error_type", "binding_error"), "path": value.get("path", "$.interfaces"),
+            "message": "Interface binding is invalid.", "observed_value": value.get("observed_value"),
+            "expected_constraint": value.get("expected_constraint"), "details": {"reason_code": value["code"]},
+        })
+    issues.extend(edge_issues)
     closure_failures = [
         issue_value.get("observed_value", {}).get("closure_failure")
         for issue_value in issues
@@ -1572,6 +1713,8 @@ def build_graph_obligations_from_interfaces(*, interface_plan: dict[str, Any]) -
 
 def _interface_plan_prompt() -> str:
     return f"""{AUTHORITY_CONTRACT}
+
+    {INTERFACE_CONTRACT_SCOPE_CONTRACT}
 
     {CANONICAL_INTERFACE_CONTRACT_RULE}
 
@@ -2180,6 +2323,9 @@ async def plan_function_item_interfaces(*, original_user_goal: str, frozen_funct
         "requirement_channels": requirement_channels or {},
         "unowned_system_requirements": system_requirements_context,
         "platform_contract": platform_contract or {},
+        "frozen_interface_slots": build_frozen_interface_slots(
+            function_items=frozen_function_items, platform_contract=platform_contract,
+        ),
         "runtime_binding_facts": build_runtime_binding_facts(function_items=frozen_function_items, platform_contract=platform_contract),
     }
     raw_response = await model_call([{"role": "system", "content": _interface_plan_prompt()}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}], planner_model)
@@ -2209,6 +2355,10 @@ async def plan_function_item_interfaces(*, original_user_goal: str, frozen_funct
         facts = ([{"code": protocol_issue.code, "message": str(protocol_issue), "details": protocol_issue.details}]
                  if protocol_issue is not None else deterministic_issues)
         correction_prompt = f"""{AUTHORITY_CONTRACT}
+
+        {INTERFACE_CONTRACT_SCOPE_CONTRACT}
+
+        {VALID_INTERFACE_FREEZE_CONTRACT}
 
         {PLATFORM_OUTPUT_CONTRACT}
 
@@ -2247,9 +2397,9 @@ Do not invent a source outside the declared candidate domain.
 Do not patch only visible wording. Never regenerate all interfaces for a
 semantically valid transport.
 4. CURRENT AUTHORITY
-Modify only the Interface semantic layer. You may add or remove an Interface,
-revise a logical binding or source_path, and preserve correct bindings. You
-decide the semantic repair; the backend does not choose the producer.
+Modify only Interfaces explicitly named by violations. Use only
+remove_interface, replace_source, replace_target, or replace_transform. Never
+add an Interface and never regenerate or reorder the complete contract.
 5. HARD ACCEPTANCE CONDITIONS
 The complete result must match INTERFACE_SCHEMA. Every supplied acceptance fact
 is independently blocking; coverage alone is insufficient.
@@ -2276,6 +2426,9 @@ JSON matching INTERFACE_SCHEMA."""
                 },
                 "interface_schema": INTERFACE_SCHEMA,
                 "interface_patch_schema": INTERFACE_PATCH_SCHEMA,
+                "interfaces": (previous_candidate.get("interfaces") or []) if isinstance(previous_candidate, dict) else [],
+                "violations": facts,
+                "allowed_operations": ["remove_interface", "replace_source", "replace_target", "replace_transform"],
             }
             if _include_previous_interface_plan(feedback):
                 correction_payload["previous_interface_plan"] = previous_candidate
@@ -2287,9 +2440,10 @@ JSON matching INTERFACE_SCHEMA."""
             try:
                 corrected = _parse_object(corrected_text)
                 if protocol_issue is None:
-                    return apply_interface_patch(
-                        previous_candidate, corrected,
-                        runtime_binding_facts=payload["runtime_binding_facts"],
+                    return validate_interface_patch(
+                        plan=previous_candidate, patch=corrected,
+                        function_items=frozen_function_items,
+                        platform_contract=platform_contract, violations=facts,
                     )
                 return corrected
             except InterfaceIntentPlanError:

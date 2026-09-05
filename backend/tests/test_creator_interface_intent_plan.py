@@ -11,7 +11,53 @@ from backend.services.creator.function_item_interface_plan import (
     normalize_interface_review_issue, repair_interface_plan_semantically,
     plan_function_item_interfaces, review_interface_plan_semantically,
     validate_interface_intent_plan, validate_interface_repair_critic,
+    build_canonical_interface_contract,
+    collect_interface_contract_consistency_issues,
 )
+
+
+def test_canonical_input_contract_preserves_platform_field_identity():
+    contract = build_canonical_interface_contract(
+        plan={"interfaces": [p2m("I1", "scripts/unit_a.py", "primary_key_mapping_strategy", "primary_key_mapping_strategy")]},
+        function_items=[item("scripts/unit_a.py", ["primary_key_mapping_strategy"], ["result_z"])],
+        platform_contract={"platform_skill_boundary": {"input_envelope_fields": ["primary_key_mapping_strategy"]}},
+    )
+    binding = contract["interfaces"][0]
+    assert binding["source"]["field"] == "primary_key_mapping_strategy"
+    assert binding["target"]["field"] == "primary_key_mapping_strategy"
+    assert collect_interface_contract_consistency_issues(
+        interface_contract=contract,
+        script_sources={"I1": 'value = args["primary_key_mapping_strategy"]'},
+        command_variables={"I1": ["primary_key_mapping_strategy"]},
+        runtime_bindings={"I1": ["primary_key_mapping_strategy"]},
+    ) == []
+
+
+@pytest.mark.parametrize(("output_name", "source_type", "target", "transform"), [
+    ("report_json", "object", "text", "json_serialize"),
+    ("report_path", "file_path", "file_outputs", "file_collect"),
+])
+def test_canonical_output_contract_retains_registered_transform(output_name, source_type, target, transform):
+    interface = m2p("I1", "scripts/unit_a.py", output_name, target)
+    interface["transform"] = transform
+    contract = build_canonical_interface_contract(
+        plan={"interfaces": [interface]},
+        function_items=[item("scripts/unit_a.py", [], [{"port_id": output_name, "contract": {"type": source_type}}])],
+        platform_contract={"platform_skill_boundary": {"final_output_fields": [target]}},
+    )
+    assert contract["interfaces"][0]["transform"] == transform
+
+
+def test_consistency_rejects_undeclared_options_wrapper():
+    contract = build_canonical_interface_contract(
+        plan={"interfaces": [p2m("I1", "scripts/unit_a.py", "primary_key_mapping_strategy", "primary_key_mapping_strategy")]},
+        function_items=[item("scripts/unit_a.py", ["primary_key_mapping_strategy"], ["result_z"])],
+    )
+    issues = collect_interface_contract_consistency_issues(
+        interface_contract=contract,
+        script_sources={"I1": 'value = args["options"]["primary_key_mapping_strategy"]'},
+    )
+    assert [issue["code"] for issue in issues] == ["interface_target_field_mismatch"]
 
 
 def test_apply_interface_patch_preserves_existing_interfaces():

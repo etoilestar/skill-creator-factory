@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import ast
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -416,6 +417,124 @@ INTERFACE_SCHEMA: dict[str, Any] = {
         for kind, fields in INTERFACE_FIELDS.items()
     ]}}},
 }
+
+CANONICAL_INTERFACE_CONTRACT_RULE = """CANONICAL INTERFACE CONTRACT
+
+The Interface Plan is the single source of truth for executable interface
+binding.  If an Interface Plan exists, every later generation stage MUST use it
+directly.  Do NOT infer interface bindings from graph node names, blueprint
+descriptions, or FunctionItem/function descriptions.
+
+The canonical projection of every binding contains direction, source
+(kind/field/schema), target (kind/field), and transform.  A dotted source field
+is a real path declared by the platform input contract; words such as options,
+config, and params have no special meaning and are neither forbidden nor
+implicitly inserted.  Generated command variables and script argv keys equal
+target.field, while runtime lookup paths equal source.field.
+"""
+
+
+def build_canonical_interface_contract(
+    *, plan: dict[str, Any], function_items: list[dict[str, Any]],
+    platform_contract: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Project the accepted legacy wire shape into the sole executable contract.
+
+    The planner wire format retains endpoint member identifiers needed by graph
+    materialization.  This projection deliberately contains only binding facts
+    consumed by generators, preventing those stages from reconstructing paths,
+    names, schemas, or transforms from descriptive text.
+    """
+    validated = validate_interface_intent_plan(plan=plan, function_items=function_items)
+    compact = _compact_function_items(function_items)
+    schemas = {
+        (item["target_file"], port["name"]): dict(port.get("contract") or {})
+        for item in compact for port in item.get("outputs") or []
+    }
+    boundary = (platform_contract or {}).get("platform_skill_boundary", platform_contract or {})
+    platform_input_schemas = boundary.get("input_schemas") if isinstance(boundary.get("input_schemas"), dict) else {}
+    interfaces: list[dict[str, Any]] = []
+    for interface in validated["interfaces"]:
+        kind = interface["kind"]
+        if kind == "platform_to_member":
+            path = [interface["source_platform_input"], *interface["source_path"]]
+            source = {
+                "kind": "platform_input",
+                "field": ".".join(path),
+                "schema": dict(platform_input_schemas.get(interface["source_platform_input"]) or {}),
+            }
+            target = {"kind": "function_input", "field": interface["target_input"]}
+            direction = "input"
+        elif kind == "member_to_member":
+            source = {
+                "kind": "function_output",
+                "field": interface["source_output"],
+                "schema": schemas.get((interface["source_member"], interface["source_output"]), {}),
+            }
+            target = {"kind": "function_input", "field": interface["target_input"]}
+            direction = "input"
+        else:
+            source = {
+                "kind": "function_output",
+                "field": interface["source_output"],
+                "schema": schemas.get((interface["source_member"], interface["source_output"]), {}),
+            }
+            target = {"kind": "platform_output", "field": interface["target_platform_output"]}
+            direction = "output"
+        interfaces.append({
+            "interface_id": interface["interface_id"],
+            "direction": direction,
+            "source": source,
+            "target": target,
+            "transform": interface.get("transform"),
+        })
+    return {"interfaces": interfaces}
+
+
+def _script_arg_paths(source: str) -> set[str]:
+    """Return literal ``args`` access paths without applying naming policy."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    paths: set[str] = set()
+    for node in ast.walk(tree):
+        parts: list[str] = []
+        current: ast.AST = node
+        while isinstance(current, ast.Subscript) and isinstance(current.slice, ast.Constant) and isinstance(current.slice.value, str):
+            parts.append(current.slice.value)
+            current = current.value
+        if isinstance(current, ast.Name) and current.id == "args" and parts:
+            paths.add(".".join(reversed(parts)))
+    return paths
+
+
+def collect_interface_contract_consistency_issues(
+    *, interface_contract: dict[str, Any], script_sources: dict[str, str] | None = None,
+    command_variables: dict[str, list[str]] | None = None,
+    runtime_bindings: dict[str, list[str]] | None = None,
+) -> list[dict[str, Any]]:
+    """Deterministically reject downstream bindings that diverge from the plan."""
+    issues: list[dict[str, Any]] = []
+    scripts = script_sources or {}
+    commands = command_variables or {}
+    bindings = runtime_bindings or {}
+    for interface in interface_contract.get("interfaces") or []:
+        iid = str(interface.get("interface_id") or "")
+        target = str((interface.get("target") or {}).get("field") or "")
+        source = str((interface.get("source") or {}).get("field") or "")
+        for artifact, observed in (
+            ("SKILL command", set(commands.get(iid) or [])),
+            ("script", _script_arg_paths(scripts.get(iid, ""))),
+        ):
+            if observed and target not in observed:
+                issues.append({"code": "interface_target_field_mismatch", "interface_id": iid,
+                               "artifact": artifact, "observed": sorted(observed), "expected": target})
+        observed_bindings = set(bindings.get(iid) or [])
+        if observed_bindings and source not in observed_bindings:
+            issues.append({"code": "interface_source_field_mismatch", "interface_id": iid,
+                           "artifact": "runtime binding", "observed": sorted(observed_bindings), "expected": source})
+    return issues
 
 
 def _include_previous_interface_plan(feedback: dict[str, Any]) -> bool:
@@ -1001,6 +1120,8 @@ def build_graph_obligations_from_interfaces(*, interface_plan: dict[str, Any]) -
 def _interface_plan_prompt() -> str:
     return f"""{AUTHORITY_CONTRACT}
 
+    {CANONICAL_INTERFACE_CONTRACT_RULE}
+
     {PLATFORM_OUTPUT_CONTRACT}
 
     {PLATFORM_OUTPUT_MAPPING_CONTRACT}
@@ -1328,6 +1449,8 @@ A plausible goal cannot make an incorrect structured source/target binding valid
 """
     prompt = AUTHORITY_CONTRACT + """
 
+    """ + CANONICAL_INTERFACE_CONTRACT_RULE + """
+
     """ + PLATFORM_OUTPUT_CONTRACT + """
 
     """ + PLATFORM_OUTPUT_MAPPING_CONTRACT + """
@@ -1437,6 +1560,8 @@ A plausible goal cannot make an incorrect structured source/target binding valid
 
     Do NOT check:
 
+    - whether a source or target field exists (deterministic validation owns this)
+    - whether source and target schemas are structurally equal
     - whether a field name looks natural
     - whether another field name would be clearer
     - whether another design would be preferred
@@ -1453,9 +1578,10 @@ A plausible goal cannot make an incorrect structured source/target binding valid
             ->
     target_platform_output
 
-    A declared transform is part of this compatibility check. It is valid only
-    when its declared adapter source_type and target_type match the source and
-    target schemas. Without an adapter, differing types are incompatible.
+    A declared transform is part of this compatibility check. Transform
+    registration and schema compatibility have already been checked
+    deterministically. Review only whether that transform preserves the
+    intended business meaning.
 
     Do not report that mapping as a type mismatch merely because its endpoint
     schemas differ when the registered transform matches both contracts. Judge

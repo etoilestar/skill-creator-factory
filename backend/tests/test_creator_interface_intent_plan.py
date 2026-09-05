@@ -265,8 +265,10 @@ def test_structured_output_to_text_requires_declared_serializer():
     ("source_name", "source_type", "target_name", "target_schema", "transform", "valid"),
     [
         ("report", "object", "text", {"type": "string"}, "json_serialize", True),
-        ("report", "object", "file_outputs", {"type": "array", "items": {"type": "string"}}, "json_serialize", False),
         ("artifact", "file_path", "file_outputs", {"type": "array", "items": {"type": "string"}}, "file_collect", True),
+        ("report", "object", "text", {"type": "string"}, None, False),
+        ("report", "string", "text", {"type": "string"}, "json_serialize", False),
+        ("report", "object", "file_outputs", {"type": "array", "items": {"type": "string"}}, "json_serialize", False),
         ("internal_report", "object", "text_result", {"type": "string"}, "json_serialize", True),
     ],
 )
@@ -282,7 +284,8 @@ def test_output_adapter_contract_closes_types_independently_of_port_names(
         "required_final_output_fields": [target_name],
     }}
     interface = m2p("I1", "scripts/unit_a.py", source_name, target_name)
-    interface["transform"] = transform
+    if transform is not None:
+        interface["transform"] = transform
 
     issues = collect_interface_plan_validation_issues(
         plan={"interfaces": [interface]}, function_items=items,
@@ -291,7 +294,12 @@ def test_output_adapter_contract_closes_types_independently_of_port_names(
 
     assert (issues == []) is valid
     if not valid:
-        assert [issue["code"] for issue in issues] == ["incompatible_platform_output_transform"]
+        expected_code = (
+            "incompatible_platform_output_transform"
+            if transform is not None
+            else "incompatible_platform_output_type"
+        )
+        assert [issue["code"] for issue in issues] == [expected_code]
 
 
 def test_canonical_binding_signature_ignores_goal_id_and_order_but_not_binding():

@@ -92,6 +92,22 @@ PLATFORM_OUTPUT_MAPPING_CONTRACT = """PLATFORM OUTPUT MAPPING CONTRACT
 
 FunctionItem outputs and platform outputs belong to different semantic layers.
 
+FunctionItem outputs and platform outputs are different semantic layers.
+
+A declared transform represents a boundary adaptation.
+
+The reviewer MUST NOT reject a mapping only because source schema and target
+schema differ, when the declared transform is registered and its source/target
+contracts match.
+
+Examples:
+
+- object -> text with json_serialize is valid.
+- file_path -> file_outputs with file_collect is valid.
+
+The reviewer should judge whether semantic meaning is preserved, not require
+structural schema equality.
+
 FunctionItem outputs are internal logical ports produced inside the Skill.
 
 Platform outputs are external boundary ports exposed to the host.
@@ -1440,6 +1456,10 @@ A plausible goal cannot make an incorrect structured source/target binding valid
     A declared transform is part of this compatibility check. It is valid only
     when its declared adapter source_type and target_type match the source and
     target schemas. Without an adapter, differing types are incompatible.
+
+    Do not report that mapping as a type mismatch merely because its endpoint
+    schemas differ when the registered transform matches both contracts. Judge
+    whether the boundary adaptation preserves the semantic meaning instead.
 
 
     The reviewer checks semantic compatibility only.

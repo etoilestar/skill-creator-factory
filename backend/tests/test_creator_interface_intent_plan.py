@@ -7,7 +7,6 @@ from backend.services.creator.function_item_interface_plan import (
     apply_interface_patch,
     build_interface_repair_scope, collect_interface_plan_validation_issues,
     canonical_logical_binding_signatures,
-    existing_binding_references_valid,
     _include_previous_interface_plan,
     normalize_interface_review_issue, repair_interface_plan_semantically,
     plan_function_item_interfaces, review_interface_plan_semantically,
@@ -978,7 +977,7 @@ async def test_nonblocking_interface_review_issues_are_retained_without_failing(
 
 
 @pytest.mark.asyncio
-async def test_correction_receives_uncovered_slot_and_existing_binding_semantic_fact():
+async def test_deterministic_correction_finishes_before_semantic_review():
     items = [
         item("scripts/a.py", [], [
             {"port_id": "alpha", "description": "alpha value"},
@@ -1030,18 +1029,15 @@ async def test_correction_receives_uncovered_slot_and_existing_binding_semantic_
     )
     assert result == corrected
     assert any(fact.get("code") == "uncovered_required_logical_input" for fact in correction_facts)
-    semantic = [fact for fact in correction_facts if fact.get("source_stage") == "existing_binding_semantic_review"]
-    assert semantic == [{
-        "source_stage": "existing_binding_semantic_review",
-        "interface_id": "I1", "current_binding": initial["interfaces"][0],
-        "message": "declared alpha does not satisfy beta",
-        "expected_constraint": "Declared semantic source must satisfy declared receiving slot.",
-    }]
-    assert reviewer_modes == ["existing", "full"]
+    assert not any(
+        fact.get("source_stage") == "existing_binding_semantic_review"
+        for fact in correction_facts
+    )
+    assert reviewer_modes == ["full"]
 
 
 @pytest.mark.asyncio
-async def test_invalid_existing_reference_skips_early_semantic_audit():
+async def test_invalid_existing_reference_is_corrected_before_semantic_review():
     items = [item("scripts/a.py", [], ["alpha"])]
     initial = {"interfaces": [
         m2m("I1", "scripts/missing.py", "alpha", "scripts/a.py", "alpha"),
@@ -1049,10 +1045,6 @@ async def test_invalid_existing_reference_skips_early_semantic_audit():
     ]}
     corrected = {"interfaces": [m2p("I2", "scripts/a.py", "alpha")]}
     reviewer_modes = []
-
-    assert not existing_binding_references_valid(
-        plan=initial, function_items=items, platform_contract=platform(),
-    )
 
     async def planner(messages, _model):
         payload = json.loads(messages[-1]["content"])
@@ -1074,14 +1066,15 @@ async def test_invalid_existing_reference_skips_early_semantic_audit():
 
 
 @pytest.mark.asyncio
-async def test_early_semantic_review_protocol_failure_fails_open():
-    items = [item("scripts/a.py", ["alpha", "gamma"], ["result"])]
-    initial = {"interfaces": [p2m("I1", "scripts/a.py", "alpha"), m2p("I2", "scripts/a.py", "result")]}
-    corrected = {"interfaces": [p2m("I1", "scripts/a.py", "alpha"), p2m("I3", "scripts/a.py", "gamma"), m2p("I2", "scripts/a.py", "result")]}
-    reviewer_responses = iter(["bad-json", "still-bad"])
+async def test_unknown_platform_output_is_deterministic_before_semantic_review():
+    items = [item("scripts/a.py", [], ["report_pdf"])]
+    initial = {"interfaces": [m2p("I1", "scripts/a.py", "report_pdf", "pdf_path")]}
+    corrected = {"interfaces": [m2p("I1", "scripts/a.py", "report_pdf", "text")]}
     correction_facts = []
+    events = []
 
     async def planner(messages, _model):
+        events.append("planner")
         payload = json.loads(messages[-1]["content"])
         if "refinement_feedback" not in payload:
             return json.dumps(initial)
@@ -1089,18 +1082,19 @@ async def test_early_semantic_review_protocol_failure_fails_open():
         return json.dumps(corrected)
 
     async def reviewer(_messages, _model):
-        try:
-            return next(reviewer_responses)
-        except StopIteration:
-            return json.dumps({"passed": True, "issues": []})
+        events.append("reviewer")
+        return json.dumps({"passed": True, "issues": []})
 
     assert await plan_function_item_interfaces(
-        original_user_goal="process alpha and gamma", frozen_function_items=items,
+        original_user_goal="produce a PDF report", frozen_function_items=items,
         platform_contract=platform(), planner_model="planner-test-model",
         model_call=planner, reviewer_model="reviewer-test-model",
         reviewer_model_call=reviewer,
     ) == corrected
-    assert [fact["code"] for fact in correction_facts] == ["uncovered_required_logical_input"]
+    assert [fact["code"] for fact in correction_facts] == ["unknown_platform_logical_output"]
+    assert correction_facts[0]["observed_value"] == "pdf_path"
+    assert correction_facts[0]["expected_constraint"] == ["text"]
+    assert events == ["planner", "planner", "reviewer"]
 
 
 def test_prompts_define_structured_binding_and_canonical_input_semantics():

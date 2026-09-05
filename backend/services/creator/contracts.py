@@ -1,10 +1,18 @@
 """Skill/file contract and blueprint validation helpers."""
 
 from .common import *  # noqa: F403
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, TypedDict
 from .model_gateway import creator_model_call
 from .command_normalizer import parse_skill_md_bash_command_blocks
 from .tool_pool_models import (ToolPoolModel, ToolPoolTool, ToolPoolFileBinding, ToolPoolGateEvent, ToolPoolDeniedRequest, ToolPoolMissingRequest, ToolPoolPatch, ToolPoolAddToolRequest, RuntimeImportGuardResult)
+
+
+class RuntimeProvenanceContract(TypedDict):
+    """Explicit source identity stored with an Interface Contract binding."""
+
+    source_type: str
+    source_platform_input: str
+    source_path: list[str]
 
 
 @dataclass(frozen=True)

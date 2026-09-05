@@ -532,6 +532,19 @@ def project_script_interface_contract(graph: Any, target_file: str) -> dict[str,
     inputs = [p for p in contract["input_ports"] if p["consumer"] == target_file]
     outputs = [p for p in contract["output_ports"] if p["producer"] == target_file]
     bindings = [e for e in contract["edge_mappings"] if e["consumer"] == target_file or e["producer"] == target_file]
+    for binding in bindings:
+        if binding["producer"] != "platform_input_node":
+            continue
+        source_path: list[str] = []
+        for constraint in binding.get("constraints") or []:
+            if constraint.get("type") == "platform_parameter_binding":
+                source_path = list(constraint.get("source_path") or [])
+                break
+        binding["runtime_provenance"] = {
+            "source_type": "platform_input",
+            "source_platform_input": binding["producer_port"],
+            "source_path": source_path,
+        }
     properties = {p["name"]: {"type": "array" if str(p["type"]).startswith("list[") else p["type"], "x-graph-type": p["type"], "x-shape": p["shape"]} for p in inputs}
     stdout_properties = {p["name"]: {"type": "array" if str(p["type"]).startswith("list[") else p["type"], "x-graph-type": p["type"], "x-shape": p["shape"]} for p in outputs}
     platform_output_mapping: dict[str, list[str]] = {}

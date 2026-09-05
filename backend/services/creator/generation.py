@@ -2224,6 +2224,9 @@ def _script_local_contract_payload(
     else:
         function_execution_context = dict(function_execution_context)
 
+    # Runtime argv provenance is frozen by the Interface Contract. The code
+    # generator may consume this projection but must never reconstruct a source
+    # from an argv key, variable name, filename, or description.
     # Interface fields are projected exclusively from the graph.  SkillPlan and
     # source-code inspection remain implementation inputs, never competing
     # interface authorities.
@@ -2429,6 +2432,8 @@ def _script_local_contract_payload(
             "inputs": runtime_input_ports,
             "input_binding": graph_projection["runtime_binding"] if graph_projection is not None else declared_bindings,
             "authority": "ResponsibilityGraph Interface Contract" if graph_projection is not None else "SkillPlan/runtime_contract/input_binding",
+            "runtime_provenance": [binding["runtime_provenance"] for binding in (graph_projection["runtime_binding"] if graph_projection is not None else []) if binding.get("runtime_provenance")],
+            "provenance_rule": "Use only declared runtime_provenance; never infer a source from variable names.",
         },
         "command_argv_contract": (
             command_argv_contract

@@ -3,6 +3,7 @@ import pytest
 from backend.services.creator.function_item_interface_plan import (
     build_interface_repair_scope,
     collect_interface_plan_validation_issues,
+    validate_interface_patch,
 )
 
 
@@ -62,3 +63,33 @@ def test_transform_failure_is_structured_for_targeted_repair():
         "error": "transform_result_type_mismatch", "source_type": "artifact",
         "transform": "file_collect", "result_type": "file", "target_type": "text",
     }
+
+
+@pytest.mark.parametrize(("source_type", "transform", "valid"), [
+    ("object", "json_serialize", True),
+    ("object", None, False),
+    ("string", "json_serialize", False),
+])
+def test_json_serialize_contract_is_transform_aware(source_type, transform, valid):
+    assert (_issues(source_type, "text_result", transform) == []) is valid
+
+
+def test_noop_transform_patch_is_rejected():
+    plan = {"interfaces": [{
+        "interface_id": "I1", "kind": "member_to_platform",
+        "source_member": "scripts/unit.py", "source_output": "arbitrary_name",
+        "target_platform_output": "text_result", "transform": "json_serialize",
+        "goal": "return result",
+    }]}
+    item = {
+        "target_file": "scripts/unit.py", "role": "script", "purpose": "produce result",
+        "inputs": [], "outputs": [{"port_id": "arbitrary_name", "contract": {"type": "object"}}],
+        "default_values": {}, "required_capabilities": [], "constraints": [],
+    }
+    with pytest.raises(Exception) as exc_info:
+        validate_interface_patch(
+            plan=plan, function_items=[item], violations=[{"interface_id": "I1"}],
+            patch={"operations": [{"op": "replace_transform", "interface_id": "I1",
+                                    "reason": "same transform", "transform": "json_serialize"}]},
+        )
+    assert getattr(exc_info.value, "code", None) == "no_effective_patch"

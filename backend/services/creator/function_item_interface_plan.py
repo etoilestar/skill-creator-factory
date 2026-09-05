@@ -15,7 +15,9 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from ..skill_plan import GraphValidationError, normalize_structured_function_items
-from ..platform_io_contract import get_platform_output_sink, platform_output_names
+from ..platform_io_contract import (
+    OUTPUT_TRANSFORM_REGISTRY, get_platform_output_sink, platform_output_names,
+)
 from .bounded_refinement import (
     BoundedRefinementFailed,
     CandidateEvaluation,
@@ -405,17 +407,6 @@ INTERFACE_KINDS = {"platform_to_member", "member_to_member", "member_to_platform
 # contracts are intentionally expressed in terms of value types/schemas rather
 # than output field names, so the same adapter can be used with any compatible
 # platform output namespace.
-OUTPUT_TRANSFORM_REGISTRY: dict[str, dict[str, Any]] = {
-    "json_serialize": {
-        "source_type": ("object", "array"),
-        "target_type": "string",
-    },
-    "file_collect": {
-        "source_type": ("file_path", "list[file_path]"),
-        "target_type": "file_outputs",
-        "target_schema": {"type": "array", "items": {"type": "string"}},
-    },
-}
 MEMBER_TO_PLATFORM_TRANSFORMS = frozenset(OUTPUT_TRANSFORM_REGISTRY)
 _DANGEROUS_PATH_PARTS = {"__proto__", "prototype", "constructor"}
 INTERFACE_FIELDS = {
@@ -884,6 +875,12 @@ def _schema_type(schema: dict[str, Any]) -> str | None:
     return str(value).strip() if value is not None and str(value).strip() else None
 
 
+def _canonical_semantic_type(value: str | None) -> str | None:
+    """Collapse representation aliases only for direct semantic comparison."""
+    aliases = {"string": "text", "artifact": "file", "file_path": "file", "list[file_path]": "file"}
+    return aliases.get(value, value)
+
+
 def _schema_matches(expected: dict[str, Any], actual: dict[str, Any]) -> bool:
     """Match the structural subset declared by an adapter target contract."""
     return all(
@@ -898,15 +895,13 @@ def _adapter_matches(
     adapter: dict[str, Any], *, source_schema: dict[str, Any], target_schema: dict[str, Any]
 ) -> bool:
     source_type = _schema_type(source_schema)
-    allowed_sources = adapter["source_type"]
+    allowed_sources = adapter["input_types"]
     if isinstance(allowed_sources, str):
         allowed_sources = (allowed_sources,)
     if source_type not in allowed_sources:
         return False
-    declared_target_schema = adapter.get("target_schema")
-    if isinstance(declared_target_schema, dict):
-        return _schema_matches(declared_target_schema, target_schema)
-    return _schema_type(target_schema) == adapter["target_type"]
+    target_semantic = _semantic_identity(target_schema) or _schema_type(target_schema)
+    return target_semantic == adapter["result_type"]
 
 
 def _semantic_identity(contract: dict[str, Any]) -> str:
@@ -1031,24 +1026,41 @@ def collect_interface_plan_validation_issues(
                 covered_platform.add(target)
                 source_schema = output_schemas.get((source, output), {})
                 sink = get_platform_output_sink(platform_contract, target)
-                target_schema = (sink or {}).get("value_schema", {})
+                target_schema = {
+                    **((sink or {}).get("value_schema", {})),
+                    "semantic_type": (sink or {}).get("semantic_type", ""),
+                }
                 transform = interface.get("transform")
                 source_type = _schema_type(source_schema)
-                target_type = _schema_type(target_schema)
+                target_type = (sink or {}).get("semantic_type") or _schema_type(target_schema)
                 adapter = OUTPUT_TRANSFORM_REGISTRY.get(transform) if transform else None
-                if transform and (adapter is None or not _adapter_matches(
-                    adapter, source_schema=source_schema, target_schema=target_schema
-                )):
+                accepted_sources = set((sink or {}).get("accepted_source_types") or [])
+                allowed_transforms = set((sink or {}).get("allowed_transforms") or [])
+                source_semantic = _semantic_identity(source_schema) or source_type
+                result_type = adapter.get("result_type") if adapter else _canonical_semantic_type(source_semantic)
+                invalid_transform = bool(transform) and (
+                    adapter is None
+                    or transform not in allowed_transforms
+                    or source_semantic not in set(adapter.get("input_types") or ())
+                    or result_type != target_type
+                )
+                if invalid_transform:
                     issue(
-                        "incompatible_platform_output_transform", f"{path}.transform", iid,
-                        {"source_type": source_type, "target_type": target_type, "transform": transform},
-                        "transform source_type and target_type must match its declared output adapter contract", error_type="invalid_transform_error",
+                        "transform_result_type_mismatch", f"{path}.transform", iid,
+                        {"source_type": source_semantic, "transform": transform, "result_type": result_type, "target_type": target_type},
+                        "source type, registered transform result type, and target contract must all match", error_type="invalid_transform_error",
                     )
-                elif not transform and source_type and target_type and source_type != target_type:
+                elif not transform and source_semantic and target_type and result_type != target_type:
                     issue(
                         "incompatible_platform_output_type", path, iid,
-                        {"source_type": source_type, "target_type": target_type, "transform": transform},
-                        "matching source/target types or a declared compatible output adapter", error_type="schema_error",
+                        {"source_type": source_semantic, "transform": None, "result_type": source_semantic, "target_type": target_type},
+                        "direct output must already have the target semantic type; otherwise declare an allowed transform", error_type="schema_error",
+                    )
+                elif source_semantic and source_semantic not in accepted_sources:
+                    issue(
+                        "platform_output_source_type_rejected", path, iid,
+                        {"source_type": source_semantic, "transform": transform, "result_type": result_type, "target_type": target_type},
+                        sorted(accepted_sources), error_type="schema_error",
                     )
     for member, slot in sorted(required_slots - covered_slots):
         candidates = generate_provenance_candidates(
@@ -1142,8 +1154,8 @@ def build_interface_repair_scope(
         "binding_error": {"reselect_legal_source"},
         "provenance_error": {"reselect_legal_source", "reclassify_input_role", "make_input_optional"},
         "missing_source_error": {"request_additional_input"},
-        "invalid_transform_error": {"select_registered_transform"},
-        "schema_error": {"restore_declared_schema_binding"},
+        "invalid_transform_error": {"adjust_source_transform_or_target", "select_registered_transform"},
+        "schema_error": {"adjust_source_transform_or_target", "restore_declared_schema_binding"},
     }
     error_types = {str(issue.get("error_type") or "binding_error") for issue in validation_issues}
     return {
@@ -1154,6 +1166,13 @@ def build_interface_repair_scope(
         "preserve_unaffected_semantics": True,
         "max_semantic_repair_cycles": 2,
         "error_types": sorted(error_types),
+        "failed_validation_reason": [
+            {
+                "error": issue.get("code"),
+                **(issue.get("observed_value") if isinstance(issue.get("observed_value"), dict) else {}),
+            }
+            for issue in validation_issues
+        ],
         "allowed_repairs": sorted(set().union(*(policy.get(value, set()) for value in error_types))),
         "forbidden_repairs": ["invent_source", "invent_transform", "infer_input_hierarchy"],
     }
@@ -2134,6 +2153,10 @@ legal member/input domains, and repair_scope.
 
 2. TASK
 Repair the Interface Plan so all supplied blocking facts are resolved simultaneously.
+For a platform-output validation failure, use failed_validation_reason to repair
+only the incompatible source, transform, or target contract tuple. Do not guess
+a replacement output merely from its field name and do not redesign the whole
+Interface Plan.
 
 3. SEMANTIC RESPONSIBILITY
 Deterministic repair constraints are contractual obligations.
@@ -2275,6 +2298,7 @@ include explanations, Markdown, comments, or hidden reasoning.
         "function_items": _compact_function_items(frozen_function_items),
         "current_interface_plan": current_interface_plan,
         "validation_issues": validation_issues,
+        "failed_validation_reason": repair_scope.get("failed_validation_reason", []),
         "legal_member_domain": [
             item["target_file"] for item in _compact_function_items(frozen_function_items)
         ],

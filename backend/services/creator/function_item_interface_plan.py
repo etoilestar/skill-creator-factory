@@ -89,6 +89,28 @@ the platform merely so another FunctionItem can consume it.
 
 Do not choose Interface kind from field-name similarity."""
 
+SOURCE_PROVENANCE_CONTRACT = """SOURCE PROVENANCE CONTRACT
+
+A valid source must be able to provide the semantic value required by the
+target.  Source existence, name similarity, and schema convertibility are not
+evidence of that fact.  Never create a binding merely to close coverage.
+
+Compatibility is evaluated from the declared source role, source schema,
+source origin, target role, target schema, and an explicitly registered
+transform.  A transform adapts representation; it never invents semantic
+provenance.  An optional input with no valid source remains unbound.  A derived
+input accepts only a preceding FunctionItem output and never a platform input.
+"""
+
+INPUT_PORT_ROLES = frozenset({
+    "required_runtime_input", "optional_runtime_input", "derived_input",
+})
+OUTPUT_PORT_ROLES = frozenset({"runtime_output", "intermediate_output"})
+REVIEW_ERROR_TYPES = frozenset({
+    "binding_error", "provenance_error", "missing_source_error",
+    "invalid_transform_error", "schema_error",
+})
+
 PLATFORM_OUTPUT_MAPPING_CONTRACT = """PLATFORM OUTPUT MAPPING CONTRACT
 
 FunctionItem outputs and platform outputs belong to different semantic layers.
@@ -451,6 +473,14 @@ def build_canonical_interface_contract(
         (item["target_file"], port["name"]): dict(port.get("contract") or {})
         for item in compact for port in item.get("outputs") or []
     }
+    output_roles = {
+        (item["target_file"], port["name"]): port.get("role")
+        for item in compact for port in item.get("outputs") or []
+    }
+    input_contracts = {
+        (item["target_file"], port["name"]): port
+        for item in compact for port in item.get("inputs") or []
+    }
     boundary = (platform_contract or {}).get("platform_skill_boundary", platform_contract or {})
     platform_input_schemas = boundary.get("input_schemas") if isinstance(boundary.get("input_schemas"), dict) else {}
     interfaces: list[dict[str, Any]] = []
@@ -460,22 +490,29 @@ def build_canonical_interface_contract(
             path = [interface["source_platform_input"], *interface["source_path"]]
             source = {
                 "kind": "platform_input",
+                "role": "platform_input",
                 "field": ".".join(path),
                 "schema": dict(platform_input_schemas.get(interface["source_platform_input"]) or {}),
             }
-            target = {"kind": "function_input", "field": interface["target_input"]}
+            target_port = input_contracts.get((interface["target_member"], interface["target_input"]), {})
+            target = {"kind": "function_input", "field": interface["target_input"],
+                      "role": target_port.get("role"), "schema": dict(target_port.get("contract") or {})}
             direction = "input"
         elif kind == "member_to_member":
             source = {
                 "kind": "function_output",
+                "role": output_roles.get((interface["source_member"], interface["source_output"])),
                 "field": interface["source_output"],
                 "schema": schemas.get((interface["source_member"], interface["source_output"]), {}),
             }
-            target = {"kind": "function_input", "field": interface["target_input"]}
+            target_port = input_contracts.get((interface["target_member"], interface["target_input"]), {})
+            target = {"kind": "function_input", "field": interface["target_input"],
+                      "role": target_port.get("role"), "schema": dict(target_port.get("contract") or {})}
             direction = "input"
         else:
             source = {
                 "kind": "function_output",
+                "role": output_roles.get((interface["source_member"], interface["source_output"])),
                 "field": interface["source_output"],
                 "schema": schemas.get((interface["source_member"], interface["source_output"]), {}),
             }
@@ -513,12 +550,18 @@ def collect_interface_contract_consistency_issues(
     *, interface_contract: dict[str, Any], script_sources: dict[str, str] | None = None,
     command_variables: dict[str, list[str]] | None = None,
     runtime_bindings: dict[str, list[str]] | None = None,
+    artifact_contracts: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Deterministically reject downstream bindings that diverge from the plan."""
     issues: list[dict[str, Any]] = []
     scripts = script_sources or {}
     commands = command_variables or {}
     bindings = runtime_bindings or {}
+    for artifact, observed_contract in (artifact_contracts or {}).items():
+        if observed_contract != interface_contract:
+            issues.append({"code": "interface_contract_mismatch", "error_type": "schema_error",
+                           "artifact": artifact, "observed": observed_contract,
+                           "expected": interface_contract})
     for interface in interface_contract.get("interfaces") or []:
         iid = str(interface.get("interface_id") or "")
         target = str((interface.get("target") or {}).get("field") or "")
@@ -619,6 +662,24 @@ def runtime_input_source_facts(raw_input: Any, default_values: dict[str, Any] | 
     }
 
 
+def _input_port_role(raw_input: Any, facts: dict[str, bool]) -> str:
+    """Return the explicit role, with a compatibility default for old plans."""
+    role = str(raw_input.get("role") or "").strip() if isinstance(raw_input, dict) else ""
+    if role and role not in INPUT_PORT_ROLES:
+        raise ValueError(f"invalid FunctionItem input role: {role}")
+    if role:
+        return role
+    return "required_runtime_input" if facts["runtime_source_required"] else "optional_runtime_input"
+
+
+def _output_port_role(raw_output: Any) -> str:
+    """Return the explicit output role, retaining legacy plan compatibility."""
+    role = str(raw_output.get("role") or "").strip() if isinstance(raw_output, dict) else ""
+    if role and role not in OUTPUT_PORT_ROLES:
+        raise ValueError(f"invalid FunctionItem output role: {role}")
+    return role or "runtime_output"
+
+
 def _compact_function_items(function_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     normalized = normalize_structured_function_items(function_items, source="interface_intent_plan")
     compact_items: list[dict[str, Any]] = []
@@ -633,7 +694,11 @@ def _compact_function_items(function_items: list[dict[str, Any]]) -> list[dict[s
             facts = runtime_input_source_facts(raw_input, default_values)
             description = str(raw_input.get("description") or "") if isinstance(raw_input, dict) else ""
             contract = dict(raw_input.get("contract") or {}) if isinstance(raw_input, dict) and isinstance(raw_input.get("contract"), dict) else {}
-            compact_input = {"name": port_id, "description": description, "contract": contract, **facts}
+            role = _input_port_role(raw_input, facts)
+            # Role is the canonical coverage authority.  The legacy booleans
+            # remain in the compact payload solely for old persisted plans.
+            facts["runtime_source_required"] = role in {"required_runtime_input", "derived_input"}
+            compact_input = {"name": port_id, "role": role, "description": description, "contract": contract, **facts}
             compact_inputs.append(compact_input)
         required_inputs = [
             value["name"] for value in compact_inputs
@@ -647,6 +712,7 @@ def _compact_function_items(function_items: list[dict[str, Any]]) -> list[dict[s
                 "inputs": compact_inputs,
                 "outputs": [
                     {"name": _compact_port_id(value),
+                     "role": _output_port_role(value),
                      "description": str(value.get("description") or "") if isinstance(value, dict) else "",
                      "contract": dict(value.get("contract") or {}) if isinstance(value, dict) and isinstance(value.get("contract"), dict) else {}}
                     for value in item.get("outputs") or [] if _compact_port_id(value)
@@ -842,6 +908,44 @@ def _adapter_matches(
         return _schema_matches(declared_target_schema, target_schema)
     return _schema_type(target_schema) == adapter["target_type"]
 
+
+def _semantic_identity(contract: dict[str, Any]) -> str:
+    """Read a contract-declared semantic identity without consulting names."""
+    for key in ("semantic_type", "semantic_value", "x-semantic-type"):
+        value = contract.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def semantic_provenance_compatibility(
+    *, source_role: str, source_schema: dict[str, Any], source_origin: str,
+    target_role: str, target_schema: dict[str, Any], transform: str | None = None,
+) -> tuple[bool, str]:
+    """Deterministically validate a declared semantic transfer.
+
+    Missing semantic annotations are treated as unknown for compatibility with
+    persisted contracts.  When both endpoints declare identities they must
+    agree.  Structural conversion is legal only through a registered adapter.
+    """
+    if target_role == "derived_input" and source_role != "intermediate_output":
+        return False, "derived inputs require an intermediate FunctionItem output"
+    target_origins = target_schema.get("allowed_origins")
+    if isinstance(target_origins, list) and source_origin not in {str(v) for v in target_origins}:
+        return False, "source origin is not allowed by the target contract"
+    source_semantic = _semantic_identity(source_schema)
+    target_semantic = _semantic_identity(target_schema)
+    if source_semantic and target_semantic and source_semantic != target_semantic:
+        return False, "source and target semantic identities differ"
+    source_type, target_type = _schema_type(source_schema), _schema_type(target_schema)
+    if transform:
+        adapter = OUTPUT_TRANSFORM_REGISTRY.get(transform)
+        if adapter is None or not _adapter_matches(adapter, source_schema=source_schema, target_schema=target_schema):
+            return False, "transform is absent from the registry or violates its schema contract"
+    elif source_type and target_type and source_type != target_type:
+        return False, "source and target schemas differ without a declared transform"
+    return True, "declared provenance contracts are compatible"
+
 def collect_interface_plan_validation_issues(
     *, plan: dict[str, Any], function_items: list[dict[str, Any]],
     platform_contract: dict[str, Any] | None = None,
@@ -851,9 +955,14 @@ def collect_interface_plan_validation_issues(
     inputs = {item["target_file"]: {value["name"] for value in item["inputs"]} for item in compact}
     outputs = {item["target_file"]: {value["name"] for value in item["outputs"]} for item in compact}
     output_schemas = {(item["target_file"], value["name"]): value["contract"] for item in compact for value in item["outputs"]}
-    required_slots = {(item["target_file"], value["name"]) for item in compact for value in item["inputs"] if value["runtime_source_required"]}
+    input_ports = {(item["target_file"], value["name"]): value for item in compact for value in item["inputs"]}
+    output_ports = {(item["target_file"], value["name"]): value for item in compact for value in item["outputs"]}
+    member_order = {item["target_file"]: index for index, item in enumerate(compact)}
+    required_slots = {(member, name) for (member, name), value in input_ports.items()
+                      if value["role"] in {"required_runtime_input", "derived_input"}}
     boundary = (platform_contract or {}).get("platform_skill_boundary", platform_contract or {})
     platform_inputs = {_compact_port_id(value) for value in boundary.get("input_envelope_fields") or []}
+    platform_input_schemas = boundary.get("input_schemas") if isinstance(boundary.get("input_schemas"), dict) else {}
     platform_outputs = set(platform_output_names(platform_contract))
     required_platform_outputs = required_platform_output_fields(platform_contract)
     covered_slots: set[tuple[str, str]] = set()
@@ -861,8 +970,9 @@ def collect_interface_plan_validation_issues(
     covered_platform: set[str] = set()
     issues: list[dict[str, Any]] = []
 
-    def issue(code: str, path: str, interface_id: str, observed: Any, expected: Any) -> None:
+    def issue(code: str, path: str, interface_id: str, observed: Any, expected: Any, *, error_type: str = "binding_error") -> None:
         issues.append({"code": code, "stage": "interface_plan_validation", "path": path,
+                       "error_type": error_type,
                        "interface_id": interface_id, "message": "Interface logical contract is invalid.",
                        "observed_value": observed, "expected_constraint": expected, "details": {}})
 
@@ -883,13 +993,33 @@ def collect_interface_plan_validation_issues(
             source, target, slot = interface["source_platform_input"], interface["target_member"], interface["target_input"]
             if source not in platform_inputs: issue("unknown_platform_logical_input", f"{path}.source_platform_input", iid, source, sorted(platform_inputs))
             if target not in inputs or slot not in inputs.get(target, set()): issue("unknown_interface_logical_input", f"{path}.target_input", iid, slot, sorted(inputs.get(target, set())))
-            else: cover(target, slot, path, iid)
+            else:
+                target_port = input_ports[(target, slot)]
+                compatible, reason = semantic_provenance_compatibility(
+                    source_role="platform_input", source_schema=dict(platform_input_schemas.get(source) or {}),
+                    source_origin="platform_input", target_role=target_port["role"], target_schema=target_port["contract"],
+                )
+                if not compatible:
+                    issue("incompatible_semantic_provenance", path, iid, {"source_origin": "platform_input", "target_role": target_port["role"]}, reason, error_type="provenance_error")
+                else: cover(target, slot, path, iid)
         elif kind == "member_to_member":
             source, output = interface["source_member"], interface["source_output"]
             target, slot = interface["target_member"], interface["target_input"]
             if source not in outputs or output not in outputs.get(source, set()): issue("unknown_interface_logical_output", f"{path}.source_output", iid, output, sorted(outputs.get(source, set())))
             if target not in inputs or slot not in inputs.get(target, set()): issue("unknown_interface_logical_input", f"{path}.target_input", iid, slot, sorted(inputs.get(target, set())))
-            else: cover(target, slot, path, iid)
+            else:
+                target_port = input_ports[(target, slot)]
+                source_port = output_ports.get((source, output), {"role": "runtime_output", "contract": {}})
+                compatible, reason = semantic_provenance_compatibility(
+                    source_role=source_port["role"], source_schema=source_port["contract"],
+                    source_origin="member_output", target_role=target_port["role"], target_schema=target_port["contract"],
+                )
+                if (target_port["role"] == "derived_input"
+                        and member_order.get(source, -1) >= member_order.get(target, -1)):
+                    compatible, reason = False, "derived provenance must come from a preceding member"
+                if not compatible:
+                    issue("incompatible_semantic_provenance", path, iid, {"source_origin": "member_output", "target_role": target_port["role"]}, reason, error_type="provenance_error")
+                else: cover(target, slot, path, iid)
             if source == target: issue("interface_self_connection", path, iid, source, "distinct members")
         elif kind == "member_to_platform":
             source, output, target = interface["source_member"], interface["source_output"], interface["target_platform_output"]
@@ -912,13 +1042,13 @@ def collect_interface_plan_validation_issues(
                     issue(
                         "incompatible_platform_output_transform", f"{path}.transform", iid,
                         {"source_type": source_type, "target_type": target_type, "transform": transform},
-                        "transform source_type and target_type must match its declared output adapter contract",
+                        "transform source_type and target_type must match its declared output adapter contract", error_type="invalid_transform_error",
                     )
                 elif not transform and source_type and target_type and source_type != target_type:
                     issue(
                         "incompatible_platform_output_type", path, iid,
                         {"source_type": source_type, "target_type": target_type, "transform": transform},
-                        "matching source/target types or a declared compatible output adapter",
+                        "matching source/target types or a declared compatible output adapter", error_type="schema_error",
                     )
     for member, slot in sorted(required_slots - covered_slots):
         candidates = generate_provenance_candidates(
@@ -928,6 +1058,9 @@ def collect_interface_plan_validation_issues(
             platform_inputs=platform_inputs,
         )
 
+        target_port = input_ports[(member, slot)]
+        if target_port["role"] == "derived_input":
+            candidates = [candidate for candidate in candidates if candidate["kind"] == "member_to_member"]
         issue(
             "uncovered_required_logical_input",
             "$.interfaces",
@@ -946,7 +1079,7 @@ def collect_interface_plan_validation_issues(
                         "establish_one_valid_semantic_provenance",
                 },
             },
-            "at least one Interface"
+            "at least one semantically valid Interface", error_type="missing_source_error"
         )
     for output in sorted(required_platform_outputs - covered_platform):
         issue(
@@ -1004,7 +1137,15 @@ def build_interface_repair_scope(
     current_interface_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return stage authority without deriving a repair operation from issues."""
-    _ = validation_issues, current_interface_plan
+    _ = current_interface_plan
+    policy = {
+        "binding_error": {"reselect_legal_source"},
+        "provenance_error": {"reselect_legal_source", "reclassify_input_role", "make_input_optional"},
+        "missing_source_error": {"request_additional_input"},
+        "invalid_transform_error": {"select_registered_transform"},
+        "schema_error": {"restore_declared_schema_binding"},
+    }
+    error_types = {str(issue.get("error_type") or "binding_error") for issue in validation_issues}
     return {
         "editable_layer": "interface_plan",
         "frozen_layers": [
@@ -1012,6 +1153,9 @@ def build_interface_repair_scope(
         ],
         "preserve_unaffected_semantics": True,
         "max_semantic_repair_cycles": 2,
+        "error_types": sorted(error_types),
+        "allowed_repairs": sorted(set().union(*(policy.get(value, set()) for value in error_types))),
+        "forbidden_repairs": ["invent_source", "invent_transform", "infer_input_hierarchy"],
     }
 
 
@@ -1025,8 +1169,8 @@ def validate_interface_repair_scope(
     after_by_id = {value.get("interface_id"): value for value in after_list}
     if len(after_by_id) != len(after_list):
         _raise("interface_id must remain unique", "interface_repair_scope_error", path="$.interfaces")
-    expected_scope = build_interface_repair_scope([])
-    if repair_scope != expected_scope:
+    required_scope_fields = set(build_interface_repair_scope([]))
+    if set(repair_scope) != required_scope_fields or repair_scope.get("editable_layer") != "interface_plan":
         _raise("invalid Interface repair stage authority", "interface_repair_scope_error", path="$.repair_scope")
     if before_list and not after_list:
         _raise("repair cannot erase the complete Interface Plan", "interface_repair_scope_error", path="$.interfaces")
@@ -1131,6 +1275,8 @@ def _interface_plan_prompt() -> str:
 
     {PLATFORM_BOUNDARY_CONTRACT}
 
+    {SOURCE_PROVENANCE_CONTRACT}
+
     {PLATFORM_INPUT_HIERARCHY_CONTRACT}
 
     {RUNTIME_INPUT_PROVENANCE_CONTRACT}
@@ -1167,8 +1313,10 @@ representation of whole-slot platform binding.
 
 3. CURRENT TASK
 Produce a complete semantic Interface Plan over frozen logical ports.
-For every runtime_source_required FunctionItem input choose the semantic source
-value. For every required platform output choose the frozen FunctionItem output.
+For required_runtime_input choose one valid platform input or preceding member
+output. For optional_runtime_input bind only when a valid source already exists;
+otherwise leave it unbound. For derived_input choose only a preceding member
+output. For every required platform output choose the frozen FunctionItem output.
 Record each choice in structured logical binding fields.
 
 4. CURRENT AUTHORITY
@@ -1186,10 +1334,10 @@ Two independently selectable receiving slots require separate records. A source
 output may be reused by separate Interfaces.
 
 5. HARD ACCEPTANCE CONDITIONS
-COMPLETENESS PRIORITY
-Completeness is a hard acceptance condition. First construct a complete
-semantic Interface Plan that covers every runtime_source_required receiving
-slot and every semantically required platform output. Only after completeness
+VALIDITY BEFORE COVERAGE
+Completeness applies only to required_runtime_input and derived_input ports.
+Never select a similar name, convertible type, or arbitrary available input to
+obtain coverage. First construct a valid semantic Interface Plan. Only after validity
 is established may redundant Interfaces be avoided. Never omit a required
 receiving slot in order to reduce Interface count.
 
@@ -1264,6 +1412,7 @@ Return strict parseable JSON only."""
 
 
 INTERFACE_REVIEW_ISSUE_FIELDS = {
+    "error_type",
     "message",
     "affected_interfaces",
     "affected_inputs",
@@ -1274,6 +1423,7 @@ INTERFACE_REVIEW_SCHEMA = {
     "passed": "boolean",
     "issues": [
         {
+            "error_type": "binding_error | provenance_error | missing_source_error | invalid_transform_error | schema_error",
             "message": "string",
             "affected_interfaces": ["string"],
             "affected_inputs": [
@@ -1301,6 +1451,9 @@ def normalize_interface_review_issue(raw_issue: dict[str, Any], frozen_function_
     """Validate a free-form semantic defect envelope and logical references."""
     if not isinstance(raw_issue, dict) or set(raw_issue) != INTERFACE_REVIEW_ISSUE_FIELDS:
         _raise("semantic review issue has invalid shape", "invalid_interface_semantic_review_protocol", path=path)
+    error_type = str(raw_issue["error_type"] or "").strip()
+    if error_type not in REVIEW_ERROR_TYPES:
+        _raise("semantic review issue has invalid error_type", "invalid_interface_semantic_review_protocol", path=f"{path}.error_type")
     message = raw_issue["message"]
     interface_ids = raw_issue["affected_interfaces"]
     affected_inputs = raw_issue["affected_inputs"]
@@ -1349,6 +1502,7 @@ def normalize_interface_review_issue(raw_issue: dict[str, Any], frozen_function_
             _raise("review issue references an unknown logical input", "invalid_interface_semantic_review_reference", path=f"{path}.affected_inputs[{index}]")
         normalized_inputs.append(dict(value))
     envelope = {
+        "error_type": error_type,
         "message": message.strip(),
         "affected_interfaces": list(interface_ids),
         "affected_inputs": normalized_inputs,
@@ -1630,6 +1784,13 @@ A plausible goal cannot make an incorrect structured source/target binding valid
 
 
     8. OUTPUT CONTRACT
+
+    Classify every defect by its primary failed dimension:
+    binding_error (boundary/reference), provenance_error (semantic origin),
+    missing_source_error (required source absent), invalid_transform_error
+    (undeclared/incompatible adapter), or schema_error (contract structure).
+    Independently check schema correctness, boundary correctness, and
+    provenance correctness. Do not collapse these into "interface invalid".
 
     passed=true exactly when issues is empty.
 

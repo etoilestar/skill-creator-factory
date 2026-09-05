@@ -293,6 +293,23 @@ Forbidden: input_files -> primary_key_field
 Correct: options.primary_key_field -> primary_key_field
 """
 
+RUNTIME_REPAIR_RESTRICTION_CONTRACT = """RUNTIME REPAIR RESTRICTION CONTRACT
+
+Repair is not allowed to redesign runtime provenance.
+
+Repair MUST NOT:
+- invent new platform input names
+- replace source based on semantic similarity
+- switch between input envelope fields
+
+Repair MUST ONLY:
+- remove invalid interface
+- replace source using provided allowed_sources
+- replace transform using provided transform registry
+
+All replacement sources MUST exist in runtime_binding_facts.
+"""
+
 SOURCE_PATH_CONTRACT = """SOURCE PATH CONTRACT
 
 Every platform_to_member Interface MUST explicitly contain source_path.
@@ -453,21 +470,85 @@ INTERFACE_PATCH_SCHEMA: dict[str, Any] = {
         "properties": {
             "op": {"enum": ["remove_interface", "replace_source", "replace_transform"]},
             "interface_id": {"type": "string", "minLength": 1},
-            "reason": {"type": "string", "minLength": 1},
+            "reason": {"type": "string", "minLength": 1, "maxLength": 200},
             "source_platform_input": {"type": "string", "minLength": 1},
             "source_path": {"type": "array", "items": {"type": "string"}},
             "source_member": {"type": "string", "minLength": 1},
             "source_output": {"type": "string", "minLength": 1},
             "transform": {"type": ["string", "null"]},
-        },
+        }, "additionalProperties": False,
     }}},
 }
 
 
-def apply_interface_patch(plan: Any, patch: Any) -> Any:
+def validate_patch_operation_against_runtime_binding_facts(
+    *, operation: dict[str, Any], interface: dict[str, Any],
+    runtime_binding_facts: dict[str, Any],
+) -> None:
+    """Reject a platform source edit that is not present in frozen facts."""
+    if operation.get("op") != "replace_source" or "source_platform_input" not in operation:
+        return
+    observed = {
+        "source_platform_input": operation.get("source_platform_input"),
+        "source_path": list(operation.get("source_path") or []),
+    }
+    member = interface.get("target_member")
+    slot = interface.get("target_input")
+    allowed = (
+        runtime_binding_facts.get(member, {}).get(slot, {}).get("allowed_sources") or []
+    )
+    if observed not in allowed:
+        raise InterfaceIntentPlanError(
+            "replacement source is absent from frozen runtime binding facts",
+            code="invalid_interface_patch_source",
+            details={"interface_id": interface.get("interface_id"), "target": f"{member}.{slot}",
+                     "observed_source": observed, "allowed_sources": allowed},
+        )
+
+
+def validate_interface_patch_protocol(patch: Any) -> dict[str, Any]:
+    """Validate the deliberately small, strict repair wire protocol."""
+    if not isinstance(patch, dict) or set(patch) != {"operations"} or not isinstance(patch["operations"], list):
+        raise InterfaceIntentPlanError("repair must be patch operations", code="invalid_interface_patch", details={"path": "$"})
+    common = {"op", "interface_id", "reason"}
+    for index, operation in enumerate(patch["operations"]):
+        path = f"$.operations[{index}]"
+        if not isinstance(operation, dict) or not common <= set(operation):
+            raise InterfaceIntentPlanError("patch operation fields are invalid", code="invalid_interface_patch", details={"path": path})
+        op = operation.get("op")
+        if op not in {"remove_interface", "replace_source", "replace_transform"}:
+            raise InterfaceIntentPlanError("patch operation is unsupported", code="invalid_interface_patch", details={"path": f"{path}.op"})
+        allowed_fields = {
+            "remove_interface": common,
+            "replace_transform": common | {"transform"},
+            "replace_source": common | {"source_platform_input", "source_path", "source_member", "source_output"},
+        }[op]
+        if not set(operation) <= allowed_fields:
+            raise InterfaceIntentPlanError("patch operation contains fields invalid for op", code="invalid_interface_patch", details={"path": path})
+        if op == "replace_transform" and "transform" not in operation:
+            raise InterfaceIntentPlanError("replace_transform lacks transform", code="invalid_interface_patch", details={"path": path})
+        if op == "replace_source":
+            platform_source = "source_platform_input" in operation and "source_path" in operation
+            member_source = "source_member" in operation and "source_output" in operation
+            if platform_source == member_source:
+                raise InterfaceIntentPlanError("replace_source must contain exactly one source shape", code="invalid_interface_patch", details={"path": path})
+        if not isinstance(operation.get("interface_id"), str) or not operation["interface_id"].strip():
+            raise InterfaceIntentPlanError("patch interface_id is invalid", code="invalid_interface_patch", details={"path": f"{path}.interface_id"})
+        reason = operation.get("reason")
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 200:
+            raise InterfaceIntentPlanError("patch reason must contain at most 200 characters", code="invalid_interface_patch", details={"path": f"{path}.reason"})
+    return patch
+
+
+def apply_interface_patch(
+    plan: Any, patch: Any, *, runtime_binding_facts: dict[str, Any] | None = None,
+) -> Any:
     """Apply the bounded Interface repair protocol without regenerating a plan."""
     legacy_list = isinstance(plan, list)
     interfaces = [dict(value) for value in (plan if legacy_list else plan.get("interfaces") or [])]
+    if (isinstance(patch, dict)
+            and all("op" in value for value in (patch.get("operations") or []))):
+        patch = validate_interface_patch_protocol(patch)
     operations = patch if isinstance(patch, list) else patch.get("operations") or []
     by_id = {value.get("interface_id"): value for value in interfaces}
     for operation in operations:
@@ -482,6 +563,11 @@ def apply_interface_patch(plan: Any, patch: Any) -> Any:
         if iid not in by_id:
             raise InterfaceIntentPlanError("patch references unknown interface", code="invalid_interface_patch", details={"interface_id": iid})
         current = by_id[iid]
+        if runtime_binding_facts is not None:
+            validate_patch_operation_against_runtime_binding_facts(
+                operation=operation, interface=current,
+                runtime_binding_facts=runtime_binding_facts,
+            )
         if op == "remove_interface":
             interfaces.remove(current); del by_id[iid]
         elif op == "replace_source":
@@ -908,10 +994,10 @@ def build_runtime_binding_facts(
 ) -> dict[str, dict[str, dict[str, list[dict[str, Any]]]]]:
     """Build deterministic, LLM-free platform provenance for frozen inputs.
 
-    Explicit ``runtime_provenance``/``source_platform_input`` annotations on a
-    FunctionItem input take precedence. Otherwise a source is projected only
-    when its declared semantic identity equals the target's identity. Field
-    names and descriptions are deliberately never consulted.
+    Explicit ``runtime_provenance``/``source_platform_input`` annotations take
+    precedence, followed by an exact mapping in the declared platform schema.
+    Semantic identities, descriptions, and approximate names are never used to
+    select runtime provenance.
     """
     compact = _compact_function_items(function_items)
     boundary = (platform_contract or {}).get("platform_skill_boundary", platform_contract or {})
@@ -929,19 +1015,24 @@ def build_runtime_binding_facts(
             if explicit_source in names and isinstance(explicit_path, list) and all(isinstance(x, str) for x in explicit_path):
                 allowed.append({"source_platform_input": explicit_source, "source_path": list(explicit_path)})
             else:
-                target_semantic = _semantic_identity(contract)
-                if target_semantic:
-                    for source in names:
-                        for path, source_schema in _walk_platform_schema(dict(schemas.get(source) or {})):
-                            if _semantic_identity(source_schema) == target_semantic:
-                                allowed.append({"source_platform_input": source, "source_path": list(path)})
-                elif len(names) == 1 and port.get("role") != "derived_input":
+                # The platform envelope itself is a declared mapping: an exact
+                # top-level slot or exact nested property is factual provenance.
+                # This is intentionally identifier equality, not semantic or
+                # descriptive matching.
+                for source in names:
+                    if source == port["name"]:
+                        allowed.append({"source_platform_input": source, "source_path": []})
+                    for path, _source_schema in _walk_platform_schema(dict(schemas.get(source) or {})):
+                        if path and path[-1] == port["name"]:
+                            allowed.append({"source_platform_input": source, "source_path": list(path)})
+                if not allowed and len(names) == 1 and port.get("role") != "derived_input":
                     # Legacy contracts with one undifferentiated platform slot
                     # remain projectable without choosing among sources or using
                     # receiver-name similarity.
                     allowed.append({"source_platform_input": names[0], "source_path": []})
             member_facts[port["name"]] = {"allowed_sources": allowed}
         facts[item["target_file"]] = member_facts
+    logger.info("[interface_runtime_binding_facts] %s", json.dumps(facts, ensure_ascii=False, sort_keys=True))
     return facts
 
 
@@ -1111,6 +1202,7 @@ def collect_interface_plan_validation_issues(
     )
     covered_platform: set[str] = set()
     issues: list[dict[str, Any]] = []
+    binding_failures: dict[tuple[str, str], list[dict[str, Any]]] = {}
 
     def issue(code: str, path: str, interface_id: str, observed: Any, expected: Any, *, error_type: str = "binding_error") -> None:
         issues.append({"code": code, "stage": "interface_plan_validation", "path": path,
@@ -1147,6 +1239,13 @@ def collect_interface_plan_validation_issues(
                     source_origin="platform_input", target_role=target_port["role"], target_schema=target_port["contract"],
                 )
                 if not compatible:
+                    binding_failures.setdefault((target, slot), []).append({
+                        "interface_id": iid,
+                        "status": "binding_not_found" if reason.startswith("source is absent") else "provenance_error",
+                        "actual_source": {"source_platform_input": source,
+                                          "source_path": list(interface.get("source_path") or [])},
+                        "reason": reason,
+                    })
                     issue("incompatible_semantic_provenance", path, iid, {"source_origin": "platform_input", "target_role": target_port["role"]}, reason, error_type="provenance_error")
                 else: cover(target, slot, path, iid)
         elif kind == "member_to_member":
@@ -1241,6 +1340,21 @@ def collect_interface_plan_validation_issues(
         target_port = input_ports[(member, slot)]
         if target_port["role"] == "derived_input":
             candidates = [candidate for candidate in candidates if candidate["kind"] == "member_to_member"]
+        candidate_ids = [
+            str(value.get("interface_id") or "")
+            for value in plan.get("interfaces") or []
+            if value.get("target_member") == member and value.get("target_input") == slot
+        ]
+        expected_sources = binding_facts.get(member, {}).get(slot, {}).get("allowed_sources") or []
+        failures = binding_failures.get((member, slot), [])
+        closure_failure = {
+            "slot": f"{member}.{slot}",
+            "status": failures[0]["status"] if failures else "interface_not_found",
+            "candidate_interfaces": candidate_ids,
+            "expected_sources": expected_sources,
+            "actual_source": failures[0].get("actual_source") if failures else None,
+            "failure_reasons": failures,
+        }
         issue(
             "uncovered_required_logical_input",
             "$.interfaces",
@@ -1258,6 +1372,7 @@ def collect_interface_plan_validation_issues(
                     "required_action":
                         "establish_one_valid_semantic_provenance",
                 },
+                "closure_failure": closure_failure,
             },
             "at least one semantically valid Interface", error_type="missing_source_error"
         )
@@ -1278,8 +1393,15 @@ def collect_interface_plan_validation_issues(
         )
     if not required_platform_outputs and not covered_platform:
         issue("missing_platform_terminal", "$.interfaces", "", {}, "at least one legal member_to_platform Interface")
-    logger.info("[Creator][interface_closure] runtime_required_slot_count=%d covered_required_slot_count=%d uncovered_required_slots=%s required_platform_output_count=%d covered_platform_output_count=%d",
-                len(required_slots), len(required_slots & covered_slots), sorted(required_slots - covered_slots), len(required_platform_outputs), len(required_platform_outputs & covered_platform))
+    closure_failures = [
+        issue_value.get("observed_value", {}).get("closure_failure")
+        for issue_value in issues
+        if issue_value.get("code") == "uncovered_required_logical_input"
+    ]
+    logger.info("[Creator][interface_closure] runtime_required_slot_count=%d covered_required_slot_count=%d uncovered_required_slots=%s binding_failures=%s required_platform_output_count=%d covered_platform_output_count=%d",
+                len(required_slots), len(required_slots & covered_slots), sorted(required_slots - covered_slots),
+                json.dumps(closure_failures, ensure_ascii=False, sort_keys=True),
+                len(required_platform_outputs), len(required_platform_outputs & covered_platform))
     return issues
 
 
@@ -1473,6 +1595,8 @@ def _interface_plan_prompt() -> str:
     {SOURCE_PATH_CONTRACT}
 
     {RUNTIME_BINDING_FACTS_CONTRACT}
+
+    {RUNTIME_REPAIR_RESTRICTION_CONTRACT}
 
 1. AUTHORITATIVE FACTS
 The payload contains confirmed requirements, frozen FunctionItems and their
@@ -2163,7 +2287,10 @@ JSON matching INTERFACE_SCHEMA."""
             try:
                 corrected = _parse_object(corrected_text)
                 if protocol_issue is None:
-                    return apply_interface_patch(previous_candidate, corrected)
+                    return apply_interface_patch(
+                        previous_candidate, corrected,
+                        runtime_binding_facts=payload["runtime_binding_facts"],
+                    )
                 return corrected
             except InterfaceIntentPlanError:
                 return {"__invalid_transport__": corrected_text}
@@ -2289,6 +2416,8 @@ async def repair_interface_plan_semantically(
 
 {MULTIMODAL_INPUT_PROVENANCE_CONTRACT}
 
+{RUNTIME_REPAIR_RESTRICTION_CONTRACT}
+
 1. AUTHORITATIVE FACTS
 The payload contains the failed complete Interface Plan; frozen FunctionItems
 and required/default input facts; the platform contract; requirements; unified
@@ -2328,6 +2457,8 @@ Return only {{"diagnosis":"...","required_postcondition":"..."}}."""
 {PLATFORM_OUTPUT_MAPPING_CONTRACT}
 
 {MULTIMODAL_INPUT_PROVENANCE_CONTRACT}
+
+{RUNTIME_REPAIR_RESTRICTION_CONTRACT}
 
 1. AUTHORITATIVE FACTS
 The payload contains the complete failed Interface Plan, frozen FunctionItems,
@@ -2475,7 +2606,9 @@ Returning a renamed equivalent without semantic improvement is forbidden.
 8. OUTPUT CONTRACT
 Return only a patch object matching interface_patch_schema. The only allowed
 operations are remove_interface, replace_source, and replace_transform. Do not
-return or regenerate the complete Interface Plan.
+return or regenerate the complete Interface Plan. This is a strict JSON-schema
+response: output exactly one {"operations": [...]} object and no prose. Keep
+the entire response concise and every reason at or below 200 characters.
 """
     payload = {
         "system_goal": original_user_goal,
@@ -2567,10 +2700,11 @@ Return only strict JSON matching critic_schema."""
             planner_model,
         )
         try:
-            patch = _parse_object(text)
-            if set(patch) != {"operations"} or not isinstance(patch["operations"], list):
-                raise InterfaceIntentPlanError("repair must be patch operations", code="invalid_interface_patch", details={"path": "$"})
-            return apply_interface_patch(previous_candidate, patch)
+            patch = validate_interface_patch_protocol(_parse_object(text))
+            return apply_interface_patch(
+                previous_candidate, patch,
+                runtime_binding_facts=payload["runtime_binding_facts"],
+            )
         except InterfaceIntentPlanError:
             generator_transport_repair_used = True
             return {"__invalid_transport__": text}
@@ -2627,8 +2761,15 @@ Return only strict JSON matching critic_schema."""
         residual = merge_interface_validation_issues(
             remaining, review_issues, graph_issues,
         )
+        before_issue_codes = sorted({str(issue.get("code")) for issue in validation_issues if issue.get("code")})
+        after_issue_codes = sorted({str(issue.get("code")) for issue in residual if issue.get("code")})
+        unresolved_old_codes = sorted(set(before_issue_codes) & set(after_issue_codes))
+        logger.info(
+            "[Creator][interface_repair_acceptance] before_issue_codes=%s after_issue_codes=%s unresolved_old_issue_codes=%s blocking_issue_count=%d",
+            before_issue_codes, after_issue_codes, unresolved_old_codes, len(residual),
+        )
         return CandidateEvaluation(
-            accepted=not residual, candidate=candidate,
+            accepted=not residual and not unresolved_old_codes, candidate=candidate,
             acceptance_facts=residual, semantic_comparable=True,
         )
 

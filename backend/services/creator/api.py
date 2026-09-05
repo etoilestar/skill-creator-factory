@@ -9270,6 +9270,18 @@ its value in default_values. Do not mark an input optional merely because it
 sounds like a preference; judge only from the confirmed user goal and proposed
 runtime contract. Do not infer optionality from the input field name.
 
+FUNCTIONITEM PORT ROLE CONTRACT
+
+Every structured input and output port MUST contain an explicit role. Input
+role is exactly one of required_runtime_input, optional_runtime_input, or
+derived_input. required_runtime_input requires a real runtime source and may be
+supplied by the platform or an upstream member. optional_runtime_input may
+remain unbound when no valid source exists. derived_input must be produced by a
+preceding FunctionItem and may never be supplied by a platform input. Output
+role is exactly one of runtime_output or intermediate_output. Declare roles
+from the value's contract and provenance, never from its field name, file type,
+or a desire to make graph coverage close.
+
 In this pass, FilePlan owns file topology and file-local metadata.
 Declare script file responsibilities inside SkillPlan entries only.
 Resource usage remains in FilePlan dependencies/references/resource metadata.

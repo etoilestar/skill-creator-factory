@@ -22,6 +22,46 @@ _LEGACY_OUTPUT_VALUE_SCHEMAS: dict[str, dict[str, Any]] = {
     "file_outputs": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1},
 }
 
+# Runtime representation adapters are part of the platform boundary contract,
+# not UI output-name rules.  Validators infer the post-transform semantic type
+# from this registry before comparing it with a sink contract.
+OUTPUT_TRANSFORM_REGISTRY: dict[str, dict[str, Any]] = {
+    "json_serialize": {
+        "input_types": ("object", "json", "array"),
+        "result_type": "text",
+    },
+    "file_write": {
+        "input_types": ("object", "json"),
+        "result_type": "file",
+    },
+    "markdown_render": {
+        "input_types": ("structured_data", "object", "json"),
+        "result_type": "markdown",
+    },
+    # Compatibility adapter retained for existing generated plans.
+    "file_collect": {
+        "input_types": ("artifact", "file", "file_path", "list[file_path]"),
+        "result_type": "file",
+    },
+}
+
+
+def _default_output_semantics(name: str, schema: dict[str, Any]) -> dict[str, Any]:
+    """Infer compatibility metadata for legacy declarations only."""
+    if name in {"file_outputs", "file_paths", "image_paths"} or name.endswith("_path"):
+        return {
+            "semantic_type": "file",
+            "accepted_source_types": ["artifact", "file", "file_path", "list[file_path]", "object", "json"],
+            "allowed_transforms": ["file_collect", "file_write"],
+        }
+    semantic_type = "markdown" if name == "markdown" else "text" if schema.get("type") == "string" else str(schema.get("type") or "unknown")
+    allowed = ["markdown_render"] if semantic_type == "markdown" else ["json_serialize", "markdown_render"] if semantic_type == "text" else []
+    return {
+        "semantic_type": semantic_type,
+        "accepted_source_types": [semantic_type, "string", "json", "object", "structured_data"],
+        "allowed_transforms": allowed,
+    }
+
 
 def normalize_platform_output_sinks(contract: dict[str, Any] | None) -> list[dict[str, Any]]:
     """Return the sole canonical representation of platform output sinks.
@@ -54,7 +94,19 @@ def normalize_platform_output_sinks(contract: dict[str, Any] | None) -> list[dic
         if (cardinality, write_semantics) not in {("one", "single"), ("many", "append"), ("many", "collect")}:
             raise ValueError(f"invalid platform output sink semantics: {name}")
         seen.add(name)
-        sinks.append({"name": name, "value_schema": schema, "cardinality": cardinality, "write_semantics": write_semantics})
+        defaults = _default_output_semantics(name, schema)
+        if isinstance(declaration, dict):
+            semantic_type = str(declaration.get("semantic_type") or defaults["semantic_type"]).strip()
+            accepted = declaration.get("accepted_source_types", defaults["accepted_source_types"])
+            allowed = declaration.get("allowed_transforms", defaults["allowed_transforms"])
+        else:
+            semantic_type, accepted, allowed = defaults["semantic_type"], defaults["accepted_source_types"], defaults["allowed_transforms"]
+        sinks.append({
+            "name": name, "semantic_type": semantic_type,
+            "accepted_source_types": list(accepted), "allowed_transforms": list(allowed),
+            "value_schema": schema, "cardinality": cardinality,
+            "write_semantics": write_semantics,
+        })
     return sinks
 
 
@@ -161,7 +213,7 @@ def build_platform_io_contract() -> dict[str, Any]:
                 "runtime_resources": {"canonical": "resources", "globally_required": False},
             },
             "final_output_fields": [
-                {"name": "text", "value_schema": {"type": "string", "minLength": 1}, "cardinality": "many", "write_semantics": "append"},
+                {"name": "text", "semantic_type": "text", "accepted_source_types": ["string", "text", "json", "object"], "allowed_transforms": ["json_serialize", "markdown_render"], "value_schema": {"type": "string", "minLength": 1}, "cardinality": "many", "write_semantics": "append"},
                 {"name": "markdown", "value_schema": {"type": "string", "minLength": 1}, "cardinality": "many", "write_semantics": "append"},
                 {"name": "image_path", "value_schema": {"type": "string", "minLength": 1}, "cardinality": "one", "write_semantics": "single"},
                 {"name": "image_paths", "value_schema": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1}, "cardinality": "one", "write_semantics": "single"},

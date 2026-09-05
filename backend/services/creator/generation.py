@@ -11,9 +11,12 @@ from ..platform_io_contract import (
 
 _RUNTIME_BINDING_AUTHORITY_PROMPT = """## Runtime Binding Authority
 
-ResponsibilityGraph Interface Contract is the first and sole interface
-authority. Natural-language requirements, SKILL.md, examples, and source code
-must not be used to infer, rename, wrap, or redesign input/output fields.
+Interface Plan is the single source of truth for executable interface binding.
+The ResponsibilityGraph values supplied here are a deterministic materialized
+projection of that plan, not a second interface authority. Natural-language
+requirements, graph node names, blueprint descriptions, function descriptions,
+SKILL.md, examples, and source code must not be used to infer, rename, wrap, or
+redesign input/output fields.
 
 The runtime input contract has already been resolved by the platform.
 
@@ -31,7 +34,8 @@ Do not redesign the runtime interface.
 
 Do not:
 - wrap existing inputs into another object
-- create request/options/config wrapper objects
+- create wrapper objects not declared by Interface Plan (names such as
+  request/options/config/params are valid when, and only when, they are declared)
 - introduce a second input schema
 - rename existing runtime inputs
 - add an adapter layer for invocation
@@ -48,6 +52,11 @@ Do not recreate framework-level transport, invocation, or input handling logic i
 """
 
 _SKILL_MD_RUNTIME_BINDING_PROMPT = """The execution environment already provides runtime inputs.
+
+Interface Plan is the single source of truth for executable interface binding.
+Do NOT infer bindings from graph node names, blueprint descriptions, or function
+descriptions.  Use the supplied canonical target.field as the command variable
+and its canonical source.field as the runtime placeholder path, verbatim.
 
 SKILL.md should describe how the skill uses existing inputs.
 

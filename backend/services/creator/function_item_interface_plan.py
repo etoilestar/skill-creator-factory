@@ -759,6 +759,8 @@ def collect_interface_plan_validation_issues(
         elif kind == "member_to_platform":
             source, output, target = interface["source_member"], interface["source_output"], interface["target_platform_output"]
             if source not in outputs or output not in outputs.get(source, set()): issue("unknown_interface_logical_output", f"{path}.source_output", iid, output, sorted(outputs.get(source, set())))
+            # Contract membership is deterministic. Semantic review is only
+            # allowed to assess mappings whose two endpoints already exist.
             if target not in platform_outputs: issue("unknown_platform_logical_output", f"{path}.target_platform_output", iid, target, sorted(platform_outputs))
             else:
                 covered_platform.add(target)
@@ -1535,99 +1537,6 @@ A plausible goal cannot make an incorrect structured source/target binding valid
     return issues
 
 
-def existing_binding_references_valid(
-    *, plan: dict[str, Any], function_items: list[dict[str, Any]],
-    platform_contract: dict[str, Any] | None = None,
-) -> bool:
-    """Return whether every declared binding resolves to existing logical ports."""
-    try:
-        validated = validate_interface_intent_plan(
-            plan=plan, function_items=function_items,
-        )
-    except InterfaceIntentPlanError:
-        return False
-    boundary = (platform_contract or {}).get(
-        "platform_skill_boundary", platform_contract or {},
-    )
-    platform_inputs = {
-        _compact_port_id(value)
-        for value in boundary.get("input_envelope_fields") or []
-    }
-    platform_outputs = {
-        _compact_port_id(value)
-        for value in platform_output_names(platform_contract)
-    }
-    return all(
-        (interface["kind"] != "platform_to_member"
-         or interface["source_platform_input"] in platform_inputs)
-        and (interface["kind"] != "member_to_platform"
-             or interface["target_platform_output"] in platform_outputs)
-        for interface in validated["interfaces"]
-    )
-
-
-def _existing_binding_acceptance_facts(
-    issues: list[dict[str, Any]], interface_plan: dict[str, Any],
-) -> list[dict[str, Any]]:
-    """Attach candidate identity to reviewer conclusions without semantic inference."""
-    by_id = {
-        str(interface.get("interface_id") or ""): interface
-        for interface in interface_plan.get("interfaces") or []
-    }
-    facts: list[dict[str, Any]] = []
-    for issue in issues:
-        for interface_id in issue.get("affected_interfaces") or []:
-            current_binding = by_id.get(interface_id)
-            if current_binding is None:
-                continue
-            facts.append({
-                "source_stage": "existing_binding_semantic_review",
-                "interface_id": interface_id,
-                "current_binding": dict(current_binding),
-                "message": issue["message"],
-                "expected_constraint": (
-                    "Declared semantic source must satisfy declared receiving slot."
-                ),
-            })
-    return facts
-
-
-async def _audit_existing_bindings_fail_open(
-    *, original_user_goal: str, frozen_function_items: list[dict[str, Any]],
-    interface_plan: dict[str, Any], requirement_allocations: list[dict[str, Any]] | None,
-    requirement_channels: dict[str, str] | None,
-    system_requirements: list[dict[str, Any]] | None,
-    platform_contract: dict[str, Any] | None, reviewer_model: str,
-    model_call: ModelCall,
-) -> tuple[list[dict[str, Any]], bool]:
-    """Run the early diagnostic enhancement; reviewer protocol failures are non-fatal."""
-    try:
-        issues = await review_interface_plan_semantically(
-            original_user_goal=original_user_goal,
-            frozen_function_items=frozen_function_items,
-            interface_plan=interface_plan,
-            requirement_allocations=requirement_allocations,
-            requirement_channels=requirement_channels,
-            system_requirements=system_requirements,
-            platform_contract=platform_contract,
-            reviewer_model=reviewer_model,
-            model_call=model_call,
-            review_mode="existing_bindings_only",
-        )
-    except InterfaceIntentPlanError as exc:
-        logger.warning(
-            "[Creator][existing_binding_semantic_review] semantic_audit_available=false error_code=%s",
-            exc.code,
-        )
-        return [], False
-    facts = _existing_binding_acceptance_facts(issues, interface_plan)
-    logger.info(
-        "[Creator][existing_binding_semantic_review] semantic_audit_available=true issue_count=%d acceptance_fact_count=%d",
-        len(issues), len(facts),
-    )
-    return facts, True
-
-
 async def plan_function_item_interfaces(*, original_user_goal: str, frozen_function_items: list[dict[str, Any]], requirement_allocations: list[dict[str, Any]] | None = None, requirement_channels: dict[str, str] | None = None, system_requirements: list[dict[str, Any]] | None = None, interaction_requirements: list[dict[str, Any]] | None = None, platform_contract: dict[str, Any] | None = None, skill_name: str = "", planner_model: str, model_call: ModelCall, reviewer_model: str | None = None, reviewer_model_call: ModelCall | None = None) -> dict[str, Any]:
     """Ask the model for interaction intents between frozen FunctionItems."""
 
@@ -1670,33 +1579,13 @@ async def plan_function_item_interfaces(*, original_user_goal: str, frozen_funct
     deterministic_issues = collect_interface_plan_validation_issues(
         plan=parsed, function_items=frozen_function_items, platform_contract=platform_contract,
     ) if protocol_issue is None else []
-    early_semantic_facts: list[dict[str, Any]] = []
-    early_semantic_audit_available = False
-    if (protocol_issue is None and deterministic_issues and reviewer_model
-            and existing_binding_references_valid(
-                plan=parsed, function_items=frozen_function_items,
-                platform_contract=platform_contract,
-            )):
-        early_semantic_facts, early_semantic_audit_available = await _audit_existing_bindings_fail_open(
-            original_user_goal=original_user_goal,
-            frozen_function_items=frozen_function_items,
-            interface_plan=parsed,
-            requirement_allocations=requirement_allocations,
-            requirement_channels=requirement_channels,
-            system_requirements=system_requirements_context,
-            platform_contract=platform_contract,
-            reviewer_model=reviewer_model,
-            model_call=reviewer_model_call or model_call,
-        )
     logger.info(
-        "[Creator][interface_validation] stage=early initial_deterministic_issue_count=%d early_existing_binding_semantic_issue_count=%d early_semantic_audit_available=%s",
-        len(deterministic_issues), len(early_semantic_facts), early_semantic_audit_available,
+        "[Creator][interface_validation] stage=deterministic initial_issue_count=%d",
+        len(deterministic_issues),
     )
     if protocol_issue is not None or deterministic_issues:
         facts = ([{"code": protocol_issue.code, "message": str(protocol_issue), "details": protocol_issue.details}]
-                 if protocol_issue is not None else merge_interface_validation_issues(
-                     deterministic_issues, early_semantic_facts,
-                 ))
+                 if protocol_issue is not None else deterministic_issues)
         correction_prompt = f"""{AUTHORITY_CONTRACT}
 
         {PLATFORM_OUTPUT_CONTRACT}
@@ -1782,27 +1671,9 @@ Return strict JSON matching INTERFACE_SCHEMA only."""
                 plan=candidate, function_items=frozen_function_items,
                 platform_contract=platform_contract,
             )
-            semantic_facts: list[dict[str, Any]] = []
-            references_valid = bool(remaining) and existing_binding_references_valid(
-                plan=candidate, function_items=frozen_function_items,
-                platform_contract=platform_contract,
-            )
-            if reviewer_model and references_valid:
-                semantic_facts, _ = await _audit_existing_bindings_fail_open(
-                    original_user_goal=original_user_goal,
-                    frozen_function_items=frozen_function_items,
-                    interface_plan=candidate,
-                    requirement_allocations=requirement_allocations,
-                    requirement_channels=requirement_channels,
-                    system_requirements=system_requirements_context,
-                    platform_contract=platform_contract,
-                    reviewer_model=reviewer_model,
-                    model_call=reviewer_model_call or model_call,
-                )
-            residual = merge_interface_validation_issues(remaining, semantic_facts)
             return CandidateEvaluation(
-                accepted=not residual, candidate=candidate,
-                acceptance_facts=residual, semantic_comparable=True,
+                accepted=not remaining, candidate=candidate,
+                acceptance_facts=remaining, semantic_comparable=True,
             )
 
         initial_evaluation = CandidateEvaluation(

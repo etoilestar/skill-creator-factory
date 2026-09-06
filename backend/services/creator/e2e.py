@@ -8543,6 +8543,21 @@ async def _repair_existing_file_for_e2e_failure(
     """
 
     structured_failure = _structured_failure_from_errors(e2e_errors)
+    if _failure_code_from_structured(structured_failure) == "runtime_io_mapping_failure":
+        # Runtime mapping is execution-session state.  It may be replanned, but
+        # E2E repair must never turn this failure into permission to edit the
+        # frozen Interface Contract (or any Skill source file).
+        details = structured_failure.get("details") if isinstance(structured_failure.get("details"), dict) else {}
+        return {
+            "status": "runtime_io_mapping_replan_required",
+            "repaired_target": None,
+            "next_target": "RUNTIME_IO_MAPPING",
+            "runtime_mapping_path": details.get("runtime_mapping_path"),
+            "next_failure": e2e_errors,
+            "error_type": "runtime_io_mapping_failure",
+            "interface_contract_mutable": False,
+            "sandbox_executed": False,
+        }
     if _failure_code_from_structured(structured_failure) == "upstream_interface_contract_conflict":
         return {
             "status": "upstream_handoff_required",

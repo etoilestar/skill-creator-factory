@@ -22,9 +22,9 @@ def _item(element_type: str) -> dict:
         "role": "worker",
         "purpose": "compare the two semantically selected inputs",
         "inputs": [
-            {"port_id": "left_file" if element_type == "file" else "source_image",
+            {"port_id": "file1" if element_type == "file" else "image1",
              "role": "required_runtime_input", "contract": {"type": element_type}},
-            {"port_id": "right_file" if element_type == "file" else "reference_image",
+            {"port_id": "file2" if element_type == "file" else "image2",
              "role": "required_runtime_input", "contract": {"type": element_type}},
         ],
         "outputs": [
@@ -41,10 +41,10 @@ def _platform(source: str, element_type: str) -> dict:
     return {"platform_skill_boundary": {
         "input_envelope_fields": [source],
         "input_schemas": {source: {"type": f"list[{element_type}]"}},
-        "final_output_fields": ["final_result"],
-        "required_final_output_fields": ["final_result"],
+        "final_output_fields": ["result"],
+        "required_final_output_fields": ["result"],
         "output_sinks": {
-            "final_result": {"name": "final_result", "value_schema": {"type": "string"}},
+            "result": {"name": "result", "value_schema": {"type": "string"}},
         },
         "runtime_capability_summary": {
             "indexed_source_paths": True,
@@ -65,8 +65,8 @@ def _contains_forbidden_conversion_field(value) -> bool:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("element_type", "source", "targets"), [
-    ("file", "input_files", ("left_file", "right_file")),
-    ("image", "images", ("source_image", "reference_image")),
+    ("file", "input_files", ("file1", "file2")),
+    ("image", "images", ("image1", "image2")),
 ])
 async def test_semantic_list_mapping_reaches_runtime_by_index(
     element_type, source, targets,
@@ -111,7 +111,7 @@ async def test_semantic_list_mapping_reaches_runtime_by_index(
             {
                 "interface_id": "I3", "kind": "member_to_platform",
                 "source_member": "scripts/compare.py", "source_output": "report",
-                "target_platform_output": "final_result",
+                "target_platform_output": "result",
                 "semantic_reason": "the generated report is the final result",
             },
         ]})
@@ -127,7 +127,7 @@ async def test_semantic_list_mapping_reaches_runtime_by_index(
     )
     assert not _contains_forbidden_conversion_field(canonical)
     assert canonical["interfaces"][2]["source"]["field"] == "report"
-    assert canonical["interfaces"][2]["target"]["field"] == "final_result"
+    assert canonical["interfaces"][2]["target"]["field"] == "result"
 
     edges = await expand_responsibility_graph(
         function_items=items, platform_contract=platform, planner_model="unused",
@@ -177,10 +177,10 @@ async def test_semantic_output_mapping_needs_no_conversion_field(source_output, 
     }]
     platform = {"platform_skill_boundary": {
         "input_envelope_fields": [],
-        "final_output_fields": ["final_result"],
-        "required_final_output_fields": ["final_result"],
-        "output_sinks": {"final_result": {
-            "name": "final_result", "value_schema": {"type": output_type},
+        "final_output_fields": ["result"],
+        "required_final_output_fields": ["result"],
+        "output_sinks": {"result": {
+            "name": "result", "value_schema": {"type": output_type},
         }},
         "runtime_capability_summary": {"representation_adaptation": "runtime-owned"},
     }}
@@ -189,14 +189,14 @@ async def test_semantic_output_mapping_needs_no_conversion_field(source_output, 
         candidates = json.loads(messages[1]["content"])["semantic_mapping_candidates"]
         assert candidates["output_mappings"] == [{
             "source_member": "scripts/generate.py", "source_output": source_output,
-            "target_platform_output": "final_result",
+            "target_platform_output": "result",
             "source_contract": {"type": output_type},
             "target_contract": {"type": output_type},
         }]
         return json.dumps({"interfaces": [{
             "interface_id": "I1", "kind": "member_to_platform",
             "source_member": "scripts/generate.py", "source_output": source_output,
-            "target_platform_output": "final_result",
+            "target_platform_output": "result",
             "semantic_reason": "the generated value is the requested final result",
         }]})
 
@@ -210,4 +210,4 @@ async def test_semantic_output_mapping_needs_no_conversion_field(source_output, 
     assert not _contains_forbidden_conversion_field(plan)
     assert not _contains_forbidden_conversion_field(canonical)
     assert canonical["interfaces"][0]["source"]["field"] == source_output
-    assert canonical["interfaces"][0]["target"]["field"] == "final_result"
+    assert canonical["interfaces"][0]["target"]["field"] == "result"

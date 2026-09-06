@@ -93,3 +93,48 @@ def test_removing_invalid_duplicate_interface_restores_closure():
     assert not any(issue["code"] in {
         "uncovered_required_logical_input", "multiple_runtime_sources",
     } for issue in issues)
+
+
+@pytest.mark.parametrize(("element_type", "source", "slots"), [
+    ("file", "files", ["file1", "file2"]),
+    ("image", "images", ["image1", "image2"]),
+    ("document", "documents", ["doc1", "doc2"]),
+    ("file", "uploads", ["left", "right"]),
+])
+def test_list_input_projects_by_element_type_into_ordered_slots(element_type, source, slots):
+    items = [{
+        "target_file": "scripts/consume.py", "role": "worker", "purpose": "consume",
+        "inputs": [{
+            "port_id": slot, "role": "required_runtime_input",
+            "contract": {"type": element_type},
+        } for slot in slots],
+        "outputs": [], "constraints": [], "required_capabilities": [],
+    }]
+    platform = {"platform_skill_boundary": {
+        "input_envelope_fields": [source],
+        "input_schemas": {source: {"type": f"list[{element_type}]"}},
+        "final_output_fields": [],
+    }}
+
+    facts = build_runtime_binding_facts(function_items=items, platform_contract=platform)
+
+    assert facts["scripts/consume.py"] == {
+        slot: {"allowed_sources": [{
+            "source_platform_input": source, "source_path": [str(index)],
+        }]}
+        for index, slot in enumerate(slots)
+    }
+    plan = {"interfaces": [
+        {
+            "interface_id": f"I{index + 1}", "kind": "platform_to_member",
+            "source_platform_input": source, "source_path": [str(index)],
+            "target_member": "scripts/consume.py", "target_input": slot,
+            "goal": "consume one projected list element",
+        }
+        for index, slot in enumerate(slots)
+    ]}
+    issues = collect_interface_plan_validation_issues(
+        plan=plan, function_items=items, platform_contract=platform)
+    assert not [issue for issue in issues if issue["code"] in {
+        "incompatible_semantic_provenance", "uncovered_required_logical_input",
+    }]

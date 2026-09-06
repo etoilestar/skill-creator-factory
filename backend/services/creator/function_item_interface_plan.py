@@ -1092,13 +1092,67 @@ def _walk_platform_schema(schema: dict[str, Any], path: tuple[str, ...] = ()):
                 yield from _walk_platform_schema(child, (*path, name))
 
 
+def _declared_schema_type(schema: dict[str, Any]) -> tuple[str, Any] | None:
+    """Return a structural type identity without consulting a port name.
+
+    Both the compact ``list[T]`` notation used by some platform contracts and
+    JSON Schema's ``array``/``items`` notation are accepted.  Object identities
+    include their declared property shapes so that unrelated objects are not
+    treated as interchangeable merely because both say ``object``.
+    """
+    raw_type = schema.get("type")
+    if not isinstance(raw_type, str) or not raw_type.strip():
+        return None
+    type_name = raw_type.strip().lower()
+    if type_name.startswith("list[") and type_name.endswith("]"):
+        element = type_name[5:-1].strip()
+        return ("list", (element, None)) if element else None
+    if type_name in {"array", "list"}:
+        items = schema.get("items")
+        element = _declared_schema_type(items) if isinstance(items, dict) else None
+        return "list", element
+    if type_name == "object":
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            return "object", None
+        shape = tuple(sorted(
+            (name, _declared_schema_type(child))
+            for name, child in properties.items()
+            if isinstance(name, str) and isinstance(child, dict)
+        ))
+        return "object", shape
+    return type_name, None
+
+
+def _schema_types_compatible(source: dict[str, Any], target: dict[str, Any]) -> bool:
+    """Match declared structural types, leaving representation work to runtime."""
+    source_type = _declared_schema_type(source)
+    target_type = _declared_schema_type(target)
+    return source_type is not None and target_type is not None and source_type == target_type
+
+
+def _list_element_schema(schema: dict[str, Any]) -> dict[str, Any] | None:
+    """Return a synthetic schema for a list element when one is declared."""
+    raw_type = schema.get("type")
+    if not isinstance(raw_type, str):
+        return None
+    type_name = raw_type.strip().lower()
+    if type_name.startswith("list[") and type_name.endswith("]"):
+        element = type_name[5:-1].strip()
+        return {"type": element} if element else None
+    if type_name in {"array", "list"} and isinstance(schema.get("items"), dict):
+        return dict(schema["items"])
+    return None
+
+
 def build_runtime_binding_facts(
     *, function_items: list[dict[str, Any]], platform_contract: dict[str, Any] | None,
 ) -> dict[str, dict[str, dict[str, list[dict[str, Any]]]]]:
     """Build deterministic, LLM-free platform provenance for frozen inputs.
 
     Explicit ``runtime_provenance``/``source_platform_input`` annotations take
-    precedence, followed by an exact mapping in the declared platform schema.
+    precedence, followed by exact names, object fields, structural list
+    expansion, and finally a single structurally compatible source.
     Semantic identities, descriptions, and approximate names are never used to
     select runtime provenance.
     """
@@ -1109,6 +1163,7 @@ def build_runtime_binding_facts(
     facts: dict[str, dict[str, dict[str, list[dict[str, Any]]]]] = {}
     for item in compact:
         member_facts: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        unresolved: list[dict[str, Any]] = []
         for port in item["inputs"]:
             contract = port.get("contract") or {}
             explicit = contract.get("runtime_provenance") if isinstance(contract.get("runtime_provenance"), dict) else contract
@@ -1122,18 +1177,60 @@ def build_runtime_binding_facts(
                 # top-level slot or exact nested property is factual provenance.
                 # This is intentionally identifier equality, not semantic or
                 # descriptive matching.
+                # Priority 1: exact top-level identifier.
                 for source in names:
                     if source == port["name"]:
                         allowed.append({"source_platform_input": source, "source_path": []})
-                    for path, _source_schema in _walk_platform_schema(dict(schemas.get(source) or {})):
-                        if path and path[-1] == port["name"]:
-                            allowed.append({"source_platform_input": source, "source_path": list(path)})
-                if not allowed and len(names) == 1 and port.get("role") != "derived_input":
-                    # Legacy contracts with one undifferentiated platform slot
-                    # remain projectable without choosing among sources or using
-                    # receiver-name similarity.
-                    allowed.append({"source_platform_input": names[0], "source_path": []})
+                # Priority 2: exact object-field identifier.
+                if not allowed:
+                    for source in names:
+                        for path, _source_schema in _walk_platform_schema(dict(schemas.get(source) or {})):
+                            if path and path[-1] == port["name"]:
+                                allowed.append({"source_platform_input": source, "source_path": list(path)})
+            if not allowed and port.get("role") != "derived_input":
+                unresolved.append(port)
             member_facts[port["name"]] = {"allowed_sources": allowed}
+
+        # Priority 3: expand one unambiguous list[T] source into the remaining
+        # compatible T slots, in frozen FunctionItem input order.  Indices are
+        # structural paths and never depend on receiver naming conventions.
+        list_sources = {
+            source: element
+            for source in names
+            if (element := _list_element_schema(dict(schemas.get(source) or {}))) is not None
+        }
+        list_assignments: dict[str, list[dict[str, Any]]] = {}
+        for port in unresolved:
+            candidates = [source for source, element in list_sources.items()
+                          if _schema_types_compatible(element, port["contract"])]
+            if len(candidates) == 1:
+                list_assignments.setdefault(candidates[0], []).append(port)
+        projected_names: set[str] = set()
+        for source, ports in list_assignments.items():
+            for index, port in enumerate(ports):
+                member_facts[port["name"]]["allowed_sources"].append(
+                    {"source_platform_input": source, "source_path": [str(index)]}
+                )
+                projected_names.add(port["name"])
+
+        # Priority 4: bind only when exactly one whole platform value has the
+        # same declared structural type.  Preserve the historical one-envelope
+        # fallback solely when neither side declares enough type information.
+        for port in unresolved:
+            if port["name"] in projected_names:
+                continue
+            candidates = [source for source in names if _schema_types_compatible(
+                dict(schemas.get(source) or {}), port["contract"])]
+            if len(candidates) == 1:
+                member_facts[port["name"]]["allowed_sources"].append(
+                    {"source_platform_input": candidates[0], "source_path": []}
+                )
+            elif (len(names) == 1 and not candidates
+                  and _declared_schema_type(dict(schemas.get(names[0]) or {})) is None
+                  and _declared_schema_type(port["contract"]) is None):
+                member_facts[port["name"]]["allowed_sources"].append(
+                    {"source_platform_input": names[0], "source_path": []}
+                )
         facts[item["target_file"]] = member_facts
     logger.info("[interface_runtime_binding_facts] %s", json.dumps(facts, ensure_ascii=False, sort_keys=True))
     return facts

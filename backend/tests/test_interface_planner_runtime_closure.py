@@ -9,7 +9,11 @@ from backend.services.creator.function_item_interface_plan import (
 from backend.services.creator.responsibility_graph_expansion import (
     expand_responsibility_graph,
 )
-from backend.services.skill_dataflow import resolve_context_value
+from backend.routers.sandbox.runtime_execution_plan import (
+    VERSION,
+    resolve_step_bindings,
+    validate_runtime_execution_plan,
+)
 
 
 def _item(element_type: str) -> dict:
@@ -131,11 +135,31 @@ async def test_semantic_list_mapping_reaches_runtime_by_index(
     )
     bindings = [edge["constraints"][0] for edge in edges if edge["from_node"] == "platform_input_node"]
     assert [binding["source_path"] for binding in bindings] == [["0"], ["1"]]
-    runtime_context = {source: ["first-value", "second-value"]}
-    assert [
-        resolve_context_value(runtime_context, f"{source}.{binding['source_key']}")
-        for binding in bindings
-    ] == ["first-value", "second-value"]
+    runtime_envelope = {source: ["first-value", "second-value"]}
+    runtime_plan = validate_runtime_execution_plan(
+        {
+            "version": VERSION,
+            "steps": [{
+                "step_id": "compare", "script_path": "scripts/compare.py",
+                "bindings": {
+                    edge["to_input"]: {
+                        "source_type": "envelope",
+                        "source": f"{edge['from_output']}.{edge['constraints'][0]['source_key']}",
+                    }
+                    for edge in edges if edge["from_node"] == "platform_input_node"
+                },
+            }],
+        },
+        {"entries": [{
+            "script_path": "scripts/compare.py", "inputs": list(targets),
+            "optional_inputs": [], "command_keys": list(targets), "outputs": ["report"],
+            "default_values": {},
+        }]},
+        runtime_envelope,
+    )
+    assert resolve_step_bindings(
+        runtime_plan["steps"][0], runtime_envelope, {"steps": {}},
+    ) == {targets[0]: "first-value", targets[1]: "second-value"}
 
 
 @pytest.mark.asyncio

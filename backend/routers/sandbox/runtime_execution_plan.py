@@ -57,8 +57,12 @@ def _lookup(value: Any, path: str) -> Any:
     return current
 
 
-def _valid_envelope_source(source: Any) -> bool:
-    return isinstance(source, str) and bool(source) and source.split(".", 1)[0] in ENVELOPE_ROOTS
+def _valid_envelope_source(source: Any, envelope: dict | None = None) -> bool:
+    """Accept a declared runtime-envelope root without enumerating media kinds."""
+    if not isinstance(source, str) or not source:
+        return False
+    root = source.split(".", 1)[0]
+    return root in envelope if isinstance(envelope, dict) else root in ENVELOPE_ROOTS
 
 
 def _canonical_binding(parameter: str, binding: Any, entry: dict, envelope: dict | None) -> dict:
@@ -83,7 +87,7 @@ def _canonical_binding(parameter: str, binding: Any, entry: dict, envelope: dict
     if unknown or missing:
         _fail("runtime_plan_invalid_binding", f"binding {parameter} shape is invalid", {"unknown": sorted(unknown), "missing": sorted(missing)})
     if source_type == "envelope":
-        if not _valid_envelope_source(binding["source"]):
+        if not _valid_envelope_source(binding["source"], envelope):
             _fail("runtime_plan_invalid_envelope_source", f"invalid envelope source for {parameter}")
         return dict(binding)
     if source_type in {"user_input", "derived_from_user_input"}:

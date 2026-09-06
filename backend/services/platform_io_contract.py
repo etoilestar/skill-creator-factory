@@ -22,9 +22,8 @@ _LEGACY_OUTPUT_VALUE_SCHEMAS: dict[str, dict[str, Any]] = {
     "file_outputs": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1},
 }
 
-# Runtime representation adapters are part of the platform boundary contract,
-# not UI output-name rules.  Validators infer the post-transform semantic type
-# from this registry before comparing it with a sink contract.
+# Transform is a runtime capability, not interface planning information.
+# Runtime binding queries this registry only when an interface is executed.
 OUTPUT_TRANSFORM_REGISTRY: dict[str, dict[str, Any]] = {
     "json_serialize": {
         "input_types": ("object", "json", "array"),
@@ -44,6 +43,27 @@ OUTPUT_TRANSFORM_REGISTRY: dict[str, dict[str, Any]] = {
         "result_type": "file",
     },
 }
+
+
+def resolve_runtime_output_transform(
+    *, source_type: str, target_type: str, allowed_transforms: list[str] | None = None,
+) -> str | None:
+    """Resolve representation adaptation at execution time.
+
+    ``None`` means the representations bind directly. A missing runtime
+    capability is an execution failure, never an Interface Plan failure.
+    """
+    aliases = {"string": "text", "artifact": "file", "file_path": "file", "list[file_path]": "file"}
+    source = aliases.get(str(source_type), str(source_type))
+    target = aliases.get(str(target_type), str(target_type))
+    if source == target:
+        return None
+    permitted = set(allowed_transforms) if allowed_transforms is not None else set(OUTPUT_TRANSFORM_REGISTRY)
+    for name, capability in OUTPUT_TRANSFORM_REGISTRY.items():
+        accepted = capability.get("input_types", ())
+        if name in permitted and str(source_type) in accepted and capability.get("result_type") == target:
+            return name
+    raise RuntimeError(f"no runtime output adaptation from {source_type} to {target_type}")
 
 
 def _default_output_semantics(name: str, schema: dict[str, Any]) -> dict[str, Any]:

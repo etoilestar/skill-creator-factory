@@ -25,6 +25,7 @@ from .generation import *  # noqa: F403
 from ..kernel_loader import load_kernel_creator_for_phase
 from ..blueprint_parser import BlueprintShapeError, exact_file_plan_paths_from_strict_skillplan, parse_blueprint, parse_resource_source_from_block, validate_blueprint_shape_for_creator
 from ..skill_plan import GraphValidationError, file_type_for_path, normalize_structured_function_items, normalize_structured_responsibility_edges, resource_role_source_issue, validate_structured_responsibility_edge_transport, structured_responsibility_graph_input_provenance_gaps
+from ..platform_io_contract import project_function_item_outputs_to_platform_contract
 
 from .upload_context import save_creator_context_upload, UPLOAD_ROOT, sanitize_session_id
 from .tool_pool_store import (
@@ -7057,7 +7058,9 @@ async def _bind_executable_responsibility_plan(
             messages, "reviewer", fallback_model=model, stage="Interface Reviewer / Repair Critic",
         )
 
-    platform_contract = build_platform_io_contract()
+    platform_contract = project_function_item_outputs_to_platform_contract(
+        build_platform_io_contract(), frozen_function_items,
+    )
     system_requirements_context = [
         allocation for allocation in (requirement_allocations or [])
         if not (allocation.get("owners") or [])

@@ -888,7 +888,12 @@ def runtime_input_source_facts(raw_input: Any, default_values: dict[str, Any] | 
     port_id = _compact_port_id(raw_input)
     defaults = default_values if isinstance(default_values, dict) else {}
     inline_default = isinstance(raw_input, dict) and "default" in raw_input
-    default_present = inline_default or (bool(port_id) and port_id in defaults)
+    # ``options.font`` is a field default owned by the declared structured
+    # ``options`` input; it is not a second logical port.
+    default_present = inline_default or (
+        bool(port_id)
+        and any(key == port_id or key.startswith(f"{port_id}.") for key in defaults)
+    )
     explicitly_optional = isinstance(raw_input, dict) and raw_input.get("required") is False
     return {
         "required": not explicitly_optional,
@@ -1741,7 +1746,9 @@ type-table projection: for example an indexed list source may satisfy two
 distinct document inputs when their declared meanings support that choice.
 For required_runtime_input choose one valid platform input or preceding member
 output. For optional_runtime_input bind only when a valid source already exists;
-otherwise leave it unbound. For derived_input choose only a preceding member
+its declared default is also a valid frozen source, so a defaulted slot may
+remain unbound. Never assume that an unbound, non-defaulted parameter will be
+invented during script generation. For derived_input choose only a preceding member
 output. For every required platform output choose the frozen FunctionItem output.
 Record each choice in structured logical binding fields.
 

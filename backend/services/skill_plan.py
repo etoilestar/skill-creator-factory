@@ -400,6 +400,16 @@ def _port_identifier(value: object) -> str:
     return str(value or "").strip()
 
 
+def _default_resolves_to_input(default_key: object, input_names: set[str]) -> bool:
+    """Return whether a default addresses a declared input or one of its fields."""
+    if not isinstance(default_key, str) or not default_key:
+        return False
+    # Preserve the dotted path: this validator checks contract ownership only;
+    # runtime IO mapping remains responsible for representation conversion.
+    root = default_key.split(".", 1)[0]
+    return bool(root) and root in input_names
+
+
 def _normalize_port_array(value: object, *, source: str, index: int, field: str) -> list[object]:
     if not isinstance(value, list):
         raise ValueError(f"{source}.function_items[{index}].{field} must be an array")
@@ -490,7 +500,13 @@ def normalize_structured_function_items(raw_items: object, *, source: str = "pla
         inline_defaults: dict[str, object] = {}
         for raw_input in inputs:
             if isinstance(raw_input, dict):
+                if "required" in raw_input and not isinstance(raw_input.get("required"), bool):
+                    invalid.append({"index": index, "field": "inputs.required", "reason": "must_be_boolean"})
+                    continue
                 normalized_inputs.append(raw_input)
+                input_name = _port_identifier(raw_input)
+                if input_name and "default" in raw_input:
+                    inline_defaults[input_name] = raw_input.get("default")
                 continue
             input_name, inline_default = parse_schema_input_item(raw_input)
             has_inline_default = "=" in raw_input or bool(re.search(r"(?:default|默认|缺省)", raw_input, re.I))
@@ -504,8 +520,8 @@ def normalize_structured_function_items(raw_items: object, *, source: str = "pla
             continue
         default_values = {**inline_defaults, **default_values}
         input_names = {_port_identifier(value) for value in inputs}
-        if any(not isinstance(key, str) or key not in input_names for key in default_values):
-            invalid.append({"index": index, "field": "default_values", "reason": "keys_must_be_declared_inputs"})
+        if any(not _default_resolves_to_input(key, input_names) for key in default_values):
+            invalid.append({"index": index, "field": "default_values", "reason": "keys_must_resolve_to_declared_inputs"})
             continue
         constraints = item.get("constraints")
         if not isinstance(constraints, list) or not all(isinstance(constraint, dict) for constraint in constraints):
@@ -893,9 +909,14 @@ def structured_responsibility_graph_input_provenance_gaps(
         for edge in normalized_edges
     }
     defaults = {
-        (str(item["target_file"]), str(input_name))
+        (str(item["target_file"]), input_name)
         for item in normalized_function_items
-        for input_name in (item.get("default_values") or {})
+        for raw_input in item["inputs"]
+        for input_name in [_port_identifier(raw_input)]
+        if any(
+            _default_resolves_to_input(default_key, {input_name})
+            for default_key in (item.get("default_values") or {})
+        )
     }
     return [
         (str(item["target_file"]), input_name)

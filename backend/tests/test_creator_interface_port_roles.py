@@ -58,11 +58,11 @@ def test_optional_input_without_source_passes():
     assert not any(x["code"] == "uncovered_required_logical_input" for x in issues([], items))
 
 
-def test_optional_input_with_wrong_source_fails_provenance():
+def test_semantic_annotations_do_not_bind_or_reject_runtime_sources():
     items = [member("scripts/a.py", [port("input", "optional_runtime_input", "wanted")], [port("value", "runtime_output")])]
     contract = boundary("external")
     contract["platform_skill_boundary"]["input_schemas"]["external"]["semantic_type"] = "other"
-    assert any(x["error_type"] == "provenance_error" for x in issues([p2m("external")], items, contract))
+    assert not any(x["error_type"] == "provenance_error" for x in issues([p2m("external")], items, contract))
 
 
 def test_derived_input_from_preceding_intermediate_output_passes():
@@ -73,13 +73,23 @@ def test_derived_input_from_preceding_intermediate_output_passes():
     assert not any(x["error_type"] == "provenance_error" for x in issues([m2m()], items))
 
 
-def test_derived_input_from_platform_fails():
+def test_runtime_source_role_is_not_creator_validation():
     items = [member("scripts/a.py", [port("input", "derived_input")], [port("value", "runtime_output")])]
-    assert any(x["error_type"] == "provenance_error" for x in issues([p2m("external")], items))
+    assert not any(x["error_type"] == "provenance_error" for x in issues([p2m("external")], items))
 
 
-@pytest.mark.parametrize("source_type", ["file", "image", "object"])
-def test_semantic_output_mapping_leaves_representation_to_runtime(source_type):
+def test_required_input_without_platform_mapping_is_a_valid_creator_contract():
+    items = [member("scripts/a.py", [port("key_column", "required_runtime_input")], [port("value", "runtime_output")])]
+    assert not any(x["code"] == "uncovered_required_logical_input" for x in issues([], items))
+
+
+def test_declared_interface_requires_compatible_data_types():
+    items = [member("scripts/a.py", [port("input", "optional_runtime_input", schema_type="number")], [port("value", "runtime_output")])]
+    assert any(x["code"] == "incompatible_interface_types" for x in issues([p2m("external")], items))
+
+
+def test_compatible_output_mapping_passes():
+    source_type = "string"
     items = [member("scripts/a.py", [], [port("value", "runtime_output", schema_type=source_type)])]
     plan = {"interfaces": [{"interface_id": "I1", "kind": "member_to_platform",
         "source_member": "scripts/a.py", "source_output": "value",
@@ -87,6 +97,18 @@ def test_semantic_output_mapping_leaves_representation_to_runtime(source_type):
     contract = {"platform_skill_boundary": {"final_output_fields": ["result"],
         "output_sinks": {"result": {"value_schema": {"type": "string"}}}}}
     assert collect_interface_plan_validation_issues(plan=plan, function_items=items, platform_contract=contract) == []
+
+
+def test_incompatible_output_mapping_is_rejected():
+    items = [member("scripts/a.py", [], [port("value", "runtime_output", schema_type="object")])]
+    plan = {"interfaces": [{"interface_id": "I1", "kind": "member_to_platform",
+        "source_member": "scripts/a.py", "source_output": "value",
+        "target_platform_output": "result", "semantic_reason": "final result"}]}
+    contract = {"platform_skill_boundary": {"final_output_fields": ["result"],
+        "output_sinks": {"result": {"value_schema": {"type": "string"}}}}}
+    assert any(issue["code"] == "incompatible_interface_types" for issue in
+               collect_interface_plan_validation_issues(
+                   plan=plan, function_items=items, platform_contract=contract))
 
 
 def test_transform_is_not_part_of_interface_contract():

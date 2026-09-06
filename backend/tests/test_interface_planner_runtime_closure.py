@@ -18,9 +18,9 @@ def _item(element_type: str) -> dict:
         "role": "worker",
         "purpose": "compare the two semantically selected inputs",
         "inputs": [
-            {"port_id": "left_file" if element_type == "file" else "image_a",
+            {"port_id": "left_file" if element_type == "file" else "source_image",
              "role": "required_runtime_input", "contract": {"type": element_type}},
-            {"port_id": "right_file" if element_type == "file" else "image_b",
+            {"port_id": "right_file" if element_type == "file" else "reference_image",
              "role": "required_runtime_input", "contract": {"type": element_type}},
         ],
         "outputs": [
@@ -62,7 +62,7 @@ def _contains_forbidden_conversion_field(value) -> bool:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("element_type", "source", "targets"), [
     ("file", "input_files", ("left_file", "right_file")),
-    ("image", "images", ("image_a", "image_b")),
+    ("image", "images", ("source_image", "reference_image")),
 ])
 async def test_semantic_list_mapping_reaches_runtime_by_index(
     element_type, source, targets,
@@ -83,6 +83,13 @@ async def test_semantic_list_mapping_reaches_runtime_by_index(
         assert {candidate["target_contract"]["type"] for candidate in source_candidates} == {
             element_type
         }
+        assert {candidate["source_capabilities"]["element_type"] for candidate in source_candidates} == {
+            element_type
+        }
+        assert all(
+            candidate["source_capabilities"]["supports_index_selection"]
+            for candidate in source_candidates
+        )
         assert payload["runtime_capability_summary"]["indexed_source_paths"] is True
         return json.dumps({"interfaces": [
             {
@@ -129,3 +136,54 @@ async def test_semantic_list_mapping_reaches_runtime_by_index(
         resolve_context_value(runtime_context, f"{source}.{binding['source_key']}")
         for binding in bindings
     ] == ["first-value", "second-value"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("source_output", "output_type"), [
+    ("report", "string"),
+    ("generated_file", "file"),
+])
+async def test_semantic_output_mapping_needs_no_conversion_field(source_output, output_type):
+    items = [{
+        "target_file": "scripts/generate.py", "role": "worker", "purpose": "generate result",
+        "inputs": [],
+        "outputs": [{"port_id": source_output, "role": "runtime_output",
+                     "contract": {"type": output_type}}],
+        "default_values": {}, "constraints": [], "required_capabilities": [],
+    }]
+    platform = {"platform_skill_boundary": {
+        "input_envelope_fields": [],
+        "final_output_fields": ["final_result"],
+        "required_final_output_fields": ["final_result"],
+        "output_sinks": {"final_result": {
+            "name": "final_result", "value_schema": {"type": output_type},
+        }},
+        "runtime_capability_summary": {"representation_adaptation": "runtime-owned"},
+    }}
+
+    async def planner(messages, _model):
+        candidates = json.loads(messages[1]["content"])["semantic_mapping_candidates"]
+        assert candidates["output_mappings"] == [{
+            "source_member": "scripts/generate.py", "source_output": source_output,
+            "target_platform_output": "final_result",
+            "source_contract": {"type": output_type},
+            "target_contract": {"type": output_type},
+        }]
+        return json.dumps({"interfaces": [{
+            "interface_id": "I1", "kind": "member_to_platform",
+            "source_member": "scripts/generate.py", "source_output": source_output,
+            "target_platform_output": "final_result",
+            "semantic_reason": "the generated value is the requested final result",
+        }]})
+
+    plan = await plan_function_item_interfaces(
+        original_user_goal="generate the final result", frozen_function_items=items,
+        platform_contract=platform, planner_model="planner", model_call=planner,
+    )
+    canonical = build_canonical_interface_contract(
+        plan=plan, function_items=items, platform_contract=platform,
+    )
+    assert not _contains_forbidden_conversion_field(plan)
+    assert not _contains_forbidden_conversion_field(canonical)
+    assert canonical["interfaces"][0]["source"]["field"] == source_output
+    assert canonical["interfaces"][0]["target"]["field"] == "final_result"

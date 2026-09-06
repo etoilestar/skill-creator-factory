@@ -1229,6 +1229,7 @@ def build_semantic_mapping_candidates(
                     source_port = next(value for value in source_item["outputs"] if value["name"] == candidate["source_output"])
                     source_contract = dict(source_port.get("contract") or {})
                 candidate["source_contract"] = source_contract
+                candidate["source_capabilities"] = _semantic_source_capabilities(source_contract)
                 candidate["target_contract"] = dict(port.get("contract") or {})
             input_candidates.extend(candidates)
     output_candidates = [
@@ -1240,6 +1241,22 @@ def build_semantic_mapping_candidates(
         for target in sorted(platform_output_names(platform_contract))
     ]
     return {"input_mappings": input_candidates, "output_mappings": output_candidates}
+
+
+def _semantic_source_capabilities(contract: dict[str, Any]) -> dict[str, Any]:
+    """Describe generic selection affordances without choosing a mapping."""
+    raw_type = str(contract.get("type") or "").strip()
+    element_type: str | None = None
+    if raw_type.lower().startswith("list[") and raw_type.endswith("]"):
+        element_type = raw_type[5:-1].strip() or None
+    elif raw_type.lower() in {"array", "list"}:
+        items = contract.get("items")
+        if isinstance(items, dict):
+            element_type = _schema_type(items)
+    return {
+        "element_type": element_type,
+        "supports_index_selection": element_type is not None,
+    }
 
 
 def _schema_type(schema: dict[str, Any]) -> str | None:

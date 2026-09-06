@@ -1095,48 +1095,6 @@ def validate_interface_intent_plan(*, plan: dict[str, Any], function_items: list
     )
     return {"interfaces": normalized}
 
-def _walk_platform_schema(schema: dict[str, Any], path: tuple[str, ...] = ()):
-    """Yield declared schema nodes without deriving paths from receiver names."""
-    yield path, schema
-    properties = schema.get("properties")
-    if isinstance(properties, dict):
-        for name, child in properties.items():
-            if isinstance(name, str) and isinstance(child, dict):
-                yield from _walk_platform_schema(child, (*path, name))
-
-
-def _declared_schema_type(schema: dict[str, Any]) -> tuple[str, Any] | None:
-    """Return a structural type identity without consulting a port name.
-
-    Both the compact ``list[T]`` notation used by some platform contracts and
-    JSON Schema's ``array``/``items`` notation are accepted.  Object identities
-    include their declared property shapes so that unrelated objects are not
-    treated as interchangeable merely because both say ``object``.
-    """
-    raw_type = schema.get("type")
-    if not isinstance(raw_type, str) or not raw_type.strip():
-        return None
-    type_name = raw_type.strip().lower()
-    if type_name.startswith("list[") and type_name.endswith("]"):
-        element = type_name[5:-1].strip()
-        return ("list", (element, None)) if element else None
-    if type_name in {"array", "list"}:
-        items = schema.get("items")
-        element = _declared_schema_type(items) if isinstance(items, dict) else None
-        return "list", element
-    if type_name == "object":
-        properties = schema.get("properties")
-        if not isinstance(properties, dict):
-            return "object", None
-        shape = tuple(sorted(
-            (name, _declared_schema_type(child))
-            for name, child in properties.items()
-            if isinstance(name, str) and isinstance(child, dict)
-        ))
-        return "object", shape
-    return type_name, None
-
-
 def build_runtime_binding_facts(
     *, function_items: list[dict[str, Any]], platform_contract: dict[str, Any] | None,
 ) -> dict[str, dict[str, dict[str, list[dict[str, Any]]]]]:
@@ -1254,16 +1212,30 @@ def build_semantic_mapping_candidates(
     compact = _compact_function_items(function_items)
     boundary = (platform_contract or {}).get("platform_skill_boundary", platform_contract or {})
     platform_inputs = {_compact_port_id(value) for value in boundary.get("input_envelope_fields") or []}
+    platform_input_schemas = boundary.get("input_schemas") if isinstance(boundary.get("input_schemas"), dict) else {}
+    platform_output_sinks = boundary.get("output_sinks") if isinstance(boundary.get("output_sinks"), dict) else {}
     input_candidates: list[dict[str, Any]] = []
     for item in compact:
         for port in item["inputs"]:
-            input_candidates.extend(generate_provenance_candidates(
+            candidates = generate_provenance_candidates(
                 target_member=item["target_file"], target_input=port["name"],
                 compact_function_items=compact, platform_inputs=platform_inputs,
-            ))
+            )
+            for candidate in candidates:
+                if candidate["kind"] == "platform_to_member":
+                    source_contract = dict(platform_input_schemas.get(candidate["source_platform_input"]) or {})
+                else:
+                    source_item = next(value for value in compact if value["target_file"] == candidate["source_member"])
+                    source_port = next(value for value in source_item["outputs"] if value["name"] == candidate["source_output"])
+                    source_contract = dict(source_port.get("contract") or {})
+                candidate["source_contract"] = source_contract
+                candidate["target_contract"] = dict(port.get("contract") or {})
+            input_candidates.extend(candidates)
     output_candidates = [
         {"source_member": item["target_file"], "source_output": port["name"],
-         "target_platform_output": target}
+         "target_platform_output": target,
+         "source_contract": dict(port.get("contract") or {}),
+         "target_contract": dict((platform_output_sinks.get(target) or {}).get("value_schema") or {})}
         for item in compact for port in item["outputs"]
         for target in sorted(platform_output_names(platform_contract))
     ]

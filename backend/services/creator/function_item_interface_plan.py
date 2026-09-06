@@ -16,7 +16,7 @@ from typing import Any
 
 from ..skill_plan import GraphValidationError, normalize_structured_function_items
 from ..platform_io_contract import (
-    OUTPUT_TRANSFORM_REGISTRY, get_platform_output_sink, platform_output_names,
+    get_platform_output_sink, platform_output_names,
 )
 from .bounded_refinement import (
     BoundedRefinementFailed,
@@ -60,7 +60,7 @@ Allowed decisions:
 2. source member output
 3. target member input
 4. target platform output
-5. explicit transform
+5. no conversion operation: representation adaptation belongs to runtime
 
 The planner must not infer new semantics.
 """
@@ -131,10 +131,9 @@ A valid source must be able to provide the semantic value required by the
 target.  Source existence, name similarity, and schema convertibility are not
 evidence of that fact.  Never create a binding merely to close coverage.
 
-Compatibility is evaluated from the declared source role, source schema,
-source origin, target role, target schema, and an explicitly registered
-transform.  A transform adapts representation; it never invents semantic
-provenance.  An optional input with no valid source remains unbound.  A derived
+Compatibility is evaluated from the declared source role, source origin, and
+target role. Representation conversion is a runtime capability, not interface
+planning information. An optional input with no valid source remains unbound. A derived
 input accepts only a preceding FunctionItem output and never a platform input.
 """
 
@@ -144,7 +143,7 @@ INPUT_PORT_ROLES = frozenset({
 OUTPUT_PORT_ROLES = frozenset({"runtime_output", "intermediate_output"})
 REVIEW_ERROR_TYPES = frozenset({
     "binding_error", "provenance_error", "missing_source_error",
-    "invalid_transform_error", "schema_error",
+    "schema_error",
 })
 
 PLATFORM_OUTPUT_MAPPING_CONTRACT = """PLATFORM OUTPUT MAPPING CONTRACT
@@ -153,16 +152,9 @@ FunctionItem outputs and platform outputs belong to different semantic layers.
 
 FunctionItem outputs and platform outputs are different semantic layers.
 
-A declared transform represents a boundary adaptation.
-
-The reviewer MUST NOT reject a mapping only because source schema and target
-schema differ, when the declared transform is registered and its source/target
-contracts match.
-
-Examples:
-
-- object -> text with json_serialize is valid.
-- file_path -> file_outputs with file_collect is valid.
+Representation conversion is a runtime capability, not interface planning
+information. The reviewer MUST NOT reject a mapping only because source and
+target schemas differ.
 
 The reviewer should judge whether semantic meaning is preserved, not require
 structural schema equality.
@@ -241,13 +233,11 @@ The reviewer evaluates semantic compatibility only after deterministic
 validation has established that target_platform_output belongs to the declared
 platform contract.
 
-OUTPUT ADAPTER CONTRACT
-
-transform MUST be selected from the declared OUTPUT_TRANSFORM_REGISTRY. Each
-adapter declares the source_type values it accepts and the target_type/schema
-it produces. The planner MUST NOT invent a transform based only on semantic
-relatedness. Direct mapping is permitted only when source and target types are
-equal; adapter mapping is permitted only when both sides match the adapter.
+Interface planning only determines semantic connections.
+The planner MUST NOT generate conversion operations.
+The planner MUST NOT invent transform names.
+A valid interface describes source port -> target port.
+Representation conversion is handled by the runtime capability layer.
 """
 
 RUNTIME_INPUT_PROVENANCE_CONTRACT = """RUNTIME INPUT PROVENANCE CONTRACT
@@ -339,7 +329,7 @@ Repair MUST NOT:
 Repair MUST ONLY:
 - remove invalid interface
 - replace source using provided allowed_sources
-- replace transform using provided transform registry
+- replace target using declared ports
 
 All replacement sources MUST exist in runtime_binding_facts.
 """
@@ -469,29 +459,8 @@ win over the previous candidate. Minimize edits only among candidates that fully
 satisfy all acceptance facts. Never preserve invalid or incomplete semantic state
 merely to minimize changes."""
 INTERFACE_KINDS = {"platform_to_member", "member_to_member", "member_to_platform"}
-# Output transforms are adapters, not free-form planner annotations.  Their
-# contracts are intentionally expressed in terms of value types/schemas rather
-# than output field names, so the same adapter can be used with any compatible
-# platform output namespace.
-MEMBER_TO_PLATFORM_TRANSFORMS = frozenset(OUTPUT_TRANSFORM_REGISTRY)
+# Transform is a runtime capability, not interface planning information.
 
-
-def _resolve_effective_interface_type(
-    *, source_type: str, transform: str | None,
-) -> str | None:
-    """Resolve the effective value type after a declared output transform."""
-    normalized_source = str(source_type or "").strip()
-    if not transform:
-        return normalized_source
-    adapter = OUTPUT_TRANSFORM_REGISTRY.get(transform)
-    if not adapter:
-        return None
-    accepted_types = adapter.get("input_types", ())
-    if isinstance(accepted_types, str):
-        accepted_types = (accepted_types,)
-    if normalized_source not in accepted_types:
-        return None
-    return str(adapter.get("result_type") or "").strip()
 
 
 REPAIRABLE_INTERFACE_ISSUES = frozenset({
@@ -499,7 +468,6 @@ REPAIRABLE_INTERFACE_ISSUES = frozenset({
     "missing_target_binding",
     "invalid_source_port",
     "invalid_target_port",
-    "transform_missing",
 })
 _DANGEROUS_PATH_PARTS = {"__proto__", "prototype", "constructor"}
 INTERFACE_FIELDS = {
@@ -507,18 +475,13 @@ INTERFACE_FIELDS = {
     "member_to_member": {"interface_id", "kind", "source_member", "source_output", "target_member", "target_input", "goal"},
     "member_to_platform": {"interface_id", "kind", "source_member", "source_output", "target_platform_output", "goal"},
 }
-OPTIONAL_INTERFACE_FIELDS = {
-    "platform_to_member": set(),
-    "member_to_member": set(),
-    "member_to_platform": {"transform"},
-}
+OPTIONAL_INTERFACE_FIELDS = {kind: set() for kind in INTERFACE_KINDS}
 INTERFACE_SCHEMA: dict[str, Any] = {
     "type": "object", "additionalProperties": False, "required": ["interfaces"],
     "properties": {"interfaces": {"type": "array", "items": {"oneOf": [
         {"type": "object", "additionalProperties": False, "required": sorted(fields),
          "properties": {
              **{key: ({"const": kind} if key == "kind" else {"type": "array", "items": {"type": "string", "minLength": 1}} if key == "source_path" else {"type": "string", "minLength": 1}) for key in fields},
-             **({"transform": {"enum": sorted(MEMBER_TO_PLATFORM_TRANSFORMS)}} if kind == "member_to_platform" else {}),
          }}
         for kind, fields in INTERFACE_FIELDS.items()
     ]}}},
@@ -529,7 +492,7 @@ INTERFACE_PATCH_SCHEMA: dict[str, Any] = {
     "properties": {"operations": {"type": "array", "items": {
         "type": "object", "required": ["op", "interface_id", "reason"],
         "properties": {
-            "op": {"enum": ["remove_interface", "replace_source", "replace_target", "replace_transform"]},
+            "op": {"enum": ["remove_interface", "replace_source", "replace_target"]},
             "interface_id": {"type": "string", "minLength": 1},
             "reason": {"type": "string", "minLength": 1, "maxLength": 200},
             "source_platform_input": {"type": "string", "minLength": 1},
@@ -539,7 +502,6 @@ INTERFACE_PATCH_SCHEMA: dict[str, Any] = {
             "target_member": {"type": "string", "minLength": 1},
             "target_input": {"type": "string", "minLength": 1},
             "target_platform_output": {"type": "string", "minLength": 1},
-            "transform": {"type": ["string", "null"]},
         }, "additionalProperties": False,
     }}},
 }
@@ -580,18 +542,15 @@ def validate_interface_patch_protocol(patch: Any) -> dict[str, Any]:
         if not isinstance(operation, dict) or not common <= set(operation):
             raise InterfaceIntentPlanError("patch operation fields are invalid", code="invalid_interface_patch", details={"path": path})
         op = operation.get("op")
-        if op not in {"remove_interface", "replace_source", "replace_target", "replace_transform"}:
+        if op not in {"remove_interface", "replace_source", "replace_target"}:
             raise InterfaceIntentPlanError("patch operation is unsupported", code="invalid_interface_patch", details={"path": f"{path}.op"})
         allowed_fields = {
             "remove_interface": common,
-            "replace_transform": common | {"transform"},
             "replace_source": common | {"source_platform_input", "source_path", "source_member", "source_output"},
             "replace_target": common | {"target_member", "target_input", "target_platform_output"},
         }[op]
         if not set(operation) <= allowed_fields:
             raise InterfaceIntentPlanError("patch operation contains fields invalid for op", code="invalid_interface_patch", details={"path": path})
-        if op == "replace_transform" and "transform" not in operation:
-            raise InterfaceIntentPlanError("replace_transform lacks transform", code="invalid_interface_patch", details={"path": path})
         if op == "replace_source":
             platform_source = "source_platform_input" in operation and "source_path" in operation
             member_source = "source_member" in operation and "source_output" in operation
@@ -649,15 +608,12 @@ def apply_interface_patch(
                 current.update(kind="member_to_member", source_member=operation["source_member"], source_output=operation["source_output"])
             else:
                 raise InterfaceIntentPlanError("replace_source lacks source fields", code="invalid_interface_patch", details={"interface_id": iid})
-        elif op == "replace_transform":
-            if operation.get("transform") is None: current.pop("transform", None)
-            else: current["transform"] = operation["transform"]
         elif op == "replace_target":
             if "target_platform_output" in operation:
                 current.pop("target_member", None); current.pop("target_input", None)
                 current.update(kind="member_to_platform", target_platform_output=operation["target_platform_output"])
             else:
-                current.pop("target_platform_output", None); current.pop("transform", None)
+                current.pop("target_platform_output", None)
                 current.update(target_member=operation["target_member"], target_input=operation["target_input"])
         else:
             raise InterfaceIntentPlanError("unsupported interface patch operation", code="invalid_interface_patch", details={"op": op})
@@ -710,7 +666,7 @@ directly.  Do NOT infer interface bindings from graph node names, blueprint
 descriptions, or FunctionItem/function descriptions.
 
 The canonical projection of every binding contains direction, source
-(kind/field/schema), target (kind/field), and transform.  A dotted source field
+(kind/field/schema), target (kind/field), A dotted source field
 is a real path declared by the platform input contract; words such as options,
 config, and params have no special meaning and are neither forbidden nor
 implicitly inserted.  Generated command variables and script argv keys equal
@@ -727,7 +683,7 @@ def build_canonical_interface_contract(
     The planner wire format retains endpoint member identifiers needed by graph
     materialization.  This projection deliberately contains only binding facts
     consumed by generators, preventing those stages from reconstructing paths,
-    names, schemas, or transforms from descriptive text.
+    names or schemas from descriptive text.
     """
     validated = validate_interface_intent_plan(plan=plan, function_items=function_items)
     compact = _compact_function_items(function_items)
@@ -792,7 +748,6 @@ def build_canonical_interface_contract(
             "direction": direction,
             "source": source,
             "target": target,
-            "transform": interface.get("transform"),
             "runtime_provenance": runtime_provenance,
         })
     return {"interfaces": interfaces}
@@ -1041,6 +996,9 @@ def validate_interface_plan_protocol(plan: dict[str, Any]) -> dict[str, Any]:
         path = f"$.interfaces[{index}]"
         if not isinstance(raw, dict):
             _raise("interface must be an object", "invalid_interface_protocol", path=path)
+        # Historical plans may carry a planner-selected transform.  It is not
+        # part of the canonical Interface Contract and is ignored on load.
+        raw = {key: value for key, value in raw.items() if key != "transform"}
         kind = raw.get("kind")
         if kind not in INTERFACE_KINDS:
             _raise("interface kind is invalid", "invalid_interface_kind", path=f"{path}.kind")
@@ -1055,8 +1013,6 @@ def validate_interface_plan_protocol(plan: dict[str, Any]) -> dict[str, Any]:
         _require_nonempty_string(raw, "goal", "invalid_interface_protocol", f"{path}.goal")
         for field in expected - {"interface_id", "kind", "goal", "source_path"}:
             _require_nonempty_string(raw, field, "invalid_interface_protocol", f"{path}.{field}")
-        if kind == "member_to_platform" and "transform" in raw and raw["transform"] not in MEMBER_TO_PLATFORM_TRANSFORMS:
-            _raise("member_to_platform transform is invalid", "invalid_interface_transform", path=f"{path}.transform")
         if kind == "platform_to_member":
             source_path = raw.get("source_path")
             if not isinstance(source_path, list) or any(not isinstance(part, str) or not part or part.lower() in _DANGEROUS_PATH_PARTS for part in source_path):
@@ -1096,8 +1052,6 @@ def validate_interface_intent_plan(*, plan: dict[str, Any], function_items: list
         seen_ids.add(interface_id)
         _require_nonempty_string(raw_interface, "goal", "invalid_interface_protocol", f"{path}.goal")
         interface = dict(raw_interface)
-        if kind == "member_to_platform" and "transform" in interface and interface["transform"] not in MEMBER_TO_PLATFORM_TRANSFORMS:
-            _raise("member_to_platform transform is invalid", "invalid_interface_transform", path=f"{path}.transform")
         if kind in {"member_to_member", "member_to_platform"}:
             source = _require_nonempty_string(raw_interface, "source_member", "invalid_interface_member", f"{path}.source_member")
             if source not in frozen_targets:
@@ -1275,13 +1229,13 @@ def _semantic_identity(contract: dict[str, Any]) -> str:
 
 def semantic_provenance_compatibility(
     *, source_role: str, source_schema: dict[str, Any], source_origin: str,
-    target_role: str, target_schema: dict[str, Any], transform: str | None = None,
+    target_role: str, target_schema: dict[str, Any],
 ) -> tuple[bool, str]:
     """Deterministically validate a declared semantic transfer.
 
     Missing semantic annotations are treated as unknown for compatibility with
     persisted contracts.  When both endpoints declare identities they must
-    agree.  Structural conversion is legal only through a registered adapter.
+    agree. Representation differences are deliberately left to runtime adaptation.
     """
     if target_role == "derived_input" and source_role != "intermediate_output":
         return False, "derived inputs require an intermediate FunctionItem output"
@@ -1292,19 +1246,6 @@ def semantic_provenance_compatibility(
     target_semantic = _semantic_identity(target_schema)
     if source_semantic and target_semantic and source_semantic != target_semantic:
         return False, "source and target semantic identities differ"
-    source_type, target_type = _schema_type(source_schema), _schema_type(target_schema)
-    if transform:
-        effective_type = _resolve_effective_interface_type(
-            source_type=source_type or "", transform=transform,
-        )
-        if effective_type is None:
-            return False, "transform is invalid for source type"
-        effective_target = _semantic_identity(target_schema) or target_type
-        if effective_target and effective_type != effective_target:
-            return False, "transform result type does not match target type"
-        return True, "declared transform resolves source and target compatibility"
-    if source_type and target_type and source_type != target_type:
-        return False, "source and target schemas differ without a declared transform"
     return True, "declared provenance contracts are compatible"
 
 def collect_interface_plan_validation_issues(
@@ -1408,59 +1349,6 @@ def collect_interface_plan_validation_issues(
             if target not in platform_outputs: issue("unknown_platform_logical_output", f"{path}.target_platform_output", iid, target, sorted(platform_outputs))
             else:
                 covered_platform.add(target)
-                source_schema = output_schemas.get((source, output), {})
-                sink = get_platform_output_sink(platform_contract, target)
-                target_schema = {
-                    **((sink or {}).get("value_schema", {})),
-                    "semantic_type": (sink or {}).get("semantic_type", ""),
-                }
-                transform = interface.get("transform")
-                source_type = _schema_type(source_schema)
-                target_type = (sink or {}).get("semantic_type") or _schema_type(target_schema)
-                accepted_sources = set((sink or {}).get("accepted_source_types") or [])
-                allowed_transforms = set((sink or {}).get("allowed_transforms") or [])
-                source_semantic = _semantic_identity(source_schema) or source_type
-                adapter = OUTPUT_TRANSFORM_REGISTRY.get(transform) if transform else None
-                effective_type = _resolve_effective_interface_type(
-                    source_type=source_semantic or "", transform=transform,
-                )
-                result_type = effective_type if transform else _canonical_semantic_type(effective_type)
-                if transform and adapter is None:
-                    issue(
-                        "transform_unknown", f"{path}.transform", iid,
-                        {"source_type": source_semantic, "transform": transform, "result_type": result_type, "target_type": target_type},
-                        "transform must be registered", error_type="invalid_transform_error",
-                    )
-                elif transform and effective_type is None:
-                    issue(
-                        "transform_input_type_invalid", f"{path}.transform", iid,
-                        {"source_type": source_semantic, "transform": transform, "result_type": result_type, "target_type": target_type},
-                        "transform must accept the source type", error_type="invalid_transform_error",
-                    )
-                elif transform and effective_type != target_type:
-                    issue(
-                        "transform_result_type_mismatch", f"{path}.transform", iid,
-                        {"source_type": source_semantic, "transform": transform, "result_type": result_type, "target_type": target_type},
-                        "transform result type must match the target contract", error_type="invalid_transform_error",
-                    )
-                elif transform and transform not in allowed_transforms:
-                    issue(
-                        "transform_unknown", f"{path}.transform", iid,
-                        {"source_type": source_semantic, "transform": transform, "result_type": result_type, "target_type": target_type},
-                        "transform must be allowed by the target contract", error_type="invalid_transform_error",
-                    )
-                elif not transform and source_semantic and target_type and result_type != target_type:
-                    issue(
-                        "transform_missing", path, iid,
-                        {"source_type": source_semantic, "transform": None, "result_type": source_semantic, "target_type": target_type},
-                        "direct output must already have the target semantic type; otherwise declare an allowed transform", error_type="schema_error",
-                    )
-                elif not transform and source_semantic and source_semantic not in accepted_sources:
-                    issue(
-                        "platform_output_source_type_rejected", path, iid,
-                        {"source_type": source_semantic, "transform": transform, "result_type": result_type, "target_type": target_type},
-                        sorted(accepted_sources), error_type="schema_error",
-                    )
     for (member, slot), sources in sorted(slot_sources.items()):
         distinct_sources = sorted(set(sources))
         if len(sources) > 1:
@@ -1617,8 +1505,7 @@ def build_interface_repair_scope(
         "binding_error": {"reselect_legal_source"},
         "provenance_error": {"reselect_legal_source", "reclassify_input_role", "make_input_optional"},
         "missing_source_error": {"request_additional_input"},
-        "invalid_transform_error": {"adjust_source_transform_or_target", "select_registered_transform"},
-        "schema_error": {"adjust_source_transform_or_target", "restore_declared_schema_binding"},
+        "schema_error": {"replace_source_or_target", "restore_declared_binding"},
     }
     error_types = {str(issue.get("error_type") or "binding_error") for issue in validation_issues}
     return {
@@ -1717,7 +1604,7 @@ def canonical_logical_binding_signatures(plan: dict[str, Any]) -> tuple[tuple[An
         elif kind == "member_to_member":
             signature = (kind, value.get("source_member"), value.get("source_output"), value.get("target_member"), value.get("target_input"))
         elif kind == "member_to_platform":
-            signature = (kind, value.get("source_member"), value.get("source_output"), value.get("target_platform_output"), value.get("transform"))
+            signature = (kind, value.get("source_member"), value.get("source_output"), value.get("target_platform_output"))
         else:
             signature = (str(kind), json.dumps(value, sort_keys=True, default=str))
         signatures.append(signature)
@@ -1754,9 +1641,6 @@ def _interface_plan_prompt() -> str:
 
     {PLATFORM_OUTPUT_MAPPING_CONTRACT}
 
-    DECLARED OUTPUT_TRANSFORM_REGISTRY:
-    {json.dumps(OUTPUT_TRANSFORM_REGISTRY, ensure_ascii=False, default=list)}
-
     {PLATFORM_BOUNDARY_CONTRACT}
 
     {SOURCE_PROVENANCE_CONTRACT}
@@ -1791,10 +1675,10 @@ source_path, target_member, target_input, goal.
 member_to_member always contains: interface_id, kind, source_member,
 source_output, target_member, target_input, goal.
 member_to_platform always contains: interface_id, kind, source_member,
-source_output, target_platform_output, goal, and may contain transform.
-When source and target types differ, select a transform from the declared
-OUTPUT_TRANSFORM_REGISTRY whose source_type and target_type match both schemas.
-Never invent a transform merely because two values are semantically related.
+source_output, target_platform_output, goal.
+Interface planning only determines semantic connections. The planner MUST NOT
+generate conversion operations or invent transform names. Representation
+conversion is handled by the runtime capability layer.
 This wire contract and INTERFACE_SCHEMA describe the same protocol. Do not omit
 a required field because its value is empty-like; source_path=[] is the explicit
 representation of whole-slot platform binding.
@@ -1911,7 +1795,7 @@ INTERFACE_REVIEW_SCHEMA = {
     "passed": "boolean",
     "issues": [
         {
-            "error_type": "binding_error | provenance_error | missing_source_error | invalid_transform_error | schema_error",
+            "error_type": "binding_error | provenance_error | missing_source_error | schema_error",
             "message": "string",
             "affected_interfaces": ["string"],
             "affected_inputs": [
@@ -2220,14 +2104,8 @@ A plausible goal cannot make an incorrect structured source/target binding valid
             ->
     target_platform_output
 
-    A declared transform is part of this compatibility check. Transform
-    registration and schema compatibility have already been checked
-    deterministically. Review only whether that transform preserves the
-    intended business meaning.
-
-    Do not report that mapping as a type mismatch merely because its endpoint
-    schemas differ when the registered transform matches both contracts. Judge
-    whether the boundary adaptation preserves the semantic meaning instead.
+    Do not report a mapping as a type mismatch merely because its endpoint
+    schemas differ. Representation adaptation is resolved only at runtime.
 
 
     The reviewer checks semantic compatibility only.
@@ -2275,8 +2153,7 @@ A plausible goal cannot make an incorrect structured source/target binding valid
 
     Classify every defect by its primary failed dimension:
     binding_error (boundary/reference), provenance_error (semantic origin),
-    missing_source_error (required source absent), invalid_transform_error
-    (undeclared/incompatible adapter), or schema_error (contract structure).
+    missing_source_error (required source absent), or schema_error (contract structure).
     Independently check schema correctness, boundary correctness, and
     provenance correctness. Do not collapse these into "interface invalid".
 
@@ -2430,7 +2307,7 @@ Do not patch only visible wording. Never regenerate all interfaces for a
 semantically valid transport.
 4. CURRENT AUTHORITY
 Modify only Interfaces explicitly named by violations. Use only
-remove_interface, replace_source, replace_target, or replace_transform. Never
+remove_interface, replace_source, or replace_target. Never
 add an Interface and never regenerate or reorder the complete contract.
 5. HARD ACCEPTANCE CONDITIONS
 The complete result must match INTERFACE_SCHEMA. Every supplied acceptance fact
@@ -2460,7 +2337,7 @@ JSON matching INTERFACE_SCHEMA."""
                 "interface_patch_schema": INTERFACE_PATCH_SCHEMA,
                 "interfaces": (previous_candidate.get("interfaces") or []) if isinstance(previous_candidate, dict) else [],
                 "violations": facts,
-                "allowed_operations": ["remove_interface", "replace_source", "replace_target", "replace_transform"],
+                "allowed_operations": ["remove_interface", "replace_source", "replace_target"],
             }
             if _include_previous_interface_plan(feedback):
                 correction_payload["previous_interface_plan"] = previous_candidate
@@ -2655,7 +2532,7 @@ legal member/input domains, and repair_scope.
 2. TASK
 Repair the Interface Plan so all supplied blocking facts are resolved simultaneously.
 For a platform-output validation failure, use failed_validation_reason to repair
-only the incompatible source, transform, or target contract tuple. Do not guess
+only the incompatible source or target contract tuple. Do not guess
 a replacement output merely from its field name and do not redesign the whole
 Interface Plan.
 
@@ -2791,14 +2668,13 @@ Returning a renamed equivalent without semantic improvement is forbidden.
 
 8. OUTPUT CONTRACT
 Return only a patch object matching interface_patch_schema. The only allowed
-operations are remove_interface, replace_source, and replace_transform. Do not
+operations are remove_interface, replace_source, and replace_target. Do not
 return or regenerate the complete Interface Plan. This is a strict JSON-schema
 response: output exactly one {"operations": [...]} object and no prose. Keep
 the entire response concise and every reason at or below 200 characters.
 
 If no valid semantic patch exists, return empty operations. Do not repeat
-unchanged values. Do not create a patch that keeps the same source, target, or
-transform.
+unchanged values. Do not create a patch that keeps the same source or target.
 """
     payload = {
         "system_goal": original_user_goal,

@@ -92,3 +92,21 @@ def test_unknown_script_parameter_is_rejected_before_generation():
             [_item(["topic"], {"unknown_parameter": "xxx"})],
             source="frozen_blueprint",
         )
+
+
+def test_optional_default_remains_on_function_item_without_platform_mapping():
+    normalized = normalize_structured_function_items(
+        [_item([{"name": "key_column", "required": False, "default": "id"}], {})],
+        source="frozen_blueprint",
+    )
+
+    assert normalized[0]["inputs"][0] == {
+        "name": "key_column", "port_id": "key_column",
+        "required": False, "default": "id",
+    }
+    assert normalized[0]["default_values"] == {"key_column": "id"}
+    issues = collect_interface_plan_validation_issues(
+        plan={"interfaces": []}, function_items=normalized, platform_contract={}
+    )
+    assert not any(issue["code"] == "uncovered_required_logical_input" for issue in issues)
+    assert all("options.key_column" not in str(issue) for issue in issues)

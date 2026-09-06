@@ -250,31 +250,29 @@ A valid interface describes source port -> target port.
 Representation conversion is handled by the runtime capability layer.
 """
 
-RUNTIME_INPUT_PROVENANCE_CONTRACT = """RUNTIME INPUT PROVENANCE CONTRACT
+RUNTIME_INPUT_PROVENANCE_CONTRACT = """RUNTIME INPUT CONTRACT BOUNDARY
 
-A normal logical FunctionItem input represents one runtime receiving slot.
-In the current execution contract, one receiving slot has one runtime
-provenance. The same source output may fan out to multiple different receiving
-slots. Multiple independent sources must not target the same logical input.
+A FunctionItem input is a reusable invocation contract.  It declares the input
+name, type, whether it is required or optional, and (when appropriate) a local
+default.  It does not declare where a future runtime obtains a user's value.
 
 RUNTIME SLOT IDENTITY RULE
 
 Each FunctionItem input declaration is an independent contract.
 
-Coverage is evaluated by:
+When an explicit member-to-member transfer exists, its target identity is:
 
 (target_member, target_input)
 
 not by input name or semantic value.
 
-If multiple FunctionItems declare the same input name,
-each FunctionItem requires an independent binding.
+If multiple FunctionItems declare the same input name, they still have distinct
+input contracts; this does not require either one to have a Creator-time
+platform binding.
 
-Do not assume:
-- caller input propagation;
-- shared runtime state;
-- implicit inheritance;
-- execution order provides input availability."""
+Creator must not require a FunctionItem input to be mapped to a current platform
+input.  At invocation time runtime combines raw user input with this contract,
+applies explicit defaults, and reports any still-missing required input."""
 MULTIMODAL_INPUT_PROVENANCE_CONTRACT = """MULTIMODAL INPUT PROVENANCE CONTRACT
 
 No platform input source is universally required.
@@ -935,16 +933,25 @@ def _compact_function_items(function_items: list[dict[str, Any]]) -> list[dict[s
             description = str(raw_input.get("description") or "") if isinstance(raw_input, dict) else ""
             contract = dict(raw_input.get("contract") or {}) if isinstance(raw_input, dict) and isinstance(raw_input.get("contract"), dict) else {}
             role = _input_port_role(raw_input, facts)
-            # Role is the canonical coverage authority.  The legacy booleans
-            # remain in the compact payload solely for old persisted plans.
-            facts["runtime_source_required"] = role in {"required_runtime_input", "derived_input"}
-            compact_input = {"name": port_id, "role": role, "description": description, "contract": contract, **facts}
+            compact_input = {
+                "name": port_id,
+                "role": role,
+                "description": description,
+                "contract": contract,
+                "required": facts["required"],
+                "optional": not facts["required"],
+            }
+            if facts["default_present"]:
+                if isinstance(raw_input, dict) and "default" in raw_input:
+                    compact_input["default"] = raw_input.get("default")
+                elif port_id in default_values:
+                    compact_input["default"] = default_values[port_id]
             compact_inputs.append(compact_input)
         required_inputs = [
             value["name"] for value in compact_inputs
-            if value["runtime_source_required"]
+            if value["required"]
         ]
-        defaulted_inputs = [value["name"] for value in compact_inputs if value["default_present"]]
+        defaulted_inputs = [value["name"] for value in compact_inputs if "default" in value]
         compact_items.append(
             {
                 "target_file": item["target_file"],
@@ -970,7 +977,6 @@ def build_frozen_interface_slots(
     """Project the frozen contracts into the only endpoint domain a planner may use."""
     compact = _compact_function_items(function_items)
     boundary = (platform_contract or {}).get("platform_skill_boundary", platform_contract or {})
-    input_schemas = boundary.get("input_schemas") if isinstance(boundary.get("input_schemas"), dict) else {}
     output_sinks = boundary.get("output_sinks") if isinstance(boundary.get("output_sinks"), dict) else {}
     return {
         "members": {
@@ -981,10 +987,8 @@ def build_frozen_interface_slots(
             for item in compact
         },
         "platform_ports": {
-            "inputs": [
-                {"name": name, "type": _schema_type(dict(input_schemas.get(name) or {}))}
-                for name in sorted({_compact_port_id(v) for v in boundary.get("input_envelope_fields") or []})
-            ],
+            # Runtime user-input slots are intentionally not planning inputs.
+            "inputs": [],
             "outputs": [
                 {"name": name, "type": (output_sinks.get(name) or {}).get("semantic_type")}
                 for name in sorted(platform_output_names(platform_contract))
@@ -1236,7 +1240,10 @@ def build_semantic_mapping_candidates(
                 candidate["source_contract"] = source_contract
                 candidate["source_capabilities"] = _semantic_source_capabilities(source_contract)
                 candidate["target_contract"] = dict(port.get("contract") or {})
-            input_candidates.extend(candidates)
+            input_candidates.extend(
+                candidate for candidate in candidates
+                if candidate["kind"] == "member_to_member"
+            )
     output_candidates = [
         {"source_member": item["target_file"], "source_output": port["name"],
          "target_platform_output": target,
@@ -1283,48 +1290,38 @@ def semantic_provenance_compatibility(
     *, source_role: str, source_schema: dict[str, Any], source_origin: str,
     target_role: str, target_schema: dict[str, Any],
 ) -> tuple[bool, str]:
-    """Deterministically validate a declared semantic transfer.
+    """Validate only the data types of two explicitly declared endpoints.
 
-    Missing semantic annotations are treated as unknown for compatibility with
-    persisted contracts.  When both endpoints declare identities they must
-    agree. Representation differences are deliberately left to runtime adaptation.
+    Runtime provenance is deliberately outside Creator's contract.  Missing
+    type annotations remain compatible for persisted contracts.
     """
-    if target_role == "derived_input" and source_role != "intermediate_output":
-        return False, "derived inputs require an intermediate FunctionItem output"
-    target_origins = target_schema.get("allowed_origins")
-    if isinstance(target_origins, list) and source_origin not in {str(v) for v in target_origins}:
-        return False, "source origin is not allowed by the target contract"
-    source_semantic = _semantic_identity(source_schema)
-    target_semantic = _semantic_identity(target_schema)
-    if source_semantic and target_semantic and source_semantic != target_semantic:
-        return False, "source and target semantic identities differ"
-    return True, "declared provenance contracts are compatible"
+    _ = source_role, source_origin, target_role
+    source_type = (_schema_type(source_schema) or "").lower()
+    target_type = (_schema_type(target_schema) or "").lower()
+    aliases = {"list": "array", "dict": "object", "integer": "number", "float": "number"}
+    source_type = aliases.get(source_type, source_type)
+    target_type = aliases.get(target_type, target_type)
+    if source_type and target_type and source_type != target_type:
+        return False, f"source type {source_type!r} is incompatible with target type {target_type!r}"
+    return True, "declared endpoint types are compatible"
 
 def collect_interface_plan_validation_issues(
     *, plan: dict[str, Any], function_items: list[dict[str, Any]],
     platform_contract: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Validate logical references, output compatibility, and slot coverage."""
+    """Validate declared endpoint names and types, never runtime input sourcing."""
     compact = _compact_function_items(function_items)
     inputs = {item["target_file"]: {value["name"] for value in item["inputs"]} for item in compact}
     outputs = {item["target_file"]: {value["name"] for value in item["outputs"]} for item in compact}
-    output_schemas = {(item["target_file"], value["name"]): value["contract"] for item in compact for value in item["outputs"]}
     input_ports = {(item["target_file"], value["name"]): value for item in compact for value in item["inputs"]}
     output_ports = {(item["target_file"], value["name"]): value for item in compact for value in item["outputs"]}
-    member_order = {item["target_file"]: index for index, item in enumerate(compact)}
-    required_slots = {runtime_slot_key(member, name) for (member, name), value in input_ports.items()
-                      if value["role"] in {"required_runtime_input", "derived_input"}}
     boundary = (platform_contract or {}).get("platform_skill_boundary", platform_contract or {})
     platform_inputs = {_compact_port_id(value) for value in boundary.get("input_envelope_fields") or []}
     platform_input_schemas = boundary.get("input_schemas") if isinstance(boundary.get("input_schemas"), dict) else {}
     platform_outputs = set(platform_output_names(platform_contract))
     required_platform_outputs = required_platform_output_fields(platform_contract)
-    covered_slots: set[tuple[str, str]] = set()
-    valid_bindings: dict[tuple[str, str], list[tuple[str, str]]] = {}
-    slot_sources: dict[tuple[str, str], list[str]] = {}
     covered_platform: set[str] = set()
     issues: list[dict[str, Any]] = []
-    binding_failures: dict[tuple[str, str], list[dict[str, Any]]] = {}
 
     def issue(code: str, path: str, interface_id: str, observed: Any, expected: Any, *, error_type: str = "binding_error") -> None:
         issues.append({"code": code, "stage": "interface_plan_validation", "path": path,
@@ -1336,46 +1333,31 @@ def collect_interface_plan_validation_issues(
     if invalid_required_outputs:
         issue("invalid_required_platform_output", "$.platform_contract.required_final_output_fields", "", sorted(invalid_required_outputs), sorted(platform_outputs))
 
-    def record_source(member: str, slot: str, source: str) -> None:
-        slot_sources.setdefault(runtime_slot_key(member, slot), []).append(source)
-
-    def cover(member: str, slot: str, path: str, iid: str) -> None:
-        valid_bindings.setdefault(runtime_slot_key(member, slot), []).append((path, iid))
-
     for index, interface in enumerate(plan.get("interfaces") or []):
         path, iid, kind = f"$.interfaces[{index}]", str(interface.get("interface_id") or ""), interface.get("kind")
         if kind == "platform_to_member":
             source, target, slot = interface["source_platform_input"], interface["target_member"], interface["target_input"]
-            record_source(target, slot, ".".join([source, *interface.get("source_path", [])]))
             if source not in platform_inputs: issue("unknown_platform_logical_input", f"{path}.source_platform_input", iid, source, sorted(platform_inputs))
             if target not in inputs or slot not in inputs.get(target, set()): issue("unknown_interface_logical_input", f"{path}.target_input", iid, slot, sorted(inputs.get(target, set())))
             else:
                 target_port = input_ports[(target, slot)]
+                declared_root_schema = dict(platform_input_schemas.get(source) or {})
                 source_schema = _resolve_declared_source_path(
-                    dict(platform_input_schemas.get(source) or {}),
+                    declared_root_schema,
                     list(interface.get("source_path") or []),
                 )
-                compatible = source_schema is not None
-                reason = "source path is not declared by the platform contract"
-                if compatible:
-                    compatible, reason = semantic_provenance_compatibility(
-                        source_role="platform_input", source_schema=source_schema,
-                        source_origin="platform_input", target_role=target_port["role"], target_schema=target_port["contract"],
-                    )
+                # Persisted platform contracts may name a source without
+                # carrying a schema.  In that case its type is unknown rather
+                # than incompatible; runtime will interpret the raw value.
+                compatible, reason = semantic_provenance_compatibility(
+                    source_role="platform_input", source_schema=source_schema or {},
+                    source_origin="platform_input", target_role=target_port["role"], target_schema=target_port["contract"],
+                )
                 if not compatible:
-                    binding_failures.setdefault(runtime_slot_key(target, slot), []).append({
-                        "interface_id": iid,
-                        "status": "binding_not_found" if reason.startswith("source is absent") else "provenance_error",
-                        "actual_source": {"source_platform_input": source,
-                                          "source_path": list(interface.get("source_path") or [])},
-                        "reason": reason,
-                    })
-                    issue("incompatible_semantic_provenance", path, iid, {"source_origin": "platform_input", "target_role": target_port["role"]}, reason, error_type="provenance_error")
-                else: cover(target, slot, path, iid)
+                    issue("incompatible_interface_types", path, iid, {"source_type": _schema_type(source_schema or {}), "target_type": _schema_type(target_port["contract"])}, reason, error_type="schema_error")
         elif kind == "member_to_member":
             source, output = interface["source_member"], interface["source_output"]
             target, slot = interface["target_member"], interface["target_input"]
-            record_source(target, slot, f"{source}.{output}")
             if source not in outputs or output not in outputs.get(source, set()): issue("unknown_interface_logical_output", f"{path}.source_output", iid, output, sorted(outputs.get(source, set())))
             if target not in inputs or slot not in inputs.get(target, set()): issue("unknown_interface_logical_input", f"{path}.target_input", iid, slot, sorted(inputs.get(target, set())))
             else:
@@ -1385,12 +1367,8 @@ def collect_interface_plan_validation_issues(
                     source_role=source_port["role"], source_schema=source_port["contract"],
                     source_origin="member_output", target_role=target_port["role"], target_schema=target_port["contract"],
                 )
-                if (target_port["role"] == "derived_input"
-                        and member_order.get(source, -1) >= member_order.get(target, -1)):
-                    compatible, reason = False, "derived provenance must come from a preceding member"
                 if not compatible:
-                    issue("incompatible_semantic_provenance", path, iid, {"source_origin": "member_output", "target_role": target_port["role"]}, reason, error_type="provenance_error")
-                else: cover(target, slot, path, iid)
+                    issue("incompatible_interface_types", path, iid, {"source_type": _schema_type(source_port["contract"]), "target_type": _schema_type(target_port["contract"])}, reason, error_type="schema_error")
             if source == target: issue("interface_self_connection", path, iid, source, "distinct members")
         elif kind == "member_to_platform":
             source, output, target = interface["source_member"], interface["source_output"], interface["target_platform_output"]
@@ -1400,68 +1378,18 @@ def collect_interface_plan_validation_issues(
             if target not in platform_outputs: issue("unknown_platform_logical_output", f"{path}.target_platform_output", iid, target, sorted(platform_outputs))
             else:
                 covered_platform.add(target)
-    for (member, slot), sources in sorted(slot_sources.items()):
-        distinct_sources = sorted(set(sources))
-        if len(sources) > 1:
-            issues.append({
-                "code": "multiple_runtime_sources", "stage": "interface_plan_validation",
-                "path": "$.interfaces", "error_type": "provenance_error", "interface_id": "",
-                "message": "A runtime receiving slot has multiple source provenances.",
-                "target": f"{member}.{slot}", "sources": distinct_sources,
-                "required_action": "remove invalid source binding", "details": {},
-                "observed_value": distinct_sources, "expected_constraint": "exactly one valid runtime source",
-            })
-            continue
-        if len(valid_bindings.get(runtime_slot_key(member, slot), [])) == 1:
-            covered_slots.add(runtime_slot_key(member, slot))
-
-    for member, slot in sorted(required_slots - covered_slots):
-        candidates = generate_provenance_candidates(
-            target_member=member,
-            target_input=slot,
-            compact_function_items=compact,
-            platform_inputs=platform_inputs,
-        )
-
-        target_port = input_ports[runtime_slot_key(member, slot)]
-        if target_port["role"] == "derived_input":
-            candidates = [candidate for candidate in candidates if candidate["kind"] == "member_to_member"]
-        candidate_ids = [
-            str(value.get("interface_id") or "")
-            for value in plan.get("interfaces") or []
-            if value.get("target_member") == member and value.get("target_input") == slot
-        ]
-        expected_sources = []
-        failures = binding_failures.get(runtime_slot_key(member, slot), [])
-        closure_failure = {
-            "slot": f"{member}.{slot}",
-            "status": failures[0]["status"] if failures else "interface_not_found",
-            "candidate_interfaces": candidate_ids,
-            "expected_sources": expected_sources,
-            "actual_source": failures[0].get("actual_source") if failures else None,
-            "failure_reasons": failures,
-        }
-        issue(
-            "uncovered_required_logical_input",
-            "$.interfaces",
-            "",
-            {
-                "target_member": member,
-                "target_input": slot,
-
-                "provenance_candidates": candidates,
-
-                "repair_constraint": {
-                    "type": "missing_receiving_slot_binding",
-                    "target_member": member,
-                    "target_input": slot,
-                    "required_action":
-                        "establish_one_valid_semantic_provenance",
-                },
-                "closure_failure": closure_failure,
-            },
-            "at least one semantically valid Interface", error_type="missing_source_error"
-        )
+                sink = get_platform_output_sink(platform_contract, target) or {}
+                source_port = output_ports.get((source, output), {"contract": {}})
+                target_schema = dict(sink.get("value_schema") or {})
+                compatible, reason = semantic_provenance_compatibility(
+                    source_role="runtime_output", source_schema=source_port.get("contract") or {},
+                    source_origin="member_output", target_role="platform_output", target_schema=target_schema,
+                )
+                if not compatible:
+                    issue("incompatible_interface_types", path, iid,
+                          {"source_type": _schema_type(source_port.get("contract") or {}),
+                           "target_type": _schema_type(target_schema)},
+                          reason, error_type="schema_error")
     for output in sorted(required_platform_outputs - covered_platform):
         issue(
             "uncovered_required_platform_output",
@@ -1505,14 +1433,7 @@ def collect_interface_plan_validation_issues(
             "expected_constraint": value.get("expected_constraint"), "details": {"reason_code": value["code"]},
         })
     issues.extend(edge_issues)
-    closure_failures = [
-        issue_value.get("observed_value", {}).get("closure_failure")
-        for issue_value in issues
-        if issue_value.get("code") == "uncovered_required_logical_input"
-    ]
-    logger.info("[Creator][interface_closure] runtime_required_slot_count=%d covered_required_slot_count=%d uncovered_required_slots=%s binding_failures=%s required_platform_output_count=%d covered_platform_output_count=%d",
-                len(required_slots), len(required_slots & covered_slots), sorted(required_slots - covered_slots),
-                json.dumps(closure_failures, ensure_ascii=False, sort_keys=True),
+    logger.info("[Creator][interface_contract_validation] runtime_input_sources_deferred=true required_platform_output_count=%d covered_platform_output_count=%d",
                 len(required_platform_outputs), len(required_platform_outputs & covered_platform))
     return issues
 
@@ -1694,27 +1615,15 @@ def _interface_plan_prompt() -> str:
 
     {PLATFORM_BOUNDARY_CONTRACT}
 
-    {SOURCE_PROVENANCE_CONTRACT}
-
-    {PLATFORM_INPUT_HIERARCHY_CONTRACT}
-
     {RUNTIME_INPUT_PROVENANCE_CONTRACT}
-
-    {MULTIMODAL_INPUT_PROVENANCE_CONTRACT}
-
-    {SOURCE_PATH_CONTRACT}
-
-    {RUNTIME_BINDING_FACTS_CONTRACT}
-
-    {RUNTIME_REPAIR_RESTRICTION_CONTRACT}
 
 1. AUTHORITATIVE FACTS
 The payload contains confirmed requirements, frozen FunctionItems and their
-logical input/output contracts, Logical port contracts include semantic type constraints.
+logical input/output contracts. Logical port contracts include type constraints.
 When creating Interface bindings, preserve the declared type and cardinality
-of the logical ports.Do not change a single-value logical input into a different structural form
-unless the FunctionItem contract explicitly declares that structure.runtime_source_required facts, and the platform
-logical input/output contract. These facts are authoritative.
+of the logical ports. Do not change a single-value logical input into a
+different structural form unless the FunctionItem contract explicitly declares
+that structure. Runtime user-parameter provenance is not part of this payload.
 
 Logical ports are declared FunctionItem/platform input or output names. Opaque
 endpoint IDs are later registry identities such as INxxxx/OUTxxxx/PINxxxx/POUTxxxx.
@@ -1737,20 +1646,12 @@ a required field because its value is empty-like; source_path=[] is the explicit
 representation of whole-slot platform binding.
 
 3. CURRENT TASK
-Produce a complete semantic Interface Plan over frozen logical ports.
-First act as the Input Mapping Planner and Output Mapping Planner: compare the
-FunctionItem ports with platform slots and the supplied runtime capability
-summary, and form candidate semantic source-target mappings. Then emit only the
-accepted mappings as the Interface Contract. This is semantic planning, not
-type-table projection: for example an indexed list source may satisfy two
-distinct document inputs when their declared meanings support that choice.
-For required_runtime_input choose one valid platform input or preceding member
-output. For optional_runtime_input bind only when a valid source already exists;
-its declared default is also a valid frozen source, so a defaulted slot may
-remain unbound. Never assume that an unbound, non-defaulted parameter will be
-invented during script generation. For derived_input choose only a preceding member
-output. For every required platform output choose the frozen FunctionItem output.
-Record each choice in structured logical binding fields.
+Produce an Interface Plan only for explicitly known transfers between
+FunctionItems and for required final outputs. Do not create platform_to_member
+bindings to supply FunctionItem invocation parameters. Required, optional, and
+default are properties of the FunctionItem input contract; future runtime input
+provenance is deliberately unknown during creation. For every interface that is
+present, use declared endpoint names and ensure its endpoint types are compatible.
 
 4. CURRENT AUTHORITY
 You, not the backend, own and choose the semantic producer using responsibilities, port
@@ -1767,12 +1668,11 @@ Two independently selectable receiving slots require separate records. A source
 output may be reused by separate Interfaces.
 
 5. HARD ACCEPTANCE CONDITIONS
-VALIDITY BEFORE COVERAGE
-Completeness applies only to required_runtime_input and derived_input ports.
-Never select a similar name, convertible type, or arbitrary available input to
-obtain coverage. First construct a valid semantic Interface Plan. Only after validity
-is established may redundant Interfaces be avoided. Never omit a required
-receiving slot in order to reduce Interface count.
+FUNCTIONITEM CONTRACT BEFORE RUNTIME BINDING
+An unbound FunctionItem input is valid during creation. Never select a similar
+platform field, create options.<name>, or otherwise manufacture a runtime source
+to obtain input coverage. Missing invocation values are resolved by runtime from
+raw user input, the input's required/optional declaration, and its default.
 
 Do not modify FunctionItems, requirements, channels, or logical ports. Do not
 return opaque endpoint IDs, Graph edges, or extra fields. Do not
@@ -1790,19 +1690,9 @@ If it is produced by another frozen FunctionItem, choose member_to_member.
 Use member_to_platform only for a semantic value that leaves the Skill
 through the platform output boundary.
 
-Before returning, for every receiving slot identify the semantic value that
-slot requires, then choose the authoritative upstream source that actually
-provides it. Do not bind merely because a source/output exists or because
-coverage needs an Interface. Finally verify goal agrees with the structured
-source and target fields.
-
-Before returning JSON, silently construct a coverage ledger. For every frozen
-FunctionItem: (1) enumerate every input whose runtime_source_required=true; (2)
-identify exactly which Interface supplies that receiving slot. For every
-semantically required platform output: (3) identify the member_to_platform
-Interface that produces it. Do not return until every required receiving slot
-and required final result is accounted for. The coverage ledger is internal
-verification only. Do not output the ledger.
+Do not bind merely because a platform source exists. Verify only that each
+declared transfer references real contract ports with compatible types and that
+each required final platform output has a producer.
 
 OUTPUT FIELD IDENTITY CHECK
 
@@ -2233,7 +2123,6 @@ A plausible goal cannot make an incorrect structured source/target binding valid
         "requirement_channels": requirement_channels or {},
         "unowned_system_requirements": system_requirements or [],
         "platform_contract": platform_contract or {},
-        "runtime_binding_facts": build_runtime_binding_facts(function_items=frozen_function_items, platform_contract=platform_contract),
     }
     raw_response = await model_call(
             [{"role": "system", "content": prompt},
@@ -2301,11 +2190,6 @@ async def plan_function_item_interfaces(*, original_user_goal: str, frozen_funct
         "semantic_mapping_candidates": build_semantic_mapping_candidates(
             function_items=frozen_function_items, platform_contract=platform_contract,
         ),
-        "runtime_capability_summary": (
-            ((platform_contract or {}).get("platform_skill_boundary", platform_contract or {}))
-            .get("runtime_capability_summary", {})
-        ),
-        "runtime_binding_facts": build_runtime_binding_facts(function_items=frozen_function_items, platform_contract=platform_contract),
     }
     raw_response = await model_call([{"role": "system", "content": _interface_plan_prompt()}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}], planner_model)
     try:
@@ -2345,16 +2229,13 @@ async def plan_function_item_interfaces(*, original_user_goal: str, frozen_funct
 
         {PLATFORM_BOUNDARY_CONTRACT}
 
-        {PLATFORM_INPUT_HIERARCHY_CONTRACT}
-
         {RUNTIME_INPUT_PROVENANCE_CONTRACT}
-
-        {SOURCE_PATH_CONTRACT}
 
 INTERFACE PLAN CORRECTION
 1. AUTHORITATIVE FACTS
-Confirmed requirements, frozen FunctionItems, logical ports, runtime source
-facts, platform contract, and shared Interface contracts remain authoritative.
+Confirmed requirements, frozen FunctionItems, logical ports, platform contract,
+and shared Interface contracts remain authoritative. Runtime user-parameter
+sources are intentionally unavailable to Creator.
 2. SHARED CONTRACTS
 INTERFACE_SCHEMA and the shared contracts above define the protocol.
 3. CURRENT TASK
@@ -2363,16 +2244,6 @@ return only targeted patch operations and resolve every supplied acceptance
 failure simultaneously. A protocol-invalid transport may be reconstructed only
 to restore the wire shape. Facts describe invalid state.
 
-When validation facts contain provenance_candidates,
-they represent backend-discovered possible semantic origins.
-
-They are not final decisions.
-
-Evaluate these candidates semantically and choose the source
-that actually provides the required value.
-
-Do not ignore available provenance candidates.
-Do not invent a source outside the declared candidate domain.
 Do not patch only visible wording. Never regenerate all interfaces for a
 semantically valid transport.
 4. CURRENT AUTHORITY
@@ -2383,12 +2254,10 @@ add an Interface and never regenerate or reorder the complete contract.
 The complete result must match INTERFACE_SCHEMA. Every supplied acceptance fact
 is independently blocking; coverage alone is insufficient.
 6. SILENT SELF-CHECK
-Silently rebuild the complete required-slot coverage ledger before returning.
-For each required receiving slot, first determine the semantic value required,
-then determine which authoritative upstream source actually produces it.
-Silently verify every structured binding in both directions: target to source,
-does the source provide what the target needs; source to target, is the declared
-source value actually appropriate for this target.
+Silently verify that every interface present uses declared source and target
+parameter names and compatible data types. Do not repair an absent input by
+adding or changing a platform mapping; that repair belongs solely to the
+FunctionItem input contract.
 7. OUTPUT CONTRACT
 For deterministic semantic correction return strict JSON matching
 INTERFACE_PATCH_SCHEMA only. For protocol-shape correction only, return strict

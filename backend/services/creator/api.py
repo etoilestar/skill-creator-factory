@@ -6699,18 +6699,18 @@ are immutable. Do not add, remove, rename, or modify a FunctionItem, its inputs,
 or its outputs. Generate a complete new responsibility_edges array from the
 compact Graph Construction Context. Do not inherit the old edge topology.
 
-For every declared runtime input, choose its semantic provenance from only the
-platform input contract or a declared FunctionItem output. Backend provides the
-legal source domain but does not choose the semantically correct source for you.
-Close platform input/output boundaries and use only exact declared endpoints.
+Connect only values exchanged between FunctionItems and declared final outputs.
+Do not bind FunctionItem inputs to current platform inputs merely to make the
+graph look complete; runtime resolves raw user input against the input contract.
+Use only exact declared endpoints for every connection that is present.
 Do not invent aliases, functions, inputs, outputs, or platform slots. If frozen
 FunctionItems make closure impossible, do not redesign them.
 An input with an explicit frozen/default value is locally resolved. Do not
 create a platform_input_node edge for it unless the frozen contract explicitly
 declares it runtime-configurable, and never externalize a default for closure.
 
-Before returning, verify every declared runtime input has exactly one legal
-provenance; every from_output and to_input exists; required final outputs have a
+Before returning, verify every from_output and to_input exists, connected types
+are compatible, and required final outputs have a
 producer-to-platform_output path; and no input, output, or FunctionItem was added.
 
 Return only strict JSON: {"responsibility_edges": [...]}
@@ -8475,8 +8475,8 @@ and FunctionItems. Only modify the minimum Blueprint facts necessary to cover th
 blocking user requirement. Do not redesign unrelated workflow. Do not invent new
 user requirements. Do not add files merely to satisfy a structural checker. If
 the issue is a missing input declaration, do not patch the generated script:
-first re-plan the owning Blueprint FunctionItem input (including required and
-default), then update Graph/Interface binding, and only then regenerate the
+repair only the owning Blueprint FunctionItem input contract (including
+required, optional, and default), and only then regenerate the
 script. Never add or legitimize a post-generation implicit parameter. If
 an existing FunctionItem can legitimately own the requirement, first make the
 minimum clarification to its purpose, inputs, outputs, or constraints. Multiple

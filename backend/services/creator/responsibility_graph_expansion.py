@@ -191,16 +191,9 @@ def _finalize_graph(*, state: GraphExpansionState, function_items: list[dict], t
     if actual_terminals != terminal_edges or not actual_terminals:
         raise ResponsibilityGraphExpansionError("terminal set changed during expansion", code="invalid_terminal_closure")
     items = {item["target_file"]: item for item in normalize_structured_function_items(function_items, source="graph_expansion")}
-    incoming = {(edge["to_node"], edge["to_input"]) for edge in state.committed_edges}
-    unresolved = []
-    for node in state.activation_order:
-        for raw_input in items[node].get("inputs") or []:
-            port_id = _port(raw_input)[0]
-            facts = runtime_input_source_facts(raw_input, items[node].get("default_values"))
-            if port_id and facts["runtime_source_required"] and (node, port_id) not in incoming:
-                unresolved.append({"target": node, "input_id": port_id, "required": True, "default_present": False})
-    if unresolved:
-        raise ResponsibilityGraphExpansionError("interface plan does not cover all required FunctionItem inputs", code="interface_plan_incomplete", details={"uncovered_inputs": unresolved})
+    # Runtime, not Creator graph expansion, combines raw user input with each
+    # FunctionItem contract and applies defaults.  An input therefore need not
+    # have a platform edge at skill-creation time.
     for node in state.active_nodes:
         pending, seen = [node], set()
         while pending and PLATFORM_OUTPUT_NODE not in seen:

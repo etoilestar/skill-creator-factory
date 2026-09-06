@@ -8474,6 +8474,10 @@ complete replacement internal_blueprint_text. Preserve unrelated FilePlan entrie
 and FunctionItems. Only modify the minimum Blueprint facts necessary to cover the
 blocking user requirement. Do not redesign unrelated workflow. Do not invent new
 user requirements. Do not add files merely to satisfy a structural checker. If
+the issue is a missing input declaration, do not patch the generated script:
+first re-plan the owning Blueprint FunctionItem input (including required and
+default), then update Graph/Interface binding, and only then regenerate the
+script. Never add or legitimize a post-generation implicit parameter. If
 an existing FunctionItem can legitimately own the requirement, first make the
 minimum clarification to its purpose, inputs, outputs, or constraints. Multiple
 existing FunctionItems may jointly cover one requirement. Only add the minimum
@@ -9265,6 +9269,14 @@ of the same runtime value as multiple required FunctionItem inputs.
 The provenance of an input is NOT part of the definition of that input. A valid
 FunctionItem input may later be supplied by a platform input, an upstream
 FunctionItem output, or a frozen/default value. Interface Planner owns provenance.
+
+All business parameters must nevertheless be fixed here, before script
+generation. If the Skill has optional business parameters such as style,
+format, page count, font, filter conditions, or output options, declare each in
+the owning FunctionItem inputs (use an input object with name, required, and
+default when appropriate). Script generation must never add an undeclared
+parameter. Object-to-file and object-to-text representation conversion is not a
+business parameter and remains exclusively owned by runtime IO mapping.
 
 For every FunctionItem input, explicitly state whether it is required at
 runtime. When the input may be omitted, mark required=false. When the

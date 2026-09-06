@@ -86,8 +86,8 @@ async def test_missing_declared_logical_port_returns_structured_unbound():
     plan = {"interfaces": [{"interface_id": "I1", "kind": "platform_to_member", "source_platform_input": "payload", "source_path": [], "target_member": "scripts/unit_a.py", "target_input": "missing", "goal": "invalid"}]}
     with pytest.raises(ResponsibilityGraphExpansionError) as raised:
         await expand_responsibility_graph(function_items=items, platform_contract=platform(), planner_model="p", interface_plan=plan)
-    assert raised.value.code == "interface_endpoint_unbound"
-    assert raised.value.details["logical_binding"]["target_input"] == "missing"
+    assert raised.value.code == "missing_interface_contract"
+    assert raised.value.details["issues"][0]["observed_value"]["target_input"] == "slot_x"
 
 @pytest.mark.asyncio
 async def test_nested_source_path_materializes_constraint():

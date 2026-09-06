@@ -42,11 +42,19 @@ Tool Planner owns concrete tool/helper binding.
 No later stage may silently revise an upstream frozen fact outside its declared authority."""
 INTERFACE_CONTRACT_SCOPE_CONTRACT = """The FunctionItem contract is already frozen.
 
+The planner is responsible for creating semantic bindings between existing
+contract ports. It determines only:
+
+source port -> target port
+
 Interface Planner MUST NOT:
 - create new FunctionItems
 - modify FunctionItem inputs
 - modify FunctionItem outputs
 - reinterpret business responsibility
+- invent new output fields
+- invent transformation names
+- design runtime conversion logic
 
 Interface Planner ONLY creates connections:
 
@@ -62,7 +70,9 @@ Allowed decisions:
 4. target platform output
 5. no conversion operation: representation adaptation belongs to runtime
 
-The planner must not infer new semantics.
+The planner must not generate a transform, select an adapter, choose a
+serializer, or declare a conversion. Representation adaptation is handled by
+runtime capability.
 """
 VALID_INTERFACE_FREEZE_CONTRACT = """Interfaces without validation errors are immutable.
 
@@ -471,17 +481,20 @@ REPAIRABLE_INTERFACE_ISSUES = frozenset({
 })
 _DANGEROUS_PATH_PARTS = {"__proto__", "prototype", "constructor"}
 INTERFACE_FIELDS = {
-    "platform_to_member": {"interface_id", "kind", "source_platform_input", "source_path", "target_member", "target_input", "goal"},
-    "member_to_member": {"interface_id", "kind", "source_member", "source_output", "target_member", "target_input", "goal"},
-    "member_to_platform": {"interface_id", "kind", "source_member", "source_output", "target_platform_output", "goal"},
+    "platform_to_member": {"interface_id", "kind", "source_platform_input", "source_path", "target_member", "target_input"},
+    "member_to_member": {"interface_id", "kind", "source_member", "source_output", "target_member", "target_input"},
+    "member_to_platform": {"interface_id", "kind", "source_member", "source_output", "target_platform_output"},
 }
-OPTIONAL_INTERFACE_FIELDS = {kind: set() for kind in INTERFACE_KINDS}
+# ``goal`` is accepted only as a persisted-contract compatibility alias. New
+# contracts and the published schema use ``semantic_reason``.
+OPTIONAL_INTERFACE_FIELDS = {kind: {"semantic_reason", "goal"} for kind in INTERFACE_KINDS}
 INTERFACE_SCHEMA: dict[str, Any] = {
     "type": "object", "additionalProperties": False, "required": ["interfaces"],
     "properties": {"interfaces": {"type": "array", "items": {"oneOf": [
         {"type": "object", "additionalProperties": False, "required": sorted(fields),
          "properties": {
              **{key: ({"const": kind} if key == "kind" else {"type": "array", "items": {"type": "string", "minLength": 1}} if key == "source_path" else {"type": "string", "minLength": 1}) for key in fields},
+             "semantic_reason": {"type": "string", "minLength": 1},
          }}
         for kind, fields in INTERFACE_FIELDS.items()
     ]}}},
@@ -592,11 +605,6 @@ def apply_interface_patch(
         if iid not in by_id:
             raise InterfaceIntentPlanError("patch references unknown interface", code="invalid_interface_patch", details={"interface_id": iid})
         current = by_id[iid]
-        if runtime_binding_facts is not None:
-            validate_patch_operation_against_runtime_binding_facts(
-                operation=operation, interface=current,
-                runtime_binding_facts=runtime_binding_facts,
-            )
         if op == "remove_interface":
             interfaces.remove(current); del by_id[iid]
         elif op == "replace_source":
@@ -749,6 +757,8 @@ def build_canonical_interface_contract(
             "source": source,
             "target": target,
             "runtime_provenance": runtime_provenance,
+            **({"semantic_reason": interface.get("semantic_reason") or interface.get("goal")}
+               if interface.get("semantic_reason") or interface.get("goal") else {}),
         })
     return {"interfaces": interfaces}
 
@@ -996,9 +1006,6 @@ def validate_interface_plan_protocol(plan: dict[str, Any]) -> dict[str, Any]:
         path = f"$.interfaces[{index}]"
         if not isinstance(raw, dict):
             _raise("interface must be an object", "invalid_interface_protocol", path=path)
-        # Historical plans may carry a planner-selected transform.  It is not
-        # part of the canonical Interface Contract and is ignored on load.
-        raw = {key: value for key, value in raw.items() if key != "transform"}
         kind = raw.get("kind")
         if kind not in INTERFACE_KINDS:
             _raise("interface kind is invalid", "invalid_interface_kind", path=f"{path}.kind")
@@ -1010,8 +1017,11 @@ def validate_interface_plan_protocol(plan: dict[str, Any]) -> dict[str, Any]:
         if interface_id in seen:
             _raise("duplicate interface_id", "duplicate_interface_id", path=f"{path}.interface_id")
         seen.add(interface_id)
-        _require_nonempty_string(raw, "goal", "invalid_interface_protocol", f"{path}.goal")
-        for field in expected - {"interface_id", "kind", "goal", "source_path"}:
+        if "semantic_reason" in raw:
+            _require_nonempty_string(raw, "semantic_reason", "invalid_interface_protocol", f"{path}.semantic_reason")
+        if "goal" in raw:
+            _require_nonempty_string(raw, "goal", "invalid_interface_protocol", f"{path}.goal")
+        for field in expected - {"interface_id", "kind", "source_path"}:
             _require_nonempty_string(raw, field, "invalid_interface_protocol", f"{path}.{field}")
         if kind == "platform_to_member":
             source_path = raw.get("source_path")
@@ -1050,7 +1060,10 @@ def validate_interface_intent_plan(*, plan: dict[str, Any], function_items: list
         if interface_id in seen_ids:
             _raise("duplicate interface_id", "duplicate_interface_id", path=f"{path}.interface_id", interface_id=interface_id)
         seen_ids.add(interface_id)
-        _require_nonempty_string(raw_interface, "goal", "invalid_interface_protocol", f"{path}.goal")
+        if "semantic_reason" in raw_interface:
+            _require_nonempty_string(raw_interface, "semantic_reason", "invalid_interface_protocol", f"{path}.semantic_reason")
+        if "goal" in raw_interface:
+            _require_nonempty_string(raw_interface, "goal", "invalid_interface_protocol", f"{path}.goal")
         interface = dict(raw_interface)
         if kind in {"member_to_member", "member_to_platform"}:
             source = _require_nonempty_string(raw_interface, "source_member", "invalid_interface_member", f"{path}.source_member")
@@ -1124,46 +1137,16 @@ def _declared_schema_type(schema: dict[str, Any]) -> tuple[str, Any] | None:
     return type_name, None
 
 
-def _schema_types_compatible(source: dict[str, Any], target: dict[str, Any]) -> bool:
-    """Match declared structural types, leaving representation work to runtime."""
-    source_type = _declared_schema_type(source)
-    target_type = _declared_schema_type(target)
-    return source_type is not None and target_type is not None and source_type == target_type
-
-
-def _list_element_schema(schema: dict[str, Any]) -> dict[str, Any] | None:
-    """Return a synthetic schema for a list element when one is declared."""
-    raw_type = schema.get("type")
-    if not isinstance(raw_type, str):
-        return None
-    type_name = raw_type.strip().lower()
-    if type_name.startswith("list[") and type_name.endswith("]"):
-        element = type_name[5:-1].strip()
-        return {"type": element} if element else None
-    if type_name in {"array", "list"} and isinstance(schema.get("items"), dict):
-        return dict(schema["items"])
-    return None
-
-
 def build_runtime_binding_facts(
     *, function_items: list[dict[str, Any]], platform_contract: dict[str, Any] | None,
 ) -> dict[str, dict[str, dict[str, list[dict[str, Any]]]]]:
-    """Build deterministic, LLM-free platform provenance for frozen inputs.
-
-    Explicit ``runtime_provenance``/``source_platform_input`` annotations take
-    precedence, followed by exact names, object fields, structural list
-    expansion, and finally a single structurally compatible source.
-    Semantic identities, descriptions, and approximate names are never used to
-    select runtime provenance.
-    """
+    """Expose only explicitly frozen provenance; never plan mappings by type."""
     compact = _compact_function_items(function_items)
     boundary = (platform_contract or {}).get("platform_skill_boundary", platform_contract or {})
     names = [_compact_port_id(value) for value in boundary.get("input_envelope_fields") or []]
-    schemas = boundary.get("input_schemas") if isinstance(boundary.get("input_schemas"), dict) else {}
     facts: dict[str, dict[str, dict[str, list[dict[str, Any]]]]] = {}
     for item in compact:
         member_facts: dict[str, dict[str, list[dict[str, Any]]]] = {}
-        unresolved: list[dict[str, Any]] = []
         for port in item["inputs"]:
             contract = port.get("contract") or {}
             explicit = contract.get("runtime_provenance") if isinstance(contract.get("runtime_provenance"), dict) else contract
@@ -1172,65 +1155,7 @@ def build_runtime_binding_facts(
             allowed: list[dict[str, Any]] = []
             if explicit_source in names and isinstance(explicit_path, list) and all(isinstance(x, str) for x in explicit_path):
                 allowed.append({"source_platform_input": explicit_source, "source_path": list(explicit_path)})
-            else:
-                # The platform envelope itself is a declared mapping: an exact
-                # top-level slot or exact nested property is factual provenance.
-                # This is intentionally identifier equality, not semantic or
-                # descriptive matching.
-                # Priority 1: exact top-level identifier.
-                for source in names:
-                    if source == port["name"]:
-                        allowed.append({"source_platform_input": source, "source_path": []})
-                # Priority 2: exact object-field identifier.
-                if not allowed:
-                    for source in names:
-                        for path, _source_schema in _walk_platform_schema(dict(schemas.get(source) or {})):
-                            if path and path[-1] == port["name"]:
-                                allowed.append({"source_platform_input": source, "source_path": list(path)})
-            if not allowed and port.get("role") != "derived_input":
-                unresolved.append(port)
             member_facts[port["name"]] = {"allowed_sources": allowed}
-
-        # Priority 3: expand one unambiguous list[T] source into the remaining
-        # compatible T slots, in frozen FunctionItem input order.  Indices are
-        # structural paths and never depend on receiver naming conventions.
-        list_sources = {
-            source: element
-            for source in names
-            if (element := _list_element_schema(dict(schemas.get(source) or {}))) is not None
-        }
-        list_assignments: dict[str, list[dict[str, Any]]] = {}
-        for port in unresolved:
-            candidates = [source for source, element in list_sources.items()
-                          if _schema_types_compatible(element, port["contract"])]
-            if len(candidates) == 1:
-                list_assignments.setdefault(candidates[0], []).append(port)
-        projected_names: set[str] = set()
-        for source, ports in list_assignments.items():
-            for index, port in enumerate(ports):
-                member_facts[port["name"]]["allowed_sources"].append(
-                    {"source_platform_input": source, "source_path": [str(index)]}
-                )
-                projected_names.add(port["name"])
-
-        # Priority 4: bind only when exactly one whole platform value has the
-        # same declared structural type.  Preserve the historical one-envelope
-        # fallback solely when neither side declares enough type information.
-        for port in unresolved:
-            if port["name"] in projected_names:
-                continue
-            candidates = [source for source in names if _schema_types_compatible(
-                dict(schemas.get(source) or {}), port["contract"])]
-            if len(candidates) == 1:
-                member_facts[port["name"]]["allowed_sources"].append(
-                    {"source_platform_input": candidates[0], "source_path": []}
-                )
-            elif (len(names) == 1 and not candidates
-                  and _declared_schema_type(dict(schemas.get(names[0]) or {})) is None
-                  and _declared_schema_type(port["contract"]) is None):
-                member_facts[port["name"]]["allowed_sources"].append(
-                    {"source_platform_input": names[0], "source_path": []}
-                )
         facts[item["target_file"]] = member_facts
     logger.info("[interface_runtime_binding_facts] %s", json.dumps(facts, ensure_ascii=False, sort_keys=True))
     return facts
@@ -1247,6 +1172,25 @@ def validate_runtime_binding(
     observed = {"source_platform_input": interface.get("source_platform_input"),
                 "source_path": list(interface.get("source_path") or [])}
     return (observed in allowed, "binding is frozen" if observed in allowed else "source is absent from frozen runtime binding facts")
+
+
+def _resolve_declared_source_path(schema: dict[str, Any], path: list[str]) -> dict[str, Any] | None:
+    """Resolve a planner-selected path without assigning semantic meaning to types."""
+    current = schema
+    for part in path:
+        properties = current.get("properties") if isinstance(current, dict) else None
+        if isinstance(properties, dict) and isinstance(properties.get(part), dict):
+            current = properties[part]
+            continue
+        raw_type = str(current.get("type") or "").lower() if isinstance(current, dict) else ""
+        if part.isdigit() and raw_type in {"array", "list"} and isinstance(current.get("items"), dict):
+            current = current["items"]
+            continue
+        if part.isdigit() and raw_type.startswith("list[") and raw_type.endswith("]"):
+            current = {"type": raw_type[5:-1]}
+            continue
+        return None
+    return current
 
 
 def generate_provenance_candidates(
@@ -1303,16 +1247,33 @@ def generate_provenance_candidates(
     return candidates
 
 
+def build_semantic_mapping_candidates(
+    *, function_items: list[dict[str, Any]], platform_contract: dict[str, Any] | None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Enumerate legal endpoints for the LLM mapping planners, without ranking them."""
+    compact = _compact_function_items(function_items)
+    boundary = (platform_contract or {}).get("platform_skill_boundary", platform_contract or {})
+    platform_inputs = {_compact_port_id(value) for value in boundary.get("input_envelope_fields") or []}
+    input_candidates: list[dict[str, Any]] = []
+    for item in compact:
+        for port in item["inputs"]:
+            input_candidates.extend(generate_provenance_candidates(
+                target_member=item["target_file"], target_input=port["name"],
+                compact_function_items=compact, platform_inputs=platform_inputs,
+            ))
+    output_candidates = [
+        {"source_member": item["target_file"], "source_output": port["name"],
+         "target_platform_output": target}
+        for item in compact for port in item["outputs"]
+        for target in sorted(platform_output_names(platform_contract))
+    ]
+    return {"input_mappings": input_candidates, "output_mappings": output_candidates}
+
+
 def _schema_type(schema: dict[str, Any]) -> str | None:
-    """Return the declared type identity used by output adapter contracts."""
+    """Return a declared type as descriptive planner context."""
     value = schema.get("type")
     return str(value).strip() if value is not None and str(value).strip() else None
-
-
-def _canonical_semantic_type(value: str | None) -> str | None:
-    """Collapse representation aliases only for direct semantic comparison."""
-    aliases = {"string": "text", "artifact": "file", "file_path": "file", "list[file_path]": "file"}
-    return aliases.get(value, value)
 
 
 def _semantic_identity(contract: dict[str, Any]) -> str:
@@ -1367,9 +1328,6 @@ def collect_interface_plan_validation_issues(
     covered_slots: set[tuple[str, str]] = set()
     valid_bindings: dict[tuple[str, str], list[tuple[str, str]]] = {}
     slot_sources: dict[tuple[str, str], list[str]] = {}
-    binding_facts = build_runtime_binding_facts(
-        function_items=function_items, platform_contract=platform_contract,
-    )
     covered_platform: set[str] = set()
     issues: list[dict[str, Any]] = []
     binding_failures: dict[tuple[str, str], list[dict[str, Any]]] = {}
@@ -1399,15 +1357,17 @@ def collect_interface_plan_validation_issues(
             if target not in inputs or slot not in inputs.get(target, set()): issue("unknown_interface_logical_input", f"{path}.target_input", iid, slot, sorted(inputs.get(target, set())))
             else:
                 target_port = input_ports[(target, slot)]
-                compatible, reason = validate_runtime_binding(interface=interface, binding_facts=binding_facts)
-                if compatible:
-                    source_schema = dict(platform_input_schemas.get(source) or {})
-                    for part in interface.get("source_path") or []:
-                        source_schema = (source_schema.get("properties") or {}).get(part, {}) if isinstance(source_schema, dict) else {}
-                    compatible, reason = semantic_provenance_compatibility(
-                    source_role="platform_input", source_schema=source_schema,
-                    source_origin="platform_input", target_role=target_port["role"], target_schema=target_port["contract"],
+                source_schema = _resolve_declared_source_path(
+                    dict(platform_input_schemas.get(source) or {}),
+                    list(interface.get("source_path") or []),
                 )
+                compatible = source_schema is not None
+                reason = "source path is not declared by the platform contract"
+                if compatible:
+                    compatible, reason = semantic_provenance_compatibility(
+                        source_role="platform_input", source_schema=source_schema,
+                        source_origin="platform_input", target_role=target_port["role"], target_schema=target_port["contract"],
+                    )
                 if not compatible:
                     binding_failures.setdefault(runtime_slot_key(target, slot), []).append({
                         "interface_id": iid,
@@ -1477,7 +1437,7 @@ def collect_interface_plan_validation_issues(
             for value in plan.get("interfaces") or []
             if value.get("target_member") == member and value.get("target_input") == slot
         ]
-        expected_sources = binding_facts.get(member, {}).get(slot, {}).get("allowed_sources") or []
+        expected_sources = []
         failures = binding_failures.get(runtime_slot_key(member, slot), [])
         closure_failure = {
             "slot": f"{member}.{slot}",
@@ -1715,7 +1675,7 @@ def build_graph_obligations_from_interfaces(*, interface_plan: dict[str, Any]) -
         obligation = {
             "obligation_id": f"O{len(obligations) + 1:04d}",
             "interface_id": interface["interface_id"],
-            "goal": interface["goal"],
+            "goal": interface.get("semantic_reason", "semantic source-target binding"),
         }
         if interface["kind"] == "platform_to_member":
             obligation.update({"kind": "platform_to_script", "source_platform_input": interface["source_platform_input"], "source_path": list(interface["source_path"]), "target_member": interface["target_member"], "target_input": interface["target_input"]})
@@ -1768,11 +1728,13 @@ endpoint IDs are later registry identities such as INxxxx/OUTxxxx/PINxxxx/POUTxx
 2. SHARED CONTRACTS
 WIRE CONTRACT
 platform_to_member always contains: interface_id, kind, source_platform_input,
-source_path, target_member, target_input, goal.
+source_path, target_member, target_input.
 member_to_member always contains: interface_id, kind, source_member,
-source_output, target_member, target_input, goal.
+source_output, target_member, target_input.
 member_to_platform always contains: interface_id, kind, source_member,
-source_output, target_platform_output, goal.
+source_output, target_platform_output.
+Every kind may contain semantic_reason explaining why the source satisfies the
+target. It is optional and never changes the binding.
 Interface planning only determines semantic connections. The planner MUST NOT
 generate conversion operations or invent transform names. Representation
 conversion is handled by the runtime capability layer.
@@ -1782,6 +1744,12 @@ representation of whole-slot platform binding.
 
 3. CURRENT TASK
 Produce a complete semantic Interface Plan over frozen logical ports.
+First act as the Input Mapping Planner and Output Mapping Planner: compare the
+FunctionItem ports with platform slots and the supplied runtime capability
+summary, and form candidate semantic source-target mappings. Then emit only the
+accepted mappings as the Interface Contract. This is semantic planning, not
+type-table projection: for example an indexed list source may satisfy two
+distinct document inputs when their declared meanings support that choice.
 For required_runtime_input choose one valid platform input or preceding member
 output. For optional_runtime_input bind only when a valid source already exists;
 otherwise leave it unbound. For derived_input choose only a preceding member
@@ -1795,8 +1763,8 @@ platform contract. Do not choose by field-name similarity alone. Never choose
 from target-port name similarity.
 
 INTERFACE BINDING AUTHORITY
-Structured logical binding fields are authoritative for transfer identity. goal
-explains why the declared logical source satisfies the declared receiving slot;
+Structured logical binding fields are authoritative for transfer identity.
+semantic_reason optionally explains why the declared logical source satisfies the declared receiving slot;
 it does not redefine, broaden, merge, or replace that binding. One Interface is
 one declared logical source -> one declared receiving slot -> one future edge.
 Two independently selectable receiving slots require separate records. A source
@@ -1853,6 +1821,8 @@ external result.
 Do not output a descriptive label as target_platform_output.
 Do not output a format name, file format name, or presentation name unless it
 is explicitly declared as a platform output field.
+
+Never output transform, adapter, serializer, or conversion fields.
 
 7. OUTPUT CONTRACT
 Return only strict JSON matching this schema:
@@ -2331,6 +2301,13 @@ async def plan_function_item_interfaces(*, original_user_goal: str, frozen_funct
         "platform_contract": platform_contract or {},
         "frozen_interface_slots": build_frozen_interface_slots(
             function_items=frozen_function_items, platform_contract=platform_contract,
+        ),
+        "semantic_mapping_candidates": build_semantic_mapping_candidates(
+            function_items=frozen_function_items, platform_contract=platform_contract,
+        ),
+        "runtime_capability_summary": (
+            ((platform_contract or {}).get("platform_skill_boundary", platform_contract or {}))
+            .get("runtime_capability_summary", {})
         ),
         "runtime_binding_facts": build_runtime_binding_facts(function_items=frozen_function_items, platform_contract=platform_contract),
     }

@@ -1,9 +1,4 @@
-import logging
-
-import pytest
-
 from backend.services.creator.function_item_interface_plan import (
-    InterfaceIntentPlanError,
     apply_interface_patch,
     build_runtime_binding_facts,
     collect_interface_plan_validation_issues,
@@ -42,8 +37,7 @@ def _binding(iid, source, target, path=None):
             "goal": "use frozen runtime provenance"}
 
 
-def test_declared_platform_mapping_closes_required_bindings(caplog):
-    caplog.set_level(logging.INFO)
+def test_declared_platform_mapping_closes_required_bindings():
     plan = {"interfaces": [
         _binding("I1", "input_files", "input_files"),
         _binding("I2", "options", "primary_key_candidates", ["primary_key_candidates"]),
@@ -51,7 +45,6 @@ def test_declared_platform_mapping_closes_required_bindings(caplog):
     issues = collect_interface_plan_validation_issues(
         plan=plan, function_items=_items(), platform_contract=_platform())
     assert not any(issue["code"] == "uncovered_required_logical_input" for issue in issues)
-    assert "[interface_runtime_binding_facts]" in caplog.text
 
 
 def test_semantic_identity_does_not_create_runtime_binding():
@@ -68,15 +61,14 @@ def test_semantic_identity_does_not_create_runtime_binding():
     assert facts["scripts/compare_csvs.py"]["primary_key_candidates"]["allowed_sources"] == []
 
 
-def test_patch_rejects_source_outside_frozen_facts():
+def test_patch_source_is_checked_by_contract_validator_not_mapping_facts():
     plan = {"interfaces": [_binding("I1", "input_files", "input_files")]}
     facts = build_runtime_binding_facts(function_items=_items(), platform_contract=_platform())
-    with pytest.raises(InterfaceIntentPlanError) as raised:
-        apply_interface_patch(plan, {"operations": [{
-            "op": "replace_source", "interface_id": "I1", "reason": "wrong source",
-            "source_platform_input": "files", "source_path": [],
-        }]}, runtime_binding_facts=facts)
-    assert raised.value.code == "invalid_interface_patch_source"
+    repaired = apply_interface_patch(plan, {"operations": [{
+        "op": "replace_source", "interface_id": "I1", "reason": "semantic replan",
+        "source_platform_input": "options", "source_path": [],
+    }]}, runtime_binding_facts=facts)
+    assert repaired["interfaces"][0]["source_platform_input"] == "options"
 
 
 def test_removing_invalid_duplicate_interface_restores_closure():
@@ -95,41 +87,30 @@ def test_removing_invalid_duplicate_interface_restores_closure():
     } for issue in issues)
 
 
-@pytest.mark.parametrize(("element_type", "source", "slots"), [
-    ("file", "files", ["file1", "file2"]),
-    ("image", "images", ["image1", "image2"]),
-    ("document", "documents", ["doc1", "doc2"]),
-    ("file", "uploads", ["left", "right"]),
-])
-def test_list_input_projects_by_element_type_into_ordered_slots(element_type, source, slots):
+def test_semantic_plan_may_select_distinct_indexed_inputs_without_type_projection():
+    source, slots = "uploaded_files", ["source_document", "reference_document"]
     items = [{
         "target_file": "scripts/consume.py", "role": "worker", "purpose": "consume",
         "inputs": [{
             "port_id": slot, "role": "required_runtime_input",
-            "contract": {"type": element_type},
+            "contract": {"type": "artifact", "semantic_type": slot},
         } for slot in slots],
         "outputs": [], "constraints": [], "required_capabilities": [],
     }]
     platform = {"platform_skill_boundary": {
         "input_envelope_fields": [source],
-        "input_schemas": {source: {"type": f"list[{element_type}]"}},
+        "input_schemas": {source: {"type": "list[artifact]"}},
         "final_output_fields": [],
     }}
 
     facts = build_runtime_binding_facts(function_items=items, platform_contract=platform)
-
-    assert facts["scripts/consume.py"] == {
-        slot: {"allowed_sources": [{
-            "source_platform_input": source, "source_path": [str(index)],
-        }]}
-        for index, slot in enumerate(slots)
-    }
+    assert all(not value["allowed_sources"] for value in facts["scripts/consume.py"].values())
     plan = {"interfaces": [
         {
             "interface_id": f"I{index + 1}", "kind": "platform_to_member",
             "source_platform_input": source, "source_path": [str(index)],
             "target_member": "scripts/consume.py", "target_input": slot,
-            "goal": "consume one projected list element",
+            "semantic_reason": f"selected by semantics for {slot}",
         }
         for index, slot in enumerate(slots)
     ]}

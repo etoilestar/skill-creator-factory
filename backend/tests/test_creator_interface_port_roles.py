@@ -1,9 +1,12 @@
 """Business-agnostic regression tests for the shared Interface contract."""
 
+import pytest
+
 from backend.services.creator.function_item_interface_plan import (
     build_canonical_interface_contract,
     collect_interface_contract_consistency_issues,
     collect_interface_plan_validation_issues,
+    validate_interface_plan_protocol,
 )
 
 
@@ -75,14 +78,24 @@ def test_derived_input_from_platform_fails():
     assert any(x["error_type"] == "provenance_error" for x in issues([p2m("external")], items))
 
 
-def test_object_to_text_with_declared_transform_passes():
-    items = [member("scripts/a.py", [], [port("value", "runtime_output", schema_type="object")])]
+@pytest.mark.parametrize("source_type", ["file", "image", "object"])
+def test_semantic_output_mapping_leaves_representation_to_runtime(source_type):
+    items = [member("scripts/a.py", [], [port("value", "runtime_output", schema_type=source_type)])]
     plan = {"interfaces": [{"interface_id": "I1", "kind": "member_to_platform",
         "source_member": "scripts/a.py", "source_output": "value",
-        "target_platform_output": "result", "transform": "json_serialize", "goal": "return result"}]}
+        "target_platform_output": "result", "semantic_reason": "final generated artifact"}]}
     contract = {"platform_skill_boundary": {"final_output_fields": ["result"],
         "output_sinks": {"result": {"value_schema": {"type": "string"}}}}}
     assert collect_interface_plan_validation_issues(plan=plan, function_items=items, platform_contract=contract) == []
+
+
+def test_transform_is_not_part_of_interface_contract():
+    plan = {"interfaces": [{"interface_id": "I1", "kind": "member_to_platform",
+        "source_member": "scripts/a.py", "source_output": "value",
+        "target_platform_output": "result", "transform": "serialize"}]}
+    with pytest.raises(Exception) as raised:
+        validate_interface_plan_protocol(plan)
+    assert raised.value.code == "invalid_interface_protocol"
 
 
 def test_cross_stage_contract_divergence_fails():

@@ -11,6 +11,7 @@ from typing import Any
 from .function_item_interface_plan import (
     AUTHORITY_CONTRACT,
     build_graph_obligations_from_interfaces,
+    interface_contract_closure_check,
     runtime_input_source_facts,
     required_platform_output_fields,
 )
@@ -417,6 +418,15 @@ def validate_responsibility_graph_candidate(
 ) -> list[dict]:
     """Materialize and authoritatively validate an Interface Plan's graph."""
     normalized = normalize_structured_function_items(function_items, source="graph_expansion")
+    closure_failures = interface_contract_closure_check(
+        interface_plan=interface_plan, function_items=normalized,
+        platform_contract=platform_contract,
+    )
+    if closure_failures:
+        raise ResponsibilityGraphExpansionError(
+            "interface plan does not close every FunctionItem input contract",
+            code="missing_interface_contract", details={"issues": closure_failures},
+        )
     registry = build_endpoint_registry(
         function_items=normalized, platform_contract=platform_contract,
     )

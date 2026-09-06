@@ -483,15 +483,19 @@ INTERFACE_FIELDS = {
     "member_to_member": {"interface_id", "kind", "source_member", "source_output", "target_member", "target_input"},
     "member_to_platform": {"interface_id", "kind", "source_member", "source_output", "target_platform_output"},
 }
+PLATFORM_INPUT_SOURCE_TYPE = "platform_input"
 # ``goal`` is accepted only as a persisted-contract compatibility alias. New
 # contracts and the published schema use ``semantic_reason``.
 OPTIONAL_INTERFACE_FIELDS = {kind: {"semantic_reason", "goal"} for kind in INTERFACE_KINDS}
+OPTIONAL_INTERFACE_FIELDS["platform_to_member"].add("source_type")
 INTERFACE_SCHEMA: dict[str, Any] = {
     "type": "object", "additionalProperties": False, "required": ["interfaces"],
     "properties": {"interfaces": {"type": "array", "items": {"oneOf": [
-        {"type": "object", "additionalProperties": False, "required": sorted(fields),
+        {"type": "object", "additionalProperties": False,
+         "required": sorted(fields | ({"source_type"} if kind == "platform_to_member" else set())),
          "properties": {
              **{key: ({"const": kind} if key == "kind" else {"type": "array", "items": {"type": "string", "minLength": 1}} if key == "source_path" else {"type": "string", "minLength": 1}) for key in fields},
+             **({"source_type": {"const": PLATFORM_INPUT_SOURCE_TYPE}} if kind == "platform_to_member" else {}),
              "semantic_reason": {"type": "string", "minLength": 1},
          }}
         for kind, fields in INTERFACE_FIELDS.items()
@@ -977,6 +981,7 @@ def build_frozen_interface_slots(
     """Project the frozen contracts into the only endpoint domain a planner may use."""
     compact = _compact_function_items(function_items)
     boundary = (platform_contract or {}).get("platform_skill_boundary", platform_contract or {})
+    input_schemas = boundary.get("input_schemas") if isinstance(boundary.get("input_schemas"), dict) else {}
     output_sinks = boundary.get("output_sinks") if isinstance(boundary.get("output_sinks"), dict) else {}
     return {
         "members": {
@@ -987,8 +992,10 @@ def build_frozen_interface_slots(
             for item in compact
         },
         "platform_ports": {
-            # Runtime user-input slots are intentionally not planning inputs.
-            "inputs": [],
+            "inputs": [
+                {"name": name, "type": _schema_type(dict(input_schemas.get(name) or {}))}
+                for name in sorted({_compact_port_id(value) for value in boundary.get("input_envelope_fields") or []})
+            ],
             "outputs": [
                 {"name": name, "type": (output_sinks.get(name) or {}).get("semantic_type")}
                 for name in sorted(platform_output_names(platform_contract))
@@ -1019,7 +1026,8 @@ def validate_interface_plan_protocol(plan: dict[str, Any]) -> dict[str, Any]:
         if kind not in INTERFACE_KINDS:
             _raise("interface kind is invalid", "invalid_interface_kind", path=f"{path}.kind")
         expected = INTERFACE_FIELDS[kind]
-        if not expected <= set(raw) <= expected | OPTIONAL_INTERFACE_FIELDS[kind]:
+        allowed = expected | OPTIONAL_INTERFACE_FIELDS[kind] | ({"source_type"} if kind == "platform_to_member" else set())
+        if not expected <= set(raw) <= allowed:
             _raise("interface fields do not match kind schema", "invalid_interface_protocol", path=path,
                    expected=sorted(expected), observed=sorted(raw))
         interface_id = _require_nonempty_string(raw, "interface_id", "invalid_interface_protocol", f"{path}.interface_id")
@@ -1033,10 +1041,15 @@ def validate_interface_plan_protocol(plan: dict[str, Any]) -> dict[str, Any]:
         for field in expected - {"interface_id", "kind", "source_path"}:
             _require_nonempty_string(raw, field, "invalid_interface_protocol", f"{path}.{field}")
         if kind == "platform_to_member":
+            if raw.get("source_type", PLATFORM_INPUT_SOURCE_TYPE) != PLATFORM_INPUT_SOURCE_TYPE:
+                _raise("source_type must be platform_input", "invalid_interface_protocol", path=f"{path}.source_type")
             source_path = raw.get("source_path")
             if not isinstance(source_path, list) or any(not isinstance(part, str) or not part or part.lower() in _DANGEROUS_PATH_PARTS for part in source_path):
                 _raise("source_path must contain only safe non-empty strings", "invalid_interface_protocol", path=f"{path}.source_path")
-        normalized.append(dict(raw))
+        value = dict(raw)
+        if kind == "platform_to_member":
+            value["source_type"] = PLATFORM_INPUT_SOURCE_TYPE
+        normalized.append(value)
     return {"interfaces": normalized}
 
 
@@ -1240,10 +1253,7 @@ def build_semantic_mapping_candidates(
                 candidate["source_contract"] = source_contract
                 candidate["source_capabilities"] = _semantic_source_capabilities(source_contract)
                 candidate["target_contract"] = dict(port.get("contract") or {})
-            input_candidates.extend(
-                candidate for candidate in candidates
-                if candidate["kind"] == "member_to_member"
-            )
+            input_candidates.extend(candidates)
     output_candidates = [
         {"source_member": item["target_file"], "source_output": port["name"],
          "target_platform_output": target,
@@ -1333,10 +1343,13 @@ def collect_interface_plan_validation_issues(
     if invalid_required_outputs:
         issue("invalid_required_platform_output", "$.platform_contract.required_final_output_fields", "", sorted(invalid_required_outputs), sorted(platform_outputs))
 
+    receiving_contracts: dict[tuple[str, str], list[str]] = {}
+
     for index, interface in enumerate(plan.get("interfaces") or []):
         path, iid, kind = f"$.interfaces[{index}]", str(interface.get("interface_id") or ""), interface.get("kind")
         if kind == "platform_to_member":
             source, target, slot = interface["source_platform_input"], interface["target_member"], interface["target_input"]
+            receiving_contracts.setdefault((target, slot), []).append(iid)
             if source not in platform_inputs: issue("unknown_platform_logical_input", f"{path}.source_platform_input", iid, source, sorted(platform_inputs))
             if target not in inputs or slot not in inputs.get(target, set()): issue("unknown_interface_logical_input", f"{path}.target_input", iid, slot, sorted(inputs.get(target, set())))
             else:
@@ -1358,6 +1371,7 @@ def collect_interface_plan_validation_issues(
         elif kind == "member_to_member":
             source, output = interface["source_member"], interface["source_output"]
             target, slot = interface["target_member"], interface["target_input"]
+            receiving_contracts.setdefault((target, slot), []).append(iid)
             if source not in outputs or output not in outputs.get(source, set()): issue("unknown_interface_logical_output", f"{path}.source_output", iid, output, sorted(outputs.get(source, set())))
             if target not in inputs or slot not in inputs.get(target, set()): issue("unknown_interface_logical_input", f"{path}.target_input", iid, slot, sorted(inputs.get(target, set())))
             else:
@@ -1390,6 +1404,20 @@ def collect_interface_plan_validation_issues(
                           {"source_type": _schema_type(source_port.get("contract") or {}),
                            "target_type": _schema_type(target_schema)},
                           reason, error_type="schema_error")
+    for member, slot in sorted(set(input_ports) - set(receiving_contracts)):
+        issue(
+            "missing_interface_contract", "$.interfaces", "",
+            {"target_member": member, "target_input": slot},
+            "one source-to-target Interface", error_type="missing_source_error",
+        )
+    for (member, slot), interface_ids in sorted(receiving_contracts.items()):
+        if len(interface_ids) > 1:
+            issue(
+                "multiple_runtime_sources", "$.interfaces", "",
+                {"target_member": member, "target_input": slot, "interface_ids": interface_ids},
+                "exactly one source-to-target Interface", error_type="provenance_error",
+            )
+
     for output in sorted(required_platform_outputs - covered_platform):
         issue(
             "uncovered_required_platform_output",
@@ -1433,9 +1461,24 @@ def collect_interface_plan_validation_issues(
             "expected_constraint": value.get("expected_constraint"), "details": {"reason_code": value["code"]},
         })
     issues.extend(edge_issues)
-    logger.info("[Creator][interface_contract_validation] runtime_input_sources_deferred=true required_platform_output_count=%d covered_platform_output_count=%d",
+    logger.info("[Creator][interface_contract_validation] runtime_input_validation_deferred=true input_contract_count=%d covered_input_contract_count=%d required_platform_output_count=%d covered_platform_output_count=%d",
+                len(input_ports), len(set(input_ports) & set(receiving_contracts)),
                 len(required_platform_outputs), len(required_platform_outputs & covered_platform))
     return issues
+
+
+def interface_contract_closure_check(
+    *, interface_plan: dict[str, Any], function_items: list[dict[str, Any]],
+    platform_contract: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Check that every frozen FunctionItem input has one planned interface."""
+    return [
+        issue for issue in collect_interface_plan_validation_issues(
+            plan=interface_plan, function_items=function_items,
+            platform_contract=platform_contract,
+        )
+        if issue.get("code") == "missing_interface_contract"
+    ]
 
 
 def merge_interface_validation_issues(
@@ -1630,8 +1673,9 @@ endpoint IDs are later registry identities such as INxxxx/OUTxxxx/PINxxxx/POUTxx
 
 2. SHARED CONTRACTS
 WIRE CONTRACT
-platform_to_member always contains: interface_id, kind, source_platform_input,
-source_path, target_member, target_input.
+platform_to_member always contains: interface_id, kind,
+source_type="platform_input", source_platform_input, source_path,
+target_member, target_input.
 member_to_member always contains: interface_id, kind, source_member,
 source_output, target_member, target_input.
 member_to_platform always contains: interface_id, kind, source_member,
@@ -1646,12 +1690,10 @@ a required field because its value is empty-like; source_path=[] is the explicit
 representation of whole-slot platform binding.
 
 3. CURRENT TASK
-Produce an Interface Plan only for explicitly known transfers between
-FunctionItems and for required final outputs. Do not create platform_to_member
-bindings to supply FunctionItem invocation parameters. Required, optional, and
-default are properties of the FunctionItem input contract; future runtime input
-provenance is deliberately unknown during creation. For every interface that is
-present, use declared endpoint names and ensure its endpoint types are compatible.
+Produce a complete Interface Plan for all FunctionItem inputs and required
+final outputs. Bind invocation parameters from declared platform inputs or
+preceding member outputs. Optionality and defaults may defer runtime value
+validation, but never defer the source-to-target contract.
 
 4. CURRENT AUTHORITY
 You, not the backend, own and choose the semantic producer using responsibilities, port
@@ -1669,10 +1711,10 @@ output may be reused by separate Interfaces.
 
 5. HARD ACCEPTANCE CONDITIONS
 FUNCTIONITEM CONTRACT BEFORE RUNTIME BINDING
-An unbound FunctionItem input is valid during creation. Never select a similar
-platform field, create options.<name>, or otherwise manufacture a runtime source
-to obtain input coverage. Missing invocation values are resolved by runtime from
-raw user input, the input's required/optional declaration, and its default.
+Every FunctionItem input must have exactly one Interface during creation. Keep
+structured business values such as options as one object port; never expand
+options.font or other object properties into new logical inputs. Runtime only
+validates whether an optional/defaulted value is present.
 
 Do not modify FunctionItems, requirements, channels, or logical ports. Do not
 return opaque endpoint IDs, Graph edges, or extra fields. Do not

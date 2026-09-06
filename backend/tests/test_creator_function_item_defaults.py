@@ -40,7 +40,7 @@ def test_document_business_defaults_are_declared_optional_inputs():
     ) == [("scripts/main.py", "topic")]
 
 
-def test_csv_optional_default_passes_interface_source_closure():
+def test_csv_optional_default_still_requires_interface_contract():
     item = _item(
         ["input_files", {"name": "ignore_empty", "required": False, "default": True}],
         {},
@@ -69,9 +69,11 @@ def test_csv_optional_default_passes_interface_source_closure():
         }]
     }
 
-    assert collect_interface_plan_validation_issues(
+    issues = collect_interface_plan_validation_issues(
         plan=plan, function_items=[item], platform_contract=platform
-    ) == []
+    )
+    assert [issue["code"] for issue in issues] == ["missing_interface_contract"]
+    assert issues[0]["observed_value"]["target_input"] == "ignore_empty"
 
 
 def test_dotted_default_resolves_to_declared_structured_input():

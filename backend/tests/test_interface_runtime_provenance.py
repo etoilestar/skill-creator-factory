@@ -50,9 +50,9 @@ def test_two_sources_for_one_runtime_slot_are_reported():
 
 def test_nested_declared_runtime_source_passes_provenance():
     facts = build_runtime_binding_facts(function_items=_items(), platform_contract=_platform())
-    assert facts["scripts/compare_csv.py"]["primary_key_field"]["allowed_sources"] == [
-        {"source_platform_input": "options", "source_path": ["primary_key_field"]}
-    ]
+    # Candidate selection is owned by the semantic planner, not projected from
+    # coincidentally matching field names.
+    assert facts["scripts/compare_csv.py"]["primary_key_field"]["allowed_sources"] == []
     issues = collect_interface_plan_validation_issues(
         plan={"interfaces": [_binding("I1", "input_files", "input_files"),
                              _binding("I2", "options", "primary_key_field", ["primary_key_field"])]},

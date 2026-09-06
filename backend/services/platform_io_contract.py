@@ -6,6 +6,7 @@ only to describe that runtime contract to generation and repair models.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
 
 
@@ -132,6 +133,63 @@ def normalize_platform_output_sinks(contract: dict[str, Any] | None) -> list[dic
 
 def platform_output_names(contract: dict[str, Any] | None) -> list[str]:
     return [sink["name"] for sink in normalize_platform_output_sinks(contract)]
+
+
+def project_function_item_outputs_to_platform_contract(
+    contract: dict[str, Any], function_items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Declare typed, externally deliverable FunctionItem outputs as sinks.
+
+    The projection is deliberately structural: it uses the declared port name,
+    type, and role, never a list of business-specific output names.  An
+    ``intermediate_output`` remains private to members.  Legacy untyped string
+    ports are not projected because doing so would let arbitrary stdout keys
+    expand the platform boundary.
+    """
+    projected = deepcopy(contract)
+    boundary = projected.get("platform_skill_boundary", projected)
+    if not isinstance(boundary, dict):
+        return projected
+    declarations = boundary.setdefault("final_output_fields", [])
+    if not isinstance(declarations, list):
+        return projected
+    declared = set(platform_output_names(projected))
+    aliases = {
+        "string": "text", "str": "text", "file_path": "file",
+        "artifact": "file", "image": "file",
+    }
+    supported = {"text", "markdown", "file"}
+    for item in function_items:
+        for output in item.get("outputs", []) if isinstance(item, dict) else []:
+            if not isinstance(output, dict):
+                continue
+            name = str(output.get("name") or output.get("port_id") or output.get("field") or "").strip()
+            role = str(output.get("role") or "runtime_output").strip()
+            contract_schema = output.get("contract") if isinstance(output.get("contract"), dict) else {}
+            raw_type = output.get("type") or contract_schema.get("type")
+            type_name = aliases.get(str(raw_type or "").strip().lower(), str(raw_type or "").strip().lower())
+            is_many = type_name.startswith(("list[", "array"))
+            element_type = type_name[5:-1] if type_name.startswith("list[") else type_name
+            element_type = aliases.get(element_type, element_type)
+            if (not name or name in declared or role == "intermediate_output"
+                    or element_type not in supported):
+                continue
+            value_schema = (
+                {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1}
+                if is_many else {"type": "string", "minLength": 1}
+            )
+            semantic_type = "file" if element_type == "file" else element_type
+            declarations.append({
+                "name": name,
+                "semantic_type": semantic_type,
+                "accepted_source_types": [str(raw_type), element_type],
+                "allowed_transforms": [],
+                "value_schema": value_schema,
+                "cardinality": "one",
+                "write_semantics": "single",
+            })
+            declared.add(name)
+    return projected
 
 
 def get_platform_output_sink(contract: dict[str, Any] | None, name: str) -> dict[str, Any] | None:

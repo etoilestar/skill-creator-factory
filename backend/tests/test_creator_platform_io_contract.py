@@ -1,6 +1,11 @@
 import pytest
 
-from backend.services.platform_io_contract import build_platform_io_contract, platform_io_contract_prompt_text
+from backend.services.platform_io_contract import (
+    build_platform_io_contract,
+    platform_io_contract_prompt_text,
+    platform_output_names,
+    project_function_item_outputs_to_platform_contract,
+)
 from backend.services.creator.common import RequirementGraph, build_default_requirement_graph, normalize_requirement_graph
 from backend.services.creator.generation import _build_script_generate_file_prompt_variant, _build_generate_file_prompt
 from backend.services.creator.repair import CreatorDiffProposal, CreatorRepairScope, _validate_repair_diff_scope
@@ -32,6 +37,27 @@ def test_platform_io_contract_declares_output_dir_final_outputs_dir():
     assert "final outputs directory" in contract["environment"]["OUTPUT_DIR"]
     assert "OUTPUT_DIR already points to final outputs directory" in prompt
     assert "Do not append 'outputs' to OUTPUT_DIR" in prompt
+
+
+def test_typed_runtime_output_is_projected_without_name_special_case():
+    base = build_platform_io_contract()
+    projected = project_function_item_outputs_to_platform_contract(base, [{
+        "outputs": [{"name": "archive_path", "type": "file"}],
+    }])
+    assert "archive_path" in platform_output_names(projected)
+    assert "archive_path" not in platform_output_names(base)
+
+
+def test_intermediate_or_untyped_output_cannot_expand_platform_boundary():
+    projected = project_function_item_outputs_to_platform_contract(
+        build_platform_io_contract(),
+        [{"outputs": [
+            {"name": "private_path", "type": "file", "role": "intermediate_output"},
+            {"name": "arbitrary_stdout_key"},
+        ]}],
+    )
+    assert "private_path" not in platform_output_names(projected)
+    assert "arbitrary_stdout_key" not in platform_output_names(projected)
 
 
 def test_platform_input_source_families_are_optional_and_have_no_structured_wrapper():

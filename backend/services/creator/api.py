@@ -16741,6 +16741,7 @@ async def validate_skill(request: SkillActionRequest):
                     + suffix
                 ),
                 repair_events=repair_events or e2e_session.events,
+                e2e_review_sample=e2e_session.trial_case,
                 deterministic_workflow_passed=True,
                 advisory_validator_status=_e2e_advisory_status_from_warnings(advisory_warnings),
                 blocking_errors=[],
@@ -16760,6 +16761,7 @@ async def validate_skill(request: SkillActionRequest):
                     )
                 ),
                 repair_events=repair_events or e2e_session.events,
+                e2e_review_sample=e2e_session.trial_case,
                 deterministic_workflow_passed=False,
                 advisory_validator_status=_e2e_advisory_status_from_warnings(advisory_warnings),
                 blocking_errors=blocking_errors,
@@ -16787,6 +16789,7 @@ async def validate_skill(request: SkillActionRequest):
                     + "\n\n".join(blocking_errors)
                 ),
                 repair_events=repair_events or e2e_session.events,
+                e2e_review_sample=e2e_session.trial_case,
                 deterministic_workflow_passed=False,
                 advisory_validator_status=_e2e_advisory_status_from_warnings(advisory_warnings),
                 blocking_errors=blocking_errors,
@@ -16802,6 +16805,7 @@ async def validate_skill(request: SkillActionRequest):
                     + "\n\n".join(blocking_errors)
                 ),
                 repair_events=repair_events or e2e_session.events,
+                e2e_review_sample=e2e_session.trial_case,
                 deterministic_workflow_passed=False,
                 advisory_validator_status=_e2e_advisory_status_from_warnings(advisory_warnings),
                 blocking_errors=blocking_errors,
@@ -16814,6 +16818,7 @@ async def validate_skill(request: SkillActionRequest):
                 path=result.get("path"),
                 message=result["message"] + "\n严格 E2E 工作流已通过。LLM advisory validator 暂不可用，已跳过；Skill 已允许打包。",
                 repair_events=repair_events or e2e_session.events,
+                e2e_review_sample=e2e_session.trial_case,
                 deterministic_workflow_passed=True,
                 advisory_validator_status="unavailable",
                 blocking_errors=[],
@@ -16827,6 +16832,7 @@ async def validate_skill(request: SkillActionRequest):
                          + "\n\n".join(blocking_errors)
                          + ("\n\n端到端自动修复记录：\n" + "\n".join(repair_logs) if repair_logs else "")),
                 repair_events=repair_events or e2e_session.events,
+                e2e_review_sample=e2e_session.trial_case,
                 missing_stdlib_requests=missing_stdlib_reqs,
             )
 
@@ -16845,6 +16851,7 @@ async def validate_skill(request: SkillActionRequest):
                     )
                 ),
                 repair_events=repair_events or e2e_session.events,
+                e2e_review_sample=e2e_session.trial_case,
                 missing_stdlib_requests=missing_stdlib_reqs,
             )
         orchestration_cycle_count += 1
@@ -16907,14 +16914,16 @@ async def validate_skill(request: SkillActionRequest):
                     and repair_result.get("next_target") is None
                 ):
                     repair_logs.append(f"第 {attempt} 轮：当前 repair experiment 已确定性拒绝（{rejection_reason}），无新的 repair owner，停止重跑 baseline")
-                    return SkillActionResponse(success=False, path=None, message="严格端到端工作流校验未收敛：当前 repair experiment 已被拒绝，且没有新的确定性 repair layer。\n" + "\n\n".join(blocking_errors), repair_events=repair_events or e2e_session.events, missing_stdlib_requests=missing_stdlib_reqs)
+                    return SkillActionResponse(success=False, path=None, message="严格端到端工作流校验未收敛：当前 repair experiment 已被拒绝，且没有新的确定性 repair layer。\n" + "\n\n".join(blocking_errors), repair_events=repair_events or e2e_session.events,
+                e2e_review_sample=e2e_session.trial_case, missing_stdlib_requests=missing_stdlib_reqs)
                 repair_logs.append(f"第 {attempt} 轮：当前 hypothesis 经真实 E2E 实验未产生改善，已回滚并进入下一轮根因诊断")
                 continue
             if status == "patch_proposal_exhausted":
                 repair_logs.append(f"第 {attempt} 轮：当前 diagnosis 未能生成合法局部补丁，尚未经过真实 E2E 实验证伪，进入下一轮根因诊断")
                 continue
             if status == "diagnosis_exhausted":
-                return SkillActionResponse(success=False, path=None, message="严格端到端工作流校验失败，且根因诊断无法提出新的合法假设：\n" + "\n\n".join(blocking_errors), repair_events=repair_events or e2e_session.events, missing_stdlib_requests=missing_stdlib_reqs)
+                return SkillActionResponse(success=False, path=None, message="严格端到端工作流校验失败，且根因诊断无法提出新的合法假设：\n" + "\n\n".join(blocking_errors), repair_events=repair_events or e2e_session.events,
+                e2e_review_sample=e2e_session.trial_case, missing_stdlib_requests=missing_stdlib_reqs)
             if status == "still_failed_same_target":
                 repair_logs.append(
                     f"第 {attempt} 轮：{repaired_target} 仍报同目标错误，未完成修复"
@@ -16933,6 +16942,7 @@ async def validate_skill(request: SkillActionRequest):
                         )
                     ),
                     repair_events=repair_events or e2e_session.events,
+                e2e_review_sample=e2e_session.trial_case,
                     validation_status="needs_repair",
                     error_type="e2e_content_repair_warning",
                     editable=True,
@@ -16961,6 +16971,7 @@ async def validate_skill(request: SkillActionRequest):
                     )
                 ),
                 repair_events=repair_events or e2e_session.events,
+                e2e_review_sample=e2e_session.trial_case,
                 missing_stdlib_requests=missing_stdlib_reqs,
             )
 

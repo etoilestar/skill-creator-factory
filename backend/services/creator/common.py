@@ -1377,6 +1377,9 @@ class SkillActionResponse(BaseModel):
     path: Optional[str] = None
     message: str
     repair_events: list[dict[str, Any]] = Field(default_factory=list)
+    # Reviewable synthetic input frozen by the real Creator E2E session.
+    # This is transport-only metadata; it does not alter validation behavior.
+    e2e_review_sample: dict[str, Any] | None = None
     deterministic_workflow_passed: bool | None = None
     advisory_validator_status: str = "skipped"
     blocking_errors: list[str] = Field(default_factory=list)

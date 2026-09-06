@@ -26,9 +26,9 @@
           <div v-if="messages.length === 0" class="empty">
             <p>说明你想创建或修改什么 Skill。信息足够时会直接生成创建要点和文件清单；只有真正缺少阻塞信息时才会追问。</p>
           </div>
-          <div v-if="artifactEvents.length || graphPlanningActive" class="live-process-area">
-            <CreatorGraphProgress :events="artifactEvents" :nodes="planningNodes" :edges="planningEdges" />
-            <CreatorE2EProgress :events="artifactEvents" />
+          <div v-if="graphPlanningActive || graphArchiving || ['validating', 'reviewing'].includes(creationRuntimeStatus)" class="live-process-area">
+            <CreatorGraphProgress v-if="graphPlanningActive || graphArchiving" :events="artifactEvents" :nodes="planningNodes" :edges="planningEdges" :archiving="graphArchiving" />
+            <CreatorE2EProgress v-if="['validating', 'reviewing'].includes(creationRuntimeStatus)" :events="artifactEvents" :review-sample="e2eReviewSample" />
           </div>
           <template v-for="(msg, i) in messages" :key="i">
             <!-- action result card -->
@@ -84,6 +84,18 @@
               <pre>{{ blueprintText }}</pre>
             </details>
           </div>
+
+          <section v-if="reviewSummary || blueprintText" class="planning-reveal" aria-label="创建规划进度">
+            <div class="reveal-step complete"><span>01</span><div><small>需求已获取</small><strong>{{ reviewSummary?.goal || '已整理目标与输入输出' }}</strong></div></div>
+            <div class="reveal-line" />
+            <div class="reveal-step" :class="{ complete: blueprintText }"><span>02</span><div><small>蓝图</small><strong>{{ blueprintText ? 'Workflow 蓝图已确定' : '正在生成蓝图' }}</strong><p v-if="reviewSummary?.workflow?.length">{{ reviewSummary.workflow.join(' → ') }}</p></div></div>
+            <div class="reveal-line" />
+            <div class="reveal-step" :class="{ complete: !graphPlanningActive && planningNodes.length, active: graphPlanningActive }"><span>03</span><div><small>责任图谱与接口合同</small><strong>{{ graphPlanningActive ? '正在逐项构建与连接' : (planningNodes.length ? '结果已归档' : '等待蓝图确认') }}</strong></div></div>
+          </section>
+
+          <button v-if="graphArchiveReady" type="button" class="graph-archive-window" @click="openArchivedGraph">
+            <span class="archive-icon">↗</span><span><small>责任图谱已收进执行过程</small><strong>查看最终图谱与接口合同</strong></span><em>{{ planningNodes.length }} 个责任节点 · {{ planningEdges.length }} 条连接</em>
+          </button>
 
 
           <!-- Skill creation panel (shown after prepare-plan is ready) -->
@@ -268,6 +280,8 @@ const pendingBlueprintText = ref('')
 const pendingFunctionItems = ref([])
 const pendingResponsibilityEdges = ref([])
 const graphPlanningActive = ref(false)
+const graphArchiving = ref(false)
+const graphArchiveReady = ref(false)
 const resolvedFunctionItems = ref(null)
 const resolvedResponsibilityEdges = ref(null)
 const resolvedRequirementGraph = ref(null)
@@ -297,6 +311,7 @@ const activeExecutionTab = ref('process')
 const executionPanelHasUpdate = ref(false)
 const creationRuntimeStatus = ref('pending')
 const creationRuntimeDetail = ref('等待 Skill 文件生成')
+const e2eReviewSample = ref(null)
 
 // Creation panel state
 const showCreationPanel = ref(false)
@@ -726,7 +741,23 @@ function saveResolvedGraphSnapshot({ functionItems, responsibilityEdges } = {}) 
   if (hasNonEmptyArray(responsibilityEdges) || (Array.isArray(responsibilityEdges) && !Array.isArray(resolvedResponsibilityEdges.value))) {
     resolvedResponsibilityEdges.value = responsibilityEdges
   }
-  if (Array.isArray(functionItems) || Array.isArray(responsibilityEdges)) graphPlanningActive.value = false
+  if (Array.isArray(functionItems) || Array.isArray(responsibilityEdges)) archiveResolvedGraph()
+}
+
+function archiveResolvedGraph() {
+  if (!graphPlanningActive.value && graphArchiveReady.value) return
+  graphPlanningActive.value = false
+  graphArchiving.value = true
+  window.setTimeout(() => {
+    graphArchiving.value = false
+    graphArchiveReady.value = true
+  }, 650)
+}
+
+function openArchivedGraph() {
+  activeExecutionTab.value = 'graph'
+  showThoughts.value = true
+  executionPanelHasUpdate.value = false
 }
 
 function mergeFinalPlanGraph(plan) {
@@ -827,7 +858,9 @@ async function send() {
 
   showCreationPanel.value = false
 
-  graphPlanningActive.value = true
+  graphArchiveReady.value = false
+  graphArchiving.value = false
+  graphPlanningActive.value = false
 
   messages.value.push({
     role: 'user',
@@ -935,6 +968,7 @@ async function send() {
           event.event === 'planner_draft' ||
           event.event === 'planner_converged'
         ) {
+          if (event.event === 'planner_draft') graphPlanningActive.value = true
           if (Array.isArray(event.function_items)) {
             pendingFunctionItems.value = event.function_items
           }
@@ -946,7 +980,7 @@ async function send() {
               functionItems: event.function_items,
               responsibilityEdges: event.responsibility_edges,
             })
-            graphPlanningActive.value = false
+            archiveResolvedGraph()
             appendExecutionBlock({
               step: 'planner_adjusted',
               label: 'Planner 调整完成',
@@ -974,7 +1008,7 @@ async function send() {
           currentStatus.value = { message: '责任图谱已校验' }
           saveResolvedGraphSnapshot({ functionItems: event.function_items, responsibilityEdges: event.responsibility_edges })
           saveResolvedRequirementGraphSnapshot({ requirementGraph: event.requirement_graph, functionItems: event.function_items, responsibilityEdges: event.responsibility_edges })
-          graphPlanningActive.value = false
+          archiveResolvedGraph()
           appendExecutionBlock({ step: 'graph_resolved', label: '责任图谱确认', detail: `确认 ${planningNodes.value.length} 个节点 / ${planningEdges.value.length} 条边`, content: summarizeFunctionItems(displayFunctionItems.value) })
           markExecutionPanelUpdated('graph')
           return
@@ -1265,8 +1299,20 @@ function onCreationExecutionEvent(event) {
     creationRuntimeStatus.value = 'running'
     creationRuntimeDetail.value = event.detail || '正在生成 Skill 文件'
   }
-  if (phase === 'e2e_start') creationRuntimeStatus.value = 'validating'
-  if (phase === 'e2e_success' || phase === 'package_complete') creationRuntimeStatus.value = 'success'
+  if (phase === 'e2e_start') {
+    creationRuntimeStatus.value = 'validating'
+    e2eReviewSample.value = null
+  }
+  if (event?.payload?.e2e_review_sample && typeof event.payload.e2e_review_sample === 'object') {
+    e2eReviewSample.value = event.payload.e2e_review_sample
+  }
+  if (phase === 'e2e_success') {
+    creationRuntimeStatus.value = e2eReviewSample.value ? 'reviewing' : 'success'
+    if (e2eReviewSample.value) window.setTimeout(() => {
+      if (creationRuntimeStatus.value === 'reviewing') creationRuntimeStatus.value = 'success'
+    }, 2400)
+  }
+  if (phase === 'package_complete') creationRuntimeStatus.value = 'success'
   if (phase === 'e2e_failed' || phase === 'package_failed') creationRuntimeStatus.value = 'failed'
   appendExecutionBlock({
     step: event?.phase || 'creation_event',
@@ -1449,7 +1495,18 @@ function clearChat() {
   border-color: #bfdbfe;
 }
 
-.live-process-area { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-bottom: 4px; }
+.live-process-area { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; margin: 8px 0 4px; }
+.planning-reveal { display: grid; grid-template-columns:minmax(0,1fr) 28px minmax(0,1fr) 28px minmax(0,1fr); align-items:stretch; gap:8px; padding:14px; border:1px solid var(--border); border-radius:16px; background:linear-gradient(135deg,var(--surface),var(--surface2)); }
+.reveal-step { display:flex; gap:10px; padding:10px; border-radius:11px; color:var(--text-muted); opacity:.65; }
+.reveal-step.active { color:#1d4ed8; opacity:1; background:#eff6ff; box-shadow:inset 0 0 0 1px #bfdbfe; }
+.reveal-step.complete { color:var(--text); opacity:1; }
+.reveal-step>span { display:grid; place-items:center; flex:0 0 30px; height:30px; border-radius:9px; background:#e2e8f0; font:700 10px monospace; }
+.reveal-step.complete>span { background:#dcfce7; color:#047857; }.reveal-step.active>span { background:#dbeafe; color:#2563eb; }
+.reveal-step small,.reveal-step strong,.reveal-step p { display:block; }.reveal-step small { margin-bottom:3px; font-size:9px; font-weight:800; letter-spacing:.08em; text-transform:uppercase; }.reveal-step strong { font-size:11px; }.reveal-step p { margin:5px 0 0;font-size:9px;line-height:1.45; }
+.reveal-line { align-self:center; height:1px; background:linear-gradient(90deg,#86efac,#93c5fd); }
+.graph-archive-window { display:grid; grid-template-columns:38px 1fr auto; align-items:center; gap:11px; width:100%; padding:13px 15px; border:1px solid #bfdbfe; border-radius:14px; background:linear-gradient(90deg,#eff6ff,#fff); color:var(--text); text-align:left; cursor:pointer; transition:.2s; animation:archive-arrive .35s both; }
+.graph-archive-window:hover { transform:translateY(-1px); box-shadow:0 10px 25px rgba(37,99,235,.12); border-color:#60a5fa; }.archive-icon { display:grid; place-items:center; width:36px;height:36px;border-radius:11px;background:#2563eb;color:#fff;font-size:18px; }.graph-archive-window small,.graph-archive-window strong { display:block; }.graph-archive-window small { color:#64748b;font-size:10px; }.graph-archive-window strong { margin-top:2px;font-size:12px; }.graph-archive-window em { color:#2563eb;font-size:10px;font-style:normal; }
+@keyframes archive-arrive { from { opacity:0;transform:translateY(-8px) } }
 /* Main three-column layout */
 .content-area {
   flex: 1;
@@ -1716,6 +1773,7 @@ function clearChat() {
 @media (max-width: 900px) {
   .content-area { flex-direction: column; }
   .live-process-area { grid-template-columns: 1fr; }
+  .planning-reveal { grid-template-columns:1fr; }.reveal-line { width:1px;height:12px;margin-left:25px; }.graph-archive-window { grid-template-columns:38px 1fr; }.graph-archive-window em { grid-column:2; }
 
   .thinking-sidebar {
     width: 100%;

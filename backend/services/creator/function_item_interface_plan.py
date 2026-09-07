@@ -106,6 +106,8 @@ semantic layers. Their names may differ, but the target_platform_output must
 always be selected from the declared platform output contract.
 
 Every selected platform output must belong to final_output_fields.
+Do not treat every legal final_output_field as required; only fields explicitly
+listed in required_final_output_fields require coverage.
 """
 PLATFORM_BOUNDARY_CONTRACT = """PLATFORM BOUNDARY CONTRACT
 
@@ -165,6 +167,13 @@ FunctionItem outputs and platform outputs are different semantic layers.
 Representation conversion is a runtime capability, not interface planning
 information. The reviewer MUST NOT reject a mapping only because source and
 target schemas differ.
+
+Planning records semantic connectivity, not the implementation of rendering,
+serialization, collection, or other representation adaptation. An unseen
+runtime implementation is never evidence against a binding. A mapping is
+semantically defective only when authoritative source and target declarations
+state incompatible meanings; naming, schema shape, or missing implementation
+detail alone cannot establish that incompatibility.
 
 The reviewer should judge whether semantic meaning is preserved, not require
 structural schema equality.
@@ -2128,6 +2137,26 @@ A plausible goal cannot make an incorrect structured source/target binding valid
 
     A valid alternative mapping is not a defect.
 
+    PRESUMPTION OF VALIDITY AND EVIDENCE FLOOR
+
+    Because deterministic acceptance has already passed, treat every existing
+    binding as valid unless the payload contains direct, affirmative evidence
+    of a semantic contradiction. Missing implementation details, an omitted
+    renderer/serializer, ambiguity, or uncertainty are not contradictions at
+    this planning stage.
+
+    Evidence must cite contradictory facts actually present in the payload.
+    Do not infer a defect from a port name alone. Do not use speculation such
+    as "likely", "probably", "may not", or "not necessarily" as evidence.
+
+    Apply this evidence rule uniformly to every binding, regardless of port
+    names or content format. For member_to_platform bindings, deterministic
+    validation has already proved that target_platform_output belongs to
+    final_output_fields. Treat that membership as an established fact. Compare
+    only the declared semantic meaning of the source value and target slot;
+    do not infer incompatibility from naming, schema shape, format labels, or
+    runtime representation details.
+
 
     7. AUTHORITY LIMIT
 
@@ -2146,11 +2175,13 @@ A plausible goal cannot make an incorrect structured source/target binding valid
 
     8. OUTPUT CONTRACT
 
-    Classify every defect by its primary failed dimension:
-    binding_error (boundary/reference), provenance_error (semantic origin),
-    missing_source_error (required source absent), or schema_error (contract structure).
-    Independently check schema correctness, boundary correctness, and
-    provenance correctness. Do not collapse these into "interface invalid".
+    Classify every proven semantic defect by its primary failed dimension:
+    binding_error (semantic boundary misuse, never identifier membership),
+    provenance_error (semantic origin), missing_source_error (a required
+    semantic source is affirmatively absent), or schema_error (an explicit
+    semantic constraint contradiction, never mere representation difference).
+    Do not repeat deterministic checks and do not collapse defects into
+    "interface invalid".
 
     passed=true exactly when issues is empty.
 

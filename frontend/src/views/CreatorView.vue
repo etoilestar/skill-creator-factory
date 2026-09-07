@@ -27,7 +27,7 @@
             <p>说明你想创建或修改什么 Skill。信息足够时会直接生成创建要点和文件清单；只有真正缺少阻塞信息时才会追问。</p>
           </div>
           <div v-if="graphPlanningActive || graphArchiving" class="live-process-area">
-            <CreatorGraphProgress v-if="graphPlanningActive || graphArchiving" :events="artifactEvents" :nodes="planningNodes" :edges="planningEdges" :archiving="graphArchiving" />
+            <CreatorGraphProgress v-if="graphPlanningActive || graphArchiving" :events="artifactEvents" :nodes="planningNodes" :edges="planningEdges" :interfaces="pendingInterfaces" :archiving="graphArchiving" />
           </div>
           <template v-for="(msg, i) in messages" :key="i">
             <!-- action result card -->
@@ -284,6 +284,7 @@ function actionLabel(action) {
 const pendingBlueprintText = ref('')
 const pendingFunctionItems = ref([])
 const pendingResponsibilityEdges = ref([])
+const pendingInterfaces = ref([])
 const graphPlanningActive = ref(false)
 const graphArchiving = ref(false)
 const graphArchiveReady = ref(false)
@@ -1003,6 +1004,31 @@ async function send() {
           markExecutionPanelUpdated('graph')
           return
         }
+        if (event.event === 'graph_nodes_ready' || event.event === 'interface_contract_planning') {
+          graphPlanningActive.value = true
+          if (event.event === 'graph_nodes_ready') pendingInterfaces.value = []
+          if (Array.isArray(event.function_items)) pendingFunctionItems.value = event.function_items
+          currentStatus.value = { message: event.message || '正在规划接口合同…' }
+          markExecutionPanelUpdated('graph')
+          return
+        }
+        if (event.event === 'interface_contracts_ready' || event.event === 'interface_contracts_repaired') {
+          graphPlanningActive.value = true
+          if (Array.isArray(event.function_items)) pendingFunctionItems.value = event.function_items
+          pendingInterfaces.value = Array.isArray(event.interfaces) ? event.interfaces : []
+          currentStatus.value = { message: event.message || '接口合同已就绪，正在连接图谱…' }
+          markExecutionPanelUpdated('graph')
+          return
+        }
+        if (event.event === 'graph_edges_ready') {
+          graphPlanningActive.value = true
+          if (Array.isArray(event.function_items)) pendingFunctionItems.value = event.function_items
+          if (Array.isArray(event.responsibility_edges)) pendingResponsibilityEdges.value = event.responsibility_edges
+          if (Array.isArray(event.interfaces)) pendingInterfaces.value = event.interfaces
+          currentStatus.value = { message: event.message || '图谱连接已建立，正在校验…' }
+          markExecutionPanelUpdated('graph')
+          return
+        }
         if (event.event === 'file_plan_ready') {
           currentStatus.value = { message: '文件规划已完成，正在绑定责任图谱…' }
           appendExecutionBlock({ step: 'file_plan_ready', label: '文件计划完成', detail: '文件拓扑已准备', content: [] })
@@ -1402,6 +1428,7 @@ function clearChat() {
   pendingBlueprintText.value = ''
 
   pendingFunctionItems.value = []
+  pendingInterfaces.value = []
 
   pendingResponsibilityEdges.value = []
 

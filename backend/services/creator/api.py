@@ -7040,6 +7040,7 @@ async def _bind_executable_responsibility_plan(
     allowed_function_item_targets: list[str],
     requirement_allocations: list[dict[str, Any]] | None = None,
     requirement_channels: dict[str, str] | None = None,
+    event_emitter: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
 ) -> dict[str, Any]:
     """Expand edges incrementally over Backend-materialized frozen FunctionItems."""
     frozen_blueprint_text = str(
@@ -7049,6 +7050,14 @@ async def _bind_executable_responsibility_plan(
         frozen_blueprint_text=frozen_blueprint_text,
         allowed_function_item_targets=allowed_function_item_targets,
     )
+    if event_emitter is not None:
+        await event_emitter({
+            "event": "graph_nodes_ready",
+            "stage": "graph",
+            "status": "running",
+            "message": "责任节点已冻结，正在规划接口合同",
+            "function_items": frozen_function_items,
+        })
     async def select_sources(messages: list[dict[str, str]], model: str) -> str:
         return await complete_creator_role_once(
             messages, "planner", fallback_model=model, stage="Interface Planner / Repair Generator",
@@ -7065,6 +7074,14 @@ async def _bind_executable_responsibility_plan(
         allocation for allocation in (requirement_allocations or [])
         if not (allocation.get("owners") or [])
     ]
+    if event_emitter is not None:
+        await event_emitter({
+            "event": "interface_contract_planning",
+            "stage": "graph",
+            "status": "running",
+            "message": "正在为节点输入输出选择来源与去向",
+            "function_items": frozen_function_items,
+        })
     interface_plan = await plan_function_item_interfaces(
         original_user_goal=request.user_request,
         frozen_function_items=frozen_function_items,
@@ -7078,6 +7095,21 @@ async def _bind_executable_responsibility_plan(
         reviewer_model=planner_model,
         reviewer_model_call=review_interfaces,
     )
+    interface_payload = (
+        interface_plan.model_dump(mode="json")
+        if hasattr(interface_plan, "model_dump")
+        else dict(interface_plan or {})
+    )
+    if event_emitter is not None:
+        await event_emitter({
+            "event": "interface_contracts_ready",
+            "stage": "graph",
+            "status": "running",
+            "message": "接口合同已规划，正在连接责任图谱",
+            "function_items": frozen_function_items,
+            "interface_plan": interface_payload,
+            "interfaces": interface_payload.get("interfaces", []),
+        })
     graph_context = {
         "system_goal": request.user_request,
         "skill_name": current_planner_result.get("skill_name", ""),
@@ -7115,6 +7147,21 @@ async def _bind_executable_responsibility_plan(
             reviewer_model=planner_model,
             reviewer_model_call=review_interfaces,
         )
+        interface_payload = (
+            interface_plan.model_dump(mode="json")
+            if hasattr(interface_plan, "model_dump")
+            else dict(interface_plan or {})
+        )
+        if event_emitter is not None:
+            await event_emitter({
+                "event": "interface_contracts_repaired",
+                "stage": "repair",
+                "status": "running",
+                "message": "接口合同已修复，正在重新连接图谱",
+                "function_items": frozen_function_items,
+                "interface_plan": interface_payload,
+                "interfaces": interface_payload.get("interfaces", []),
+            })
         try:
             responsibility_edges = await expand_responsibility_graph(
                 function_items=frozen_function_items,
@@ -7139,6 +7186,17 @@ async def _bind_executable_responsibility_plan(
                 },
             ) from repair_exc
         logger.info("[Creator][interface_graph_revalidation] attempt=1 result=success")
+    if event_emitter is not None:
+        await event_emitter({
+            "event": "graph_edges_ready",
+            "stage": "graph",
+            "status": "running",
+            "message": "责任连接已建立，正在执行最终合同校验",
+            "function_items": frozen_function_items,
+            "responsibility_edges": responsibility_edges,
+            "interface_plan": interface_payload,
+            "interfaces": interface_payload.get("interfaces", []),
+        })
     return {
         "function_items": frozen_function_items,
         "responsibility_edges": responsibility_edges,
@@ -10149,6 +10207,7 @@ Blueprint Planner 只规划业务责任。
                 allowed_function_item_targets=allowed_function_item_targets,
                 requirement_allocations=requirement_allocations,
                 requirement_channels=requirement_channels,
+                event_emitter=event_emitter,
             )
             if allowed_function_item_targets
             else {"function_items": [], "responsibility_edges": []}

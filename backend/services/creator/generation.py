@@ -2478,10 +2478,11 @@ def _script_local_contract_payload(
             (
                 "Available tools are implementation "
                 "candidates, not mandatory execution "
-                "requirements. A tool should only be "
-                "invoked when using that capability is "
-                "necessary or materially improves the "
-                "implementation required by the "
+                "requirements. Prefer a suitable hinted "
+                "tool when its real contract directly helps, "
+                "but selecting zero tools is acceptable when "
+                "local logic, the standard library, or an "
+                "allowed dependency fully satisfies the "
                 "responsibility contract."
             ),
 
@@ -3338,7 +3339,8 @@ def _build_script_generate_file_prompt_variant(
         (
             "执行顺序：1. Read script_goal; 2. Read responsibility_requirements.must_do; "
             "3. Read responsibility_requirements.must_not_do; 4. Read responsibility_requirements.constraints; 5. Determine the current file's responsibility closure; "
-            "6. Only then inspect available_tools; 7. Select zero or more tools whose real function contracts directly help implement that responsibility."
+            "6. Only then inspect available_tools; 7. Prefer a suitable hinted tool whose real function contract directly helps, "
+            "but select zero tools when local logic, the standard library, or an allowed dependency can fully implement that responsibility."
         ),
         (
             "available_tools 是 Skill-wide authorized candidate pool，不是当前脚本的责任所有权清单。"

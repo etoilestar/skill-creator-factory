@@ -5185,7 +5185,8 @@ async def _run_script_responsibility_review(
                 "Opening the file, assigning it to an unused variable, dead parsing code, comments claiming it is used, or superficial loading with no downstream effect are insufficient.\n\n"
                 "工具合同判断规则：你必须根据 Current File ToolPool contracts 与完整源码判断工具使用事实。"
                 "如果源码调用的平台工具不在当前 ToolPool 合同中，输出 blocking issue id=tool_contract_mismatch。"
-                "如果当前 ToolPool 缺少完成 FunctionItem 所需能力，输出 blocking issue id=tool_support_insufficient。"
+                "工具选择是可选实现决策：有直接适配的 hinted/authorized Tool 时应优先考虑，但如果标准库、已允许依赖或本地逻辑能完整完成 FunctionItem，零工具调用也必须接受。"
+                "只有 FunctionItem 无法通过这些本地方式完成、且当前 ToolPool 确实缺少不可替代的外部能力时，才输出 blocking issue id=tool_support_insufficient；不得仅因缺少 hint 对应工具或未调用已授权工具而判失败。"
                 "如果工具已提供但源码没有正确使用导致职责未完成，输出普通 semantic blocking issue。"
                 "Backend 只确认工具事实是否真实，不根据模块名、函数名、角色或 capability 映射替你判断工具语义。\n\n"
 

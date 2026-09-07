@@ -411,6 +411,53 @@ export async function validateSkill(
   return payload
 }
 
+/** Validate a Skill while receiving review-input and per-step runtime updates. */
+export async function validateSkillStream(
+  skillName,
+  {
+    model = null,
+    autoRepair = true,
+    maxE2ERepairAttempts = 10,
+    onEvent = () => {},
+  } = {}
+) {
+  const resp = await fetch('/api/creator/validate-skill/stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      skill_name: skillName,
+      model,
+      auto_repair: autoRepair,
+      max_e2e_repair_attempts: maxE2ERepairAttempts,
+    }),
+  })
+  if (!resp.ok || !resp.body) {
+    const err = await resp.json().catch(() => ({ detail: resp.statusText }))
+    throw new Error(err.detail || '校验请求失败')
+  }
+
+  const reader = resp.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let result = null
+  while (true) {
+    const { value, done } = await reader.read()
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done })
+    const lines = buffer.split('\n')
+    buffer = lines.pop() || ''
+    for (const line of lines) {
+      if (!line.trim()) continue
+      const event = JSON.parse(line)
+      onEvent(event)
+      if (event.event === 'complete') result = event.result
+      if (event.event === 'error') throw new Error(event.error?.message || '校验请求失败')
+    }
+    if (done) break
+  }
+  if (!result) throw new Error('校验流在返回结果前结束')
+  return result
+}
+
 /**
  * Package a Skill directory into a distributable archive.
  *

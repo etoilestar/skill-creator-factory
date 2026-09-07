@@ -1813,36 +1813,17 @@ def _canonical_file_fixture_format(fmt: str) -> str:
     return handler.canonical_format if handler else ""
 
 
-def _formats_from_input_evidence(text: str) -> tuple[str, ...]:
-    value = str(text or "").lower()
-    found: list[str] = []
-    for alias, handler in FILE_FIXTURE_FORMATS.items():
-        if re.search(rf"(?<![a-z0-9])\.?{re.escape(alias)}(?![a-z0-9])", value):
-            if handler.canonical_format not in found:
-                found.append(handler.canonical_format)
-    return tuple(found)
-
-
 def _resolve_e2e_file_input_spec(
     typed_spec: E2ETypedInputSpec,
     requirements: list[RequirementItem],
 ) -> E2EFileInputSpec:
-    """Resolve format/cardinality solely from frozen input-side evidence."""
-    evidence_groups: list[tuple[str, list[str]]] = []
-    input_declarations = [str(value) for req in requirements for value in (req.inputs or [])]
-    # RequirementItem used to discard these frozen prose fields and the
-    # resolver consequently consulted only its structured projections.  Prose
-    # is authoritative input-side evidence, but trim explicit output clauses
-    # so an output such as report.pdf can never select an input fixture type.
-    requirement_texts: list[str] = []
-    for req in requirements:
-        raw = next((str(getattr(req, field, "") or "") for field in ("requirement", "text", "purpose")
-                    if str(getattr(req, field, "") or "").strip()), "")
-        requirement_texts.append(re.split(
-            r"\b(?:output|result|report|generate|create|produce|write|save|return|export)\b|(?:输出|生成|导出)",
-            raw, maxsplit=1, flags=re.I,
-        )[0])
-    constraint_values: list[str] = []
+    """Resolve only explicit structured file constraints.
+
+    Natural-language format selection belongs to the grounded Trial Case
+    planner.  This resolver deliberately does not maintain a keyword-to-file
+    format table.
+    """
+    declared_formats: list[str] = []
     for req in requirements:
         for constraint in req.constraints or []:
             constraint_label = " ".join([str(constraint.name or ""), str(constraint.kind or "")]).lower()
@@ -1850,36 +1831,16 @@ def _resolve_e2e_file_input_spec(
                 continue
             raw = constraint.value
             if isinstance(raw, dict):
-                raw = raw.get("allowed_formats") or raw.get("formats") or raw.get("format") or ""
-            if isinstance(raw, list):
-                constraint_values.extend(str(value) for value in raw)
-            else:
-                constraint_values.append(str(raw or ""))
-    purposes = [
-        re.split(r"\b(?:output|result|report|generate|create|produce|write|save|return|export)\b|(?:输出|生成|导出)", str(req.purpose or ""), maxsplit=1, flags=re.I)[0]
-        for req in requirements
-    ]
-    evidence_groups.extend([
-        ("requirement_text", requirement_texts),
-        ("requirement_input", input_declarations),
-        ("requirement_constraint", constraint_values),
-        ("requirement_input_context", purposes),
-    ])
-    allowed: tuple[str, ...] = ()
-    source = "unknown"
-    authority_text = ""
-    for candidate_source, values in evidence_groups:
-        formats = _formats_from_input_evidence("\n".join(values))
-        if formats:
-            allowed, source, authority_text = formats, candidate_source, "\n".join(values)
-            break
+                raw = raw.get("allowed_formats") or raw.get("formats") or raw.get("format") or []
+                values = raw if isinstance(raw, list) else [raw]
+                for value in values:
+                    canonical = _canonical_file_fixture_format(str(value))
+                    if canonical and canonical not in declared_formats:
+                        declared_formats.append(canonical)
+    allowed = tuple(declared_formats)
+    source = "requirement_constraint" if allowed else "unknown"
     shape = _canonical_e2e_shape(typed_spec.shape)
     minimum, maximum = (1, 1) if shape == "file_path" else (1, 3)
-    cardinality_match = re.search(r"\b(?:exactly\s+)?(one|two|three|[1-3])\b|([一二三两])(?:个|份|张)", authority_text.lower())
-    if cardinality_match and shape == "list[file_path]":
-        raw = cardinality_match.group(1) or cardinality_match.group(2)
-        count = {"one": 1, "two": 2, "three": 3, "一": 1, "二": 2, "两": 2, "三": 3}.get(raw, int(raw) if raw.isdigit() else 1)
-        minimum = maximum = count
     result = E2EFileInputSpec(
         source_name=typed_spec.name, runtime_shape=shape, allowed_formats=allowed,
         min_items=minimum, max_items=maximum,
@@ -2120,6 +2081,140 @@ def _build_e2e_input_case_plan(
         "inputs": {name: asdict(spec) for name, spec in plan.inputs.items()},
     }, ensure_ascii=False, sort_keys=True, default=str))
     return plan
+
+
+def _plan_unknown_e2e_file_formats(
+    plan: E2EInputCasePlan,
+    *,
+    requirements_by_file: dict[str, list[RequirementItem]],
+    requested_model: str | None,
+) -> E2EInputCasePlan:
+    """Let the model fill unresolved file semantics without changing the contract.
+
+    The materializer registry is exposed only as an execution-capability list;
+    it is not used as a natural-language keyword map.  Names, shapes,
+    cardinalities, and explicitly declared formats remain frozen.
+    """
+    unresolved = [
+        spec for spec in plan.inputs.values()
+        if spec.runtime_shape in {"file_path", "list[file_path]"} and not spec.allowed_formats
+    ]
+    if not unresolved:
+        return plan
+
+    evidence: list[dict[str, Any]] = []
+    for spec in unresolved:
+        requirements = []
+        for req in requirements_by_file.get(spec.target_file, []) or []:
+            text = next((
+                str(getattr(req, field, "") or "").strip()
+                for field in ("requirement", "text", "purpose")
+                if str(getattr(req, field, "") or "").strip()
+            ), "")
+            inputs = [str(value) for value in (req.inputs or []) if str(value).strip()]
+            if text or inputs:
+                requirements.append({"id": str(req.id or ""), "text": text, "inputs": inputs})
+        if requirements:
+            evidence.append({
+                "name": spec.name,
+                "target_file": spec.target_file,
+                "shape": spec.runtime_shape,
+                "requirements": requirements,
+            })
+
+    # With no semantic evidence, guessing would weaken rather than complete the
+    # frozen authority.  The caller will report the existing infrastructure
+    # failure.
+    evidence_names = {item["name"] for item in evidence}
+    unresolved = [spec for spec in unresolved if spec.name in evidence_names]
+    if not unresolved:
+        return plan
+
+    capabilities = sorted({handler.canonical_format for handler in FILE_FIXTURE_FORMATS.values()})
+    variants = []
+    for spec in unresolved:
+        variants.append({
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["name", "formats", "reason"],
+            "properties": {
+                "name": {"const": spec.name},
+                "formats": {
+                    "type": "array", "minItems": 1, "uniqueItems": True,
+                    "items": {"type": "string", "enum": capabilities},
+                },
+                "reason": {"type": "string", "minLength": 1},
+            },
+        })
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["inputs"],
+        "properties": {
+            "inputs": {
+                "type": "array", "minItems": len(unresolved), "maxItems": len(unresolved),
+                "items": {"oneOf": variants},
+            },
+        },
+    }
+    try:
+        route = route_model(
+            VALIDATOR_TASK, requested_model=requested_model,
+            reason="creator grounded E2E file semantic planning",
+        )
+        proposed = _complete_creator_json_object_once_sync_for_e2e(
+            messages=[
+                {"role": "system", "content": (
+                    "Select file formats for unresolved runtime file inputs from semantic evidence. "
+                    "The supplied names, shapes, targets, and cardinalities are a frozen contract: do not change them. "
+                    "Available formats are execution capabilities, not hints that every format is appropriate. "
+                    "Use only input-side evidence, never an output artifact format. Return exactly the bound JSON Schema."
+                )},
+                {"role": "user", "content": json.dumps({
+                    "unresolved_inputs": evidence,
+                    "materialization_capabilities": capabilities,
+                }, ensure_ascii=False, sort_keys=True)},
+            ],
+            model=route.model,
+            phase="creator_e2e_file_semantic_plan",
+            response_schema=schema,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[Creator][E2E][file_semantic_plan_failed] type=%s error=%s",
+            type(exc).__name__, exc,
+        )
+        return plan
+    items = proposed.get("inputs", []) if isinstance(proposed, dict) else []
+    selected: dict[str, tuple[str, ...]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "")
+        formats = tuple(dict.fromkeys(
+            canonical for value in (item.get("formats") or [])
+            if (canonical := _canonical_file_fixture_format(str(value)))
+        ))
+        if name in evidence_names and formats:
+            selected[name] = formats
+    if set(selected) != evidence_names:
+        return plan
+
+    inputs = dict(plan.inputs)
+    for name, formats in selected.items():
+        inputs[name] = replace(
+            inputs[name],
+            allowed_formats=formats,
+            homogeneous_files=True if len(formats) == 1 else False,
+            file_format_source="model_semantic_planner",
+        )
+    resolved = E2EInputCasePlan(inputs=inputs, digest=_case_plan_digest(inputs))
+    logger.info("[Creator][E2E][file_semantic_plan] %s", json.dumps({
+        "previous_digest": plan.digest,
+        "digest": resolved.digest,
+        "formats": {name: list(formats) for name, formats in selected.items()},
+    }, ensure_ascii=False, sort_keys=True))
+    return resolved
 
 
 def _path_tokens(path: str) -> list[str | int]:
@@ -4005,6 +4100,11 @@ def _prepare_e2e_trial_case(
         list(candidates.values()),
         requirements_by_file=
             requirements_by_file,
+    )
+    plan = _plan_unknown_e2e_file_formats(
+        plan,
+        requirements_by_file=requirements_by_file,
+        requested_model=requested_model,
     )
 
     # =========================================================

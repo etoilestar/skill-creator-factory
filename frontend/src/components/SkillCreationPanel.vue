@@ -349,7 +349,7 @@ import {
   initSkill,
   generateFileStream,
   writeFile,
-  validateSkill,
+  validateSkillStream,
   packageSkill,
   uploadAssetAPI,
 } from '../composables/useCreator.js'
@@ -526,6 +526,7 @@ const phase = ref('idle')   // idle | running | paused | validating | packaging 
 const paused = ref(false)
 
 const validateResult = ref(null)
+const liveRuntimeEvents = ref([])
 const packageResult = ref(null)
 
 const addFilePrompt = ref(false)
@@ -564,22 +565,31 @@ const generationStages = computed(() => {
   ]
 })
 
-const runtimeEvents = computed(() => Array.isArray(validateResult.value?.runtime_trace)
-  ? validateResult.value.runtime_trace
-  : (Array.isArray(validateResult.value?.repair_events) ? validateResult.value.repair_events : []))
+const runtimeEvents = computed(() => liveRuntimeEvents.value.length
+  ? liveRuntimeEvents.value
+  : (Array.isArray(validateResult.value?.runtime_trace)
+      ? validateResult.value.runtime_trace
+      : (Array.isArray(validateResult.value?.repair_events) ? validateResult.value.repair_events : [])))
 
-const runtimeSteps = computed(() => runtimeEvents.value
-  .filter(event => event && (event.current_step || event.step_index || event.step_id || event.script_path || event.target_file))
-  .map((event, index) => ({
-    id: event.step_id || event.current_step || event.step_index || index,
-    script: event.script_path || event.target_file || event.step_id || `执行步骤 ${event.current_step || event.step_index || index + 1}`,
-    input: summaryValue(event.input_summary || event.inputs || event.rendered_payload_summary),
-    output: summaryValue(event.output_summary || event.outputs || event.artifact),
-    files: summaryValue(event.file_changes || event.changed_files || event.invalidated_checkpoints),
-    duration: summaryValue(event.duration || event.duration_ms || event.elapsed_ms),
-    status: normalizeRuntimeStatus(event.status || event.rerun_status || event.patch_status),
-    index,
-  })))
+const runtimeSteps = computed(() => {
+  const steps = new Map()
+  runtimeEvents.value
+    .filter(event => event && (event.current_step || event.step_index || event.step_id || event.script_path || event.target_file))
+    .forEach((event, eventIndex) => {
+      const id = event.step_id || event.current_step || event.step_index || `${event.target_file || event.script_path}-${eventIndex}`
+      const previous = steps.get(id) || { id, index: steps.size }
+      steps.set(id, {
+        ...previous,
+        script: event.script_path || event.target_file || previous.script || `执行步骤 ${id}`,
+        input: summaryValue(event.input_summary || event.inputs || event.rendered_payload_preview || event.rendered_payload_summary) || previous.input,
+        output: summaryValue(event.output_summary || event.outputs || event.artifact) || previous.output,
+        files: summaryValue(event.file_changes || event.changed_files || event.invalidated_checkpoints) || previous.files,
+        duration: summaryValue(event.duration || event.duration_ms || event.elapsed_ms) || previous.duration,
+        status: normalizeRuntimeStatus(event.status || event.rerun_status || event.patch_status),
+      })
+    })
+  return [...steps.values()]
+})
 const currentRuntimeStep = computed(() => runtimeSteps.value.find(step => step.status === 'running') || (runtimeStatus.value === 'running' ? runtimeSteps.value.at(-1) : null))
 const historyRuntimeSteps = computed(() => runtimeSteps.value.filter(step => step !== currentRuntimeStep.value))
 
@@ -1231,14 +1241,39 @@ async function runCreationFromCurrentIndex() {
 
 async function runPostValidationAndPackaging() {
   phase.value = 'validating'
+  liveRuntimeEvents.value = []
+  validateResult.value = null
   emitExecutionEvent({ phase: 'e2e_start', label: 'E2E 开始', detail: '开始严格端到端校验', content: [] })
   packageResult.value = null
 
   try {
-    validateResult.value = await validateSkill(localSkillName.value, {
+    validateResult.value = await validateSkillStream(localSkillName.value, {
       model: props.model,
       autoRepair: true,
       maxE2ERepairAttempts: 10,
+      onEvent(event) {
+        if (event.event === 'e2e_input_ready') {
+          validateResult.value = {
+            ...(validateResult.value || {}),
+            e2e_review_sample: event.e2e_review_sample,
+          }
+          emitExecutionEvent({
+            phase: 'e2e_input_ready',
+            label: 'E2E 输入已构造',
+            detail: 'Runtime 待测输入已冻结，可供审阅',
+            payload: { e2e_review_sample: event.e2e_review_sample },
+          })
+        }
+        if (event.event === 'e2e_runtime_event' && event.runtime_event) {
+          liveRuntimeEvents.value.push(event.runtime_event)
+          emitExecutionEvent({
+            phase: 'e2e_runtime_event',
+            label: event.runtime_event.event || 'Runtime 步骤更新',
+            detail: event.runtime_event.target_file || event.runtime_event.script_path || '',
+            payload: { runtime_event: event.runtime_event },
+          })
+        }
+      },
     })
   } catch (err) {
     validateResult.value = {

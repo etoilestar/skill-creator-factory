@@ -26,9 +26,8 @@
           <div v-if="messages.length === 0" class="empty">
             <p>说明你想创建或修改什么 Skill。信息足够时会直接生成创建要点和文件清单；只有真正缺少阻塞信息时才会追问。</p>
           </div>
-          <div v-if="graphPlanningActive || graphArchiving || ['validating', 'reviewing'].includes(creationRuntimeStatus)" class="live-process-area">
+          <div v-if="graphPlanningActive || graphArchiving" class="live-process-area">
             <CreatorGraphProgress v-if="graphPlanningActive || graphArchiving" :events="artifactEvents" :nodes="planningNodes" :edges="planningEdges" :archiving="graphArchiving" />
-            <CreatorE2EProgress v-if="['validating', 'reviewing'].includes(creationRuntimeStatus)" :events="artifactEvents" :review-sample="e2eReviewSample" />
           </div>
           <template v-for="(msg, i) in messages" :key="i">
             <!-- action result card -->
@@ -117,6 +116,12 @@
             @creation-complete="onCreationComplete"
             @creation-error="onCreationError"
             @execution-event="onCreationExecutionEvent"
+          />
+          <CreatorE2EProgress
+            v-if="['validating', 'reviewing'].includes(creationRuntimeStatus)"
+            class="creator-e2e-followup"
+            :events="artifactEvents"
+            :review-sample="e2eReviewSample"
           />
         </div>
 
@@ -1321,6 +1326,7 @@ function onCreationExecutionEvent(event) {
     content: event?.content || [],
     publish: false,
   })
+  nextTick(scrollBottom)
 }
 
 function onCreationComplete({ skillName, validateResult, packageResult }) {

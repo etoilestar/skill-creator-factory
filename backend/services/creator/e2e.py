@@ -7461,6 +7461,9 @@ def _run_skill_workflow_e2e_once(
                         "current_step": command.ordinal,
                         "total_steps": len(commands),
                         "target_file": command.script_path,
+                        # Transport-only preview for live Creator review. It does
+                        # not participate in execution or validation decisions.
+                        "rendered_payload_preview": _preview_object(rendered_payload),
                         "rendered_payload_summary": json.dumps(_json_object_shape(rendered_payload), ensure_ascii=False, sort_keys=True),
                         "trace_summary": _format_e2e_trace(traces)[-2000:],
                     })

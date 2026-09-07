@@ -16664,8 +16664,11 @@ def _external_context_from_skill_action_request(request: SkillActionRequest) -> 
     return context
 
 
-@router.post("/validate-skill", response_model=SkillActionResponse)
-async def validate_skill(request: SkillActionRequest):
+async def _validate_skill_impl(
+    request: SkillActionRequest,
+    *,
+    event_emitter: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+):
     """Validate and strictly E2E-run a Skill package.
 
     Flow:
@@ -16700,17 +16703,48 @@ async def validate_skill(request: SkillActionRequest):
     repair_logs: list[str] = []
     repair_events: list[dict[str, Any]] = []
     e2e_session = _create_e2e_session(skill_name, source_skill_dir=settings.skills_path / skill_name)
+    emitted_event_count = 0
+    emitted_trial_digest = ""
+
+    async def run_e2e_with_progress(external_context: dict[str, Any]) -> list[str]:
+        """Run the existing synchronous validator while forwarding transport-only updates."""
+        nonlocal emitted_event_count, emitted_trial_digest
+        task = asyncio.create_task(asyncio.to_thread(
+            validate_workflow_e2e,
+            skill_name,
+            external_context=external_context,
+            requested_model=request.model,
+            e2e_session=e2e_session,
+        ))
+
+        async def flush_updates() -> None:
+            nonlocal emitted_event_count, emitted_trial_digest
+            if event_emitter is None:
+                return
+            trial_digest = e2e_session.trial_case_digest
+            if e2e_session.trial_case is not None and trial_digest != emitted_trial_digest:
+                emitted_trial_digest = trial_digest
+                await event_emitter({
+                    "event": "e2e_input_ready",
+                    "e2e_review_sample": e2e_session.trial_case,
+                })
+            while emitted_event_count < len(e2e_session.events):
+                event = dict(e2e_session.events[emitted_event_count])
+                emitted_event_count += 1
+                await event_emitter({"event": "e2e_runtime_event", "runtime_event": event})
+
+        while not task.done():
+            await flush_updates()
+            await asyncio.sleep(0.1)
+        try:
+            return await task
+        finally:
+            await flush_updates()
 
     while True:
         external_context = _external_context_from_skill_action_request(request)
         try:
-            e2e_errors = await asyncio.to_thread(
-                validate_workflow_e2e,
-                skill_name,
-                external_context=external_context,
-                requested_model=request.model,
-                e2e_session=e2e_session,
-            )
+            e2e_errors = await run_e2e_with_progress(external_context)
         except Exception as exc:
             logger.exception("validate-skill e2e validator crashed skill=%s", skill_name)
             e2e_errors = [
@@ -16974,6 +17008,49 @@ async def validate_skill(request: SkillActionRequest):
                 e2e_review_sample=e2e_session.trial_case,
                 missing_stdlib_requests=missing_stdlib_reqs,
             )
+
+
+@router.post("/validate-skill", response_model=SkillActionResponse)
+async def validate_skill(request: SkillActionRequest):
+    """Backward-compatible non-streaming Creator E2E validation endpoint."""
+    return await _validate_skill_impl(request)
+
+
+@router.post("/validate-skill/stream")
+async def validate_skill_stream(request: SkillActionRequest):
+    """Stream review input and runtime events without changing E2E decisions."""
+    async def emit_ndjson():
+        queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+
+        async def event_emitter(event: dict[str, Any]) -> None:
+            await queue.put(event)
+
+        async def run_validation() -> None:
+            try:
+                result = await _validate_skill_impl(request, event_emitter=event_emitter)
+                await queue.put({"event": "complete", "result": result})
+            except Exception as exc:
+                logger.exception("validate-skill streaming request failed skill=%s", request.skill_name)
+                await queue.put({"event": "error", "error": {"type": type(exc).__name__, "message": str(exc)}})
+            finally:
+                await queue.put(None)
+
+        task = asyncio.create_task(run_validation())
+        try:
+            while True:
+                event = await queue.get()
+                if event is None:
+                    break
+                yield json.dumps(jsonable_encoder(event), ensure_ascii=False) + "\n"
+        finally:
+            if not task.done():
+                task.cancel()
+
+    return StreamingResponse(
+        emit_ndjson(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.post("/package-skill", response_model=SkillActionResponse)

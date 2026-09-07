@@ -1995,6 +1995,27 @@ def test_same_breakpoint_with_only_session_path_change_is_not_progress():
     assert e2e._e2e_failure_identity(before)["traceback_source_line"] == e2e._e2e_failure_identity(after)["traceback_source_line"]
 
 
+def test_detects_traceback_from_replaced_source_revision():
+    stale = _structured_runtime_error(
+        workspace="/tmp/creator-e2e-session-a",
+        exception="ValueError",
+        source='raise ValueError("No common columns found")',
+    )
+
+    assert e2e._failure_references_replaced_source(
+        [stale],
+        target_file="scripts/generate_images.py",
+        previous_content='raise ValueError("No common columns found")\n',
+        candidate_content="return {'report': {}}\n",
+    ) is True
+    assert e2e._failure_references_replaced_source(
+        [stale],
+        target_file="scripts/generate_images.py",
+        previous_content='raise ValueError("No common columns found")\n',
+        candidate_content='raise ValueError("No common columns found")\n',
+    ) is False
+
+
 def test_experiment_key_deduplicates_wording_but_allows_different_patch(tmp_path):
     before = _structured_runtime_error(
         workspace="/tmp/creator-e2e-session-a", exception="TypeError", source='response["text"]',

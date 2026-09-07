@@ -5116,6 +5116,34 @@ def _e2e_failure_position(error: str) -> tuple[int, int]:
     return (step, _E2E_LAYER_RANK.get(layer, 3))
 
 
+def _failure_references_replaced_source(
+    errors: list[str],
+    *,
+    target_file: str,
+    previous_content: str,
+    candidate_content: str,
+) -> bool:
+    """Detect a runtime result produced from the pre-patch source revision.
+
+    A traceback carries the source line loaded by the interpreter.  If that line
+    belongs to the previous revision but no longer exists in the candidate, the
+    result cannot be used to judge the candidate.  This can happen when a resumed
+    E2E run observes stale process/checkpoint output while a repair is in flight.
+    """
+    for error in errors or []:
+        identity = _e2e_failure_identity(error, target_file=target_file)
+        if identity.get("target_file") != target_file:
+            continue
+        source_line = str(identity.get("traceback_source_line") or "").strip()
+        if (
+            source_line
+            and source_line in previous_content
+            and source_line not in candidate_content
+        ):
+            return True
+    return False
+
+
 def _normalize_e2e_failure_text(value: str) -> str:
     """Stabilize volatile runtime values without discarding breakpoint evidence."""
     text = str(value or "")
@@ -10177,6 +10205,42 @@ async def _repair_existing_file_for_e2e_failure(
                     ),
                 )
             )
+
+            # Never reject or roll back a candidate using a traceback emitted
+            # from the source revision it just replaced.  Force a clean replay
+            # from the affected step so the acceptance decision observes the
+            # candidate currently stored in the session workspace.
+            gate_errors = sandbox_gate.get("errors") or []
+            if (
+                not sandbox_gate.get("accepted")
+                and _failure_references_replaced_source(
+                    gate_errors,
+                    target_file=target_path,
+                    previous_content=previous_session_content,
+                    candidate_content=sanitized,
+                )
+            ):
+                clean_resume_step = earliest_step or 1
+                _invalidate_checkpoints_from(
+                    e2e_session,
+                    clean_resume_step,
+                )
+                logger.warning(
+                    "[Creator][E2E][stale_runtime_revision_replay] "
+                    "target=%s resume_from_step=%d",
+                    target_path,
+                    clean_resume_step,
+                )
+                sandbox_gate = _run_e2e_sandbox_acceptance_gate(
+                    skill_name=skill_name,
+                    candidate_skill_dir=e2e_session.workspace_dir,
+                    patched_file=target_path,
+                    original_errors=baseline_errors,
+                    external_context=external_context,
+                    requested_model=requested_model,
+                    e2e_session=e2e_session,
+                    resume_from_step=clean_resume_step,
+                )
 
             e2e_session.events.append({
                 **e2e_session.to_event_base(),

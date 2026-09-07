@@ -757,6 +757,9 @@ function saveResolvedGraphSnapshot({ functionItems, responsibilityEdges } = {}) 
 function archiveResolvedGraph() {
   if (!graphPlanningActive.value && graphArchiveReady.value) return
   graphPlanningActive.value = false
+  // Keep the blueprint visible while it is being produced, then reclaim the
+  // conversation space once the graph and its summary have been finalized.
+  showInternalBlueprint.value = false
   graphArchiving.value = true
   window.setTimeout(() => {
     graphArchiving.value = false
@@ -1539,13 +1542,14 @@ function clearChat() {
 
 .live-blueprint { margin-top: 12px; padding: 12px; border: 1px solid #bfdbfe; border-radius: 10px; background: #eff6ff; }
 .live-blueprint > div { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.live-blueprint small { color: #2563eb; font-size: 9px; font-weight: 800; letter-spacing: .14em; }
-.live-blueprint strong { font-size: 12px; }
+.live-blueprint small { color: #1d4ed8; font-size: 10px; font-weight: 800; letter-spacing: .14em; }
+.live-blueprint strong { color: #0f172a; font-size: 13px; }
 .live-blueprint details { margin-top: 10px; }
-.live-blueprint pre { max-height: 360px; overflow: auto; white-space: pre-wrap; font-size: 11px; line-height: 1.55; }
+.live-blueprint summary { color: #1e3a8a; font-size: 12px; font-weight: 700; cursor: pointer; }
+.live-blueprint pre { max-height: 360px; overflow: auto; color: #1e293b; white-space: pre-wrap; font-size: 12px; font-weight: 500; line-height: 1.65; }
 .live-process-area { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; margin: 8px 0 4px; }
 .planning-reveal { display: grid; grid-template-columns:minmax(0,1fr) 28px minmax(0,1fr) 28px minmax(0,1fr); align-items:stretch; gap:8px; padding:14px; border:1px solid var(--border); border-radius:16px; background:linear-gradient(135deg,var(--surface),var(--surface2)); }
-.reveal-step { display:flex; gap:10px; padding:10px; border-radius:11px; color:var(--text-muted); opacity:.65; }
+.reveal-step { display:flex; gap:10px; padding:10px; border-radius:11px; color:#475569; opacity:1; }
 .reveal-step.active { color:#1d4ed8; opacity:1; background:#eff6ff; box-shadow:inset 0 0 0 1px #bfdbfe; }
 .reveal-step.complete { color:var(--text); opacity:1; }
 .reveal-step>span { display:grid; place-items:center; flex:0 0 30px; height:30px; border-radius:9px; background:#e2e8f0; font:700 10px monospace; }

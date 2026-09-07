@@ -9993,6 +9993,10 @@ Blueprint Planner 只规划业务责任。
         )
         if event_emitter is not None:
             await event_emitter({
+                "event": "blueprint_ready",
+                "blueprint_text": frozen_blueprint_text,
+            })
+            await event_emitter({
                 "event": "file_plan_ready",
                 "allowed_function_item_targets": allowed_function_item_targets,
             })
@@ -10234,6 +10238,7 @@ Blueprint Planner 只规划业务责任。
         if event_emitter is not None:
             await event_emitter({
                 "event": "planner_converged",
+                "blueprint_text": data["internal_blueprint_text"],
                 "function_items": normalized_function_items,
                 "responsibility_edges": normalized_edges,
             })
@@ -13056,6 +13061,7 @@ async def prepare_plan_stream(
     return StreamingResponse(
         emit_ndjson(),
         media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 

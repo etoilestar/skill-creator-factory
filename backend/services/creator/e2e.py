@@ -4713,6 +4713,18 @@ def _file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
 
 
+def _verify_e2e_source_revision(path: Path, expected_digest: str) -> str | None:
+    """Return a deterministic mismatch message for an inactive candidate."""
+    actual_digest = _file_sha256(path)
+    if actual_digest == expected_digest:
+        return None
+    return (
+        "E2E candidate source revision mismatch: "
+        f"path={path} expected_digest={expected_digest} "
+        f"actual_digest={actual_digest or '(missing)'}"
+    )
+
+
 def _command_plan_signature(commands: list[E2EWorkflowCommand]) -> str:
     return _stable_json_hash([
         {
@@ -7113,6 +7125,7 @@ def _run_skill_workflow_e2e_once(
     requested_model: str | None = None,
     e2e_session: CreatorE2ESession | None = None,
     resume_from_step: int = 1,
+    expected_source_digests: dict[str, str] | None = None,
 ) -> list[str]:
     """Run SKILL.md workflow once.
 
@@ -7391,6 +7404,22 @@ def _run_skill_workflow_e2e_once(
             if command.ordinal < resume_from_step:
                 continue
             try:
+                expected_digest = str(
+                    (expected_source_digests or {}).get(command.script_path) or ""
+                )
+                if expected_digest:
+                    revision_error = _verify_e2e_source_revision(
+                        trial_skill_dir / command.script_path,
+                        expected_digest,
+                    )
+                    if revision_error:
+                        return [
+                            _e2e_error(
+                                target="creator_e2e",
+                                layer="e2e_candidate_revision_mismatch",
+                                message=revision_error,
+                            )
+                        ]
                 entry = _attach_requirements_to_entry(_validate_e2e_command_static(
                     command=command,
                     trial_skill_dir=trial_skill_dir,
@@ -7536,6 +7565,19 @@ def _run_skill_workflow_e2e_once(
                     )
 
                 fs_after = snapshot_runtime_files(trial_skill_dir)
+                if expected_digest:
+                    revision_error = _verify_e2e_source_revision(
+                        trial_skill_dir / command.script_path,
+                        expected_digest,
+                    )
+                    if revision_error:
+                        return [
+                            _e2e_error(
+                                target="creator_e2e",
+                                layer="e2e_candidate_revision_mismatch",
+                                message=revision_error,
+                            )
+                        ]
                 filesystem_diff = diff_runtime_files(fs_before, fs_after)
 
                 stdout_json = _parse_e2e_stdout_json(
@@ -10089,6 +10131,18 @@ async def _repair_existing_file_for_e2e_failure(
                 encoding="utf-8",
             )
 
+            candidate_source_digest = _file_sha256(session_target)
+            expected_candidate_digest = hashlib.sha256(
+                sanitized.encode("utf-8")
+            ).hexdigest()[:16]
+            if candidate_source_digest != expected_candidate_digest:
+                raise RuntimeError(
+                    "E2E candidate write verification failed: "
+                    f"target={target_path} "
+                    f"expected_digest={expected_candidate_digest} "
+                    f"actual_digest={candidate_source_digest or '(missing)'}"
+                )
+
             e2e_session.current_revision += 1
 
             session_skill_md = (
@@ -10175,6 +10229,9 @@ async def _repair_existing_file_for_e2e_failure(
                     resume_from_step=(
                         resume_from_step
                     ),
+                    expected_source_digests={
+                        target_path: expected_candidate_digest,
+                    },
                 )
             )
 
@@ -11064,6 +11121,7 @@ def _run_e2e_sandbox_acceptance_gate(
     requested_model: str | None = None,
     e2e_session: CreatorE2ESession | None = None,
     resume_from_step: int = 1,
+    expected_source_digests: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Second-round E2E acceptance gate.
 
@@ -11090,6 +11148,7 @@ def _run_e2e_sandbox_acceptance_gate(
         requested_model=requested_model,
         e2e_session=e2e_session,
         resume_from_step=resume_from_step,
+        expected_source_digests=expected_source_digests,
     )
 
     if errors:

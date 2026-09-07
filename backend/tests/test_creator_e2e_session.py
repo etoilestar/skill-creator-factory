@@ -1995,6 +1995,21 @@ def test_same_breakpoint_with_only_session_path_change_is_not_progress():
     assert e2e._e2e_failure_identity(before)["traceback_source_line"] == e2e._e2e_failure_identity(after)["traceback_source_line"]
 
 
+def test_verifies_candidate_source_revision_by_digest(tmp_path):
+    target = tmp_path / "scripts" / "one.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("print('candidate')\n", encoding="utf-8")
+    candidate_digest = e2e._file_sha256(target)
+
+    assert e2e._verify_e2e_source_revision(target, candidate_digest) is None
+
+    target.write_text("print('previous')\n", encoding="utf-8")
+    mismatch = e2e._verify_e2e_source_revision(target, candidate_digest)
+    assert mismatch is not None
+    assert "expected_digest=" in mismatch
+    assert "actual_digest=" in mismatch
+
+
 def test_experiment_key_deduplicates_wording_but_allows_different_patch(tmp_path):
     before = _structured_runtime_error(
         workspace="/tmp/creator-e2e-session-a", exception="TypeError", source='response["text"]',
@@ -2098,7 +2113,11 @@ async def test_same_step_new_breakpoint_retains_candidate_for_next_diagnosis(tmp
     monkeypatch.setattr(e2e, "_load_valid_checkpoint", lambda *args, **kwargs: None)
     before = _structured_runtime_error(workspace="/tmp/creator-e2e-session-a", exception="TypeError", source='response["text"]')
     after = _structured_runtime_error(workspace="/tmp/creator-e2e-session-a", exception="NameError", source="file_outputs")
-    monkeypatch.setattr(e2e, "_run_e2e_sandbox_acceptance_gate", lambda **kwargs: {"accepted": False, "errors": [after]})
+    sandbox_calls = []
+    def sandbox_gate(**kwargs):
+        sandbox_calls.append(kwargs)
+        return {"accepted": False, "errors": [after]}
+    monkeypatch.setattr(e2e, "_run_e2e_sandbox_acceptance_gate", sandbox_gate)
     session = e2e._create_e2e_session("demo", source_skill_dir=skill_dir)
 
     result = await e2e._repair_existing_file_for_e2e_failure(skill_name="demo", target_path="scripts/one.py", e2e_errors=[before], e2e_session=session)
@@ -2106,6 +2125,9 @@ async def test_same_step_new_breakpoint_retains_candidate_for_next_diagnosis(tmp
     assert result["progress_reason"] == "same_step_new_breakpoint"
     assert result["candidate_retained"] is True
     assert result["candidate_rolled_back"] is False
+    assert sandbox_calls[0]["expected_source_digests"] == {
+        "scripts/one.py": e2e._file_sha256(session.workspace_dir / "scripts" / "one.py")
+    }
     assert target.read_text(encoding="utf-8") == candidate.strip()
     assert (session.workspace_dir / "scripts" / "one.py").read_text(encoding="utf-8") == candidate.strip()
 

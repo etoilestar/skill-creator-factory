@@ -4713,6 +4713,18 @@ def _file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
 
 
+def _verify_e2e_source_revision(path: Path, expected_digest: str) -> str | None:
+    """Return a deterministic mismatch message for an inactive candidate."""
+    actual_digest = _file_sha256(path)
+    if actual_digest == expected_digest:
+        return None
+    return (
+        "E2E candidate source revision mismatch: "
+        f"path={path} expected_digest={expected_digest} "
+        f"actual_digest={actual_digest or '(missing)'}"
+    )
+
+
 def _command_plan_signature(commands: list[E2EWorkflowCommand]) -> str:
     return _stable_json_hash([
         {
@@ -5114,34 +5126,6 @@ def _e2e_failure_position(error: str) -> tuple[int, int]:
     step = int(structured.get("failed_step_index") or 0) if structured else 0
     layer = str((structured or {}).get("layer") or _failure_layer_from_error_text(error) or "")
     return (step, _E2E_LAYER_RANK.get(layer, 3))
-
-
-def _failure_references_replaced_source(
-    errors: list[str],
-    *,
-    target_file: str,
-    previous_content: str,
-    candidate_content: str,
-) -> bool:
-    """Detect a runtime result produced from the pre-patch source revision.
-
-    A traceback carries the source line loaded by the interpreter.  If that line
-    belongs to the previous revision but no longer exists in the candidate, the
-    result cannot be used to judge the candidate.  This can happen when a resumed
-    E2E run observes stale process/checkpoint output while a repair is in flight.
-    """
-    for error in errors or []:
-        identity = _e2e_failure_identity(error, target_file=target_file)
-        if identity.get("target_file") != target_file:
-            continue
-        source_line = str(identity.get("traceback_source_line") or "").strip()
-        if (
-            source_line
-            and source_line in previous_content
-            and source_line not in candidate_content
-        ):
-            return True
-    return False
 
 
 def _normalize_e2e_failure_text(value: str) -> str:
@@ -7141,6 +7125,7 @@ def _run_skill_workflow_e2e_once(
     requested_model: str | None = None,
     e2e_session: CreatorE2ESession | None = None,
     resume_from_step: int = 1,
+    expected_source_digests: dict[str, str] | None = None,
 ) -> list[str]:
     """Run SKILL.md workflow once.
 
@@ -7419,6 +7404,22 @@ def _run_skill_workflow_e2e_once(
             if command.ordinal < resume_from_step:
                 continue
             try:
+                expected_digest = str(
+                    (expected_source_digests or {}).get(command.script_path) or ""
+                )
+                if expected_digest:
+                    revision_error = _verify_e2e_source_revision(
+                        trial_skill_dir / command.script_path,
+                        expected_digest,
+                    )
+                    if revision_error:
+                        return [
+                            _e2e_error(
+                                target="creator_e2e",
+                                layer="e2e_candidate_revision_mismatch",
+                                message=revision_error,
+                            )
+                        ]
                 entry = _attach_requirements_to_entry(_validate_e2e_command_static(
                     command=command,
                     trial_skill_dir=trial_skill_dir,
@@ -7564,6 +7565,19 @@ def _run_skill_workflow_e2e_once(
                     )
 
                 fs_after = snapshot_runtime_files(trial_skill_dir)
+                if expected_digest:
+                    revision_error = _verify_e2e_source_revision(
+                        trial_skill_dir / command.script_path,
+                        expected_digest,
+                    )
+                    if revision_error:
+                        return [
+                            _e2e_error(
+                                target="creator_e2e",
+                                layer="e2e_candidate_revision_mismatch",
+                                message=revision_error,
+                            )
+                        ]
                 filesystem_diff = diff_runtime_files(fs_before, fs_after)
 
                 stdout_json = _parse_e2e_stdout_json(
@@ -10117,6 +10131,18 @@ async def _repair_existing_file_for_e2e_failure(
                 encoding="utf-8",
             )
 
+            candidate_source_digest = _file_sha256(session_target)
+            expected_candidate_digest = hashlib.sha256(
+                sanitized.encode("utf-8")
+            ).hexdigest()[:16]
+            if candidate_source_digest != expected_candidate_digest:
+                raise RuntimeError(
+                    "E2E candidate write verification failed: "
+                    f"target={target_path} "
+                    f"expected_digest={expected_candidate_digest} "
+                    f"actual_digest={candidate_source_digest or '(missing)'}"
+                )
+
             e2e_session.current_revision += 1
 
             session_skill_md = (
@@ -10203,44 +10229,11 @@ async def _repair_existing_file_for_e2e_failure(
                     resume_from_step=(
                         resume_from_step
                     ),
+                    expected_source_digests={
+                        target_path: expected_candidate_digest,
+                    },
                 )
             )
-
-            # Never reject or roll back a candidate using a traceback emitted
-            # from the source revision it just replaced.  Force a clean replay
-            # from the affected step so the acceptance decision observes the
-            # candidate currently stored in the session workspace.
-            gate_errors = sandbox_gate.get("errors") or []
-            if (
-                not sandbox_gate.get("accepted")
-                and _failure_references_replaced_source(
-                    gate_errors,
-                    target_file=target_path,
-                    previous_content=previous_session_content,
-                    candidate_content=sanitized,
-                )
-            ):
-                clean_resume_step = earliest_step or 1
-                _invalidate_checkpoints_from(
-                    e2e_session,
-                    clean_resume_step,
-                )
-                logger.warning(
-                    "[Creator][E2E][stale_runtime_revision_replay] "
-                    "target=%s resume_from_step=%d",
-                    target_path,
-                    clean_resume_step,
-                )
-                sandbox_gate = _run_e2e_sandbox_acceptance_gate(
-                    skill_name=skill_name,
-                    candidate_skill_dir=e2e_session.workspace_dir,
-                    patched_file=target_path,
-                    original_errors=baseline_errors,
-                    external_context=external_context,
-                    requested_model=requested_model,
-                    e2e_session=e2e_session,
-                    resume_from_step=clean_resume_step,
-                )
 
             e2e_session.events.append({
                 **e2e_session.to_event_base(),
@@ -11128,6 +11121,7 @@ def _run_e2e_sandbox_acceptance_gate(
     requested_model: str | None = None,
     e2e_session: CreatorE2ESession | None = None,
     resume_from_step: int = 1,
+    expected_source_digests: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Second-round E2E acceptance gate.
 
@@ -11154,6 +11148,7 @@ def _run_e2e_sandbox_acceptance_gate(
         requested_model=requested_model,
         e2e_session=e2e_session,
         resume_from_step=resume_from_step,
+        expected_source_digests=expected_source_digests,
     )
 
     if errors:

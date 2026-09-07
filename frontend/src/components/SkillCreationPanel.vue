@@ -260,6 +260,13 @@
           <p v-if="currentRuntimeStep.duration"><b>耗时：</b>{{ currentRuntimeStep.duration }}</p>
           <span>● running</span>
         </div>
+        <div v-if="runtimeActivityRows.length" class="runtime-live-feed" aria-live="polite">
+          <h4>实时执行记录</h4>
+          <article v-for="row in runtimeActivityRows" :key="row.key" :class="row.status">
+            <span>{{ row.status === 'failed' ? '×' : (row.status === 'success' ? '✓' : '●') }}</span>
+            <div><strong>{{ row.title }}</strong><p v-if="row.detail">{{ row.detail }}</p></div>
+          </article>
+        </div>
         <div v-if="historyRuntimeSteps.length" class="runtime-steps">
           <h4>历史步骤</h4>
           <article v-for="step in historyRuntimeSteps" :key="`${step.id}-${step.index}`" :class="step.status">
@@ -273,8 +280,8 @@
             </div>
           </article>
         </div>
-        <p v-else class="runtime-waiting">
-          {{ runtimeStatus === 'running' ? 'Runtime 请求执行中；当前接口未提供实时步骤事件，完成后将展示返回的执行摘要。' : '本次响应没有提供可展示的步骤记录。' }}
+        <p v-if="!runtimeActivityRows.length && !runtimeSteps.length" class="runtime-waiting">
+          {{ runtimeStatus === 'running' ? 'Runtime 请求已发出，正在等待第一个执行事件…' : '本次响应没有提供可展示的步骤记录。' }}
         </p>
 
         <div v-if="friendlyFailure" class="friendly-error">
@@ -570,6 +577,18 @@ const runtimeEvents = computed(() => liveRuntimeEvents.value.length
   : (Array.isArray(validateResult.value?.runtime_trace)
       ? validateResult.value.runtime_trace
       : (Array.isArray(validateResult.value?.repair_events) ? validateResult.value.repair_events : [])))
+
+const runtimeActivityRows = computed(() => runtimeEvents.value.map((event, index) => {
+  const rawStatus = String(event?.status || event?.rerun_status || event?.patch_status || '').toLowerCase()
+  const failed = rawStatus.includes('fail') || rawStatus.includes('error') || Boolean(event?.failure_summary || event?.error)
+  const success = ['success', 'passed', 'complete', 'completed', 'accepted', 'applied'].some(value => rawStatus.includes(value))
+  return {
+    key: `${event?.event || event?.phase || event?.type || 'runtime'}-${index}`,
+    title: conciseText(event?.message || event?.event || event?.phase || event?.type || event?.step_id || 'Runtime 更新'),
+    detail: conciseText(event?.target_file || event?.script_path || event?.failure_summary || event?.output_summary || ''),
+    status: failed ? 'failed' : (success ? 'success' : 'running'),
+  }
+}).slice(-20))
 
 const runtimeSteps = computed(() => {
   const steps = new Map()
@@ -1418,6 +1437,14 @@ function openInSandbox() {
 .runtime-heading { display: flex; align-items: center; justify-content: space-between; }.runtime-heading small { color: #60a5fa; font-size: 9px; font-weight: 800; letter-spacing: .16em; }.runtime-heading h3 { margin: 3px 0 0; font-size: 16px; }
 .runtime-badge { padding: 4px 9px; border-radius: 999px; background: #334155; font-size: 11px; }.runtime-badge.running { background: #1e3a8a; color: #bfdbfe; }.runtime-badge.success { background: #14532d; color: #bbf7d0; }.runtime-badge.failed { background: #7f1d1d; color: #fecaca; }
 .runtime-current { display: grid; gap: 6px; margin-top: 14px; padding: 14px; border: 1px solid #2563eb; border-radius: 10px; background: #17233a; }.runtime-current small { color: #93c5fd; font-weight: 700; }.runtime-current strong { font-family: monospace; }.runtime-current p { margin: 0; color: #cbd5e1; font-size: 11px; }.runtime-current > span { color: #60a5fa; font-size: 11px; }
+.runtime-live-feed { display: grid; gap: 7px; margin-top: 14px; }
+.runtime-live-feed h4 { margin: 0; color: #94a3b8; font-size: 11px; text-transform: uppercase; }
+.runtime-live-feed article { display: flex; gap: 9px; padding: 9px 10px; border-radius: 7px; background: #202936; }
+.runtime-live-feed article > span { color: #60a5fa; }
+.runtime-live-feed article.success > span { color: #22c55e; }
+.runtime-live-feed article.failed > span { color: #ef4444; }
+.runtime-live-feed strong { font-size: 11px; }
+.runtime-live-feed p { margin: 3px 0 0; color: #94a3b8; font-size: 10px; }
 .runtime-steps > h4 { margin: 4px 0; color: #94a3b8; font-size: 11px; text-transform: uppercase; }
 .runtime-steps { display: grid; gap: 8px; margin-top: 14px; }.runtime-steps article { display: flex; gap: 10px; padding: 10px; border-left: 3px solid #475569; border-radius: 6px; background: #202936; }.runtime-steps article.success { border-color: #22c55e; }.runtime-steps article.failed { border-color: #ef4444; }.runtime-steps article.running { border-color: #3b82f6; }.step-number { display: grid; flex: 0 0 24px; height: 24px; place-items: center; border-radius: 50%; background: #334155; font-size: 11px; }.runtime-steps strong { font-family: monospace; font-size: 12px; }.runtime-steps p { margin: 5px 0; color: #aab6c5; font-size: 11px; }.runtime-steps article > div > span { color: #94a3b8; font-size: 11px; }
 .runtime-waiting { padding: 14px 0 2px; color: #94a3b8; }.friendly-error { margin-top: 14px; padding: 12px; border: 1px solid #7f1d1d; border-radius: 8px; background: #2a171b; }.friendly-error > strong { color: #fca5a5; }.friendly-error p { margin: 7px 0 0; line-height: 1.55; }

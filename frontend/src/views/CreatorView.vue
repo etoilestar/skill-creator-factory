@@ -26,9 +26,6 @@
           <div v-if="messages.length === 0" class="empty">
             <p>说明你想创建或修改什么 Skill。信息足够时会直接生成创建要点和文件清单；只有真正缺少阻塞信息时才会追问。</p>
           </div>
-          <div v-if="graphPlanningActive || graphArchiving" class="live-process-area">
-            <CreatorGraphProgress v-if="graphPlanningActive || graphArchiving" :events="artifactEvents" :nodes="planningNodes" :edges="planningEdges" :interfaces="pendingInterfaces" :archiving="graphArchiving" />
-          </div>
           <template v-for="(msg, i) in messages" :key="i">
             <!-- action result card -->
             <div
@@ -62,14 +59,14 @@
             </div>
           </div>
 
-          <div v-if="reviewSummary" class="review-card">
+          <div v-if="reviewSummary || blueprintText" class="review-card">
             <div class="review-header">
               <h3>{{ reviewSummaryTitle }}</h3>
               <button class="btn-ghost" @click="showInternalBlueprint = !showInternalBlueprint">
                 {{ showInternalBlueprint ? '隐藏内部蓝图' : '查看内部蓝图' }}
               </button>
             </div>
-            <ul>
+            <ul v-if="reviewSummary">
               <li v-if="reviewSummary.goal"><strong>目标：</strong>{{ reviewSummary.goal }}</li>
               <li v-if="reviewSummary.input"><strong>输入：</strong>{{ reviewSummary.input }}</li>
               <li v-if="reviewSummary.output"><strong>输出：</strong>{{ reviewSummary.output }}</li>
@@ -78,10 +75,13 @@
               <li v-if="reviewSummary.files_to_create_or_update?.length"><strong>文件：</strong>{{ reviewSummary.files_to_create_or_update.join('、') }}</li>
               <li v-if="reviewSummary.assets_to_upload?.length"><strong>需上传素材：</strong>{{ reviewSummary.assets_to_upload.join('、') }}</li>
             </ul>
-            <details v-if="showInternalBlueprint && blueprintText" open>
-              <summary>内部蓝图</summary>
-              <pre>{{ blueprintText }}</pre>
-            </details>
+            <section v-if="blueprintText" class="live-blueprint" aria-live="polite">
+              <div><small>BLUEPRINT · LIVE</small><strong>蓝图已生成并同步到主流程</strong></div>
+              <details v-if="showInternalBlueprint" open>
+                <summary>蓝图正文</summary>
+                <pre>{{ blueprintText }}</pre>
+              </details>
+            </section>
           </div>
 
           <section v-if="reviewSummary || blueprintText" class="planning-reveal" aria-label="创建规划进度">
@@ -91,6 +91,10 @@
             <div class="reveal-line" />
             <div class="reveal-step" :class="{ complete: !graphPlanningActive && planningNodes.length, active: graphPlanningActive }"><span>03</span><div><small>责任图谱与接口合同</small><strong>{{ graphPlanningActive ? '正在逐项构建与连接' : (planningNodes.length ? '结果已归档' : '等待蓝图确认') }}</strong></div></div>
           </section>
+
+          <div v-if="graphPlanningActive || graphArchiving" class="live-process-area">
+            <CreatorGraphProgress :events="artifactEvents" :nodes="planningNodes" :edges="planningEdges" :interfaces="pendingInterfaces" :archiving="graphArchiving" />
+          </div>
 
           <button v-if="graphArchiveReady" type="button" class="graph-archive-window" @click="openArchivedGraph">
             <span class="archive-icon">↗</span><span><small>责任图谱已收进执行过程</small><strong>查看最终图谱与接口合同</strong></span><em>{{ planningNodes.length }} 个责任节点 · {{ planningEdges.length }} 条连接</em>
@@ -961,6 +965,11 @@ async function send() {
       payload,
       event => {
         receiveCreatorEvent(event)
+        if (typeof event.blueprint_text === 'string' && event.blueprint_text.trim()) {
+          pendingBlueprintText.value = event.blueprint_text.trim()
+          showInternalBlueprint.value = true
+        }
+        nextTick(scrollBottom)
         if (event.event === 'planner_convergence_review') {
           appendExecutionBlock({
             step: 'planner_convergence_review',
@@ -1528,6 +1537,12 @@ function clearChat() {
   border-color: #bfdbfe;
 }
 
+.live-blueprint { margin-top: 12px; padding: 12px; border: 1px solid #bfdbfe; border-radius: 10px; background: #eff6ff; }
+.live-blueprint > div { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.live-blueprint small { color: #2563eb; font-size: 9px; font-weight: 800; letter-spacing: .14em; }
+.live-blueprint strong { font-size: 12px; }
+.live-blueprint details { margin-top: 10px; }
+.live-blueprint pre { max-height: 360px; overflow: auto; white-space: pre-wrap; font-size: 11px; line-height: 1.55; }
 .live-process-area { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; margin: 8px 0 4px; }
 .planning-reveal { display: grid; grid-template-columns:minmax(0,1fr) 28px minmax(0,1fr) 28px minmax(0,1fr); align-items:stretch; gap:8px; padding:14px; border:1px solid var(--border); border-radius:16px; background:linear-gradient(135deg,var(--surface),var(--surface2)); }
 .reveal-step { display:flex; gap:10px; padding:10px; border-radius:11px; color:var(--text-muted); opacity:.65; }

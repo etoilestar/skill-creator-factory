@@ -1003,6 +1003,43 @@ async def test_reviewer_protocol_repair_runs_on_reviewer_route():
 
 
 @pytest.mark.asyncio
+async def test_reviewer_prompt_applies_general_evidence_floor_after_deterministic_validation():
+    items = [item("scripts/unit_a.py", [], [
+        {"port_id": "report_md", "description": "human-readable Markdown report"},
+        {"port_id": "file_outputs", "description": "generated file paths"},
+    ])]
+    plan = {"interfaces": [
+        m2p("I1", "scripts/unit_a.py", "report_md", "markdown"),
+        m2p("I2", "scripts/unit_a.py", "file_outputs", "file_outputs"),
+    ]}
+
+    async def reviewer(messages, _model):
+        prompt = messages[0]["content"]
+        assert "PRESUMPTION OF VALIDITY AND EVIDENCE FLOOR" in prompt
+        assert "Do not infer a defect from a port name alone" in prompt
+        assert "Apply this evidence rule uniformly to every binding" in prompt
+        assert "Treat that membership as an established fact" in prompt
+        assert "naming, schema shape, format labels, or" in prompt
+        assert "never identifier membership" in prompt
+        return json.dumps({"passed": True, "issues": []})
+
+    contract = {"platform_skill_boundary": {"final_output_fields": [
+        "markdown", "file_outputs",
+    ]}}
+    assert await review_interface_plan_semantically(
+        original_user_goal="compare CSV files",
+        frozen_function_items=items,
+        interface_plan=plan,
+        requirement_allocations=[],
+        requirement_channels={},
+        system_requirements=[],
+        platform_contract=contract,
+        reviewer_model="reviewer-test-model",
+        model_call=reviewer,
+    ) == []
+
+
+@pytest.mark.asyncio
 async def test_nonblocking_interface_review_issues_are_retained_without_failing(caplog):
     items = [item("scripts/unit_a.py", ["slot_x"], ["file_outputs"])]
     plan = {"interfaces": [p2m("I1", "scripts/unit_a.py"), m2p("I2", "scripts/unit_a.py", "file_outputs")]}

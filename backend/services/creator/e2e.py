@@ -6507,6 +6507,25 @@ def _argv_value_shape(value: Any) -> str:
     return type(value).__name__
 
 
+def _strict_argv_type_for_runtime_value(value: Any) -> str:
+    """Return the guard type name that accepts an already-rendered JSON value."""
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, str):
+        return "str"
+    if isinstance(value, list):
+        return "list"
+    if isinstance(value, dict):
+        return "dict"
+    if isinstance(value, int):
+        return "int"
+    if isinstance(value, float):
+        return "float"
+    if value is None:
+        return "null"
+    return type(value).__name__
+
+
 
 
 def _python_run_main_read_keys(content: str) -> set[str]:
@@ -6601,6 +6620,10 @@ def _classify_argv_schema_failure(
         for key in failed_keys
         if key in (rendered_payload or {})
     ]
+    canonical_runtime_types = {
+        key: _strict_argv_type_for_runtime_value(rendered_payload[key])
+        for key in failed_runtime_keys
+    }
 
     failed_command_keys = [
         key
@@ -6704,6 +6727,7 @@ def _classify_argv_schema_failure(
         "script_has_strict_json_argv_guard": has_guard,
         "script_guard_run_mismatch": guard_run_mismatch,
         "failed_keys": failed_keys,
+        "canonical_runtime_types": canonical_runtime_types,
         "primary_target": primary_target,
         "candidate_targets": [primary_target],
         "target_reason": target_reason,
@@ -6723,6 +6747,7 @@ def _argv_schema_repair_instruction(script_path: str, details: dict[str, Any]) -
         "required_keys": details.get("required_keys"),
         "optional_keys": details.get("optional_keys"),
         "expected_types": details.get("expected_types"),
+        "canonical_runtime_types": details.get("canonical_runtime_types"),
         "command_argv_keys": details.get("command_argv_keys"),
         "script_run_required_read_keys": details.get("script_run_required_read_keys"),
         "script_run_optional_read_keys": details.get("script_run_optional_read_keys"),
@@ -6736,6 +6761,8 @@ def _argv_schema_repair_instruction(script_path: str, details: dict[str, Any]) -
         "command_argv_keys/script_required_keys 仅作 diagnostics，不作为主提示或新合同。\n"
         f"diagnostics={json.dumps(diagnostics, ensure_ascii=False, sort_keys=True, default=str)}\n"
         "不得修改 SKILL.md command、placeholder 或上游输入值；禁止只改 guard schema，必须同步修复脚本的 guard 与实际消费逻辑。"
+        " 对 canonical_runtime_types 中列出的字段，strict_json_argv_guard 必须直接接受该运行时类型；"
+        "类型转换只能发生在 guard 成功返回之后，绝不能先用冲突类型的 guard 拒绝该值、再尝试转换。"
     )
     if primary == script_path:
         return common + f"\nprimary_target={script_path}：只修当前脚本中与失败相关的 parse_args/strict_json_argv_guard/run/main/stdout；确保 guard、run(args)、main() 自洽；run(args) 不得读取 guard 未声明 key，不得重新读取 sys.argv/json argv，guard required key 必须被 run(args) 消费；不得改 SKILL.md。"

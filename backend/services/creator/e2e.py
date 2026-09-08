@@ -1626,6 +1626,26 @@ class E2EFileFixtureHandler:
     media_types: tuple[str, ...] = ()
 
 
+# This is a deliberately small format ontology, not an open-ended map from
+# requirement prose to file extensions.  Terms identify explicit format names
+# that may ground a model proposal; generic words such as "text", "document",
+# or "image" are intentionally absent.
+_E2E_FILE_FORMAT_EVIDENCE_TERMS: dict[str, tuple[str, ...]] = {
+    "txt": ("txt", "text/plain", ".txt"),
+    "md": ("markdown", "text/markdown", ".md", ".markdown"),
+    "html": ("html", "text/html", ".html", ".htm"),
+    "csv": ("csv", "text/csv", ".csv"),
+    "json": ("json", "application/json", ".json"),
+    "pdf": ("pdf", "application/pdf", ".pdf"),
+    "docx": ("docx", ".docx"),
+    "png": ("png", "image/png", ".png"),
+    "jpeg": ("jpeg", "jpg", "image/jpeg", ".jpeg", ".jpg"),
+    "tiff": ("tiff", "tif", "image/tiff", ".tiff", ".tif"),
+    "webp": ("webp", "image/webp", ".webp"),
+    "bmp": ("bmp", "image/bmp", ".bmp"),
+}
+
+
 def _text_fixture_schema(fmt: str, content_kind: str) -> dict[str, Any]:
     return {"type": "object", "additionalProperties": False,
             "required": ["format", "content_kind", "text"],

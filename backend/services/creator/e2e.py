@@ -17,7 +17,8 @@ from ..platform_io_contract import (
     build_platform_io_contract,
     get_platform_output_sink,
     normalize_platform_output_sinks,
-    project_and_commit_platform_outputs,
+    parse_runtime_output_mappings,
+    project_and_commit_skill_outputs,
     value_matches_platform_schema,
 )
 from backend.routers.chat_utils import (
@@ -999,6 +1000,28 @@ def _terminal_runtime_contract_violation(
 
     return None
 
+
+def _portable_terminal_runtime_contract_violation(
+    *, mappings: list[dict[str, str]], completed_outputs: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Attribute only missing artifact-declared stdout ports to a producer."""
+    for binding in mappings:
+        producer = binding["script"]
+        output_name = binding["source"]
+        observed = completed_outputs.get(producer)
+        if isinstance(observed, dict) and output_name not in observed:
+            return {
+                "target_file": producer,
+                "output_name": output_name,
+                "sink_name": binding["target"],
+                "expected": {"output_present": True},
+                "observed": {
+                    "output_present": False,
+                    "stdout_keys": sorted(str(key) for key in observed),
+                },
+            }
+    return None
+
 def _valid_terminal_output_value(key: str, value: Any) -> bool:
     sink = get_platform_output_sink(_SANDBOX_OUTPUT_CONTRACT, key)
     return bool(sink and value_matches_platform_schema(value, sink["value_schema"]))
@@ -1624,26 +1647,6 @@ class E2EFileFixtureHandler:
     materializer: Any
     semantic_names: tuple[str, ...] = ()
     media_types: tuple[str, ...] = ()
-
-
-# This is a deliberately small format ontology, not an open-ended map from
-# requirement prose to file extensions.  Terms identify explicit format names
-# that may ground a model proposal; generic words such as "text", "document",
-# or "image" are intentionally absent.
-_E2E_FILE_FORMAT_EVIDENCE_TERMS: dict[str, tuple[str, ...]] = {
-    "txt": ("txt", "text/plain", ".txt"),
-    "md": ("markdown", "text/markdown", ".md", ".markdown"),
-    "html": ("html", "text/html", ".html", ".htm"),
-    "csv": ("csv", "text/csv", ".csv"),
-    "json": ("json", "application/json", ".json"),
-    "pdf": ("pdf", "application/pdf", ".pdf"),
-    "docx": ("docx", ".docx"),
-    "png": ("png", "image/png", ".png"),
-    "jpeg": ("jpeg", "jpg", "image/jpeg", ".jpeg", ".jpg"),
-    "tiff": ("tiff", "tif", "image/tiff", ".tiff", ".tif"),
-    "webp": ("webp", "image/webp", ".webp"),
-    "bmp": ("bmp", "image/bmp", ".bmp"),
-}
 
 
 def _text_fixture_schema(fmt: str, content_kind: str) -> dict[str, Any]:
@@ -7995,15 +7998,12 @@ def _run_skill_workflow_e2e_once(
                 break
 
         if not errors:
-            terminal_edges = [
-                dict(edge) for edge in (requirement_graph.dataflow_edges or [])
-                if str(edge.get("to_node") or "") == "platform_output_node"
-            ]
-            if terminal_edges:
+            portable_output_mappings = parse_runtime_output_mappings(trial_skill_md)
+            if portable_output_mappings:
                 try:
-                    final_platform_payload = project_and_commit_platform_outputs(
-                        requirement_graph.platform_io_contract,
-                        terminal_edges,
+                    final_platform_payload = project_and_commit_skill_outputs(
+                        _SANDBOX_OUTPUT_CONTRACT,
+                        trial_skill_md,
                         completed_outputs,
                     )
                     if not final_platform_payload:
@@ -8015,15 +8015,14 @@ def _run_skill_workflow_e2e_once(
                             "event": "terminal_outputs_committed",
                             "phase": "e2e_run",
                             "status": "passed",
-                            "terminal_edge_count": len(terminal_edges),
+                            "terminal_edge_count": len(portable_output_mappings),
                             "platform_output_keys": sorted(final_platform_payload),
                             "platform_output_payload": final_platform_payload,
                         })
                 except Exception as exc:
-                    runtime_violation = _terminal_runtime_contract_violation(
-                        terminal_edges=terminal_edges,
+                    runtime_violation = _portable_terminal_runtime_contract_violation(
+                        mappings=portable_output_mappings,
                         completed_outputs=completed_outputs,
-                        platform_contract=requirement_graph.platform_io_contract,
                     )
 
                     if runtime_violation:

@@ -11650,9 +11650,10 @@ def _validate_trial_stdout_json(*, stdout: str, content: str, args: list[str], r
     """Validate trial stdout with dynamic, field-name-agnostic rules.
 
     SkillPlan.outputs is a blueprint hint, not the sole runtime contract.  The
-    hard requirements here are: stdout is a JSON object, it has at least one
-    non-empty value, it does not report an error, and any file-looking values it
-    declares point at real files.
+    hard requirements here are: stdout is a JSON object, it does not report an
+    error, and any file-looking values it declares point at real files.  Empty
+    display values are legitimate results; required outputs require presence,
+    not truthiness.
     """
     stripped = (stdout or "").strip()
     if not stripped:
@@ -11665,12 +11666,10 @@ def _validate_trial_stdout_json(*, stdout: str, content: str, args: list[str], r
         raise ValueError(f"脚本试运行 stdout 必须是 JSON object：argv={args!r} stdout={stripped[-4000:]}")
     if "error" in payload:
         raise ValueError(f"脚本试运行 stdout JSON 不得包含 error 字段：argv={args!r} stdout={stripped[-4000:]}")
-    if not any(_json_value_non_empty(value) for value in payload.values()):
-        raise ValueError(f"脚本试运行 stdout JSON 至少需要一个非空字段：argv={args!r} stdout={stripped[-4000:]}")
     if canonical_contract is not None:
         stdout_schema = getattr(canonical_contract, "stdout_schema", {}) or {}
         required = stdout_schema.get("required") if isinstance(stdout_schema, dict) else []
-        missing = [str(key) for key in required or [] if str(key) not in payload or not _json_value_non_empty(payload.get(str(key)))]
+        missing = [str(key) for key in required or [] if str(key) not in payload]
         if missing:
             raise ValueError(
                 "stdout_required_outputs_missing: 当前脚本 stdout 缺少 required_outputs。"
@@ -11681,7 +11680,7 @@ def _validate_trial_stdout_json(*, stdout: str, content: str, args: list[str], r
         entry = _skill_plan_entry_for_file(file_path=str((skill_plan_entry or {}).get("path") or "scripts/main.py"), skill_plan_entry=skill_plan_entry)
         stdout_schema = _script_stdout_schema_for_entry(entry)
         required = stdout_schema.get("required") if isinstance(stdout_schema, dict) else []
-        missing = [str(key) for key in required or [] if str(key) not in payload or not _json_value_non_empty(payload.get(str(key)))]
+        missing = [str(key) for key in required or [] if str(key) not in payload]
         if missing:
             raise ValueError(
                 "stdout_required_outputs_missing: 当前脚本 stdout 缺少 required_outputs。"

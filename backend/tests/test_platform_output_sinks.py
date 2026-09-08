@@ -77,6 +77,14 @@ def test_commit_composes_already_ordered_emissions():
     assert committed == {"sink_a": "value_yvalue_x"}
 
 
+def test_real_display_sinks_accept_empty_strings():
+    contract = build_platform_io_contract()
+    assert commit_platform_output_emissions(contract, [
+        {"sink": "text", "value": ""},
+        {"sink": "markdown", "value": ""},
+    ]) == {"text": "", "markdown": ""}
+
+
 def test_runtime_projection_uses_terminal_edge_order_not_completion_order():
     contract = _contract({
         "name": "sink_a", "value_schema": {"type": "string"},
@@ -122,7 +130,10 @@ def test_legacy_runtime_commit_rejects_multiple_emissions():
 
 def test_real_platform_contract_declares_runtime_capabilities_canonically():
     sinks = normalize_platform_output_sinks(build_platform_io_contract())
-    assert all(set(sink) == {"name", "value_schema", "cardinality", "write_semantics"} for sink in sinks)
+    assert all(set(sink) == {
+        "name", "semantic_type", "accepted_source_types", "allowed_transforms",
+        "value_schema", "cardinality", "write_semantics",
+    } for sink in sinks)
     by_name = {sink["name"]: sink for sink in sinks}
     assert (by_name["text"]["cardinality"], by_name["text"]["write_semantics"]) == ("many", "append")
     assert (by_name["file_outputs"]["cardinality"], by_name["file_outputs"]["write_semantics"]) == ("one", "single")

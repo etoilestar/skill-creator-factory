@@ -13,8 +13,8 @@ from typing import Any
 
 
 _LEGACY_OUTPUT_VALUE_SCHEMAS: dict[str, dict[str, Any]] = {
-    "text": {"type": "string", "minLength": 1},
-    "markdown": {"type": "string", "minLength": 1},
+    "text": {"type": "string"},
+    "markdown": {"type": "string"},
     "image_path": {"type": "string", "minLength": 1},
     "pdf_path": {"type": "string", "minLength": 1},
     "docx_path": {"type": "string", "minLength": 1},
@@ -147,6 +147,11 @@ def _adapt_runtime_output_value(value: Any, sink: dict[str, Any]) -> Any:
         target_type=sink["semantic_type"],
         allowed_transforms=sink["allowed_transforms"],
     )
+    if transform is None:
+        # ``None`` is the resolver's explicit direct-binding result.  Value
+        # constraints are checked by the commit phase rather than being
+        # misreported as a missing transform capability.
+        return value
     if transform == "json_serialize":
         return json.dumps(value, ensure_ascii=False)
     raise RuntimeError(f"runtime output transform is not executable: {transform}")
@@ -343,7 +348,7 @@ def project_and_commit_skill_outputs(
         if binding["delivery"] == "display":
             if isinstance(value, str):
                 display_value = value
-            elif value is not None and isinstance(value, (dict, list, int, float, bool)):
+            elif value is None or isinstance(value, (dict, list, int, float, bool)):
                 display_value = json.dumps(value, ensure_ascii=False)
             else:
                 raise RuntimeError(f"output cannot be delivered to display: {binding['source']}")
@@ -404,8 +409,8 @@ def build_platform_io_contract() -> dict[str, Any]:
                 "runtime_resources": {"canonical": "resources", "globally_required": False},
             },
             "final_output_fields": [
-                {"name": "text", "semantic_type": "text", "accepted_source_types": ["string", "text", "json", "object"], "allowed_transforms": ["json_serialize", "markdown_render"], "value_schema": {"type": "string", "minLength": 1}, "cardinality": "many", "write_semantics": "append"},
-                {"name": "markdown", "value_schema": {"type": "string", "minLength": 1}, "cardinality": "many", "write_semantics": "append"},
+                {"name": "text", "semantic_type": "text", "accepted_source_types": ["string", "text", "json", "object"], "allowed_transforms": ["json_serialize", "markdown_render"], "value_schema": {"type": "string"}, "cardinality": "many", "write_semantics": "append"},
+                {"name": "markdown", "value_schema": {"type": "string"}, "cardinality": "many", "write_semantics": "append"},
                 {"name": "image_path", "value_schema": {"type": "string", "minLength": 1}, "cardinality": "one", "write_semantics": "single"},
                 {"name": "image_paths", "value_schema": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1}, "cardinality": "one", "write_semantics": "single"},
                 {"name": "pdf_path", "value_schema": {"type": "string", "minLength": 1}, "cardinality": "one", "write_semantics": "single"},

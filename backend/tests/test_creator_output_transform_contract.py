@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 
 from backend.services.creator import e2e
@@ -94,15 +96,33 @@ def test_structured_output_mapped_to_markdown_is_still_delivered_to_display():
     ) == {"text": '[{"title": "项目概述"}]'}
 
 
-def test_portable_skill_mapping_rejects_unexecutable_transform():
+def test_empty_display_output_is_a_valid_committed_value():
+    record = render_runtime_output_mapping(
+        "scripts/unit.py", {"markdown": ["result"]},
+    )
+    assert project_and_commit_skill_outputs(
+        _platform(), record,
+        {"scripts/unit.py": {"result": ""}},
+    ) == {"text": ""}
+
+
+def test_trial_stdout_accepts_present_empty_display_output():
+    e2e._validate_trial_stdout_json(
+        stdout='{"result": ""}',
+        content="",
+        args=["{}"],
+        canonical_contract=SimpleNamespace(stdout_schema={"required": ["result"]}),
+    )
+
+
+def test_portable_skill_mapping_displays_json_null():
     record = render_runtime_output_mapping(
         "scripts/unit.py", {"text": ["result"]},
     )
-    with pytest.raises(RuntimeError, match="output cannot be delivered to display"):
-        project_and_commit_skill_outputs(
-            _platform(), record,
-            {"scripts/unit.py": {"result": None}},
-        )
+    assert project_and_commit_skill_outputs(
+        _platform(), record,
+        {"scripts/unit.py": {"result": None}},
+    ) == {"text": "null"}
 
 
 def test_portable_missing_stdout_attribution_uses_artifact_binding():

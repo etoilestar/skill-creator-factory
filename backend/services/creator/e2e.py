@@ -1622,6 +1622,8 @@ class E2EFileFixtureHandler:
     fixture_schema: Any
     validator: Any
     materializer: Any
+    semantic_names: tuple[str, ...] = ()
+    media_types: tuple[str, ...] = ()
 
 
 def _text_fixture_schema(fmt: str, content_kind: str) -> dict[str, Any]:
@@ -1783,22 +1785,22 @@ def _register_file_fixture_handler(handler: E2EFileFixtureHandler) -> None:
 
 def _register_builtin_file_fixture_handlers() -> None:
     text_handlers = [
-        ("txt", (), ".txt", _materialize_text_fixture),
-        ("md", (), ".md", _materialize_text_fixture),
-        ("html", (), ".html", _materialize_html_fixture),
+        ("txt", (), ".txt", _materialize_text_fixture, (), ("text/plain",)),
+        ("md", ("markdown",), ".md", _materialize_text_fixture, ("markdown",), ("text/markdown",)),
+        ("html", ("htm",), ".html", _materialize_html_fixture, (), ("text/html",)),
     ]
-    for fmt, aliases, extension, materializer in text_handlers:
-        _register_file_fixture_handler(E2EFileFixtureHandler(fmt, aliases, extension, "text", _text_fixture_schema, _validate_text_spec, materializer))
-    _register_file_fixture_handler(E2EFileFixtureHandler("csv", (), ".csv", "tabular", _csv_fixture_schema, _validate_csv_spec, _materialize_csv_fixture))
-    _register_file_fixture_handler(E2EFileFixtureHandler("json", (), ".json", "json", _json_fixture_schema, _validate_json_spec, _materialize_json_fixture))
-    for fmt, extension, writer in (("pdf", ".pdf", _write_minimal_pdf), ("docx", ".docx", _write_minimal_docx)):
-        _register_file_fixture_handler(E2EFileFixtureHandler(fmt, (), extension, "document", _text_fixture_schema, _validate_text_spec, _document_materializer(writer)))
+    for fmt, aliases, extension, materializer, semantic_names, media_types in text_handlers:
+        _register_file_fixture_handler(E2EFileFixtureHandler(fmt, aliases, extension, "text", _text_fixture_schema, _validate_text_spec, materializer, semantic_names, media_types))
+    _register_file_fixture_handler(E2EFileFixtureHandler("csv", (), ".csv", "tabular", _csv_fixture_schema, _validate_csv_spec, _materialize_csv_fixture, (), ("text/csv",)))
+    _register_file_fixture_handler(E2EFileFixtureHandler("json", (), ".json", "json", _json_fixture_schema, _validate_json_spec, _materialize_json_fixture, (), ("application/json",)))
+    for fmt, extension, writer, media_type in (("pdf", ".pdf", _write_minimal_pdf, "application/pdf"), ("docx", ".docx", _write_minimal_docx, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")):
+        _register_file_fixture_handler(E2EFileFixtureHandler(fmt, (), extension, "document", _text_fixture_schema, _validate_text_spec, _document_materializer(writer), (), (media_type,)))
     for fmt, aliases, extension, pillow_fmt in (
         ("png", (), ".png", "PNG"), ("jpeg", ("jpg",), ".jpg", "JPEG"),
         ("tiff", ("tif",), ".tiff", "TIFF"), ("webp", (), ".webp", "WEBP"),
         ("bmp", (), ".bmp", "BMP"),
     ):
-        _register_file_fixture_handler(E2EFileFixtureHandler(fmt, aliases, extension, "image", _image_fixture_schema, _validate_image_spec, _image_materializer(pillow_fmt)))
+        _register_file_fixture_handler(E2EFileFixtureHandler(fmt, aliases, extension, "image", _image_fixture_schema, _validate_image_spec, _image_materializer(pillow_fmt), (), (f"image/{fmt}",)))
 
 
 _register_builtin_file_fixture_handlers()
@@ -1811,6 +1813,74 @@ def _resolve_file_fixture_handler(fmt: str) -> E2EFileFixtureHandler | None:
 def _canonical_file_fixture_format(fmt: str) -> str:
     handler = _resolve_file_fixture_handler(fmt)
     return handler.canonical_format if handler else ""
+
+
+def _file_format_evidence_terms(fmt: str) -> tuple[str, ...]:
+    """Derive explicit evidence identifiers from the fixture capability itself."""
+    handler = _resolve_file_fixture_handler(fmt)
+    if handler is None:
+        return ()
+    terms = (
+        handler.canonical_format,
+        *handler.aliases,
+        handler.extension,
+        *handler.semantic_names,
+        *handler.media_types,
+    )
+    return tuple(dict.fromkeys(term.casefold() for term in terms if term))
+
+
+def _requirement_quote_explicitly_names_format(quote: str, fmt: str) -> bool:
+    """Accept only a finite, explicit format identifier from quoted evidence."""
+    text = str(quote or "").casefold()
+    for term in _file_format_evidence_terms(fmt):
+        escaped = re.escape(term.casefold())
+        if re.fullmatch(r"[a-z0-9]+", term, re.I):
+            if re.search(rf"(?<![a-z0-9]){escaped}(?![a-z0-9])", text):
+                return True
+        elif term.casefold() in text:
+            return True
+    return False
+
+
+def _verified_model_file_format(
+    item: dict[str, Any],
+    *,
+    requirements_by_id: dict[str, str],
+) -> str:
+    """Verify that a resolved model proposal cites literal, format-specific prose."""
+    if item.get("decision") != "resolved":
+        return ""
+    selected_format = _canonical_file_fixture_format(str(item.get("format") or ""))
+    evidence = item.get("evidence")
+    if not selected_format or not isinstance(evidence, list) or not evidence:
+        return ""
+    for citation in evidence:
+        if not isinstance(citation, dict):
+            continue
+        requirement_id = str(citation.get("requirement_id") or "")
+        quote = str(citation.get("quote") or "").strip()
+        source = requirements_by_id.get(requirement_id, "")
+        if quote and quote.casefold() in source.casefold() and _requirement_quote_explicitly_names_format(quote, selected_format):
+            return selected_format
+    return ""
+
+
+def _explicit_file_format_mentions(requirements: list[dict[str, Any]]) -> dict[str, list[dict[str, str]]]:
+    """Project literal format names into a finite set of grounded candidates."""
+    mentions: dict[str, list[dict[str, str]]] = {}
+    for requirement in requirements:
+        requirement_id = str(requirement.get("id") or "")
+        text = str(requirement.get("text") or "")
+        canonical_formats = sorted({handler.canonical_format for handler in FILE_FIXTURE_FORMATS.values()})
+        for fmt in canonical_formats:
+            if not _requirement_quote_explicitly_names_format(text, fmt):
+                continue
+            matches = mentions.setdefault(fmt, [])
+            evidence = {"requirement_id": requirement_id, "quote": text}
+            if evidence not in matches:
+                matches.append(evidence)
+    return mentions
 
 
 def _resolve_e2e_file_input_spec(
@@ -2131,15 +2201,36 @@ def _plan_unknown_e2e_file_formats(
         return plan
 
     capabilities = sorted({handler.canonical_format for handler in FILE_FIXTURE_FORMATS.values()})
+    explicit_mentions_by_input = {
+        item["name"]: _explicit_file_format_mentions(item.get("requirements", []))
+        for item in evidence
+    }
+    for item in evidence:
+        item["explicit_format_mentions"] = explicit_mentions_by_input[item["name"]]
     variants = []
     for spec in unresolved:
+        grounded_formats = sorted(explicit_mentions_by_input.get(spec.name, {}))
+        decisions = ["resolved", "ambiguous"] if grounded_formats else ["unknown"]
+        selectable_formats = ["", *grounded_formats] if grounded_formats else [""]
         variants.append({
             "type": "object",
             "additionalProperties": False,
-            "required": ["name", "format", "reason"],
+            "required": ["name", "decision", "format", "evidence", "reason"],
             "properties": {
                 "name": {"const": spec.name},
-                "format": {"type": "string", "enum": capabilities},
+                "decision": {"type": "string", "enum": decisions},
+                "format": {"type": "string", "enum": selectable_formats},
+                "evidence": {
+                    "type": "array",
+                    "items": {
+                        "type": "object", "additionalProperties": False,
+                        "required": ["requirement_id", "quote"],
+                        "properties": {
+                            "requirement_id": {"type": "string", "minLength": 1},
+                            "quote": {"type": "string", "minLength": 1},
+                        },
+                    },
+                },
                 "reason": {"type": "string", "minLength": 1},
             },
         })
@@ -2162,11 +2253,20 @@ def _plan_unknown_e2e_file_formats(
         proposed = _complete_creator_json_object_once_sync_for_e2e(
             messages=[
                 {"role": "system", "content": (
-                    "Select exactly one best representative file format for each unresolved runtime file input. "
+                    "Extract explicit file-format evidence for each unresolved runtime file input. "
                     "The supplied names, shapes, targets, and cardinalities are a frozen contract: do not change them. "
                     "Available formats are execution capabilities, not hints that every format is appropriate. "
-                    "Do not list broadly compatible alternatives. Use only input-side evidence, never an output "
-                    "artifact format. Return exactly the bound JSON Schema."
+                    "The supplied explicit_format_mentions are deterministically extracted from a finite format "
+                    "ontology. Canonical content-format names count as explicit: for example, 'Markdown file' or "
+                    "'Markdown document' explicitly names format=md even when the extension '.md' is omitted. "
+                    "When explicit_format_mentions is non-empty, unknown is not valid: select the input-side format "
+                    "with decision=resolved, or decision=ambiguous if the input-side evidence truly conflicts. "
+                    "Use decision=resolved only when requirement prose explicitly names one available input format; "
+                    "quote the exact supporting words and requirement_id in evidence. Use decision=unknown when prose "
+                    "only says generic file, document, text, or image. Use decision=ambiguous when multiple explicit "
+                    "formats conflict. Never infer a file format from broad compatibility, and never use an output "
+                    "artifact format. For unknown or ambiguous decisions use format='' and evidence may be empty. "
+                    "Return exactly the bound JSON Schema."
                 )},
                 {"role": "user", "content": json.dumps({
                     "unresolved_inputs": evidence,
@@ -2185,15 +2285,21 @@ def _plan_unknown_e2e_file_formats(
         return plan
     items = proposed.get("inputs", []) if isinstance(proposed, dict) else []
     selected: dict[str, tuple[str, ...]] = {}
+    requirements_by_input: dict[str, dict[str, str]] = {}
+    for evidence_item in evidence:
+        requirements_by_input[evidence_item["name"]] = {
+            str(req.get("id") or ""): str(req.get("text") or "")
+            for req in evidence_item.get("requirements", [])
+        }
     for item in items:
         if not isinstance(item, dict):
             continue
         name = str(item.get("name") or "")
-        selected_format = _canonical_file_fixture_format(str(item.get("format") or ""))
+        selected_format = _verified_model_file_format(
+            item, requirements_by_id=requirements_by_input.get(name, {}),
+        )
         if name in evidence_names and selected_format:
             selected[name] = (selected_format,)
-    if set(selected) != evidence_names:
-        return plan
 
     inputs = dict(plan.inputs)
     for name, formats in selected.items():
@@ -2201,7 +2307,7 @@ def _plan_unknown_e2e_file_formats(
             inputs[name],
             allowed_formats=formats,
             homogeneous_files=True if len(formats) == 1 else False,
-            file_format_source="model_semantic_planner",
+            file_format_source="model_semantic_planner_verified_evidence",
         )
     resolved = E2EInputCasePlan(inputs=inputs, digest=_case_plan_digest(inputs))
     logger.info("[Creator][E2E][file_semantic_plan] %s", json.dumps({

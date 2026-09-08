@@ -1,12 +1,18 @@
 import pytest
 
+from backend.services.creator import e2e
 from backend.services.creator.function_item_interface_plan import (
     collect_interface_plan_validation_issues,
     validate_interface_intent_plan,
     validate_interface_plan_protocol,
     validate_interface_patch_protocol,
 )
-from backend.services.platform_io_contract import resolve_runtime_output_transform
+from backend.services.platform_io_contract import (
+    parse_runtime_output_mappings,
+    project_and_commit_skill_outputs,
+    render_runtime_output_mapping,
+    resolve_runtime_output_transform,
+)
 
 
 def _item():
@@ -60,6 +66,46 @@ def test_runtime_binding_resolves_representation_adaptation():
     ) == "json_serialize"
     with pytest.raises(RuntimeError):
         resolve_runtime_output_transform(source_type="boolean", target_type="text")
+
+
+def test_portable_skill_mapping_executes_json_serialization_without_creator_graph():
+    record = render_runtime_output_mapping(
+        "scripts/unit.py", {"text": ["result"]},
+    )
+    skill_text = f"# Installed skill\n{record}\n```bash\npython scripts/unit.py '{{}}'\n```"
+
+    assert parse_runtime_output_mappings(skill_text) == [{
+        "script": "scripts/unit.py", "source": "result", "target": "text",
+    }]
+    assert project_and_commit_skill_outputs(
+        _platform(), skill_text,
+        {"scripts/unit.py": {"result": [{"title": "项目概述"}]}},
+    ) == {"text": '[{"title": "项目概述"}]'}
+
+
+def test_portable_skill_mapping_rejects_unexecutable_transform():
+    record = render_runtime_output_mapping(
+        "scripts/unit.py", {"text": ["result"]},
+    )
+    with pytest.raises(RuntimeError, match="no runtime output adaptation"):
+        project_and_commit_skill_outputs(
+            _platform(), record,
+            {"scripts/unit.py": {"result": True}},
+        )
+
+
+def test_portable_missing_stdout_attribution_uses_artifact_binding():
+    violation = e2e._portable_terminal_runtime_contract_violation(
+        mappings=[{"script": "scripts/unit.py", "source": "result", "target": "text"}],
+        completed_outputs={"scripts/unit.py": {"other": "value"}},
+    )
+    assert violation == {
+        "target_file": "scripts/unit.py",
+        "output_name": "result",
+        "sink_name": "text",
+        "expected": {"output_present": True},
+        "observed": {"output_present": False, "stdout_keys": ["other"]},
+    }
 
 
 def test_repair_protocol_does_not_allow_transform_replacement():

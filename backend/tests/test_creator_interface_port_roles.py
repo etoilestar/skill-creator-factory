@@ -99,16 +99,16 @@ def test_compatible_output_mapping_passes():
     assert collect_interface_plan_validation_issues(plan=plan, function_items=items, platform_contract=contract) == []
 
 
-def test_incompatible_output_mapping_is_rejected():
+def test_structured_output_mapping_is_accepted_for_runtime_display_delivery():
     items = [member("scripts/a.py", [], [port("value", "runtime_output", schema_type="object")])]
     plan = {"interfaces": [{"interface_id": "I1", "kind": "member_to_platform",
         "source_member": "scripts/a.py", "source_output": "value",
         "target_platform_output": "result", "semantic_reason": "final result"}]}
     contract = {"platform_skill_boundary": {"final_output_fields": ["result"],
         "output_sinks": {"result": {"value_schema": {"type": "string"}}}}}
-    assert any(issue["code"] == "incompatible_interface_types" for issue in
-               collect_interface_plan_validation_issues(
-                   plan=plan, function_items=items, platform_contract=contract))
+    assert collect_interface_plan_validation_issues(
+        plan=plan, function_items=items, platform_contract=contract,
+    ) == []
 
 
 def test_transform_is_not_part_of_interface_contract():

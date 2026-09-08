@@ -7,6 +7,8 @@ only to describe that runtime contract to generation and repair models.
 from __future__ import annotations
 
 from copy import deepcopy
+import json
+import re
 from typing import Any
 
 
@@ -65,6 +67,89 @@ def resolve_runtime_output_transform(
         if name in permitted and str(source_type) in accepted and capability.get("result_type") == target:
             return name
     raise RuntimeError(f"no runtime output adaptation from {source_type} to {target_type}")
+
+
+_PORTABLE_OUTPUT_MAPPING_RE = re.compile(
+    r"<!--\s*runtime-output-mapping:\s*(\{.*?\})\s*-->", re.DOTALL,
+)
+
+
+def platform_output_delivery_channel(contract: dict[str, Any], target: str) -> str:
+    """Collapse concrete platform sinks into the two user-visible channels."""
+    sink = get_platform_output_sink(contract, target)
+    if not sink:
+        raise ValueError(f"unknown platform output sink: {target}")
+    return "download" if sink["semantic_type"] == "file" else "display"
+
+
+def render_runtime_output_mapping(
+    script_path: str, mapping: dict[str, list[str]], contract: dict[str, Any] | None = None,
+) -> str:
+    """Compile Creator interface facts into a portable two-channel delivery record."""
+    platform_contract = contract or build_platform_io_contract()
+    bindings = [
+        {
+            "source": source,
+            "target": target,
+            "delivery": platform_output_delivery_channel(platform_contract, target),
+        }
+        for target, sources in sorted(mapping.items())
+        for source in sources
+    ]
+    payload = {"version": 2, "script": script_path, "bindings": bindings}
+    return "<!-- runtime-output-mapping: " + json.dumps(payload, ensure_ascii=False, sort_keys=True) + " -->"
+
+
+def parse_runtime_output_mappings(skill_text: str) -> list[dict[str, str]]:
+    """Read portable output bindings using only the installed Skill artifact."""
+    bindings: list[dict[str, str]] = []
+    for match in _PORTABLE_OUTPUT_MAPPING_RE.finditer(skill_text or ""):
+        try:
+            payload = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict) or payload.get("version") not in {1, 2}:
+            continue
+        script = str(payload.get("script") or "").strip()
+        for item in payload.get("bindings") or []:
+            if not isinstance(item, dict):
+                continue
+            source = str(item.get("source") or "").strip()
+            target = str(item.get("target") or "").strip()
+            delivery = str(item.get("delivery") or "").strip()
+            if not delivery and target:
+                # Read existing v1 Skill artifacts without Creator state.
+                delivery = "download" if target.endswith("_path") or target in {"file_outputs", "file_paths", "image_paths"} else "display"
+            if script and source and target and delivery in {"display", "download"}:
+                bindings.append({"script": script, "source": source, "target": target, "delivery": delivery})
+    return bindings
+
+
+def _runtime_output_value_type(value: Any) -> str:
+    if isinstance(value, str):
+        return "text"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    return "unknown"
+
+
+def _adapt_runtime_output_value(value: Any, sink: dict[str, Any]) -> Any:
+    if value_matches_platform_schema(value, sink["value_schema"]):
+        return value
+    transform = resolve_runtime_output_transform(
+        source_type=_runtime_output_value_type(value),
+        target_type=sink["semantic_type"],
+        allowed_transforms=sink["allowed_transforms"],
+    )
+    if transform == "json_serialize":
+        return json.dumps(value, ensure_ascii=False)
+    raise RuntimeError(f"runtime output transform is not executable: {transform}")
 
 
 def _default_output_semantics(name: str, schema: dict[str, Any]) -> dict[str, Any]:
@@ -220,8 +305,13 @@ def value_matches_platform_schema(value: Any, schema: dict[str, Any]) -> bool:
 def commit_platform_output_emissions(contract: dict[str, Any], emissions: list[dict[str, Any]]) -> dict[str, Any]:
     """Validate and compose already structurally ordered terminal emissions."""
     grouped: dict[str, list[Any]] = {}
+    sinks = {sink["name"]: sink for sink in normalize_platform_output_sinks(contract)}
     for emission in emissions:
-        grouped.setdefault(str(emission.get("sink") or ""), []).append(emission.get("value"))
+        sink_name = str(emission.get("sink") or "")
+        sink = sinks.get(sink_name)
+        if sink is None:
+            raise ValueError(f"unknown platform output sink: {sink_name}")
+        grouped.setdefault(sink_name, []).append(_adapt_runtime_output_value(emission.get("value"), sink))
     committed: dict[str, Any] = {}
     for sink in normalize_platform_output_sinks(contract):
         values = grouped.get(sink["name"], [])
@@ -238,6 +328,29 @@ def commit_platform_output_emissions(contract: dict[str, Any], emissions: list[d
         else:
             committed[sink["name"]] = values[0]
     return committed
+
+
+def project_and_commit_skill_outputs(
+    contract: dict[str, Any], skill_text: str, completed_outputs: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Commit outputs from portable mappings embedded in the Skill artifact."""
+    emissions: list[dict[str, Any]] = []
+    for order, binding in enumerate(parse_runtime_output_mappings(skill_text)):
+        outputs = completed_outputs.get(binding["script"])
+        if not isinstance(outputs, dict) or binding["source"] not in outputs:
+            raise ValueError(f"missing portable terminal emission value: binding {order}")
+        value = outputs[binding["source"]]
+        if binding["delivery"] == "display":
+            if isinstance(value, str):
+                display_value = value
+            elif value is not None and isinstance(value, (dict, list, int, float, bool)):
+                display_value = json.dumps(value, ensure_ascii=False)
+            else:
+                raise RuntimeError(f"output cannot be delivered to display: {binding['source']}")
+            emissions.append({"sink": "text", "value": display_value, "order_key": order})
+        else:
+            emissions.append({"sink": binding["target"], "value": value, "order_key": order})
+    return commit_platform_output_emissions(contract, emissions) if emissions else {}
 
 
 def project_and_commit_platform_outputs(

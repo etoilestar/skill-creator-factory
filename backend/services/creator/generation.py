@@ -7,6 +7,7 @@ from .repair import *  # noqa: F403
 from ..platform_io_contract import (
     build_platform_io_contract,
     get_platform_output_sink,
+    render_runtime_output_mapping,
 )
 
 _RUNTIME_BINDING_AUTHORITY_PROMPT = """## Runtime Binding Authority
@@ -529,11 +530,20 @@ def _platform_skill_md_command_sections(
         role = str(getattr(entry, "role", "") or "script")
         inputs = ", ".join(str(value) for value in (getattr(entry, "inputs", []) or [])) or "无"
         outputs = ", ".join(str(value) for value in (getattr(entry, "outputs", []) or [])) or "无"
+        portable_output_mapping = {}
+        if responsibility_graph is not None:
+            portable_output_mapping = project_script_interface_contract(
+                responsibility_graph, script_path,
+            )["platform_output_mapping"]
+        output_mapping_record = render_runtime_output_mapping(
+            script_path, portable_output_mapping, build_platform_io_contract(),
+        )
         sections.append(
             f"### `{script_path}`\n\n"
             f"- role: `{role}`\n"
             f"- inputs: {inputs}\n"
             f"- outputs: {outputs}\n\n"
+            f"{output_mapping_record}\n"
             "<!-- generated_by=contract_renderer -->\n"
             "```bash\n"
             f"{command}\n"

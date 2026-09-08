@@ -203,6 +203,14 @@ The planner MUST follow this order:
 
 4. Verify the selected platform output semantically represents the produced value.
 
+For practical delivery, every terminal output belongs to one of two channels:
+- display: any JSON-compatible non-file value can be shown in the frontend;
+- download: a file path or collection of file paths can be returned for download.
+Choose a display sink for non-file business results and a download sink for file
+results. Do not reject a terminal result when either channel can accept it. A
+presentation name such as markdown is not evidence that a structured array must
+be rendered as Markdown; structured display values are serialized by runtime.
+
 
 Forbidden:
 
@@ -1401,18 +1409,10 @@ def collect_interface_plan_validation_issues(
             if target not in platform_outputs: issue("unknown_platform_logical_output", f"{path}.target_platform_output", iid, target, sorted(platform_outputs))
             else:
                 covered_platform.add(target)
-                sink = get_platform_output_sink(platform_contract, target) or {}
-                source_port = output_ports.get((source, output), {"contract": {}})
-                target_schema = dict(sink.get("value_schema") or {})
-                compatible, reason = semantic_provenance_compatibility(
-                    source_role="runtime_output", source_schema=source_port.get("contract") or {},
-                    source_origin="member_output", target_role="platform_output", target_schema=target_schema,
-                )
-                if not compatible:
-                    issue("incompatible_interface_types", path, iid,
-                          {"source_type": _schema_type(source_port.get("contract") or {}),
-                           "target_type": _schema_type(target_schema)},
-                          reason, error_type="schema_error")
+                # Terminal planning chooses user-visible delivery semantics.
+                # Representation normalization belongs to artifact-only runtime,
+                # so a JSON value must not be rejected merely because the
+                # concrete display sink is declared as a string.
     for member, slot in sorted(set(input_ports) - set(receiving_contracts)):
         issue(
             "missing_interface_contract", "$.interfaces", "",

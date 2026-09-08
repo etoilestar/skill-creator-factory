@@ -361,6 +361,54 @@ def test_trial_builder_prompt_contains_only_supplied_frozen_facts(monkeypatch):
         assert required_contract in schema
 
 
+def test_trial_builder_rebuild_feedback_explicitly_tells_model_to_rebuild(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(e2e, "route_model", lambda *args, **kwargs: type("Route", (), {"model": "test"})())
+    monkeypatch.setattr(
+        e2e, "_complete_creator_json_object_once_sync_for_e2e",
+        lambda **kwargs: captured.update(kwargs) or {"version": 1, "inputs": []},
+    )
+    facts = {"version": 1, "external_inputs": []}
+    e2e._build_e2e_trial_case(facts, rebuild_feedback={
+        "previous_trial_case": {"status": "unsupported"},
+        "validation_issues": [{"code": "unsupported_or_invalid_case", "message": "invalid"}],
+    })
+
+    feedback = json.loads(captured["messages"][-1]["content"])
+    assert feedback["instruction"].startswith("Rebuild the Trial Case from scratch")
+    assert feedback["previous_trial_case"] == {"status": "unsupported"}
+    assert feedback["validation_issues"][0]["code"] == "unsupported_or_invalid_case"
+
+
+def test_prepare_rebuilds_invalid_first_wave_before_review(monkeypatch):
+    calls = []
+    valid = {"version": 1, "inputs": [{
+        "name": "title", "shape": "string",
+        "fixture": {"kind": "scalar", "value": "sample"},
+        "evidence_requirement_ids": [],
+    }]}
+
+    def build(_facts, **kwargs):
+        calls.append(kwargs.get("rebuild_feedback"))
+        return {"status": "unsupported"} if len(calls) == 1 else valid
+
+    monkeypatch.setattr(e2e, "_build_e2e_trial_case", build)
+    monkeypatch.setattr(
+        e2e, "_review_e2e_trial_case",
+        lambda **kwargs: {"passed": True, "issues": [], "repair_instructions": ""},
+    )
+    accepted = e2e._prepare_e2e_trial_case(
+        typed_specs=[_spec("title", "string")], requirements_by_file={},
+        skill_plan_entries={"scripts/analyze.py": SimpleNamespace(default_values={})},
+        external_context={}, requested_model=None, session=None,
+    )
+
+    assert accepted == valid
+    assert calls[0] is None
+    assert calls[1]["previous_trial_case"] == {"status": "unsupported"}
+    assert calls[1]["validation_issues"][0]["code"] == "unsupported_or_invalid_case"
+
+
 def test_trial_schema_binds_file_collection_and_object_fixture_kinds():
     facts = {"external_inputs": [
         {
@@ -706,6 +754,39 @@ def test_model_plans_unknown_file_semantics_with_frozen_contract(monkeypatch):
     mentions = user_payload["unresolved_inputs"][0]["explicit_format_mentions"]
     assert list(mentions) == ["md"]
     assert mentions["md"][0]["requirement_id"] == "R1"
+
+
+def test_rejected_file_semantic_plan_is_rebuilt_with_validation_feedback(monkeypatch):
+    typed = _spec("uploads", "list[file_path]")
+    requirement = e2e.RequirementItem(
+        id="R1", target_file=typed.target_file,
+        requirement="读取用户上传的 Markdown 文档并提取标题。",
+    )
+    plan = e2e._build_e2e_input_case_plan(
+        [typed], requirements_by_file={typed.target_file: [requirement]},
+    )
+    calls = []
+    monkeypatch.setattr(e2e, "route_model", lambda *args, **kwargs: type("Route", (), {"model": "test"})())
+
+    def complete(**kwargs):
+        calls.append(kwargs["messages"])
+        quote = "并不存在的引用" if len(calls) == 1 else "Markdown 文档"
+        return {"inputs": [{
+            "name": "uploads", "decision": "resolved", "format": "md",
+            "evidence": [{"requirement_id": "R1", "quote": quote}],
+            "reason": "The requirement explicitly names Markdown.",
+        }]}
+
+    monkeypatch.setattr(e2e, "_complete_creator_json_object_once_sync_for_e2e", complete)
+    resolved = e2e._plan_unknown_e2e_file_formats(
+        plan, requirements_by_file={typed.target_file: [requirement]}, requested_model=None,
+    )
+
+    assert resolved.inputs["uploads"].allowed_formats == ("md",)
+    assert len(calls) == 2
+    feedback = json.loads(calls[1][-1]["content"])
+    assert feedback["instruction"].startswith("Rebuild")
+    assert feedback["validation_issues"][0]["code"] == "format_evidence_rejected"
 
 
 @pytest.mark.parametrize(("prose", "expected"), [

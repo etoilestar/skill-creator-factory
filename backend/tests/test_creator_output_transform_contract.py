@@ -48,10 +48,11 @@ def test_interface_contract_without_transform():
         plan=plan, function_items=[_item()], platform_contract=_platform()) == []
 
 
-def test_legacy_interface_transform_is_ignored_during_normalization():
-    assert validate_interface_plan_protocol(
-        {"interfaces": [_interface(transform="json_serialize")]}
-    ) == {"interfaces": [_interface()]}
+def test_interface_transform_is_rejected_because_runtime_owns_delivery():
+    with pytest.raises(Exception):
+        validate_interface_plan_protocol(
+            {"interfaces": [_interface(transform="json_serialize")]}
+        )
 
 
 def test_nonexistent_source_still_fails():
@@ -75,10 +76,20 @@ def test_portable_skill_mapping_executes_json_serialization_without_creator_grap
     skill_text = f"# Installed skill\n{record}\n```bash\npython scripts/unit.py '{{}}'\n```"
 
     assert parse_runtime_output_mappings(skill_text) == [{
-        "script": "scripts/unit.py", "source": "result", "target": "text",
+        "script": "scripts/unit.py", "source": "result", "target": "text", "delivery": "display",
     }]
     assert project_and_commit_skill_outputs(
         _platform(), skill_text,
+        {"scripts/unit.py": {"result": [{"title": "项目概述"}]}},
+    ) == {"text": '[{"title": "项目概述"}]'}
+
+
+def test_structured_output_mapped_to_markdown_is_still_delivered_to_display():
+    record = render_runtime_output_mapping(
+        "scripts/unit.py", {"markdown": ["result"]},
+    )
+    assert project_and_commit_skill_outputs(
+        _platform(), record,
         {"scripts/unit.py": {"result": [{"title": "项目概述"}]}},
     ) == {"text": '[{"title": "项目概述"}]'}
 
@@ -87,16 +98,16 @@ def test_portable_skill_mapping_rejects_unexecutable_transform():
     record = render_runtime_output_mapping(
         "scripts/unit.py", {"text": ["result"]},
     )
-    with pytest.raises(RuntimeError, match="no runtime output adaptation"):
+    with pytest.raises(RuntimeError, match="output cannot be delivered to display"):
         project_and_commit_skill_outputs(
             _platform(), record,
-            {"scripts/unit.py": {"result": True}},
+            {"scripts/unit.py": {"result": None}},
         )
 
 
 def test_portable_missing_stdout_attribution_uses_artifact_binding():
     violation = e2e._portable_terminal_runtime_contract_violation(
-        mappings=[{"script": "scripts/unit.py", "source": "result", "target": "text"}],
+        mappings=[{"script": "scripts/unit.py", "source": "result", "target": "text", "delivery": "display"}],
         completed_outputs={"scripts/unit.py": {"other": "value"}},
     )
     assert violation == {

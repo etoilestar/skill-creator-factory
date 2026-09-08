@@ -535,7 +535,9 @@ def _platform_skill_md_command_sections(
             portable_output_mapping = project_script_interface_contract(
                 responsibility_graph, script_path,
             )["platform_output_mapping"]
-        output_mapping_record = render_runtime_output_mapping(script_path, portable_output_mapping)
+        output_mapping_record = render_runtime_output_mapping(
+            script_path, portable_output_mapping, build_platform_io_contract(),
+        )
         sections.append(
             f"### `{script_path}`\n\n"
             f"- role: `{role}`\n"

@@ -9,7 +9,7 @@ from dataclasses import asdict, replace
 
 from .common import *  # noqa: F403
 from .contracts import *  # noqa: F403
-from .command_normalizer import canonicalize_skill_md_runtime_commands
+from .command_normalizer import canonicalize_skill_md_runtime_commands, parse_skill_md_bash_command_blocks
 from .basic_format import check_patch_candidate_basic_format
 from ..skill_plan import parse_responsibility_edges
 from ..skill_dataflow import parse_placeholder_expr
@@ -2136,13 +2136,10 @@ def _plan_unknown_e2e_file_formats(
         variants.append({
             "type": "object",
             "additionalProperties": False,
-            "required": ["name", "formats", "reason"],
+            "required": ["name", "format", "reason"],
             "properties": {
                 "name": {"const": spec.name},
-                "formats": {
-                    "type": "array", "minItems": 1, "uniqueItems": True,
-                    "items": {"type": "string", "enum": capabilities},
-                },
+                "format": {"type": "string", "enum": capabilities},
                 "reason": {"type": "string", "minLength": 1},
             },
         })
@@ -2165,10 +2162,11 @@ def _plan_unknown_e2e_file_formats(
         proposed = _complete_creator_json_object_once_sync_for_e2e(
             messages=[
                 {"role": "system", "content": (
-                    "Select file formats for unresolved runtime file inputs from semantic evidence. "
+                    "Select exactly one best representative file format for each unresolved runtime file input. "
                     "The supplied names, shapes, targets, and cardinalities are a frozen contract: do not change them. "
                     "Available formats are execution capabilities, not hints that every format is appropriate. "
-                    "Use only input-side evidence, never an output artifact format. Return exactly the bound JSON Schema."
+                    "Do not list broadly compatible alternatives. Use only input-side evidence, never an output "
+                    "artifact format. Return exactly the bound JSON Schema."
                 )},
                 {"role": "user", "content": json.dumps({
                     "unresolved_inputs": evidence,
@@ -2191,12 +2189,9 @@ def _plan_unknown_e2e_file_formats(
         if not isinstance(item, dict):
             continue
         name = str(item.get("name") or "")
-        formats = tuple(dict.fromkeys(
-            canonical for value in (item.get("formats") or [])
-            if (canonical := _canonical_file_fixture_format(str(value)))
-        ))
-        if name in evidence_names and formats:
-            selected[name] = formats
+        selected_format = _canonical_file_fixture_format(str(item.get("format") or ""))
+        if name in evidence_names and selected_format:
+            selected[name] = (selected_format,)
     if set(selected) != evidence_names:
         return plan
 
@@ -3091,10 +3086,10 @@ def _render_e2e_command_payload(
 
         raise ValueError(
             _e2e_error(
-                target=command.source_path,
-                layer="external_input_missing" if command.ordinal == 1 else "e2e_dataflow_missing",
+                target="creator_e2e",
+                layer="command_contract_projection_failure",
                 message=(
-                    ("missing_placeholder: 平台外部输入缺失，第一条命令不能引用 guaranteed envelope 中不存在的字段；可改为传 user_request/input/payload/envelope 并由入口脚本内部解析和默认化可选项。" if command.ordinal == 1 else "missing_placeholder: Skill 内部 dataflow 缺失，后续命令只能引用已有 context 或前序 stdout 字段。")
+                    ("missing_placeholder: 冻结合同的外部输入没有进入 canonical command payload。" if command.ordinal == 1 else "missing_placeholder: 冻结的 Skill 内部 dataflow 无法从前序 stdout 解析。")
                     + "\n"
                     + f"第 {command.ordinal} 步 {command.script_path} 的命令模板引用了当前 payload 中不存在的字段："
                     f"{', '.join(unique_missing)}。\n"
@@ -3107,10 +3102,9 @@ def _render_e2e_command_payload(
                     f"原始命令：{command.raw_command}\n\n"
                     "已成功执行的前序边界 trace：\n"
                     f"{_format_e2e_trace(traces or [])}\n\n"
-                    "这只表示 SKILL.md 当前失败步骤的命令占位符，"
-                    "无法从用户初始输入或前序 stdout JSON 中解析。"
-                    "优先局部修复当前失败步骤的 SKILL.md 命令块；"
-                    "不要修改已成功 trace 对应的前序步骤。"
+                    "command block 是冻结合同的只读投影，模型不得修改。"
+                    "请重建或报告 Creator command/dataflow projection authority；"
+                    "不要修改 SKILL.md 或业务脚本来猜测缺失 binding。"
                 ),
             )
         )
@@ -5673,6 +5667,20 @@ def _e2e_candidate_invariant_veto(
             "introduced_runtime_sentinel"
         )
 
+    # Model-driven repair may still edit SKILL.md prose, but canonical command
+    # blocks are read-only projections of the frozen contract.  Only the
+    # deterministic command normalizer may regenerate them.
+    before_commands = [
+        block.command_body_text.strip()
+        for block in parse_skill_md_bash_command_blocks(original_content or "")
+    ]
+    after_commands = [
+        block.command_body_text.strip()
+        for block in parse_skill_md_bash_command_blocks(candidate_content or "")
+    ]
+    if before_commands != after_commands:
+        reasons.append("canonical_command_changed_by_model")
+
     before_structured = (
         _structured_failure_from_errors(
             original_errors
@@ -5885,20 +5893,20 @@ def _run_e2e_step_argument_effect_review(
                 "- 平台 IO 是来源/出口层，不是 script argv key 白名单；不要求所有 argv key 来自平台字段，不要求用上所有平台 fields。\n"
                 "- literal/default/config/reference/assets/runtime constants 可以存在；第一条命令只要动态来源能从平台 envelope 解析即可，后续命令只要动态来源能从当前 payload 或前序 stdout 解析即可。\n"
                 "- 最后一步 stdout 至少有一个平台 final output field 即可；不要因为 recommended 字段不一致而 target script。\n"
-                "- E2E 阶段以已经生成的 script 为主要接口事实；SKILL.md command block 是 orchestration 描述。\n"
-                "- 当 SKILL.md command argv 与 script 入口接口不一致时，优先修改 SKILL.md 当前 command JSON argv 去对齐 script。\n"
-                "- 只有 script 自身语法错误、入口/JSON argv 读取错误、guard 与 run/main 实际读取不一致、没消费已传正确参数、stdout/artifact 输出错误时，才 target_file=当前脚本。\n"
-                "- 上游 stdout key 和下游 placeholder 不一致，应失败，并优先 target_file=SKILL.md；通过默认值绕过真实传参，应失败。\n"
+                "- SKILL.md command block 是冻结合同的后台确定性投影，不是模型可修改的接口事实。\n"
+                "- 当 canonical command argv 与 script 入口接口不一致时，必须修改当前脚本去对齐合同；禁止修改 command、placeholder 或上游值去迁就脚本。\n"
+                "- script 语法、入口/JSON argv、guard 与 run/main、参数消费、stdout/artifact 以及跨步骤字段实现错误，都 target_file=当前脚本。\n"
+                "- 上游 stdout key 和下游冻结 binding 不一致时，应修复产生或消费该字段的脚本；不得修改 command binding。通过默认值绕过真实传参，应失败。\n"
                 "- 允许脚本通过 payload、input、fields、options、统一对象、别名字段或等价结构接收参数，但必须能证明实际传入的 key 被读取并影响输出。\n"
-                "- 如果 rendered_payload 缺少当前 step 必需信息或 SKILL.md 传入 key 与自洽 script 接口不一致，failure_kind=missing_payload，target_file=SKILL.md。\n"
+                "- 如果 rendered_payload 缺少合同要求的信息，报告合同投影基础设施问题；不得提出修改 SKILL.md command。\n"
                 "- 如果 SKILL.md 已传对但脚本没有读取、读取了不同 key、或被默认值覆盖，failure_kind=script_not_consuming_payload，target_file=当前脚本。\n"
-                "- 如果当前 step 输出了内容，但后续 placeholder/字段映射接不上，failure_kind=output_mapping_mismatch，target_file=SKILL.md。\n"
+                "- 如果当前 step 输出了内容但后续冻结字段映射接不上，failure_kind=output_mapping_mismatch，并定位未遵守字段合同的脚本。\n"
                 "- 如果没有接口问题，返回 passed=true。\n\n"
 
                 "返回 JSON：\n"
                 "{\n"
                 "  \"passed\": true|false,\n"
-                "  \"target_file\": \"SKILL.md 或 当前脚本路径\",\n"
+                "  \"target_file\": \"当前脚本路径；合同投影失败时为 creator_e2e\",\n"
                 "  \"failure_kind\": \"missing_payload|script_not_consuming_payload|output_mapping_mismatch|none\",\n"
                 "  \"problem\": \"具体问题\",\n"
                 "  \"evidence\": \"从 command/rendered_payload/script/stdout/trace 中引用证据\",\n"
@@ -5949,8 +5957,8 @@ def _run_e2e_step_argument_effect_review(
                 "3. 检查脚本是否真实读取并使用同一组传入 key；不能靠默认值绕过真实传参。\n"
                 "4. 检查 stdout key 是否能被后续 placeholder 或最终输出使用。\n"
                 "5. 不要求平台统一字段名，但已选择的 workflow 字段名必须严格对齐。\n"
-                "6. 如果是 SKILL.md 没传对或上下游 placeholder 不一致，target_file=SKILL.md。\n"
-                "7. 如果是脚本没接住传入 key 或使用默认值绕过，target_file=当前脚本。\n"
+                "6. command/placeholder 是冻结合同的只读投影，禁止建议修改 SKILL.md；投影缺失时 target_file=creator_e2e。\n"
+                "7. 如果脚本没接住传入 key、产出错误字段或使用默认值绕过，target_file=当前脚本。\n"
                 "8. 如果没有真实链路问题，passed=true。\n"
             ),
         },
@@ -5986,7 +5994,7 @@ def _run_e2e_step_argument_effect_review(
             return {
                 "passed": False,
                 "failure_type": "e2e_requirement_validator_error",
-                "target_file": command.script_path if rendered_payload else "SKILL.md",
+                "target_file": "__validator__",
                 "layer": "e2e_requirement_validator_error",
                 "problem": f"E2E requirement validator unavailable: {type(exc).__name__}: {exc}",
                 "evidence": "validator unavailable after format retry; not a business-file failure",
@@ -6009,7 +6017,7 @@ def _run_e2e_step_argument_effect_review(
         return {
             "passed": False,
             "failure_type": "e2e_requirement_validator_error",
-            "target_file": command.script_path if rendered_payload else "SKILL.md",
+            "target_file": "__validator__",
             "layer": "e2e_requirement_validator_error",
             "problem": "E2E requirement validator did not return valid JSON after format retry.",
             "evidence": last_text[:1000],
@@ -6037,16 +6045,16 @@ def _run_e2e_step_argument_effect_review(
 
     target_file = str(data.get("target_file") or "").strip()
 
-    if failure_kind in {"missing_payload", "output_mapping_mismatch"}:
-        target_file = "SKILL.md"
-    elif failure_kind == "script_not_consuming_payload":
+    if failure_kind == "missing_payload":
+        target_file = "creator_e2e"
+    elif failure_kind in {"script_not_consuming_payload", "output_mapping_mismatch"}:
         target_file = command.script_path
-    elif target_file not in {"SKILL.md", command.script_path}:
+    elif target_file not in {"creator_e2e", command.script_path}:
         target_file = command.script_path
 
     layer = (
         "e2e_step_argument_mapping"
-        if target_file == "SKILL.md"
+        if target_file == "creator_e2e"
         else "e2e_step_argument_effect"
     )
 
@@ -6193,7 +6201,7 @@ def _run_e2e_requirement_flow_review(
     metadata = stdout_json.get("artifact_metadata") if isinstance(stdout_json.get("artifact_metadata"), dict) else {}
     if required and not rendered_payload and any(r.semantic_inputs for r in required):
         r = next((x for x in required if x.semantic_inputs), required[0])
-        return {"passed": False, "target_file": "SKILL.md", "layer": "e2e_requirement_mapping_failed", "failure_kind": "missing_payload", "problem": "Required semantic input was not delivered to the step payload.", "evidence": "rendered_payload is empty while requirement declares semantic_inputs", "requirement_id": r.id, "missing_evidence": ["semantic input in rendered_payload"], "repair_instruction": "Pass the required semantic input from user input or previous stdout into this command."}
+        return {"passed": False, "target_file": "creator_e2e", "layer": "e2e_requirement_mapping_failed", "failure_kind": "missing_payload", "problem": "The canonical command projection did not deliver a required semantic input.", "evidence": "rendered_payload is empty while requirement declares semantic_inputs", "requirement_id": r.id, "missing_evidence": ["semantic input in rendered_payload"], "repair_instruction": "Rebuild or report the frozen command/dataflow projection; do not edit SKILL.md or a business script."}
     if required and artifact_paths and metadata:
         for r in required:
             missing = _structured_requirement_metadata_missing(r, metadata)
@@ -6222,7 +6230,7 @@ def _e2e_argument_effect_failure(
     return _format_e2e_failure(E2EFailure(
         failed_step_index=command.ordinal,
         target_file=target_file,
-        target_region="workflow block" if target_file == "SKILL.md" else "run()",
+        target_region="frozen command/dataflow projection" if target_file == "creator_e2e" else "run()",
         failed_command=command.raw_command,
         input_payload=rendered_payload,
         rendered_payload=rendered_payload,
@@ -6327,7 +6335,7 @@ def _extract_failed_argv_keys(text: str) -> list[str]:
         r"(?:unknown|unexpected|extra)(?:\s+argv)?\s+keys?\s*[:=]\s*([A-Za-z_][\w.-]*)",
         r"missing(?:\s+required)?(?:\s+argv)?\s+keys?\s*[:=]\s*([A-Za-z_][\w.-]*)",
         r"empty(?:\s+required)?(?:\s+argv)?\s+(?:value|key)\s*[:=]\s*([A-Za-z_][\w.-]*)",
-        r"invalid(?:\s+argv)?\s+type(?:\s+for)?\s*[:=]\s*([A-Za-z_][\w.-]*)",
+        r"invalid(?:\s+argv)?\s+type(?:\s+for\s+|\s*[:=]\s*)([A-Za-z_][\w.-]*)",
     ):
         keys.update(str(match) for match in re.findall(pattern, text, flags=re.I))
     return sorted(keys)
@@ -6349,6 +6357,8 @@ def _argv_schema_error_kind(stderr: str, stdout: str) -> str | None:
         return "empty_required"
     if "invalid type" in text or "argv type" in text:
         return "invalid_type"
+    if "argv schema error" in text:
+        return "argv_guard"
     return None
 
 
@@ -6448,11 +6458,13 @@ def _classify_argv_schema_failure(
     if run_reads_guard_undeclared:
         script_reasons.append("run(args) reads keys that strict_json_argv_guard did not declare")
 
-    primary_target = "SKILL.md"
-
+    # Runtime commands are canonical projections of the frozen contract.  A
+    # generated script must conform to that projection; E2E must never mutate
+    # the command to accommodate a divergent script interface.
+    primary_target = command.script_path
     target_reason = (
-        "SKILL.md command JSON argv does not match "
-        "the current script entry strict_json_argv_guard spec."
+        "The generated script argv interface does not accept the canonical "
+        "command payload projected from the frozen contract."
     )
 
     failed_runtime_keys = [
@@ -6476,32 +6488,23 @@ def _classify_argv_schema_failure(
     )
 
     if kind in {"non_object_argv", "missing_json_argv"}:
-        primary_target = "SKILL.md"
         target_reason = (
-            "SKILL.md command did not provide exactly one JSON object argv."
+            "The generated script did not receive or parse the canonical JSON object argv."
         )
 
     elif kind == "unknown_key":
-        # SKILL.md 传了脚本根本不接受的 key。
-        primary_target = "SKILL.md"
         target_reason = (
-            "SKILL.md command passed argv keys outside "
-            "the script strict_json_argv_guard spec."
+            "The generated script guard does not declare a key supplied by the "
+            "canonical contract command."
         )
 
     elif kind == "missing_required":
-        # 如果脚本要求的 key 根本没有进入 rendered argv，
-        # 优先认为 SKILL.md command 漏参。
         if failed_keys and not failed_runtime_keys:
-            primary_target = "SKILL.md"
             target_reason = (
-                "A key required by the script strict_json_argv_guard "
-                "is missing from the rendered SKILL.md command argv."
+                "The generated script guard requires a key that is absent from "
+                "the canonical contract command payload."
             )
         else:
-            # 理论上很少走到这里；如果 key 已经进入 runtime，
-            # 再由 script consistency 规则决定。
-            primary_target = command.script_path
             target_reason = (
                 "The required argv key reached runtime but the script "
                 "still reported it as missing; inspect the script argv parser/guard."
@@ -6509,30 +6512,26 @@ def _classify_argv_schema_failure(
 
     elif kind == "invalid_type":
         if bindings_forwarded_unchanged:
-            primary_target = command.script_path
             target_reason = (
-                "The SKILL.md command forwarded the upstream runtime value unchanged, "
+                "The canonical command forwarded the upstream runtime value unchanged, "
                 "but the generated script strict_json_argv_guard rejected its type."
             )
         else:
-            primary_target = "SKILL.md"
             target_reason = (
-                "The rendered SKILL.md command changed or constructed the value "
-                "in a way that does not match the script argv type."
+                "The generated script argv type does not match the rendered canonical "
+                "contract payload."
             )
 
     elif kind == "empty_required":
         if bindings_forwarded_unchanged:
-            primary_target = command.script_path
             target_reason = (
-                "The SKILL.md command forwarded the upstream runtime value unchanged, "
+                "The canonical command forwarded the upstream runtime value unchanged, "
                 "but the generated script strict_json_argv_guard rejected the empty value."
             )
         else:
-            primary_target = "SKILL.md"
             target_reason = (
-                "The rendered SKILL.md command produced an empty required value "
-                "without faithfully forwarding the upstream source."
+                "The generated script requiredness does not match the rendered canonical "
+                "contract payload."
             )
     failed_runtime_keys = [
         key
@@ -6603,18 +6602,15 @@ def _argv_schema_repair_instruction(script_path: str, details: dict[str, Any]) -
     }
     common = (
         f"argv_schema_error 归因：{target_reason}\n"
-        "strict_json_argv_guard(payload, spec) 是当前生成脚本的已观察入口接口事实；"
-        "如果 runtime binding 已经原样转发上游输入，而 guard 拒绝该值，"
-        "则应修复当前脚本的 argv guard / 直接消费逻辑，不能反向修改输入值或 SKILL.md。"
+        "SKILL.md command 是冻结合同的后台确定性投影，不是 E2E 模型的可修改接口；"
+        "当前生成脚本必须让 argv guard、parse_args 和 run/main 对齐 canonical command payload。"
         "command_argv_keys/script_required_keys 仅作 diagnostics，不作为主提示或新合同。\n"
         f"diagnostics={json.dumps(diagnostics, ensure_ascii=False, sort_keys=True, default=str)}\n"
-        "不得新增独立 canonical argv contract；不得因为 SKILL.md block 写错字段而让 script guard 迁就 block；禁止只改 guard schema；不要只修 guard。"
+        "不得修改 SKILL.md command、placeholder 或上游输入值；禁止只改 guard schema，必须同步修复脚本的 guard 与实际消费逻辑。"
     )
-    if primary == "SKILL.md":
-        return common + "\nprimary_target=SKILL.md：只修当前失败 command block 的 JSON argv；让 block argv keys 与脚本 strict_json_argv_guard spec 逐字对齐；移除 guard 不接受的 unknown keys，补齐 guard required keys，并修正类型/空值；不得改脚本，不得改 guard，不得改 parse_args/run/main/stdout，不得重写整篇 SKILL.md，不得改其它已通过 command。"
     if primary == script_path:
         return common + f"\nprimary_target={script_path}：只修当前脚本中与失败相关的 parse_args/strict_json_argv_guard/run/main/stdout；确保 guard、run(args)、main() 自洽；run(args) 不得读取 guard 未声明 key，不得重新读取 sys.argv/json argv，guard required key 必须被 run(args) 消费；不得改 SKILL.md。"
-    return common + "\nprimary_target 不确定：停止扩大修改；先依据 strict_json_argv_guard spec 与 run(args) AST diagnostics 判断目标，默认只修当前失败 SKILL.md command block。"
+    return common + f"\nprimary_target={script_path}：command 不可修改；只修当前脚本入口和参数消费逻辑。"
 
 
 def _parse_e2e_stdout_json(
@@ -6727,9 +6723,9 @@ def _parse_e2e_stdout_json(
                 command.script_path,
                 argv_details,
             )
-            target_region = "command JSON argv"
+            target_region = "script argv guard and parameter consumption"
             expected = (
-                "真实 command argv 必须通过当前脚本 strict_json_argv_guard，"
+                "当前脚本必须接受冻结合同投影出的 canonical command argv，"
                 "并保持 strict_json_argv_guard 与 run(args) 入口接口自洽。"
             )
         elif missing_module:
@@ -6782,6 +6778,26 @@ def _parse_e2e_stdout_json(
                     layer=failure_layer,
                     details={
                         **(argv_details if is_argv_schema_error else {}),
+                        **({
+                            "repair_authority": {
+                                "mode": "deterministic",
+                                "target_file": command.script_path,
+                                "expected": {
+                                    "canonical_command_payload_shape": {
+                                        str(key): _argv_value_shape(value)
+                                        for key, value in rendered_payload.items()
+                                    },
+                                },
+                                "observed": {
+                                    "script_argv_expected_types": argv_details.get("expected_types") or {},
+                                    "argv_schema_error_kind": argv_details.get("argv_schema_error_kind"),
+                                },
+                                "mutable_scope": [
+                                    "script strict_json_argv_guard",
+                                    "script parse_args/run/main parameter consumption",
+                                ],
+                            },
+                        } if is_argv_schema_error else {}),
                         "variable_trace": variable_trace,
                         "filesystem_trace": filesystem_trace,
                         "runtime_binding_trace": runtime_binding_trace or {},
@@ -8323,7 +8339,7 @@ async def _diagnose_e2e_failure_for_repair(*, skill_name: str, skill_dir: Path, 
         "tools are authorized in the Skill-wide ToolPool, E2E repair must not switch from one tool to another. Callable "
         "repair may only correct the invocation of the tool already represented by the failing source call."
     )
-    messages = [{"role": "system", "content": "You diagnose a Creator E2E breakpoint. Output only JSON. Select exactly one primary repair_target. It must be SKILL.md or an existing scripts/*.py in this Skill. Do not propose edits or backend/runtime/tool changes." + callable_boundary}, {"role": "user", "content": json.dumps(prompt, ensure_ascii=False, default=str) + "\nReturn {repair_target, root_cause_hypothesis, evidence, repair_instruction, confidence, callable_contract_evidence}. Include callable_contract_evidence only when read_only_callable_context is non-empty, and cite the exact callable facts that ground the diagnosis. These are real Sandbox experiments with stable failure identities and patch digests. Do not re-propose the same target, breakpoint, and repair region merely by changing hypothesis wording." + callable_boundary}]
+    messages = [{"role": "system", "content": "You diagnose a Creator E2E breakpoint. Output only JSON. Select exactly one primary repair_target from the existing scripts/*.py in this Skill. SKILL.md runtime commands are immutable deterministic projections of the frozen contract and must never be edited by a model. Do not propose edits to commands, placeholders, backend/runtime, contracts, or tools." + callable_boundary}, {"role": "user", "content": json.dumps(prompt, ensure_ascii=False, default=str) + "\nReturn {repair_target, root_cause_hypothesis, evidence, repair_instruction, confidence, callable_contract_evidence}. Include callable_contract_evidence only when read_only_callable_context is non-empty, and cite the exact callable facts that ground the diagnosis. These are real Sandbox experiments with stable failure identities and patch digests. Do not re-propose the same target, breakpoint, and repair region merely by changing hypothesis wording." + callable_boundary}]
     for proposal_attempt in range(3):
         try:
             text = _complete_chat_once_sync_for_e2e(messages, route.model)
@@ -8333,7 +8349,7 @@ async def _diagnose_e2e_failure_for_repair(*, skill_name: str, skill_dir: Path, 
             data = {"repair_target": symptom, "root_cause_hypothesis": "Diagnosis model unavailable; verify the runtime symptom with one minimal localized patch.", "evidence": [str(exc)[:300]], "repair_instruction": "Make only the minimum patch supported by the runtime failure.", "confidence": "low"}
         target, hypothesis = str(data.get("repair_target") or "").strip(), str(data.get("root_cause_hypothesis") or "").strip()
         key = f"{target}|{_normalized_debug_hypothesis(hypothesis)}"
-        valid = _is_skill_repair_target(workspace, target) and bool(hypothesis)
+        valid = target != "SKILL.md" and _is_skill_repair_target(workspace, target) and bool(hypothesis)
         # Hypothesis wording is explanatory only. Actual experiment deduplication
         # happens after a patch digest exists, before Sandbox is invoked.
         if valid:
@@ -8802,7 +8818,17 @@ async def _repair_existing_file_for_e2e_failure(
             "error_type": "callable_repair_evidence_missing",
             "sandbox_executed": False,
         }
-    if repair_authority:
+    if target_path == "SKILL.md" and _is_skill_md_command_format_error(e2e_errors):
+        diagnosis = {
+            "repair_target": "SKILL.md",
+            "symptom_file": "SKILL.md",
+            "root_cause_hypothesis": "Canonical command regeneration is required.",
+            "evidence": ["command format validation"],
+            "repair_instruction": "Run only the deterministic command normalizer.",
+            "confidence": "deterministic",
+            "hypothesis_key": "deterministic-command-normalizer",
+        }
+    elif repair_authority:
         diagnosis = {
             "repair_target": authority_target,
             "symptom_file": target_path,
@@ -8953,35 +8979,27 @@ async def _repair_existing_file_for_e2e_failure(
             )
         )
 
-        if (
-            normalization.blocked
-            or normalizer_attempted
-        ):
-            if repair_events is not None:
-                repair_events.append({
-                    "type": (
-                        "command_normalizer_blocked_"
-                        "fallback_to_model"
-                    ),
-                    "target_file": "SKILL.md",
-                    "payload": payload,
-                })
+        if repair_events is not None:
+            repair_events.append({
+                "type": "command_contract_regeneration_required",
+                "target_file": "SKILL.md",
+                "normalizer_attempted": normalizer_attempted,
+                "payload": payload,
+            })
 
-            e2e_errors = list(
-                e2e_errors or []
-            ) + [
-                _e2e_error(
-                    target="SKILL.md",
-                    layer=(
-                        "command_normalizer_blocked"
-                    ),
-                    message=json.dumps(
-                        payload,
-                        ensure_ascii=False,
-                        default=str,
-                    ),
-                )
-            ]
+        # Commands are deterministic projections of the frozen contract.  If
+        # the normalizer cannot regenerate one, an LLM patch would create a
+        # second, untrusted interface authority.  Return the failure to the
+        # Creator command-contract layer without editing SKILL.md.
+        return {
+            "status": "command_contract_regeneration_required",
+            "repaired_target": None,
+            "next_target": "CREATOR_COMMAND_CONTRACT",
+            "next_failure": e2e_errors,
+            "error_type": "command_normalizer_blocked" if normalization.blocked else "canonical_command_mismatch",
+            "command_mutable_by_model": False,
+            "sandbox_executed": False,
+        }
 
     if target_path == "SKILL.md":
         hard_format_failures = (

@@ -748,10 +748,11 @@ def test_e2e_seed_does_not_materialize_recommended_or_argv_schema_root_fields(tm
     payload = e2e._seed_initial_e2e_payload([command], skill_dir=skill_dir, requirements_by_file=reqs)
 
     assert recommended_key not in payload
-    assert recommended_key not in payload["fields"]
+    assert recommended_key not in payload.get("fields", {})
     with pytest.raises(ValueError) as exc:
         e2e._render_e2e_command_payload(command, payload=payload)
-    assert "external_input_missing" in str(exc.value)
+    assert "command_contract_projection_failure" in str(exc.value)
+    assert "E2E_REPAIR_TARGET=creator_e2e" in str(exc.value)
 
 
 def test_e2e_placeholder_bracket_and_dot_indexes_are_equivalent():
@@ -1140,7 +1141,7 @@ def test_input_text_list_guard_preflight_reaches_subprocess(tmp_path, monkeypatc
     assert script_path.read_text(encoding="utf-8") == script
 
 
-def test_argv_schema_failure_targets_skill_md_for_command_key_error_and_script_for_undeclared_run_key():
+def test_argv_schema_failure_targets_script_because_command_is_contract_projection():
     command = E2EWorkflowCommand(1, "SKILL.md", "scripts/main.py", "python scripts/main.py '{}'", "python", {"title": "wrong"})
     entry = SimpleNamespace(runtime="python", inputs=["input_text"])
     self_consistent = 'ALLOWED_KEYS = {"input_text"}\nREQUIRED_KEYS = {"input_text"}\ndef run(argv):\n    return {"text": argv.get("input_text")}\n'
@@ -1152,7 +1153,7 @@ def test_argv_schema_failure_targets_skill_md_for_command_key_error_and_script_f
         stdout="",
         stderr="ValueError: missing required argv keys: ['input_text']",
     )
-    assert details["primary_target"] == "SKILL.md"
+    assert details["primary_target"] == "scripts/main.py"
 
     mismatched = 'ALLOWED_KEYS = {"input_text"}\nREQUIRED_KEYS = {"input_text"}\ndef run(argv):\n    return {"text": argv["title"]}\n'
     details = e2e._classify_argv_schema_failure(
@@ -1799,20 +1800,24 @@ def test_e2e_repair_does_not_mutate_toolpool_digest(tmp_path, monkeypatch):
     assert context.get("read_only") is True or context == {}
 
 @pytest.mark.asyncio
-async def test_e2e_debug_diagnosis_can_choose_skill_md_not_symptom(monkeypatch, tmp_path):
+async def test_e2e_debug_diagnosis_rejects_skill_md_command_target(monkeypatch, tmp_path):
     skill_dir = _make_skill(tmp_path)
     session = e2e._create_e2e_session("demo", source_skill_dir=skill_dir)
-    monkeypatch.setattr(e2e, "_complete_chat_once_sync_for_e2e", lambda *_args: json.dumps({
-        "repair_target": "SKILL.md", "root_cause_hypothesis": "The command passes an invalid upstream argument.",
-        "evidence": ["step 2 payload"], "repair_instruction": "Fix the command", "confidence": "high",
-    }))
+    proposals = iter([
+        {"repair_target": "SKILL.md", "root_cause_hypothesis": "Change the command."},
+        {"repair_target": "scripts/two.py", "root_cause_hypothesis": "Align the script with the frozen command contract."},
+    ])
+    monkeypatch.setattr(
+        e2e, "_complete_chat_once_sync_for_e2e",
+        lambda *_args: json.dumps(next(proposals)),
+    )
     diagnosis = await e2e._diagnose_e2e_failure_for_repair(
         skill_name="demo", skill_dir=skill_dir,
         e2e_errors=["E2E_SYMPTOM_FILE=scripts/two.py\nE2E_LAYER=script_exit\nE2E_STRUCTURED_FAILURE={\"target_file\": \"scripts/two.py\"}"],
         e2e_session=session,
     )
     assert diagnosis["symptom_file"] == "scripts/two.py"
-    assert diagnosis["repair_target"] == "SKILL.md"
+    assert diagnosis["repair_target"] == "scripts/two.py"
 
 
 @pytest.mark.asyncio

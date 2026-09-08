@@ -280,7 +280,7 @@ After
 
 
 @pytest.mark.asyncio
-async def test_e2e_command_normalizer_blocked_falls_back_to_model_repair(tmp_path, monkeypatch):
+async def test_e2e_command_normalizer_blocked_never_falls_back_to_model_repair(tmp_path, monkeypatch):
     from backend.services.creator import e2e
     from backend.services.creator.command_normalizer import CommandFormatIssue, CommandNormalizationResult
 
@@ -295,16 +295,6 @@ description: Test.
 
 ```bash
 python scripts/run.py --input __RUNTIME_INPUT_FILE__
-```
-"""
-    fixed_skill_md = """---
-name: Test Skill
-description: Test.
----
-# Test Skill
-
-```bash
-python scripts/run.py '{"input_file":"__RUNTIME_INPUT_FILE__"}'
 ```
 """
     (skill_dir / "SKILL.md").write_text(bad_skill_md, encoding="utf-8")
@@ -325,15 +315,8 @@ python scripts/run.py '{"input_file":"__RUNTIME_INPUT_FILE__"}'
     monkeypatch.setattr(e2e, "route_creator_file_model", lambda **kwargs: SimpleNamespace(model="test-model"))
     monkeypatch.setattr(e2e, "_log_creator_model_usage", lambda **kwargs: None)
 
-    captured = {}
-
     async def fake_request_and_apply_repair_patch(**kwargs):
-        captured.update(kwargs)
-        return None, fixed_skill_md, {
-            "changed_line_count": 1,
-            "generated_diff_excerpt": "python scripts/run.py '{...}'",
-            "applied": [{"fallback_type": "none"}],
-        }
+        pytest.fail("model repair must not edit a canonical command")
 
     monkeypatch.setattr(e2e, "_request_and_apply_repair_patch", fake_request_and_apply_repair_patch)
     monkeypatch.setattr(
@@ -352,16 +335,8 @@ python scripts/run.py '{"input_file":"__RUNTIME_INPUT_FILE__"}'
         repair_events=repair_events,
     )
 
-    assert result["status"] == "repaired"
-    assert any(event.get("type") == "command_normalizer_blocked_fallback_to_model" for event in repair_events)
-    assert "command_normalizer_blocked" in captured["failure_text"]
-    assert "missing_command_arg_binding" in captured["task_context"]
-    assert "command_normalizer_blocked" in captured["task_context"]
-    assert "一个单引号包住的 JSON argv 参数" in captured["target_rule"]
-    assert "禁止未加引号 JSON" in captured["target_rule"]
-    assert "禁止 --key value 风格" in captured["target_rule"]
-
-    repaired = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
-    block = parse_skill_md_bash_command_blocks(repaired)[0]
-    assert validate_runtime_command_format(block.content) == []
-    assert block.content == "python scripts/run.py '{\"input_file\":\"__RUNTIME_INPUT_FILE__\"}'"
+    assert result["status"] == "command_contract_regeneration_required"
+    assert result["next_target"] == "CREATOR_COMMAND_CONTRACT"
+    assert result["command_mutable_by_model"] is False
+    assert any(event.get("type") == "command_contract_regeneration_required" for event in repair_events)
+    assert (skill_dir / "SKILL.md").read_text(encoding="utf-8") == bad_skill_md

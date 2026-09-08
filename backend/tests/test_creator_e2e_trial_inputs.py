@@ -444,6 +444,15 @@ def test_candidate_invariant_veto_rejects_new_runtime_sentinel():
     ) == ["introduced_runtime_sentinel"]
 
 
+def test_candidate_invariant_veto_rejects_model_command_changes():
+    before = "# Skill\n```bash\npython scripts/run.py '{\"text\":\"{{text}}\"}'\n```\n"
+    after = "# Updated prose\n```bash\npython scripts/run.py '{\"text\":\"changed\"}'\n```\n"
+
+    assert "canonical_command_changed_by_model" in e2e._e2e_candidate_invariant_veto(
+        before, after,
+    )
+
+
 def test_candidate_invariant_veto_rejects_frozen_boundary_changes():
     before = e2e._e2e_error(target="scripts/x.py", layer="script_exit", message="before", details={
         "frozen_provenance": {"foo": "external_context"},
@@ -673,7 +682,7 @@ def test_model_plans_unknown_file_semantics_with_frozen_contract(monkeypatch):
     monkeypatch.setattr(e2e, "route_model", lambda *args, **kwargs: type("Route", (), {"model": "test"})())
     def complete(**kwargs):
         captured.update(kwargs)
-        return {"inputs": [{"name": "uploads", "formats": ["md"], "reason": "Markdown input"}]}
+        return {"inputs": [{"name": "uploads", "format": "md", "reason": "Markdown input"}]}
     monkeypatch.setattr(e2e, "_complete_creator_json_object_once_sync_for_e2e", complete)
 
     resolved = e2e._plan_unknown_e2e_file_formats(
@@ -685,6 +694,9 @@ def test_model_plans_unknown_file_semantics_with_frozen_contract(monkeypatch):
     assert resolved.inputs["uploads"].runtime_shape == "list[file_path]"
     prompt = json.dumps(captured["messages"], ensure_ascii=False)
     assert "Markdown" in prompt and "materialization_capabilities" in prompt
+    schema = json.dumps(captured["response_schema"])
+    assert '"format"' in schema
+    assert '"formats"' not in schema
 
 
 def test_frozen_requirement_without_format_remains_unknown():

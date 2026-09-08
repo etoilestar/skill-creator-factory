@@ -16874,6 +16874,8 @@ async def _validate_skill_impl(
         creator_e2e_input_layers = {
             "e2e_case_plan", "e2e_case_generation", "e2e_case_validation",
             "e2e_case_materialization", "e2e_input_fixture",
+            "command_contract_projection_failure", "e2e_requirement_mapping_failed",
+            "e2e_step_argument_mapping",
         }
         if any(
             any(f"E2E_LAYER={layer}" in error for layer in creator_e2e_input_layers)
@@ -16882,9 +16884,9 @@ async def _validate_skill_impl(
             return SkillActionResponse(
                 success=False,
                 path=None,
-                message=(
-                    "Creator E2E 输入 Case 基础设施失败；已在脚本执行前停止，"
-                    "不会将系统制造的错误输入交给业务脚本自动修复：\n"
+                    message=(
+                        "Creator E2E 输入或 command/dataflow 合同投影基础设施失败；"
+                        "不会让模型修改 canonical command，也不会将系统投影错误交给业务脚本修复：\n"
                     + "\n\n".join(blocking_errors)
                 ),
                 repair_events=repair_events or e2e_session.events,

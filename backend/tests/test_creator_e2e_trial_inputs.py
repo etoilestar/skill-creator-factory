@@ -242,7 +242,12 @@ def test_trial_case_is_built_once_and_fixture_is_stable(tmp_path, monkeypatch):
     skill_dir = tmp_path / "demo"
     skill_dir.mkdir()
     session = e2e.CreatorE2ESession("session", "demo", skill_dir, skill_dir / ".venv", skill_dir / "outputs")
-    requirement = e2e.RequirementItem(id="R1", target_file="scripts/analyze.py", purpose="Read numeric CSV input")
+    requirement = e2e.RequirementItem(
+        id="R1", target_file="scripts/analyze.py", purpose="Read numeric CSV input",
+        constraints=[{"name": "input_file_contract", "kind": "input", "value": {
+            "allowed_formats": ["csv"],
+        }}],
+    )
     case = {"version": 1, "inputs": [_item({
         "format": "csv", "content_kind": "tabular",
         "columns": [{"name": "value", "type": "number"}], "rows": [{"value": 1}],
@@ -439,6 +444,15 @@ def test_candidate_invariant_veto_rejects_new_runtime_sentinel():
     ) == ["introduced_runtime_sentinel"]
 
 
+def test_candidate_invariant_veto_rejects_model_command_changes():
+    before = "# Skill\n```bash\npython scripts/run.py '{\"text\":\"{{text}}\"}'\n```\n"
+    after = "# Updated prose\n```bash\npython scripts/run.py '{\"text\":\"changed\"}'\n```\n"
+
+    assert "canonical_command_changed_by_model" in e2e._e2e_candidate_invariant_veto(
+        before, after,
+    )
+
+
 def test_candidate_invariant_veto_rejects_frozen_boundary_changes():
     before = e2e._e2e_error(target="scripts/x.py", layer="script_exit", message="before", details={
         "frozen_provenance": {"foo": "external_context"},
@@ -626,63 +640,63 @@ def test_registry_materializes_json_and_restricts_schema_to_frozen_formats(tmp_p
     assert '"const": "csv"' not in schema_text
 
 
-@pytest.mark.parametrize(("purpose", "expected"), [
-    ("Read PNG image and output report.pdf", ("png",)),
-    ("Read TIFF image and output preview.png", ("tiff",)),
-    ("Read HTML page and output screenshot.png", ("html",)),
+@pytest.mark.parametrize("purpose", [
+    "Read PNG image and output report.pdf",
+    "Read TIFF image and output preview.png",
+    "Read HTML page and output screenshot.png",
+    "读取 Markdown 文件并输出 index.json",
 ])
-def test_file_format_authority_ignores_output_clause(purpose, expected):
+def test_file_format_resolver_does_not_keyword_map_requirement_prose(purpose):
     spec = e2e._resolve_e2e_file_input_spec(
         _spec("source", "list[file_path]"),
         [e2e.RequirementItem(target_file="scripts/a.py", purpose=purpose)],
     )
-    assert spec.allowed_formats == expected
+    assert spec.allowed_formats == ()
+    assert spec.format_source == "unknown"
 
 
-def test_file_format_authority_resolves_cardinality_and_mixed_policy():
-    homogeneous = e2e._resolve_e2e_file_input_spec(
-        _spec("uploads", "list[file_path]"),
-        [e2e.RequirementItem(target_file="scripts/a.py", inputs=["exactly two CSV input files"])],
-    )
-    assert homogeneous.allowed_formats == ("csv",)
-    assert (homogeneous.min_items, homogeneous.max_items, homogeneous.homogeneous) == (2, 2, True)
-
-    mixed = e2e._resolve_e2e_file_input_spec(
-        _spec("uploads", "list[file_path]"),
-        [e2e.RequirementItem(target_file="scripts/a.py", inputs=["one PDF and one PNG input"])],
-    )
-    assert mixed.allowed_formats == ("pdf", "png")
-    assert mixed.homogeneous is False
-
-
-@pytest.mark.parametrize(("requirement_text", "shape", "expected_format", "count"), [
-    ("Skill 必须读取两个 CSV 文件作为输入数据源。", "list[file_path]", "csv", 2),
-    ("读取一个 PDF 文件", "file_path", "pdf", 1),
-    ("读取两个 PNG 图片", "list[file_path]", "png", 2),
-    ("读取 TIFF/TIF 图像", "file_path", "tiff", 1),
-])
-def test_frozen_requirement_text_resolves_and_materializes_file_case(
-    tmp_path, requirement_text, shape, expected_format, count,
-):
-    typed = _spec("uploads", shape)
+def test_structured_file_contract_remains_authoritative():
+    typed = _spec("uploads", "list[file_path]")
     requirement = e2e.RequirementItem(
-        id="R1", target_file=typed.target_file, requirement=requirement_text,
+        id="R1", target_file=typed.target_file, requirement="process the uploads",
+        constraints=[{"name": "input_file_contract", "kind": "input", "value": {
+            "allowed_formats": ["csv", "png"],
+        }}],
     )
     resolved = e2e._resolve_e2e_file_input_spec(typed, [requirement])
-    assert resolved.allowed_formats == (expected_format,)
-    assert resolved.format_source == "requirement_text"
-    assert (resolved.min_items, resolved.max_items) == (count, count)
+    assert resolved.allowed_formats == ("csv", "png")
+    assert resolved.format_source == "requirement_constraint"
+    assert resolved.homogeneous is False
 
+
+def test_model_plans_unknown_file_semantics_with_frozen_contract(monkeypatch):
+    typed = _spec("uploads", "list[file_path]")
+    requirement = e2e.RequirementItem(
+        id="R1", target_file=typed.target_file,
+        requirement="读取用户上传的 Markdown 文档并提取标题。",
+    )
     plan = e2e._build_e2e_input_case_plan(
         [typed], requirements_by_file={typed.target_file: [requirement]},
     )
-    fixture = e2e._synthesize_e2e_input_fixture(plan.inputs[typed.name])
-    item = {"name": typed.name, "shape": shape, "fixture": fixture,
-            "evidence_requirement_ids": ["R1"]}
-    materialized = e2e._materialize_e2e_trial_fixture(item, skill_dir=tmp_path)
-    paths = materialized if isinstance(materialized, list) else [materialized]
-    assert len(paths) == count
-    assert all(Path(path).suffix.lower() == e2e.FILE_FIXTURE_FORMATS[expected_format].extension for path in paths)
+    captured = {}
+    monkeypatch.setattr(e2e, "route_model", lambda *args, **kwargs: type("Route", (), {"model": "test"})())
+    def complete(**kwargs):
+        captured.update(kwargs)
+        return {"inputs": [{"name": "uploads", "format": "md", "reason": "Markdown input"}]}
+    monkeypatch.setattr(e2e, "_complete_creator_json_object_once_sync_for_e2e", complete)
+
+    resolved = e2e._plan_unknown_e2e_file_formats(
+        plan, requirements_by_file={typed.target_file: [requirement]}, requested_model=None,
+    )
+
+    assert resolved.inputs["uploads"].allowed_formats == ("md",)
+    assert resolved.inputs["uploads"].file_format_source == "model_semantic_planner"
+    assert resolved.inputs["uploads"].runtime_shape == "list[file_path]"
+    prompt = json.dumps(captured["messages"], ensure_ascii=False)
+    assert "Markdown" in prompt and "materialization_capabilities" in prompt
+    schema = json.dumps(captured["response_schema"])
+    assert '"format"' in schema
+    assert '"formats"' not in schema
 
 
 def test_frozen_requirement_without_format_remains_unknown():
@@ -694,7 +708,7 @@ def test_frozen_requirement_without_format_remains_unknown():
     assert resolved.format_source == "unknown"
 
 
-def test_requirement_prose_survives_production_graph_round_trip_and_resolves():
+def test_requirement_prose_survives_production_graph_round_trip_for_model_planning():
     prose = "Skill 必须读取两个 CSV 文件作为输入数据源。"
     original = e2e.RequirementItem(
         id="R1", target_file="scripts/main.py", requirement=prose,
@@ -720,9 +734,8 @@ def test_requirement_prose_survives_production_graph_round_trip_and_resolves():
         ),
         loaded.requirements,
     )
-    assert resolved.allowed_formats == ("csv",)
-    assert resolved.format_source == "requirement_text"
-    assert (resolved.min_items, resolved.max_items) == (2, 2)
+    assert resolved.allowed_formats == ()
+    assert resolved.format_source == "unknown"
 
 
 def test_structured_builder_contract_freezes_and_materializes_csv(tmp_path, monkeypatch):
@@ -741,7 +754,12 @@ def test_structured_builder_contract_freezes_and_materializes_csv(tmp_path, monk
         return response
     monkeypatch.setattr(e2e, "complete_json_object_once", structured_helper)
     requirements = [
-        e2e.RequirementItem(id="R1", target_file="scripts/analyze.py", purpose="Read CSV"),
+        e2e.RequirementItem(
+            id="R1", target_file="scripts/analyze.py", purpose="Read CSV",
+            constraints=[{"name": "input_file_contract", "kind": "input", "value": {
+                "allowed_formats": ["csv"],
+            }}],
+        ),
         e2e.RequirementItem(id="R7", target_file="scripts/analyze.py", purpose="Numeric statistics"),
     ]
     accepted = e2e._prepare_e2e_trial_case(
@@ -772,6 +790,9 @@ def test_malformed_structured_builder_response_is_rejected_to_fallback(tmp_path,
         typed_specs=[_spec()],
         requirements_by_file={"scripts/analyze.py": [e2e.RequirementItem(
             id="R1", target_file="scripts/analyze.py", purpose="Read CSV",
+            constraints=[{"name": "input_file_contract", "kind": "input", "value": {
+                "allowed_formats": ["csv"],
+            }}],
         )]},
         skill_plan_entries={"scripts/analyze.py": SimpleNamespace(default_values={})},
         external_context={}, requested_model=None, session=session,

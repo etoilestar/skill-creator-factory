@@ -1870,6 +1870,22 @@ def _verified_model_file_format(
     return ""
 
 
+def _explicit_file_format_mentions(requirements: list[dict[str, Any]]) -> dict[str, list[dict[str, str]]]:
+    """Project literal format names into a finite set of grounded candidates."""
+    mentions: dict[str, list[dict[str, str]]] = {}
+    for requirement in requirements:
+        requirement_id = str(requirement.get("id") or "")
+        text = str(requirement.get("text") or "")
+        for fmt in sorted(_E2E_FILE_FORMAT_EVIDENCE_TERMS):
+            if not _requirement_quote_explicitly_names_format(text, fmt):
+                continue
+            matches = mentions.setdefault(fmt, [])
+            evidence = {"requirement_id": requirement_id, "quote": text}
+            if evidence not in matches:
+                matches.append(evidence)
+    return mentions
+
+
 def _resolve_e2e_file_input_spec(
     typed_spec: E2ETypedInputSpec,
     requirements: list[RequirementItem],
@@ -2188,16 +2204,25 @@ def _plan_unknown_e2e_file_formats(
         return plan
 
     capabilities = sorted({handler.canonical_format for handler in FILE_FIXTURE_FORMATS.values()})
+    explicit_mentions_by_input = {
+        item["name"]: _explicit_file_format_mentions(item.get("requirements", []))
+        for item in evidence
+    }
+    for item in evidence:
+        item["explicit_format_mentions"] = explicit_mentions_by_input[item["name"]]
     variants = []
     for spec in unresolved:
+        grounded_formats = sorted(explicit_mentions_by_input.get(spec.name, {}))
+        decisions = ["resolved", "ambiguous"] if grounded_formats else ["unknown"]
+        selectable_formats = ["", *grounded_formats] if grounded_formats else [""]
         variants.append({
             "type": "object",
             "additionalProperties": False,
             "required": ["name", "decision", "format", "evidence", "reason"],
             "properties": {
                 "name": {"const": spec.name},
-                "decision": {"type": "string", "enum": ["resolved", "unknown", "ambiguous"]},
-                "format": {"type": "string", "enum": ["", *capabilities]},
+                "decision": {"type": "string", "enum": decisions},
+                "format": {"type": "string", "enum": selectable_formats},
                 "evidence": {
                     "type": "array",
                     "items": {
@@ -2234,6 +2259,11 @@ def _plan_unknown_e2e_file_formats(
                     "Extract explicit file-format evidence for each unresolved runtime file input. "
                     "The supplied names, shapes, targets, and cardinalities are a frozen contract: do not change them. "
                     "Available formats are execution capabilities, not hints that every format is appropriate. "
+                    "The supplied explicit_format_mentions are deterministically extracted from a finite format "
+                    "ontology. Canonical content-format names count as explicit: for example, 'Markdown file' or "
+                    "'Markdown document' explicitly names format=md even when the extension '.md' is omitted. "
+                    "When explicit_format_mentions is non-empty, unknown is not valid: select the input-side format "
+                    "with decision=resolved, or decision=ambiguous if the input-side evidence truly conflicts. "
                     "Use decision=resolved only when requirement prose explicitly names one available input format; "
                     "quote the exact supporting words and requirement_id in evidence. Use decision=unknown when prose "
                     "only says generic file, document, text, or image. Use decision=ambiguous when multiple explicit "

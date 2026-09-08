@@ -701,6 +701,66 @@ def test_model_plans_unknown_file_semantics_with_frozen_contract(monkeypatch):
     schema = json.dumps(captured["response_schema"])
     assert '"format"' in schema
     assert '"formats"' not in schema
+    assert '"enum": ["resolved", "ambiguous"]' in schema
+    user_payload = json.loads(captured["messages"][1]["content"])
+    mentions = user_payload["unresolved_inputs"][0]["explicit_format_mentions"]
+    assert list(mentions) == ["md"]
+    assert mentions["md"][0]["requirement_id"] == "R1"
+
+
+def test_model_format_proposal_requires_literal_matching_evidence(monkeypatch):
+    typed = _spec("uploads", "list[file_path]")
+    requirement = e2e.RequirementItem(
+        id="R1", target_file=typed.target_file,
+        requirement="读取用户上传的 Markdown 文档并提取标题。",
+    )
+    plan = e2e._build_e2e_input_case_plan(
+        [typed], requirements_by_file={typed.target_file: [requirement]},
+    )
+    monkeypatch.setattr(e2e, "route_model", lambda *args, **kwargs: type("Route", (), {"model": "test"})())
+    monkeypatch.setattr(
+        e2e, "_complete_creator_json_object_once_sync_for_e2e",
+        lambda **kwargs: {"inputs": [{
+            "name": "uploads", "decision": "resolved", "format": "txt",
+            "evidence": [{"requirement_id": "R1", "quote": "Markdown 文档"}],
+            "reason": "Plain text is broadly compatible.",
+        }]},
+    )
+
+    resolved = e2e._plan_unknown_e2e_file_formats(
+        plan, requirements_by_file={typed.target_file: [requirement]}, requested_model=None,
+    )
+
+    assert resolved.inputs["uploads"].allowed_formats == ()
+    assert resolved.inputs["uploads"].file_format_source == "unknown"
+
+
+def test_model_may_abstain_when_file_format_is_not_explicit(monkeypatch):
+    typed = _spec("upload", "file_path")
+    requirement = e2e.RequirementItem(
+        id="R1", target_file=typed.target_file, requirement="处理用户上传的文档。",
+    )
+    plan = e2e._build_e2e_input_case_plan(
+        [typed], requirements_by_file={typed.target_file: [requirement]},
+    )
+    monkeypatch.setattr(e2e, "route_model", lambda *args, **kwargs: type("Route", (), {"model": "test"})())
+    captured = {}
+    def complete(**kwargs):
+        captured.update(kwargs)
+        return {"inputs": [{
+            "name": "upload", "decision": "unknown", "format": "", "evidence": [],
+            "reason": "No explicit format is stated.",
+        }]}
+    monkeypatch.setattr(e2e, "_complete_creator_json_object_once_sync_for_e2e", complete)
+
+    resolved = e2e._plan_unknown_e2e_file_formats(
+        plan, requirements_by_file={typed.target_file: [requirement]}, requested_model=None,
+    )
+
+    assert resolved == plan
+    schema = json.dumps(captured["response_schema"])
+    assert '"enum": ["unknown"]' in schema
+    assert json.loads(captured["messages"][1]["content"])["unresolved_inputs"][0]["explicit_format_mentions"] == {}
 
 
 def test_model_format_proposal_requires_literal_matching_evidence(monkeypatch):

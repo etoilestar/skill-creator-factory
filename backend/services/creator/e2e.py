@@ -1346,6 +1346,38 @@ def _collect_e2e_typed_inputs_from_graph(
     skill_dir: Path | None,
 ) -> list[E2ETypedInputSpec]:
     specs: dict[str, E2ETypedInputSpec] = {}
+    # Trial Cases may populate only values that enter the workflow from the
+    # platform boundary. A port produced by any workflow member is internal
+    # dataflow (or a terminal output), even when a downstream argv schema and
+    # RequirementItem also describe it as that member's input.
+    command_order = {
+        command.script_path: index
+        for index, command in enumerate(commands)
+    }
+    produced_at: dict[str, int] = {}
+    for target_file, entry in (skill_plan_entries or {}).items():
+        for raw in getattr(entry, "outputs", []) or []:
+            name, _shape = _parse_typed_name(raw)
+            root = _placeholder_root(_normalize_e2e_placeholder_expr(name))
+            if root:
+                produced_at[root] = min(
+                    produced_at.get(root, len(commands)),
+                    command_order.get(target_file, len(commands)),
+                )
+
+    consumed_at: dict[str, int] = {}
+    for index, command in enumerate(commands):
+        for expr in _placeholder_exprs_from_value(command.argv_template):
+            root = _placeholder_root(_normalize_e2e_placeholder_expr(expr))
+            if root:
+                consumed_at[root] = min(consumed_at.get(root, len(commands)), index)
+
+    internal_roots = {
+        name
+        for name, producer_index in produced_at.items()
+        if producer_index < consumed_at.get(name, len(commands))
+    }
+
     for target_file, reqs in (requirements_by_file or {}).items():
         for req in reqs or []:
             for raw in getattr(req, "inputs", []) or []:
@@ -1366,7 +1398,7 @@ def _collect_e2e_typed_inputs_from_graph(
                     )
 
     for target_file, entry in (skill_plan_entries or {}).items():
-        for raw in (getattr(entry, "inputs", []) or []) + (getattr(entry, "outputs", []) or []):
+        for raw in getattr(entry, "inputs", []) or []:
             name, shape = _parse_typed_name(raw)
 
             if name:
@@ -1382,11 +1414,6 @@ def _collect_e2e_typed_inputs_from_graph(
                         confidence="medium",
                     ),
                 )
-        artifact_contract = getattr(entry, "artifact_contract", None)
-        if isinstance(artifact_contract, dict):
-            for name, raw_shape in artifact_contract.items():
-                _put_typed_spec(specs, E2ETypedInputSpec(name=str(name), shape=_canonical_e2e_shape(raw_shape), item_shape=_shape_item_shape(_canonical_e2e_shape(raw_shape)), required=True, source="skill_plan_entry", target_file=target_file, confidence="medium"))
-
     for command in commands:
         command_expected_types: dict[str, str] = {}
         if skill_dir is not None and command.script_path.endswith(".py"):
@@ -1484,7 +1511,13 @@ def _collect_e2e_typed_inputs_from_graph(
             ),
         )
 
-    for spec in specs.values():
+    external_specs = {
+        name: spec
+        for name, spec in specs.items()
+        if name not in internal_roots
+    }
+
+    for spec in external_specs.values():
         logger.info(
             "[Creator][E2E][typed_input_resolution] %s",
             json.dumps({
@@ -1500,7 +1533,13 @@ def _collect_e2e_typed_inputs_from_graph(
             }, ensure_ascii=False, sort_keys=True),
         )
 
-    return list(specs.values())
+    if internal_roots & set(specs):
+        logger.info(
+            "[Creator][E2E][internal_dataflow_inputs_excluded] names=%s",
+            sorted(internal_roots & set(specs)),
+        )
+
+    return list(external_specs.values())
 
 
 def _read_e2e_skill_md_for_samples(skill_dir: Path | None) -> str:
@@ -1799,6 +1838,7 @@ def _image_materializer(fmt: str) -> Any:
 
 FILE_FIXTURE_FORMATS: dict[str, E2EFileFixtureHandler] = {}
 MAX_E2E_CASE_REPAIR_ATTEMPTS = 2
+MAX_E2E_CASE_BUILD_ATTEMPTS = 2
 
 
 def _register_file_fixture_handler(handler: E2EFileFixtureHandler) -> None:
@@ -2273,8 +2313,13 @@ def _plan_unknown_e2e_file_formats(
             VALIDATOR_TASK, requested_model=requested_model,
             reason="creator grounded E2E file semantic planning",
         )
-        proposed = _complete_creator_json_object_once_sync_for_e2e(
-            messages=[
+    except Exception as exc:
+        logger.warning(
+            "[Creator][E2E][file_semantic_plan_failed] stage=route type=%s error=%s",
+            type(exc).__name__, exc,
+        )
+        return plan
+    base_messages = [
                 {"role": "system", "content": (
                     "Extract explicit file-format evidence for each unresolved runtime file input. "
                     "The supplied names, shapes, targets, and cardinalities are a frozen contract: do not change them. "
@@ -2295,34 +2340,70 @@ def _plan_unknown_e2e_file_formats(
                     "unresolved_inputs": evidence,
                     "materialization_capabilities": capabilities,
                 }, ensure_ascii=False, sort_keys=True)},
-            ],
-            model=route.model,
-            phase="creator_e2e_file_semantic_plan",
-            response_schema=schema,
-        )
-    except Exception as exc:
-        logger.warning(
-            "[Creator][E2E][file_semantic_plan_failed] type=%s error=%s",
-            type(exc).__name__, exc,
-        )
-        return plan
-    items = proposed.get("inputs", []) if isinstance(proposed, dict) else []
-    selected: dict[str, tuple[str, ...]] = {}
+    ]
     requirements_by_input: dict[str, dict[str, str]] = {}
     for evidence_item in evidence:
         requirements_by_input[evidence_item["name"]] = {
             str(req.get("id") or ""): str(req.get("text") or "")
             for req in evidence_item.get("requirements", [])
         }
-    for item in items:
-        if not isinstance(item, dict):
+    selected: dict[str, tuple[str, ...]] = {}
+    previous_proposal: Any = None
+    validation_issues: list[dict[str, str]] = []
+    for build_attempt in range(MAX_E2E_CASE_BUILD_ATTEMPTS):
+        messages = list(base_messages)
+        if validation_issues:
+            messages.append({"role": "user", "content": json.dumps({
+                "instruction": "Rebuild the file-format plan. Correct every validation issue; do not repeat the rejected proposal.",
+                "previous_proposal": previous_proposal,
+                "validation_issues": validation_issues,
+            }, ensure_ascii=False, sort_keys=True)})
+        try:
+            proposed = _complete_creator_json_object_once_sync_for_e2e(
+                messages=messages, model=route.model,
+                phase="creator_e2e_file_semantic_plan",
+                response_schema=schema,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[Creator][E2E][file_semantic_plan_failed] attempt=%s type=%s error=%s",
+                build_attempt + 1, type(exc).__name__, exc,
+            )
+            previous_proposal = None
+            validation_issues = [{"input": "*", "code": "model_call_failed", "message": str(exc)}]
             continue
-        name = str(item.get("name") or "")
-        selected_format = _verified_model_file_format(
-            item, requirements_by_id=requirements_by_input.get(name, {}),
+
+        previous_proposal = proposed
+        validation_issues = []
+        items = proposed.get("inputs", []) if isinstance(proposed, dict) else []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "")
+            selected_format = _verified_model_file_format(
+                item, requirements_by_id=requirements_by_input.get(name, {}),
+            )
+            if name in evidence_names and selected_format:
+                selected[name] = (selected_format,)
+            elif name in evidence_names:
+                validation_issues.append({
+                    "input": name,
+                    "code": "format_evidence_rejected",
+                    "message": "The decision, format, or quoted requirement evidence was not verifiable. Rebuild this input using an exact quote from the supplied frozen requirement.",
+                })
+        missing = sorted(spec.name for spec in unresolved if spec.name not in selected)
+        for name in missing:
+            if not any(issue["input"] == name for issue in validation_issues):
+                validation_issues.append({
+                    "input": name, "code": "format_unresolved",
+                    "message": "No verified format plan was returned for this input. Rebuild it from the supplied explicit format mentions.",
+                })
+        if not validation_issues:
+            break
+        logger.warning(
+            "[Creator][E2E][file_semantic_plan_rebuild] attempt=%s issues=%s",
+            build_attempt + 1, json.dumps(validation_issues, ensure_ascii=False, sort_keys=True),
         )
-        if name in evidence_names and selected_format:
-            selected[name] = (selected_format,)
 
     inputs = dict(plan.inputs)
     for name, formats in selected.items():
@@ -2659,7 +2740,10 @@ def _materialize_e2e_trial_fixture(item: dict[str, Any], *, skill_dir: Path) -> 
     return materialized
 
 
-def _build_e2e_trial_case(facts: dict[str, Any], *, requested_model: str | None = None) -> Any:
+def _build_e2e_trial_case(
+    facts: dict[str, Any], *, requested_model: str | None = None,
+    rebuild_feedback: dict[str, Any] | None = None,
+) -> Any:
     """Make the single narrow model call used to project frozen facts to inputs."""
     route = route_model(VALIDATOR_TASK, requested_model=requested_model, reason="creator grounded E2E trial case")
     schema = _e2e_trial_case_response_schema(facts)
@@ -2669,6 +2753,11 @@ def _build_e2e_trial_case(facts: dict[str, Any], *, requested_model: str | None 
         "Do not invent platform inputs or requirements, optimize the Skill, or judge implementation quality. "
         "Return exactly the Trial Case object required by the bound JSON Schema."
     )}, {"role": "user", "content": json.dumps(facts, ensure_ascii=False, sort_keys=True)}]
+    if rebuild_feedback:
+        messages.append({"role": "user", "content": json.dumps({
+            "instruction": "Rebuild the Trial Case from scratch. Correct every reported issue while preserving all frozen input facts.",
+            **rebuild_feedback,
+        }, ensure_ascii=False, sort_keys=True, default=str)})
     return _complete_creator_json_object_once_sync_for_e2e(
         messages=messages,
         model=route.model,
@@ -4250,13 +4339,21 @@ def _prepare_e2e_trial_case(
             same_plan
             and session.input_case_plan_failure
         ):
-            raise E2ECaseInfrastructureError(
+            logger.info(
+                "[Creator][E2E][trial_case_cached_failure_rebuild] plan_digest=%s failure=%s details=%s",
+                plan.digest,
                 session.input_case_plan_failure,
-                details=(
-                    session
-                    .input_case_plan_failure_details
-                ),
+                json.dumps(session.input_case_plan_failure_details, ensure_ascii=False, sort_keys=True, default=str),
             )
+            # A failed derived Trial Case is not frozen authority. Re-enter the
+            # bounded model build flow on the next E2E pass instead of making a
+            # transient first-wave failure permanent for this session.
+            session.trial_case = None
+            session.trial_case_digest = ""
+            session.trial_case_prepared = False
+            session.input_case_fixture_digests = {}
+            session.input_case_plan_failure = ""
+            session.input_case_plan_failure_details = {}
 
         if (
             same_plan
@@ -4573,70 +4670,49 @@ def _prepare_e2e_trial_case(
     #
     # No deterministic semantic fallback.
     # =========================================================
-    try:
-        generated = (
-            _build_e2e_trial_case(
-                facts,
-                requested_model=
-                    requested_model,
+    generated: Any = None
+    generation_issues: list[dict[str, str]] = []
+    last_generation_error: Exception | None = None
+    for build_attempt in range(MAX_E2E_CASE_BUILD_ATTEMPTS):
+        feedback = None
+        if generation_issues:
+            feedback = {
+                "previous_trial_case": generated,
+                "validation_issues": generation_issues,
+            }
+        try:
+            generated = _build_e2e_trial_case(
+                facts, requested_model=requested_model, rebuild_feedback=feedback,
             )
-        )
-
-    except Exception as exc:
+            last_generation_error = None
+        except Exception as exc:
+            last_generation_error = exc
+            generation_issues = [{
+                "code": "generation_exception", "message": f"{type(exc).__name__}: {exc}",
+            }]
+        else:
+            valid_shape = (
+                isinstance(generated, dict)
+                and generated.get("status") != "unsupported"
+                and generated.get("version") == 1
+                and isinstance(generated.get("inputs"), list)
+            )
+            if valid_shape:
+                break
+            generation_issues = [{
+                "code": "unsupported_or_invalid_case",
+                "message": "Return a complete version=1 Trial Case with an inputs array matching the bound schema.",
+            }]
         logger.warning(
-            "[Creator][E2E]"
-            "[trial_case_generation_failed] "
-            "type=%s error=%s",
-            type(exc).__name__,
-            exc,
+            "[Creator][E2E][trial_case_rebuild] attempt=%s issues=%s",
+            build_attempt + 1, json.dumps(generation_issues, ensure_ascii=False, sort_keys=True),
         )
 
-        details = {
-            "error_type":
-                type(exc).__name__,
-            "error":
-                str(exc),
-            "plan_digest":
-                plan.digest,
-            "repair_owner":
-                "creator_e2e",
-            "skill_repair_allowed":
-                False,
-        }
-
-        if session is not None:
-            session.trial_case_prepared = False
-            session.input_case_plan_failure = (
-                "trial_case_generation_failed"
-            )
-            session.input_case_plan_failure_details = (
-                details
-            )
-
-        raise E2ECaseInfrastructureError(
-            "trial_case_generation_failed",
-            details=details,
-        ) from exc
-
-    if (
-        not isinstance(
-            generated,
-            dict,
-        )
-        or generated.get(
-            "status"
-        )
-        == "unsupported"
-        or generated.get(
-            "version"
-        )
-        != 1
-        or not isinstance(
-            generated.get(
-                "inputs"
-            ),
-            list,
-        )
+    if generation_issues and not (
+        isinstance(generated, dict)
+        and generated.get("status") != "unsupported"
+        and generated.get("version") == 1
+        and isinstance(generated.get("inputs"), list)
     ):
         details = {
             "reason":
@@ -4648,6 +4724,7 @@ def _prepare_e2e_trial_case(
                 _json_shape(
                     generated
                 ),
+            "validation_issues": generation_issues,
             "plan_digest":
                 plan.digest,
             "repair_owner":
@@ -4668,7 +4745,7 @@ def _prepare_e2e_trial_case(
         raise E2ECaseInfrastructureError(
             "trial_case_generation_failed",
             details=details,
-        )
+        ) from last_generation_error
 
     accepted = (
         _canonicalize_e2e_trial_case_spec(

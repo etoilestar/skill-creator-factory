@@ -1346,6 +1346,38 @@ def _collect_e2e_typed_inputs_from_graph(
     skill_dir: Path | None,
 ) -> list[E2ETypedInputSpec]:
     specs: dict[str, E2ETypedInputSpec] = {}
+    # Trial Cases may populate only values that enter the workflow from the
+    # platform boundary. A port produced by any workflow member is internal
+    # dataflow (or a terminal output), even when a downstream argv schema and
+    # RequirementItem also describe it as that member's input.
+    command_order = {
+        command.script_path: index
+        for index, command in enumerate(commands)
+    }
+    produced_at: dict[str, int] = {}
+    for target_file, entry in (skill_plan_entries or {}).items():
+        for raw in getattr(entry, "outputs", []) or []:
+            name, _shape = _parse_typed_name(raw)
+            root = _placeholder_root(_normalize_e2e_placeholder_expr(name))
+            if root:
+                produced_at[root] = min(
+                    produced_at.get(root, len(commands)),
+                    command_order.get(target_file, len(commands)),
+                )
+
+    consumed_at: dict[str, int] = {}
+    for index, command in enumerate(commands):
+        for expr in _placeholder_exprs_from_value(command.argv_template):
+            root = _placeholder_root(_normalize_e2e_placeholder_expr(expr))
+            if root:
+                consumed_at[root] = min(consumed_at.get(root, len(commands)), index)
+
+    internal_roots = {
+        name
+        for name, producer_index in produced_at.items()
+        if producer_index < consumed_at.get(name, len(commands))
+    }
+
     for target_file, reqs in (requirements_by_file or {}).items():
         for req in reqs or []:
             for raw in getattr(req, "inputs", []) or []:
@@ -1366,7 +1398,7 @@ def _collect_e2e_typed_inputs_from_graph(
                     )
 
     for target_file, entry in (skill_plan_entries or {}).items():
-        for raw in (getattr(entry, "inputs", []) or []) + (getattr(entry, "outputs", []) or []):
+        for raw in getattr(entry, "inputs", []) or []:
             name, shape = _parse_typed_name(raw)
 
             if name:
@@ -1382,11 +1414,6 @@ def _collect_e2e_typed_inputs_from_graph(
                         confidence="medium",
                     ),
                 )
-        artifact_contract = getattr(entry, "artifact_contract", None)
-        if isinstance(artifact_contract, dict):
-            for name, raw_shape in artifact_contract.items():
-                _put_typed_spec(specs, E2ETypedInputSpec(name=str(name), shape=_canonical_e2e_shape(raw_shape), item_shape=_shape_item_shape(_canonical_e2e_shape(raw_shape)), required=True, source="skill_plan_entry", target_file=target_file, confidence="medium"))
-
     for command in commands:
         command_expected_types: dict[str, str] = {}
         if skill_dir is not None and command.script_path.endswith(".py"):
@@ -1484,7 +1511,13 @@ def _collect_e2e_typed_inputs_from_graph(
             ),
         )
 
-    for spec in specs.values():
+    external_specs = {
+        name: spec
+        for name, spec in specs.items()
+        if name not in internal_roots
+    }
+
+    for spec in external_specs.values():
         logger.info(
             "[Creator][E2E][typed_input_resolution] %s",
             json.dumps({
@@ -1500,7 +1533,13 @@ def _collect_e2e_typed_inputs_from_graph(
             }, ensure_ascii=False, sort_keys=True),
         )
 
-    return list(specs.values())
+    if internal_roots & set(specs):
+        logger.info(
+            "[Creator][E2E][internal_dataflow_inputs_excluded] names=%s",
+            sorted(internal_roots & set(specs)),
+        )
+
+    return list(external_specs.values())
 
 
 def _read_e2e_skill_md_for_samples(skill_dir: Path | None) -> str:

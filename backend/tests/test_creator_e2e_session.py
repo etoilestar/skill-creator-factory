@@ -914,6 +914,62 @@ def test_strict_string_argv_remains_string_runtime_shape(tmp_path):
     assert spec.shape_source == "argv_schema"
 
 
+def test_trial_inputs_exclude_values_produced_by_an_upstream_workflow_step(tmp_path):
+    commands = [
+        E2EWorkflowCommand(
+            1, "SKILL.md", "scripts/parser.py", "python scripts/parser.py '{}'", "python",
+            {"input_files": "{{input_files}}"},
+        ),
+        E2EWorkflowCommand(
+            2, "SKILL.md", "scripts/indexer.py", "python scripts/indexer.py '{}'", "python",
+            {"parsed_headings": "{{parsed_headings}}"},
+        ),
+    ]
+    entries = {
+        "scripts/parser.py": SimpleNamespace(
+            inputs=["input_files: list[file_path]"], outputs=["parsed_headings: list"],
+        ),
+        "scripts/indexer.py": SimpleNamespace(
+            inputs=["parsed_headings: list"], outputs=["result: object"],
+        ),
+    }
+    requirements = {
+        "scripts/parser.py": [e2e.RequirementItem(
+            target_file="scripts/parser.py", inputs=["input_files: list[file_path]"],
+        )],
+        "scripts/indexer.py": [e2e.RequirementItem(
+            target_file="scripts/indexer.py", inputs=["parsed_headings: list"],
+        )],
+    }
+
+    specs = e2e._collect_e2e_typed_inputs_from_graph(
+        commands=commands, requirements_by_file=requirements,
+        skill_plan_entries=entries, skill_dir=tmp_path,
+    )
+
+    assert {spec.name for spec in specs} == {"input_files"}
+    assert {spec.name for spec in specs}.isdisjoint({"parsed_headings", "result"})
+
+
+def test_trial_inputs_keep_external_value_consumed_before_same_named_output(tmp_path):
+    command = E2EWorkflowCommand(
+        1, "SKILL.md", "scripts/normalize.py", "python scripts/normalize.py '{}'", "python",
+        {"text": "{{text}}"},
+    )
+    entries = {
+        "scripts/normalize.py": SimpleNamespace(
+            inputs=["text: string"], outputs=["text: string"],
+        ),
+    }
+
+    specs = e2e._collect_e2e_typed_inputs_from_graph(
+        commands=[command], requirements_by_file={},
+        skill_plan_entries=entries, skill_dir=tmp_path,
+    )
+
+    assert {spec.name for spec in specs} == {"text"}
+
+
 def test_e2e_input_files_files_alias_sync_preserves_non_empty_external_context(tmp_path):
     skill_dir = tmp_path / "alias-sync"
     skill_dir.mkdir()

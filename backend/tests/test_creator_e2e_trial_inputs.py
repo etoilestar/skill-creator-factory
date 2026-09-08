@@ -708,6 +708,26 @@ def test_model_plans_unknown_file_semantics_with_frozen_contract(monkeypatch):
     assert mentions["md"][0]["requirement_id"] == "R1"
 
 
+@pytest.mark.parametrize(("prose", "expected"), [
+    ("上传 Markdown 文档", "md"),
+    ("read a text/csv upload", "csv"),
+    ("accept application/json", "json"),
+    ("process a JPG image", "jpeg"),
+    ("读取 .docx 文件", "docx"),
+])
+def test_explicit_format_mentions_are_derived_from_fixture_registry(prose, expected):
+    mentions = e2e._explicit_file_format_mentions([{"id": "R1", "text": prose}])
+    assert list(mentions) == [expected]
+
+
+def test_every_registered_format_exposes_registry_derived_evidence_terms():
+    canonical_formats = {handler.canonical_format for handler in e2e.FILE_FIXTURE_FORMATS.values()}
+    for fmt in canonical_formats:
+        terms = e2e._file_format_evidence_terms(fmt)
+        assert fmt in terms
+        assert e2e._resolve_file_fixture_handler(fmt).extension in terms
+
+
 def test_model_format_proposal_requires_literal_matching_evidence(monkeypatch):
     typed = _spec("uploads", "list[file_path]")
     requirement = e2e.RequirementItem(
@@ -761,57 +781,6 @@ def test_model_may_abstain_when_file_format_is_not_explicit(monkeypatch):
     schema = json.dumps(captured["response_schema"])
     assert '"enum": ["unknown"]' in schema
     assert json.loads(captured["messages"][1]["content"])["unresolved_inputs"][0]["explicit_format_mentions"] == {}
-
-
-def test_model_format_proposal_requires_literal_matching_evidence(monkeypatch):
-    typed = _spec("uploads", "list[file_path]")
-    requirement = e2e.RequirementItem(
-        id="R1", target_file=typed.target_file,
-        requirement="读取用户上传的 Markdown 文档并提取标题。",
-    )
-    plan = e2e._build_e2e_input_case_plan(
-        [typed], requirements_by_file={typed.target_file: [requirement]},
-    )
-    monkeypatch.setattr(e2e, "route_model", lambda *args, **kwargs: type("Route", (), {"model": "test"})())
-    monkeypatch.setattr(
-        e2e, "_complete_creator_json_object_once_sync_for_e2e",
-        lambda **kwargs: {"inputs": [{
-            "name": "uploads", "decision": "resolved", "format": "txt",
-            "evidence": [{"requirement_id": "R1", "quote": "Markdown 文档"}],
-            "reason": "Plain text is broadly compatible.",
-        }]},
-    )
-
-    resolved = e2e._plan_unknown_e2e_file_formats(
-        plan, requirements_by_file={typed.target_file: [requirement]}, requested_model=None,
-    )
-
-    assert resolved.inputs["uploads"].allowed_formats == ()
-    assert resolved.inputs["uploads"].file_format_source == "unknown"
-
-
-def test_model_may_abstain_when_file_format_is_not_explicit(monkeypatch):
-    typed = _spec("upload", "file_path")
-    requirement = e2e.RequirementItem(
-        id="R1", target_file=typed.target_file, requirement="处理用户上传的文档。",
-    )
-    plan = e2e._build_e2e_input_case_plan(
-        [typed], requirements_by_file={typed.target_file: [requirement]},
-    )
-    monkeypatch.setattr(e2e, "route_model", lambda *args, **kwargs: type("Route", (), {"model": "test"})())
-    monkeypatch.setattr(
-        e2e, "_complete_creator_json_object_once_sync_for_e2e",
-        lambda **kwargs: {"inputs": [{
-            "name": "upload", "decision": "unknown", "format": "", "evidence": [],
-            "reason": "No explicit format is stated.",
-        }]},
-    )
-
-    resolved = e2e._plan_unknown_e2e_file_formats(
-        plan, requirements_by_file={typed.target_file: [requirement]}, requested_model=None,
-    )
-
-    assert resolved == plan
 
 
 def test_frozen_requirement_without_format_remains_unknown():

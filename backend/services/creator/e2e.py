@@ -1622,6 +1622,8 @@ class E2EFileFixtureHandler:
     fixture_schema: Any
     validator: Any
     materializer: Any
+    semantic_names: tuple[str, ...] = ()
+    media_types: tuple[str, ...] = ()
 
 
 # This is a deliberately small format ontology, not an open-ended map from
@@ -1803,22 +1805,22 @@ def _register_file_fixture_handler(handler: E2EFileFixtureHandler) -> None:
 
 def _register_builtin_file_fixture_handlers() -> None:
     text_handlers = [
-        ("txt", (), ".txt", _materialize_text_fixture),
-        ("md", (), ".md", _materialize_text_fixture),
-        ("html", (), ".html", _materialize_html_fixture),
+        ("txt", (), ".txt", _materialize_text_fixture, (), ("text/plain",)),
+        ("md", ("markdown",), ".md", _materialize_text_fixture, ("markdown",), ("text/markdown",)),
+        ("html", ("htm",), ".html", _materialize_html_fixture, (), ("text/html",)),
     ]
-    for fmt, aliases, extension, materializer in text_handlers:
-        _register_file_fixture_handler(E2EFileFixtureHandler(fmt, aliases, extension, "text", _text_fixture_schema, _validate_text_spec, materializer))
-    _register_file_fixture_handler(E2EFileFixtureHandler("csv", (), ".csv", "tabular", _csv_fixture_schema, _validate_csv_spec, _materialize_csv_fixture))
-    _register_file_fixture_handler(E2EFileFixtureHandler("json", (), ".json", "json", _json_fixture_schema, _validate_json_spec, _materialize_json_fixture))
-    for fmt, extension, writer in (("pdf", ".pdf", _write_minimal_pdf), ("docx", ".docx", _write_minimal_docx)):
-        _register_file_fixture_handler(E2EFileFixtureHandler(fmt, (), extension, "document", _text_fixture_schema, _validate_text_spec, _document_materializer(writer)))
+    for fmt, aliases, extension, materializer, semantic_names, media_types in text_handlers:
+        _register_file_fixture_handler(E2EFileFixtureHandler(fmt, aliases, extension, "text", _text_fixture_schema, _validate_text_spec, materializer, semantic_names, media_types))
+    _register_file_fixture_handler(E2EFileFixtureHandler("csv", (), ".csv", "tabular", _csv_fixture_schema, _validate_csv_spec, _materialize_csv_fixture, (), ("text/csv",)))
+    _register_file_fixture_handler(E2EFileFixtureHandler("json", (), ".json", "json", _json_fixture_schema, _validate_json_spec, _materialize_json_fixture, (), ("application/json",)))
+    for fmt, extension, writer, media_type in (("pdf", ".pdf", _write_minimal_pdf, "application/pdf"), ("docx", ".docx", _write_minimal_docx, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")):
+        _register_file_fixture_handler(E2EFileFixtureHandler(fmt, (), extension, "document", _text_fixture_schema, _validate_text_spec, _document_materializer(writer), (), (media_type,)))
     for fmt, aliases, extension, pillow_fmt in (
         ("png", (), ".png", "PNG"), ("jpeg", ("jpg",), ".jpg", "JPEG"),
         ("tiff", ("tif",), ".tiff", "TIFF"), ("webp", (), ".webp", "WEBP"),
         ("bmp", (), ".bmp", "BMP"),
     ):
-        _register_file_fixture_handler(E2EFileFixtureHandler(fmt, aliases, extension, "image", _image_fixture_schema, _validate_image_spec, _image_materializer(pillow_fmt)))
+        _register_file_fixture_handler(E2EFileFixtureHandler(fmt, aliases, extension, "image", _image_fixture_schema, _validate_image_spec, _image_materializer(pillow_fmt), (), (f"image/{fmt}",)))
 
 
 _register_builtin_file_fixture_handlers()
@@ -1833,11 +1835,25 @@ def _canonical_file_fixture_format(fmt: str) -> str:
     return handler.canonical_format if handler else ""
 
 
+def _file_format_evidence_terms(fmt: str) -> tuple[str, ...]:
+    """Derive explicit evidence identifiers from the fixture capability itself."""
+    handler = _resolve_file_fixture_handler(fmt)
+    if handler is None:
+        return ()
+    terms = (
+        handler.canonical_format,
+        *handler.aliases,
+        handler.extension,
+        *handler.semantic_names,
+        *handler.media_types,
+    )
+    return tuple(dict.fromkeys(term.casefold() for term in terms if term))
+
+
 def _requirement_quote_explicitly_names_format(quote: str, fmt: str) -> bool:
     """Accept only a finite, explicit format identifier from quoted evidence."""
     text = str(quote or "").casefold()
-    canonical = _canonical_file_fixture_format(fmt)
-    for term in _E2E_FILE_FORMAT_EVIDENCE_TERMS.get(canonical, ()):
+    for term in _file_format_evidence_terms(fmt):
         escaped = re.escape(term.casefold())
         if re.fullmatch(r"[a-z0-9]+", term, re.I):
             if re.search(rf"(?<![a-z0-9]){escaped}(?![a-z0-9])", text):
@@ -1876,7 +1892,8 @@ def _explicit_file_format_mentions(requirements: list[dict[str, Any]]) -> dict[s
     for requirement in requirements:
         requirement_id = str(requirement.get("id") or "")
         text = str(requirement.get("text") or "")
-        for fmt in sorted(_E2E_FILE_FORMAT_EVIDENCE_TERMS):
+        canonical_formats = sorted({handler.canonical_format for handler in FILE_FIXTURE_FORMATS.values()})
+        for fmt in canonical_formats:
             if not _requirement_quote_explicitly_names_format(text, fmt):
                 continue
             matches = mentions.setdefault(fmt, [])

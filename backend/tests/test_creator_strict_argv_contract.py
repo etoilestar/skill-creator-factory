@@ -197,6 +197,7 @@ def test_invalid_type_targets_script_when_command_forwards_runtime_value_unchang
     assert details["failed_keys"] == ["input_files"]
     assert details["primary_target"] == "scripts/main.py"
     assert "forwarded the upstream runtime value unchanged" in details["target_reason"]
+    assert details["canonical_runtime_types"] == {"input_files": "list"}
 
 
 def test_argv_schema_targets_script_when_guard_and_run_keys_disagree():
@@ -295,6 +296,23 @@ def test_argv_schema_repair_instruction_treats_guard_as_probe():
     assert "禁止只改 guard schema" in instruction
     assert "必须同步修复脚本的 guard 与实际消费逻辑" in instruction
     assert "只修当前脚本 mandatory argv guard import/call 或 guard spec" not in instruction
+
+
+def test_argv_schema_repair_instruction_requires_guard_to_accept_runtime_shape():
+    instruction = e2e._argv_schema_repair_instruction(
+        "scripts/main.py",
+        {
+            "primary_target": "scripts/main.py",
+            "target_reason": "runtime type mismatch",
+            "failed_keys": ["input_files"],
+            "expected_types": {"input_files": "str"},
+            "canonical_runtime_types": {"input_files": "list"},
+        },
+    )
+
+    assert '"canonical_runtime_types": {"input_files": "list"}' in instruction
+    assert "strict_json_argv_guard 必须直接接受该运行时类型" in instruction
+    assert "类型转换只能发生在 guard 成功返回之后" in instruction
 
 
 def test_e2e_script_target_rule_contains_coverage_guardrail():

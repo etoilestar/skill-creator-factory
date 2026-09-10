@@ -3855,6 +3855,7 @@ def _e2e_advisory_status_from_warnings(warnings: list[Any]) -> str:
 class PreparePlanRequest(BaseModel):
     mode: Literal["create", "revise"] = "create"
     skill_name: str | None = None
+    source_skill_name: str | None = None
     user_request: str = ""
     conversation_history: list[dict[str, Any]] = []
     uploaded_files: list[dict[str, Any]] = []
@@ -3904,14 +3905,21 @@ def _load_existing_skill_design(skill_name: str) -> dict[str, Any]:
 
 
 async def _preprocess_existing_skill_request(request: PreparePlanRequest) -> PreparePlanRequest:
-    """Dedicated edit-only front layer.  The create planner never sees history."""
-    if request.mode != "revise" or not request.skill_name:
+    """Resolve a selected Skill exactly once, before the create/revise flow starts."""
+    source_skill_name = request.source_skill_name or (
+        request.skill_name if request.mode == "revise" else None
+    )
+    if not source_skill_name:
         logger.debug(
             "[Creator][existing_skill_preprocess][return_request] request=%s",
             request.model_dump_json(),
         )
         return request
-    design = _load_existing_skill_design(request.skill_name)
+    design = _load_existing_skill_design(source_skill_name)
+    if request.mode == "create" and design["contract_complete"]:
+        raise PreparePlanProtocolError("保存完整合同的已有 Skill 必须使用 mode=revise")
+    if request.mode == "revise" and not design["contract_complete"]:
+        raise PreparePlanProtocolError("无完整合同的已有 Skill 必须直接使用 mode=create")
     route = route_model("creator_prepare_plan", requested_model=request.model, reason="existing Skill edit preprocessing")
     if design["contract_complete"]:
         prompt = """你是 Creator 的独立增量修改分析器，不是 Blueprint Planner。
@@ -3992,10 +4000,11 @@ skill_capability_summary 和 complete_requirement 均禁止继承或提及已有
     complete_requirement = str(data.get("complete_requirement") or "").strip()
     if not complete_requirement:
         raise PreparePlanProtocolError("已有 Skill 前置需求处理未返回 complete_requirement")
-    if not design["contract_complete"]:
-        # A contractless Skill has no Creator state that can safely seed a
-        # revision.  Re-enter the pipeline through the same request boundary as
-        # a direct creation instead of copying fields from the revise request.
+    if request.mode == "create":
+        # A contractless Skill is a creation source, not revision state.  The
+        # returned request is already a clean create request, and deliberately
+        # carries no source marker that could retrigger extraction after a
+        # clarification round trip.
         prepared_request = PreparePlanRequest(
             mode="create",
             user_request=complete_requirement,
@@ -4007,7 +4016,8 @@ skill_capability_summary 和 complete_requirement 均禁止继承或提及已有
             prepared_request.model_dump_json(),
         )
         return prepared_request
-    # Deliberately cross the boundary as an ordinary create request.  No saved
+    # The existing-contract analyzer feeds the create-only blueprint planner.
+    # No saved
     # contract, SKILL.md, edit strategy, or existing_skill_context crosses it.
     prepared_request = request.model_copy(update={
         "mode": "create", "user_request": complete_requirement,

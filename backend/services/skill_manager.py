@@ -41,6 +41,13 @@ def _resolve_version(meta: dict, *, existing_version: str | None = None) -> str:
 
 
 def _skill_info(record: dict) -> dict:
+    skill_root = Path(record["root_path"])
+    creator_contract_files = (
+        "blueprint.md",
+        "requirement_graph.json",
+        "creation_plan.json",
+        "interface_contracts.json",
+    )
     return {
         "skill_id": record["skill_id"],
         "name": record["name"],
@@ -63,6 +70,10 @@ def _skill_info(record: dict) -> dict:
         "governance": record.get("governance", {}),
         "version_history": record.get("version_history", []),
         "install_history": record.get("install_history", []),
+        "creator_contract_complete": all(
+            (skill_root / ".creator" / filename).is_file()
+            for filename in creator_contract_files
+        ),
     }
 
 

@@ -116,8 +116,8 @@ def test_contractless_skill_becomes_an_ordinary_complete_create_request(monkeypa
 
     monkeypatch.setattr(api, "complete_creator_role_once", fake_call)
     request = api.PreparePlanRequest(
-        mode="revise",
-        skill_name="demo",
+        mode="create",
+        source_skill_name="demo",
         user_request="增加差异总结",
         conversation_history=[{"role": "user", "content": "不得透传"}],
         human_feedback="不得透传",
@@ -188,8 +188,8 @@ def test_contractless_and_direct_requirements_are_identical_before_planner(monke
 
     monkeypatch.setattr(api, "complete_creator_role_once", fake_call)
     extracted = asyncio.run(api._preprocess_existing_skill_request(api.PreparePlanRequest(
-        mode="revise",
-        skill_name="demo",
+        mode="create",
+        source_skill_name="demo",
         user_request="增加差异总结",
     )))
     direct = api.PreparePlanRequest(
@@ -218,8 +218,8 @@ def test_preprocessor_debug_logs_complete_direct_and_contractless_requests(
         model="test-model",
     )
     contractless = api.PreparePlanRequest(
-        mode="revise",
-        skill_name="demo",
+        mode="create",
+        source_skill_name="demo",
         user_request="增加导出",
         uploaded_files=[{"path": "inputs/source.csv"}],
         model="test-model",
@@ -239,6 +239,38 @@ def test_preprocessor_debug_logs_complete_direct_and_contractless_requests(
         )
     ]
     assert len(matching_records) == 2
+
+
+def test_contractless_clarification_create_does_not_repeat_preprocessing(monkeypatch):
+    async def unexpected_call(*args, **kwargs):
+        raise AssertionError("clarification must not reload or summarize the source Skill")
+
+    monkeypatch.setattr(api, "complete_creator_role_once", unexpected_call)
+    request = api.PreparePlanRequest(
+        mode="create",
+        skill_name="new-skill",
+        user_request="完整创建需求",
+        conversation_history=[{"role": "assistant", "content": "请补充输入格式"}],
+        human_feedback="输入 CSV",
+        prepare_action="submit_supplement",
+    )
+
+    result = asyncio.run(api._preprocess_existing_skill_request(request))
+
+    assert result is request
+
+
+def test_contractless_skill_is_rejected_from_revise_mode(monkeypatch, tmp_path):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    _write_skill(tmp_path, complete=False)
+
+    request = api.PreparePlanRequest(mode="revise", skill_name="demo", user_request="增加导出")
+    try:
+        asyncio.run(api._preprocess_existing_skill_request(request))
+    except api.PreparePlanProtocolError as exc:
+        assert "mode=create" in str(exc)
+    else:
+        raise AssertionError("contractless Skill entered revise preprocessing")
 
 
 def test_prepare_plan_entry_debug_logs_complete_request(monkeypatch, caplog):

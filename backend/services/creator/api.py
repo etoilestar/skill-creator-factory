@@ -3928,35 +3928,27 @@ complete_requirement 必须是可交给从零 Creator 流程的完整需求描�
             },
         }
     else:
-        prompt = """你是 Skill 需求整理器。
+        prompt = """你是 Skill 创建需求整理器。
 
-输入：
-1. 已有 Skill 的功能描述。
-2. 用户提出的新需求。
+输入是一个 JSON 对象，仅包含：
+- skill_md：能力描述。
+- new_requirement：补充的能力要求。
 
-请将两者合并，形成当前需要实现的完整功能需求。
+综合两个字段中的业务信息，输出一个从零创建 Skill 时可直接使用的、独立完整的最终需求。complete_requirement 必须描述最终要创建的 Skill 具备什么能力，包括明确的目标、输入、处理能力和输出；即使脱离输入文本也能独立理解。
 
-已有 Skill 功能描述表示当前系统已经具备的业务能力，请将其中明确描述的能力纳入最终需求。
-
-用户新增需求表示需要增加或调整的能力。
-
-输出：
+只输出严格 JSON，不要输出 Markdown：
 {
-  \"skill_summary\": {
-      \"goal\": \"\",
-      \"capabilities\": [],
-      \"inputs\": [],
-      \"outputs\": []
-  },
   \"complete_requirement\": \"\"
 }
 
-要求：
-1. complete_requirement 描述最终系统需要实现的完整能力。
-2. 输出面向 Skill 创建，不面向修改过程。
-3. 不输出具体代码修改方案、文件修改方案、迁移步骤。
-4. 不需要描述需求来源。
-5. 保证已有能力和新增需求都被正确包含。"""
+complete_requirement 必须使用创建最终 Skill 的确定性表述，不得描述变更过程。禁止输出以下语义或措辞：
+- 修改已有 Skill
+- 增加某功能
+- 扩展已有能力
+- 基于原实现
+- 保留旧实现
+
+不要说明任何内容的来源或形成过程，也不要输出代码方案或文件修改方案。"""
         payload = {
             "skill_md": design["skill_md"],
             "new_requirement": request.user_request,

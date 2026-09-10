@@ -3928,16 +3928,40 @@ complete_requirement 必须是可交给从零 Creator 流程的完整需求描�
             },
         }
     else:
-        prompt = """你是 Creator 的独立已有能力提取器，不是 Blueprint Planner。
-只依据给出的 SKILL.md 提取已完成业务能力，并与新增需求合并。输出严格 JSON：skill_summary（目标、核心功能、输入、输出、已完成能力、可确认的文件职责）和 complete_requirement。
-complete_requirement 必须是完整需求描述；不得假设任何历史设计合同。不要输出 Markdown。"""
+        prompt = """你是需求整理器，不是 Skill 编辑器。
+
+输入：
+1. 一个已有 SKILL.md 文件，其中描述一个历史 Skill 已经具备的业务能力。
+2. 用户新的需求。
+
+SKILL.md 仅作为已有功能参考。
+
+请生成一个可以直接用于创建新 Skill 的完整需求描述。
+
+要求：
+- 将 SKILL.md 中明确存在的业务能力作为需求基础。
+- 合并用户新增需求。
+- 输出一个完整、独立的新 Skill 需求。
+- 不考虑旧文件结构。
+- 不考虑旧代码实现。
+- 不考虑历史合同。
+- 不进行增量修改设计。
+
+输出严格 JSON：
+{
+  \"skill_summary\": {
+    \"goal\": \"\",
+    \"capabilities\": [],
+    \"inputs\": [],
+    \"outputs\": []
+  },
+  \"complete_requirement\": \"\"
+}
+
+complete_requirement 必须和用户直接描述一个新 Skill 时的需求格式一致。不要输出 Markdown。"""
         payload = {
             "skill_md": design["skill_md"],
             "new_requirement": request.user_request,
-            "new_requirement_context": {
-                "conversation_history": request.conversation_history,
-                "human_feedback": request.human_feedback,
-            },
         }
     raw = await complete_creator_role_once(
         [{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
@@ -3952,7 +3976,7 @@ complete_requirement 必须是完整需求描述；不得假设任何历史设�
     return request.model_copy(update={
         "mode": "create", "user_request": complete_requirement,
         "conversation_history": [], "previous_blueprint_text": "",
-        "human_feedback": "", "prepare_action": "none",
+        "human_feedback": "",
         "function_items": None, "responsibility_edges": None,
         "requirement_allocations": None, "interface_contracts": None,
     })

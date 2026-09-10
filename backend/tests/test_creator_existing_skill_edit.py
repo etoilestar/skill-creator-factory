@@ -46,6 +46,76 @@ def test_edit_preprocessor_crosses_into_clean_create_request(monkeypatch, tmp_pa
     assert result.interface_contracts is None
 
 
+def test_contractless_skill_becomes_an_ordinary_complete_create_request(monkeypatch, tmp_path):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    skill = _write_skill(tmp_path, complete=False)
+    skill.joinpath("SKILL.md").write_text(
+        "该 Skill 可以比较两个 CSV 文件，并生成比较报告",
+        encoding="utf-8",
+    )
+    complete_requirement = (
+        "实现一个 CSV 比较工具：\n"
+        "1. 比较两个 CSV 文件；\n"
+        "2. 生成比较报告；\n"
+        "3. 输出差异总结。"
+    )
+
+    async def fake_call(messages, role, **kwargs):
+        assert role == "planner"
+        prompt = messages[0]["content"]
+        assert "你是需求整理器，不是 Skill 编辑器" in prompt
+        assert "完整、独立的新 Skill 需求" in prompt
+        payload = json.loads(messages[1]["content"])
+        assert payload == {
+            "skill_md": "该 Skill 可以比较两个 CSV 文件，并生成比较报告",
+            "new_requirement": "增加差异总结能力",
+        }
+        return json.dumps({
+            "skill_summary": {
+                "goal": "比较 CSV",
+                "capabilities": ["比较", "报告", "差异总结"],
+                "inputs": ["两个 CSV 文件"],
+                "outputs": ["比较报告", "差异总结"],
+            },
+            "complete_requirement": complete_requirement,
+        })
+
+    monkeypatch.setattr(api, "complete_creator_role_once", fake_call)
+    request = api.PreparePlanRequest(
+        mode="revise",
+        skill_name="demo",
+        user_request="增加差异总结能力",
+        conversation_history=[{"role": "user", "content": "不得透传"}],
+        human_feedback="不得透传",
+        previous_blueprint_text="不得透传",
+        function_items=[{"id": "不得透传"}],
+        responsibility_edges=[{"source": "不得透传"}],
+        requirement_allocations=[{"requirement": "不得透传"}],
+        interface_contracts={"不得透传": True},
+    )
+
+    result = asyncio.run(api._preprocess_existing_skill_request(request))
+
+    assert result.mode == "create"
+    assert result.user_request == complete_requirement
+    assert result.conversation_history == []
+    assert result.human_feedback == ""
+    assert result.previous_blueprint_text == ""
+    assert result.function_items is None
+    assert result.responsibility_edges is None
+    assert result.requirement_allocations is None
+    assert result.interface_contracts is None
+    for forbidden in ("修改已有 Skill", "保留旧实现", "增量调整", "patch", "resume"):
+        assert forbidden not in result.user_request
+
+    direct_create = api.PreparePlanRequest(
+        mode="create",
+        skill_name="demo",
+        user_request=complete_requirement,
+    )
+    assert result == direct_create
+
+
 def test_blueprint_planner_rejects_unprocessed_edit_request():
     request = api.PreparePlanRequest(mode="revise", skill_name="demo", user_request="增加导出")
     try:

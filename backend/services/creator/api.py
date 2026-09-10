@@ -3928,26 +3928,30 @@ complete_requirement 必须是可交给从零 Creator 流程的完整需求描�
             },
         }
     else:
-        prompt = """你是需求整理器，不是 Skill 编辑器。
+        prompt = """你是 contractless Skill 的需求提取器，不是 Skill 编辑器。
 
 输入：
-1. 一个已有 SKILL.md 文件，其中描述一个历史 Skill 已经具备的业务能力。
+1. 一个已有 SKILL.md 文件，其中只包含历史 Skill 的功能说明。
 2. 用户新的需求。
 
-SKILL.md 仅作为已有功能参考。
+SKILL.md 只是历史功能说明，不代表有任何可修改、可继承或需要兼容的现有实现。
+本任务等价于“空白创建 Skill + 从 SKILL.md 提取功能”：先提取其中明确描述的目标、能力、输入和输出，再与用户的新需求合并。
 
-请生成一个可以直接用于创建新 Skill 的完整需求描述。
+请生成一个可以直接交给空白创建流程的新 Skill 完整需求，而不是描述如何改变历史 Skill。
 
 要求：
-- 将 SKILL.md 中明确存在的业务能力作为需求基础。
+- 将 SKILL.md 中明确存在的业务能力转换为新 Skill 自身应具备的需求。
 - 合并用户新增需求。
-- 输出一个完整、独立的新 Skill 需求。
+- 输出一个完整、自包含、独立的新 Skill 需求。
+- complete_requirement 必须让一个完全不知道、也无法看到 SKILL.md 的用户，仅复制该字段就能创建出具备相同完整能力的 Skill。
+- 使用“实现/创建一个……，支持……”这类从零创建语义陈述最终目标和全部能力。
 - 不考虑旧文件结构。
 - 不考虑旧代码实现。
 - 不考虑历史合同。
 - 不进行增量修改设计。
+- 不要生成“修改已有 Skill”“增量修改”“保留旧实现”“基于原实现”“兼容旧版本”或任何同义的编辑、继承、迁移语义。
 
-输出严格 JSON：
+输出严格 JSON，且只能包含 skill_summary 和 complete_requirement 两个顶层字段：
 {
   \"skill_summary\": {
     \"goal\": \"\",
@@ -3958,7 +3962,7 @@ SKILL.md 仅作为已有功能参考。
   \"complete_requirement\": \"\"
 }
 
-complete_requirement 必须和用户直接描述一个新 Skill 时的需求格式一致。不要输出 Markdown。"""
+complete_requirement 必须在语义上等价于用户直接描述该新 Skill 的完整创建需求；不得提及 SKILL.md、历史 Skill 或本次新增过程。不要输出 Markdown。"""
         payload = {
             "skill_md": design["skill_md"],
             "new_requirement": request.user_request,

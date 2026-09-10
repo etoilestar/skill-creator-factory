@@ -63,8 +63,17 @@ def test_contractless_skill_becomes_an_ordinary_complete_create_request(monkeypa
     async def fake_call(messages, role, **kwargs):
         assert role == "planner"
         prompt = messages[0]["content"]
-        assert "你是需求整理器，不是 Skill 编辑器" in prompt
-        assert "完整、独立的新 Skill 需求" in prompt
+        assert "空白创建 Skill + 从 SKILL.md 提取功能" in prompt
+        assert "完全不知道、也无法看到 SKILL.md" in prompt
+        assert "只能包含 skill_summary 和 complete_requirement 两个顶层字段" in prompt
+        for forbidden_edit_semantics in (
+            "修改已有 Skill",
+            "增量修改",
+            "保留旧实现",
+            "基于原实现",
+            "兼容旧版本",
+        ):
+            assert forbidden_edit_semantics in prompt
         payload = json.loads(messages[1]["content"])
         assert payload == {
             "skill_md": "该 Skill 可以比较两个 CSV 文件，并生成比较报告",
@@ -114,6 +123,39 @@ def test_contractless_skill_becomes_an_ordinary_complete_create_request(monkeypa
         user_request=complete_requirement,
     )
     assert result == direct_create
+
+
+def test_contractless_and_direct_requirements_are_identical_before_planner(monkeypatch, tmp_path):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    skill = _write_skill(tmp_path, complete=False)
+    skill.joinpath("SKILL.md").write_text("CSV比较工具，可以生成报告", encoding="utf-8")
+    direct_requirement = "实现CSV比较工具，支持比较、报告、差异总结"
+
+    async def fake_call(messages, role, **kwargs):
+        return json.dumps({
+            "skill_summary": {
+                "goal": "处理并比较 CSV",
+                "capabilities": ["比较", "报告", "差异总结"],
+                "inputs": ["CSV 文件"],
+                "outputs": ["报告", "差异总结"],
+            },
+            "complete_requirement": direct_requirement,
+        })
+
+    monkeypatch.setattr(api, "complete_creator_role_once", fake_call)
+    extracted = asyncio.run(api._preprocess_existing_skill_request(api.PreparePlanRequest(
+        mode="revise",
+        skill_name="demo",
+        user_request="增加差异总结",
+    )))
+    direct = api.PreparePlanRequest(
+        mode="create",
+        skill_name="demo",
+        user_request=direct_requirement,
+    )
+
+    assert extracted.user_request == direct.user_request
+    assert extracted == direct
 
 
 def test_blueprint_planner_rejects_unprocessed_edit_request():

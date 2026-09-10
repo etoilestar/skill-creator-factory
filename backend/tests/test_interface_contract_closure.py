@@ -1,6 +1,9 @@
 """Minimal deterministic closure and edge-patch contract tests."""
 
+import pytest
+
 from backend.services.creator.function_item_interface_plan import (
+    InterfaceIntentPlanError,
     collect_interface_plan_validation_issues,
     interface_contract_closure_check,
     validate_interface_plan_protocol,
@@ -66,6 +69,60 @@ def test_replace_source_patch_restores_closure():
     )
     assert collect_interface_plan_validation_issues(
         plan=repaired, function_items=items(), platform_contract=platform()) == []
+
+
+def test_replace_kind_repairs_kind_schema_mismatch_and_converges():
+    broken = {"interfaces": [{
+        "interface_id": "i7", "kind": "member_to_member",
+        "source_member": "scripts/a.py", "source_output": "x",
+        "target_platform_output": "markdown",
+    }]}
+    function_items = [{
+        "target_file": "scripts/a.py", "role": "worker", "purpose": "render",
+        "inputs": [],
+        "outputs": [{"port_id": "x", "role": "runtime_output", "contract": {"type": "string"}}],
+        "constraints": [], "required_capabilities": [],
+    }]
+    platform_contract = {"platform_skill_boundary": {
+        "input_envelope_fields": [], "input_schemas": {},
+        "final_output_fields": ["markdown"],
+        "required_final_output_fields": ["markdown"],
+        "output_sinks": {"markdown": {"value_schema": {"type": "string"}}},
+    }}
+
+    issues = collect_interface_plan_validation_issues(
+        plan=broken, function_items=function_items, platform_contract=platform_contract,
+    )
+    mismatch = next(issue for issue in issues if issue["code"] == "kind_schema_mismatch")
+    assert mismatch == {
+        "code": "kind_schema_mismatch", "issue_code": "kind_schema_mismatch",
+        "stage": "interface_plan_validation", "path": "$.interfaces[0]",
+        "error_type": "schema_error", "interface_id": "i7",
+        "message": "Interface kind does not match its field schema.",
+        "observed_value": {"kind": "member_to_member"},
+        "expected_constraint": {"kind": "member_to_platform"}, "details": {},
+        "current_kind": "member_to_member", "expected_kind": "member_to_platform",
+        "reason": "target_platform_output requires member_to_platform",
+    }
+    with pytest.raises(InterfaceIntentPlanError) as raised:
+        validate_interface_plan_protocol(broken)
+    assert raised.value.code == "kind_schema_mismatch"
+    assert raised.value.details["expected_kind"] == "member_to_platform"
+
+    repaired = validate_interface_patch(
+        plan=broken, function_items=function_items, platform_contract=platform_contract,
+        violations=issues,
+        patch={"operations": [{"op": "replace_kind", "interface_id": "i7",
+                               "kind": "member_to_platform", "reason": "match platform target"}]},
+    )
+    assert repaired == {"interfaces": [{
+        "interface_id": "i7", "kind": "member_to_platform",
+        "source_member": "scripts/a.py", "source_output": "x",
+        "target_platform_output": "markdown",
+    }]}
+    assert collect_interface_plan_validation_issues(
+        plan=repaired, function_items=function_items, platform_contract=platform_contract,
+    ) == []
 
 
 def test_patch_preserves_valid_interface_exactly():

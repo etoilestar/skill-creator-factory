@@ -297,6 +297,7 @@ const pendingBlueprintText = ref('')
 const pendingFunctionItems = ref([])
 const pendingResponsibilityEdges = ref([])
 const pendingInterfaces = ref([])
+const pendingInterfacePlan = ref({})
 const graphPlanningActive = ref(false)
 const graphArchiving = ref(false)
 const graphArchiveReady = ref(false)
@@ -965,6 +966,12 @@ async function send() {
         []
       ),
 
+      interface_contracts: (
+        creationPlan.value?.interface_contracts ||
+        pendingInterfacePlan.value ||
+        {}
+      ),
+
       human_feedback: (
         humanFeedback
       ),
@@ -1034,7 +1041,10 @@ async function send() {
         }
         if (event.event === 'graph_nodes_ready' || event.event === 'interface_contract_planning') {
           graphPlanningActive.value = true
-          if (event.event === 'graph_nodes_ready') pendingInterfaces.value = []
+          if (event.event === 'graph_nodes_ready') {
+            pendingInterfaces.value = []
+            pendingInterfacePlan.value = {}
+          }
           if (Array.isArray(event.function_items)) pendingFunctionItems.value = event.function_items
           currentStatus.value = { message: event.message || '正在规划接口合同…' }
           markExecutionPanelUpdated('graph')
@@ -1044,6 +1054,7 @@ async function send() {
           graphPlanningActive.value = true
           if (Array.isArray(event.function_items)) pendingFunctionItems.value = event.function_items
           pendingInterfaces.value = Array.isArray(event.interfaces) ? event.interfaces : []
+          pendingInterfacePlan.value = event.interface_plan || { interfaces: pendingInterfaces.value }
           currentStatus.value = { message: event.message || '接口合同已就绪，正在连接图谱…' }
           markExecutionPanelUpdated('graph')
           return
@@ -1053,6 +1064,7 @@ async function send() {
           if (Array.isArray(event.function_items)) pendingFunctionItems.value = event.function_items
           if (Array.isArray(event.responsibility_edges)) pendingResponsibilityEdges.value = event.responsibility_edges
           if (Array.isArray(event.interfaces)) pendingInterfaces.value = event.interfaces
+          pendingInterfacePlan.value = event.interface_plan || pendingInterfacePlan.value
           currentStatus.value = { message: event.message || '图谱连接已建立，正在校验…' }
           markExecutionPanelUpdated('graph')
           return
@@ -1101,6 +1113,12 @@ async function send() {
 
     if (plan.skill_name) {
       skillName.value = plan.skill_name
+    }
+    if (plan.interface_contracts && typeof plan.interface_contracts === 'object') {
+      pendingInterfacePlan.value = plan.interface_contracts
+      pendingInterfaces.value = Array.isArray(plan.interface_contracts.interfaces)
+        ? plan.interface_contracts.interfaces
+        : pendingInterfaces.value
     }
 
     if (
@@ -1457,6 +1475,7 @@ function clearChat() {
 
   pendingFunctionItems.value = []
   pendingInterfaces.value = []
+  pendingInterfacePlan.value = {}
 
   pendingResponsibilityEdges.value = []
 

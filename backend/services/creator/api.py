@@ -3865,6 +3865,7 @@ class PreparePlanRequest(BaseModel):
     responsibility_edges: list[dict[str, Any]] | None = None
     function_items: list[dict[str, Any]] | None = None
     requirement_allocations: list[dict[str, Any]] | None = None
+    interface_contracts: dict[str, Any] | None = None
 
 
 _CREATOR_DESIGN_FILES = (
@@ -3953,7 +3954,7 @@ complete_requirement 必须是完整需求描述；不得假设任何历史设�
         "conversation_history": [], "previous_blueprint_text": "",
         "human_feedback": "", "prepare_action": "none",
         "function_items": None, "responsibility_edges": None,
-        "requirement_allocations": None,
+        "requirement_allocations": None, "interface_contracts": None,
     })
 
 
@@ -9083,16 +9084,12 @@ async def _generate_internal_blueprint_or_questions(
 
     Tool discovery and ToolPool mutation are forbidden here.
     """
+    if request.mode != "create":
+        raise PreparePlanProtocolError(
+            "Blueprint Planner only accepts create requests; edit requests must be preprocessed first"
+        )
 
     ownership_repair_budget = RequirementOwnershipRepairBudget(max_attempts=1)
-
-    existing_context = (
-        _read_prepare_existing_skill_context(
-            request.skill_name
-        )
-        if request.mode == "revise"
-        else {}
-    )
 
     system_prompt = (
         load_kernel_creator_for_phase(
@@ -9914,13 +9911,6 @@ Blueprint Planner 只规划业务责任。
 
         "platform_io_contract": platform_io_contract_prompt_text(),
     }
-    # Keep the create transport identical to a request that has never heard of
-    # editing.  Edit-only vocabulary is attached solely on the separated legacy
-    # revise branch (the public endpoints preprocess new edits before this call).
-    if request.mode == "revise":
-        payload["mode"] = "revise"
-        payload["existing_skill_context"] = existing_context
-
     route = route_model(
         "creator_prepare_plan",
         requested_model=request.model,
@@ -9974,7 +9964,7 @@ Blueprint Planner 只规划业务责任。
     allowed_resource_paths = _build_prepare_allowed_resource_paths(
         request=request,
         review_summary=first_planner_result.get("review_summary"),
-        existing_skill_context=existing_context,
+        existing_skill_context=None,
     )
     frozen_blueprint_text = str(
         first_planner_result.get("internal_blueprint_text")
@@ -10003,7 +9993,7 @@ Blueprint Planner 只规划业务责任。
         frozen_blueprint_text = await _final_blueprint_cleanup(
             request=request,
             blueprint_text=frozen_blueprint_text,
-            existing_resource_facts=existing_context,
+            existing_resource_facts={},
             planner_model=route.model,
         )
         first_planner_result = {
@@ -11110,32 +11100,6 @@ def _persist_creator_design_snapshot(
         (metadata_dir / filename).write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
 
 
-def _snapshot_interface_contracts(graph: Any, files: list[Any]) -> dict[str, Any]:
-    """Project complete per-FunctionItem contracts from the final frozen graph."""
-    file_responsibilities = {
-        str(getattr(item, "path", "") or ""): {
-            "role": str(getattr(item, "role", "") or ""),
-            "purpose": str(getattr(item, "purpose", "") or ""),
-        }
-        for item in files or []
-    }
-    graph_data = graph.model_dump(mode="json") if hasattr(graph, "model_dump") else (graph or {})
-    interfaces = []
-    for item in graph_data.get("function_items", []) if isinstance(graph_data, dict) else []:
-        target = str(item.get("target_file") or "")
-        if not target:
-            continue
-        projected = project_script_interface_contract(graph_data, target)
-        interfaces.append({
-            "target_file": target,
-            "inputs": item.get("inputs") or [],
-            "outputs": item.get("outputs") or [],
-            "runtime_contract": projected,
-            "file_responsibility": file_responsibilities.get(target, {}),
-        })
-    return {"interfaces": interfaces}
-
-
 def _persist_workflow_allocation_summary(
     skill_name: str,
     summary: str,
@@ -11753,6 +11717,10 @@ async def _prepare_plan_impl(
                 list((current_prepared or {}).get("requirement_allocations") or [])
                 if isinstance(current_prepared, dict) else []
             ),
+            interface_contracts=(
+                dict((current_prepared or {}).get("interface_plan") or {})
+                if isinstance(current_prepared, dict) else {}
+            ),
         )
 
     if (
@@ -11897,6 +11865,7 @@ async def _prepare_plan_impl(
                 if request.responsibility_edges is not None
                 else None
             ),
+            "interface_plan": request.interface_contracts or {},
         }
 
         blueprint_text = (
@@ -13122,7 +13091,7 @@ async def _prepare_plan_impl(
             )
         ),
 
-        interface_contracts=_snapshot_interface_contracts(graph_payload, plan.files),
+        interface_contracts=dict(prepared.get("interface_plan") or {}),
 
         tool_pool_summary=(
             tool_pool_summary

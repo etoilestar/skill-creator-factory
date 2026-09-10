@@ -42,6 +42,17 @@ def test_edit_preprocessor_crosses_into_clean_create_request(monkeypatch, tmp_pa
     assert result.user_request == "完整的新需求"
     assert result.previous_blueprint_text == ""
     assert result.function_items is None
+    assert result.interface_contracts is None
+
+
+def test_blueprint_planner_rejects_unprocessed_edit_request():
+    request = api.PreparePlanRequest(mode="revise", skill_name="demo", user_request="增加导出")
+    try:
+        asyncio.run(api._generate_internal_blueprint_or_questions(request))
+    except api.PreparePlanProtocolError as exc:
+        assert "only accepts create requests" in str(exc)
+    else:
+        raise AssertionError("edit request reached the create-only Blueprint Planner")
 
 
 def test_snapshot_persists_the_four_edit_contracts(monkeypatch, tmp_path):

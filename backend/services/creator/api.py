@@ -3906,6 +3906,10 @@ def _load_existing_skill_design(skill_name: str) -> dict[str, Any]:
 async def _preprocess_existing_skill_request(request: PreparePlanRequest) -> PreparePlanRequest:
     """Dedicated edit-only front layer.  The create planner never sees history."""
     if request.mode != "revise" or not request.skill_name:
+        logger.debug(
+            "[Creator][existing_skill_preprocess][return_request] request=%s",
+            request.model_dump_json(),
+        )
         return request
     design = _load_existing_skill_design(request.skill_name)
     route = route_model("creator_prepare_plan", requested_model=request.model, reason="existing Skill edit preprocessing")
@@ -3965,21 +3969,31 @@ complete_requirement 必须使用创建最终 Skill 的确定性表述，不得�
         # A contractless Skill has no Creator state that can safely seed a
         # revision.  Re-enter the pipeline through the same request boundary as
         # a direct creation instead of copying fields from the revise request.
-        return PreparePlanRequest(
+        prepared_request = PreparePlanRequest(
             mode="create",
             user_request=complete_requirement,
             uploaded_files=request.uploaded_files,
             model=request.model,
         )
+        logger.debug(
+            "[Creator][existing_skill_preprocess][return_request] request=%s",
+            prepared_request.model_dump_json(),
+        )
+        return prepared_request
     # Deliberately cross the boundary as an ordinary create request.  No saved
     # contract, SKILL.md, edit strategy, or existing_skill_context crosses it.
-    return request.model_copy(update={
+    prepared_request = request.model_copy(update={
         "mode": "create", "user_request": complete_requirement,
         "conversation_history": [], "previous_blueprint_text": "",
         "human_feedback": "",
         "function_items": None, "responsibility_edges": None,
         "requirement_allocations": None, "interface_contracts": None,
     })
+    logger.debug(
+        "[Creator][existing_skill_preprocess][return_request] request=%s",
+        prepared_request.model_dump_json(),
+    )
+    return prepared_request
 
 
 class PreparePlanReviewSummary(BaseModel):
@@ -13148,6 +13162,10 @@ async def _prepare_plan_impl(
 async def prepare_plan(
     request: PreparePlanRequest,
 ):
+    logger.debug(
+        "[Creator][prepare_plan][entry_request] request=%s",
+        request.model_dump_json(),
+    )
     return await _prepare_plan_impl(await _preprocess_existing_skill_request(request))
 
 

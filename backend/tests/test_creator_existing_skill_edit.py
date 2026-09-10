@@ -49,37 +49,34 @@ def test_edit_preprocessor_crosses_into_clean_create_request(monkeypatch, tmp_pa
 def test_contractless_skill_becomes_an_ordinary_complete_create_request(monkeypatch, tmp_path):
     monkeypatch.setattr(api.settings, "skills_path", tmp_path)
     skill = _write_skill(tmp_path, complete=False)
-    skill.joinpath("SKILL.md").write_text(
-        "该 Skill 可以比较两个 CSV 文件，并生成比较报告",
-        encoding="utf-8",
-    )
+    skill.joinpath("SKILL.md").write_text("CSV比较工具", encoding="utf-8")
     complete_requirement = (
-        "实现一个 CSV 比较工具：\n"
-        "1. 比较两个 CSV 文件；\n"
-        "2. 生成比较报告；\n"
-        "3. 输出差异总结。"
+        "创建一个 CSV 比较 Skill：接收两个 CSV 文件，比较数据差异，"
+        "并输出包含逐项差异及差异总结的比较结果。"
     )
 
     async def fake_call(messages, role, **kwargs):
         assert role == "planner"
         prompt = messages[0]["content"]
-        assert "你是 Skill 需求整理器" in prompt
-        assert "请将两者合并，形成当前需要实现的完整功能需求" in prompt
-        assert "输出面向 Skill 创建，不面向修改过程" in prompt
-        assert "不需要描述需求来源" in prompt
-        assert "保证已有能力和新增需求都被正确包含" in prompt
+        assert "最终要创建的 Skill" in prompt
+        assert '"complete_requirement"' in prompt
+        assert '"skill_summary"' not in prompt
+        for forbidden_semantics in (
+            "修改已有 Skill",
+            "增加某功能",
+            "扩展已有能力",
+            "基于原实现",
+            "保留旧实现",
+        ):
+            assert forbidden_semantics in prompt
+        assert "不要说明任何内容的来源或形成过程" in prompt
+        assert "迁移" not in prompt
         payload = json.loads(messages[1]["content"])
         assert payload == {
-            "skill_md": "该 Skill 可以比较两个 CSV 文件，并生成比较报告",
-            "new_requirement": "增加差异总结能力",
+            "skill_md": "CSV比较工具",
+            "new_requirement": "增加差异总结",
         }
         return json.dumps({
-            "skill_summary": {
-                "goal": "比较 CSV",
-                "capabilities": ["比较", "报告", "差异总结"],
-                "inputs": ["两个 CSV 文件"],
-                "outputs": ["比较报告", "差异总结"],
-            },
             "complete_requirement": complete_requirement,
         })
 
@@ -87,7 +84,7 @@ def test_contractless_skill_becomes_an_ordinary_complete_create_request(monkeypa
     request = api.PreparePlanRequest(
         mode="revise",
         skill_name="demo",
-        user_request="增加差异总结能力",
+        user_request="增加差异总结",
         conversation_history=[{"role": "user", "content": "不得透传"}],
         human_feedback="不得透传",
         previous_blueprint_text="不得透传",
@@ -115,7 +112,13 @@ def test_contractless_skill_becomes_an_ordinary_complete_create_request(monkeypa
     assert result.responsibility_edges is None
     assert result.requirement_allocations is None
     assert result.interface_contracts is None
-    for forbidden in ("修改已有 Skill", "保留旧实现", "增量调整", "patch", "resume"):
+    for forbidden in (
+        "修改已有 Skill",
+        "增加某功能",
+        "扩展已有能力",
+        "基于原实现",
+        "保留旧实现",
+    ):
         assert forbidden not in result.user_request
 
     direct_create = api.PreparePlanRequest(

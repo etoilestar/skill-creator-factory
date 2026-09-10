@@ -51,7 +51,7 @@ def test_blueprint_planner_rejects_unprocessed_edit_request():
     try:
         asyncio.run(api._generate_internal_blueprint_or_questions(request))
     except api.PreparePlanProtocolError as exc:
-        assert "only accepts create requests" in str(exc)
+        assert str(exc) == "Blueprint Planner requires mode=create"
     else:
         raise AssertionError("edit request reached the create-only Blueprint Planner")
 
@@ -60,6 +60,18 @@ def test_blueprint_planner_contains_no_edit_context_branch():
     source = inspect.getsource(api._generate_internal_blueprint_or_questions)
     assert "existing_skill_context" not in source
     assert "revise" not in source.lower()
+    assert "edit" not in source.lower()
+
+
+def test_frozen_interface_contract_is_carried_verbatim_without_graph_projection():
+    frozen = {
+        "contract_version": "planner-v1",
+        "interfaces": [{"contract_id": "opaque", "runtime": {"argv": ["source"]}}],
+    }
+    carried = api._carry_frozen_interface_contracts(frozen)
+    assert carried == frozen
+    assert carried is not frozen
+    assert carried["interfaces"] is not frozen["interfaces"]
 
 
 def test_snapshot_persists_the_four_edit_contracts(monkeypatch, tmp_path):

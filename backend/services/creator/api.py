@@ -9086,7 +9086,7 @@ async def _generate_internal_blueprint_or_questions(
     """
     if request.mode != "create":
         raise PreparePlanProtocolError(
-            "Blueprint Planner only accepts create requests; edit requests must be preprocessed first"
+            "Blueprint Planner requires mode=create"
         )
 
     ownership_repair_budget = RequirementOwnershipRepairBudget(max_attempts=1)
@@ -11094,6 +11094,13 @@ def _persist_creator_design_snapshot(
         (metadata_dir / filename).write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
 
 
+def _carry_frozen_interface_contracts(interface_plan: Any) -> dict[str, Any]:
+    """Carry the Interface Planner artifact verbatim; never reconstruct it from Graph."""
+    if not isinstance(interface_plan, dict):
+        return {}
+    return copy.deepcopy(interface_plan)
+
+
 def _persist_workflow_allocation_summary(
     skill_name: str,
     summary: str,
@@ -11712,7 +11719,9 @@ async def _prepare_plan_impl(
                 if isinstance(current_prepared, dict) else []
             ),
             interface_contracts=(
-                dict((current_prepared or {}).get("interface_plan") or {})
+                _carry_frozen_interface_contracts(
+                    (current_prepared or {}).get("interface_plan")
+                )
                 if isinstance(current_prepared, dict) else {}
             ),
         )
@@ -11859,7 +11868,9 @@ async def _prepare_plan_impl(
                 if request.responsibility_edges is not None
                 else None
             ),
-            "interface_plan": request.interface_contracts or {},
+            "interface_plan": _carry_frozen_interface_contracts(
+                request.interface_contracts
+            ),
         }
 
         blueprint_text = (
@@ -13080,7 +13091,9 @@ async def _prepare_plan_impl(
             )
         ),
 
-        interface_contracts=dict(prepared.get("interface_plan") or {}),
+        interface_contracts=_carry_frozen_interface_contracts(
+            prepared.get("interface_plan")
+        ),
 
         tool_pool_summary=(
             tool_pool_summary

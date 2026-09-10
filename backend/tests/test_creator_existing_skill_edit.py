@@ -63,17 +63,11 @@ def test_contractless_skill_becomes_an_ordinary_complete_create_request(monkeypa
     async def fake_call(messages, role, **kwargs):
         assert role == "planner"
         prompt = messages[0]["content"]
-        assert "空白创建 Skill + 从 SKILL.md 提取功能" in prompt
-        assert "完全不知道、也无法看到 SKILL.md" in prompt
-        assert "只能包含 skill_summary 和 complete_requirement 两个顶层字段" in prompt
-        for forbidden_edit_semantics in (
-            "修改已有 Skill",
-            "增量修改",
-            "保留旧实现",
-            "基于原实现",
-            "兼容旧版本",
-        ):
-            assert forbidden_edit_semantics in prompt
+        assert "你是 Skill 需求整理器" in prompt
+        assert "请将两者合并，形成当前需要实现的完整功能需求" in prompt
+        assert "输出面向 Skill 创建，不面向修改过程" in prompt
+        assert "不需要描述需求来源" in prompt
+        assert "保证已有能力和新增需求都被正确包含" in prompt
         payload = json.loads(messages[1]["content"])
         assert payload == {
             "skill_md": "该 Skill 可以比较两个 CSV 文件，并生成比较报告",

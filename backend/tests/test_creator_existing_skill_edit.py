@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import json
+import logging
 
 from backend.services.creator import api
 
@@ -160,6 +161,78 @@ def test_contractless_and_direct_requirements_are_identical_before_planner(monke
 
     assert extracted.user_request == direct.user_request
     assert extracted == direct
+
+
+def test_preprocessor_debug_logs_complete_direct_and_contractless_requests(
+    monkeypatch, tmp_path, caplog,
+):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    _write_skill(tmp_path, complete=False)
+
+    async def fake_call(messages, role, **kwargs):
+        return json.dumps({"complete_requirement": "完整创建需求"})
+
+    monkeypatch.setattr(api, "complete_creator_role_once", fake_call)
+    direct = api.PreparePlanRequest(
+        mode="create",
+        user_request="完整创建需求",
+        uploaded_files=[{"path": "inputs/source.csv"}],
+        model="test-model",
+    )
+    contractless = api.PreparePlanRequest(
+        mode="revise",
+        skill_name="demo",
+        user_request="增加导出",
+        uploaded_files=[{"path": "inputs/source.csv"}],
+        model="test-model",
+    )
+
+    with caplog.at_level(logging.DEBUG, logger=api.logger.name):
+        direct_result = asyncio.run(api._preprocess_existing_skill_request(direct))
+        contractless_result = asyncio.run(api._preprocess_existing_skill_request(contractless))
+
+    assert direct_result == contractless_result
+    expected_payload = direct.model_dump_json()
+    matching_records = [
+        record for record in caplog.records
+        if record.getMessage() == (
+            "[Creator][existing_skill_preprocess][return_request] "
+            f"request={expected_payload}"
+        )
+    ]
+    assert len(matching_records) == 2
+
+
+def test_prepare_plan_entry_debug_logs_complete_request(monkeypatch, caplog):
+    request = api.PreparePlanRequest(
+        mode="create",
+        user_request="创建 CSV 比较 Skill",
+        conversation_history=[{"role": "user", "content": "上下文"}],
+        uploaded_files=[{"path": "inputs/source.csv"}],
+        human_feedback="补充要求",
+        model="test-model",
+    )
+    sentinel = object()
+
+    async def fake_preprocess(received):
+        assert received is request
+        return received
+
+    async def fake_prepare(received):
+        assert received is request
+        return sentinel
+
+    monkeypatch.setattr(api, "_preprocess_existing_skill_request", fake_preprocess)
+    monkeypatch.setattr(api, "_prepare_plan_impl", fake_prepare)
+
+    with caplog.at_level(logging.DEBUG, logger=api.logger.name):
+        result = asyncio.run(api.prepare_plan(request))
+
+    assert result is sentinel
+    assert caplog.records[0].getMessage() == (
+        "[Creator][prepare_plan][entry_request] "
+        f"request={request.model_dump_json()}"
+    )
 
 
 def test_blueprint_planner_rejects_unprocessed_edit_request():

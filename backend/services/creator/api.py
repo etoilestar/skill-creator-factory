@@ -3969,6 +3969,16 @@ complete_requirement 必须是可交给从零 Creator 流程的完整需求描�
     complete_requirement = str(data.get("complete_requirement") or "").strip()
     if not complete_requirement:
         raise PreparePlanProtocolError("已有 Skill 前置需求处理未返回 complete_requirement")
+    if not design["contract_complete"]:
+        # A contractless Skill has no Creator state that can safely seed a
+        # revision.  Re-enter the pipeline through the same request boundary as
+        # a direct creation instead of copying fields from the revise request.
+        return PreparePlanRequest(
+            mode="create",
+            user_request=complete_requirement,
+            uploaded_files=request.uploaded_files,
+            model=request.model,
+        )
     # Deliberately cross the boundary as an ordinary create request.  No saved
     # contract, SKILL.md, edit strategy, or existing_skill_context crosses it.
     return request.model_copy(update={

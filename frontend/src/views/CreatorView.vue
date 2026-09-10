@@ -339,6 +339,7 @@ const reviewSummary = ref(null)
 const showInternalBlueprint = ref(false)
 const skillName = ref('')
 const selectedExistingSkillName = ref('')
+const existingSkillSourcePending = ref(false)
 const existingSkills = ref([])
 onMounted(async () => {
   try {
@@ -352,6 +353,7 @@ onMounted(async () => {
 function onExistingSkillSelectionChanged() {
   skillName.value = selectedExistingSkillName.value
   rootUserRequest.value = ''
+  existingSkillSourcePending.value = Boolean(selectedExistingSkillName.value)
 }
 const pendingSupplementQuestion = ref('')
 const pendingPrepareAction = ref('none')
@@ -649,8 +651,10 @@ function removeUploadedContextFile(fileId) {
 
 function shouldPreparePlanRevise({
   selectedExistingSkill,
+  existingSkills,
 }) {
-  return Boolean(selectedExistingSkill)
+  const selected = existingSkills.find(item => item.name === selectedExistingSkill)
+  return Boolean(selected?.creator_contract_complete)
 }
 
 async function scrollBottom() {
@@ -933,6 +937,7 @@ async function send() {
 
     const mode = shouldPreparePlanRevise({
       selectedExistingSkill: selectedExistingSkillName.value,
+      existingSkills: existingSkills.value,
     })
       ? 'revise'
       : 'create'
@@ -941,6 +946,10 @@ async function send() {
       mode,
 
       skill_name: currentSkillName,
+
+      source_skill_name: existingSkillSourcePending.value
+        ? selectedExistingSkillName.value
+        : null,
 
       user_request: (
         effectiveUserRequest
@@ -1101,6 +1110,10 @@ async function send() {
         }
       },
     )
+
+    // A selected Skill is only an input to the first request.  In particular,
+    // clarification requests remain create requests and cannot reload SKILL.md.
+    existingSkillSourcePending.value = false
 
     if (
       typeof plan.blueprint_text === 'string' &&
@@ -1470,6 +1483,7 @@ function clearChat() {
   skillName.value = ''
 
   selectedExistingSkillName.value = ''
+  existingSkillSourcePending.value = false
 
   pendingBlueprintText.value = ''
 

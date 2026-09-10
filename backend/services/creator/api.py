@@ -3932,16 +3932,28 @@ complete_requirement 必须是可交给从零 Creator 流程的完整需求描�
             },
         }
     else:
-        prompt = """你是 Skill 创建需求整理器。
+        prompt = """你是 Skill 创建需求整理器。请严格分层处理输入信息：
+- skill_md 是“已有 Skill 描述”，只能作为功能能力参考。
+- new_requirement 是“用户新增需求”，作为最终 Skill 的新目标需求。
 
 输入是一个 JSON 对象，仅包含：
-- skill_md：能力描述。
-- new_requirement：补充的能力要求。
+- skill_md：已有 Skill 描述。
+- new_requirement：用户新增需求。
 
-综合两个字段中的业务信息，输出一个从零创建 Skill 时可直接使用的、独立完整的最终需求。complete_requirement 必须描述最终要创建的 Skill 具备什么能力，包括明确的目标、输入、处理能力和输出；即使脱离输入文本也能独立理解。
+必须按以下两个阶段整理，禁止直接把 skill_md 拼接或改写进 complete_requirement：
+1. 先从 skill_md 抽取 skill_capability_summary，只保留抽象的业务能力，不保留实现事实。该对象必须且只能包含 goal、capabilities、inputs、outputs 四个字段。
+2. 再将 skill_capability_summary 与 new_requirement 合并，生成从零创建 Skill 时可直接使用、独立完整的 complete_requirement。
+
+complete_requirement 只描述最终要创建的 Skill 应具备的功能，只保留 Skill 目标、用户需要完成的任务、输入数据类型、输出结果类型和核心处理能力；即使脱离输入文本也能独立理解。
 
 只输出严格 JSON，不要输出 Markdown：
 {
+  \"skill_capability_summary\": {
+    \"goal\": \"\",
+    \"capabilities\": [],
+    \"inputs\": [],
+    \"outputs\": []
+  },
   \"complete_requirement\": \"\"
 }
 
@@ -3950,7 +3962,22 @@ complete_requirement 必须使用创建最终 Skill 的确定性表述，不得�
 - 增加某功能
 - 扩展已有能力
 - 基于原实现
+- 基于已有实现
 - 保留旧实现
+- 保持原实现
+- 完整复制旧 Skill
+
+skill_capability_summary 和 complete_requirement 均禁止继承或提及已有 Skill 的实现事实，包括：
+- 原 SKILL.md 文件结构
+- scripts 文件路径
+- references 文件
+- assets 文件
+- schema 文件
+- output 目录
+- runtime 参数
+- 原接口名称
+- 原函数名称
+- 原代码组织方式
 
 不要说明任何内容的来源或形成过程，也不要输出代码方案或文件修改方案。"""
         payload = {

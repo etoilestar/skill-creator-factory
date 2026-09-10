@@ -524,7 +524,7 @@ INTERFACE_PATCH_SCHEMA: dict[str, Any] = {
     "properties": {"operations": {"type": "array", "items": {
         "type": "object", "required": ["op", "interface_id", "reason"],
         "properties": {
-            "op": {"enum": ["remove_interface", "replace_source", "replace_target"]},
+            "op": {"enum": ["remove_interface", "replace_source", "replace_target", "replace_kind"]},
             "interface_id": {"type": "string", "minLength": 1},
             "reason": {"type": "string", "minLength": 1, "maxLength": 200},
             "source_platform_input": {"type": "string", "minLength": 1},
@@ -534,6 +534,7 @@ INTERFACE_PATCH_SCHEMA: dict[str, Any] = {
             "target_member": {"type": "string", "minLength": 1},
             "target_input": {"type": "string", "minLength": 1},
             "target_platform_output": {"type": "string", "minLength": 1},
+            "kind": {"enum": sorted(INTERFACE_KINDS)},
         }, "additionalProperties": False,
     }}},
 }
@@ -574,12 +575,13 @@ def validate_interface_patch_protocol(patch: Any) -> dict[str, Any]:
         if not isinstance(operation, dict) or not common <= set(operation):
             raise InterfaceIntentPlanError("patch operation fields are invalid", code="invalid_interface_patch", details={"path": path})
         op = operation.get("op")
-        if op not in {"remove_interface", "replace_source", "replace_target"}:
+        if op not in {"remove_interface", "replace_source", "replace_target", "replace_kind"}:
             raise InterfaceIntentPlanError("patch operation is unsupported", code="invalid_interface_patch", details={"path": f"{path}.op"})
         allowed_fields = {
             "remove_interface": common,
             "replace_source": common | {"source_platform_input", "source_path", "source_member", "source_output"},
             "replace_target": common | {"target_member", "target_input", "target_platform_output"},
+            "replace_kind": common | {"kind"},
         }[op]
         if not set(operation) <= allowed_fields:
             raise InterfaceIntentPlanError("patch operation contains fields invalid for op", code="invalid_interface_patch", details={"path": path})
@@ -593,6 +595,8 @@ def validate_interface_patch_protocol(patch: Any) -> dict[str, Any]:
             platform_target = "target_platform_output" in operation
             if member_target == platform_target:
                 raise InterfaceIntentPlanError("replace_target must contain exactly one target shape", code="invalid_interface_patch", details={"path": path})
+        if op == "replace_kind" and operation.get("kind") not in INTERFACE_KINDS:
+            raise InterfaceIntentPlanError("replace_kind must contain a supported kind", code="invalid_interface_patch", details={"path": f"{path}.kind"})
         if not isinstance(operation.get("interface_id"), str) or not operation["interface_id"].strip():
             raise InterfaceIntentPlanError("patch interface_id is invalid", code="invalid_interface_patch", details={"path": f"{path}.interface_id"})
         reason = operation.get("reason")
@@ -642,6 +646,19 @@ def apply_interface_patch(
             else:
                 current.pop("target_platform_output", None)
                 current.update(target_member=operation["target_member"], target_input=operation["target_input"])
+        elif op == "replace_kind":
+            new_kind = operation["kind"]
+            current["kind"] = new_kind
+            # Kind owns the structural shape.  Retain fields belonging to the
+            # selected schema and discard endpoint fields from every other kind.
+            structural_fields = set().union(*INTERFACE_FIELDS.values()) | {"source_type"}
+            allowed = INTERFACE_FIELDS[new_kind] | OPTIONAL_INTERFACE_FIELDS[new_kind]
+            if new_kind == "platform_to_member":
+                allowed.add("source_type")
+            for key in structural_fields - allowed:
+                current.pop(key, None)
+            if new_kind == "platform_to_member":
+                current["source_type"] = PLATFORM_INPUT_SOURCE_TYPE
         else:
             raise InterfaceIntentPlanError("unsupported interface patch operation", code="invalid_interface_patch", details={"op": op})
     return interfaces if legacy_list else {"interfaces": interfaces}
@@ -876,6 +893,34 @@ def _raise(message: str, code: str, *, path: str, **details: Any) -> None:
     raise InterfaceIntentPlanError(message, code=code, details=payload)
 
 
+def _kind_schema_mismatch(raw: dict[str, Any]) -> dict[str, Any] | None:
+    """Describe a kind typo when the endpoint fields identify another schema."""
+    current_kind = raw.get("kind")
+    observed = set(raw)
+    matches = []
+    for kind, required in INTERFACE_FIELDS.items():
+        allowed = required | OPTIONAL_INTERFACE_FIELDS[kind]
+        if kind == "platform_to_member":
+            allowed = allowed | {"source_type"}
+        if required <= observed <= allowed:
+            matches.append(kind)
+    if current_kind in INTERFACE_KINDS and len(matches) == 1 and matches[0] != current_kind:
+        expected_kind = matches[0]
+        distinctive = {
+            "platform_to_member": "source_platform_input requires platform_to_member",
+            "member_to_member": "target_member and target_input require member_to_member",
+            "member_to_platform": "target_platform_output requires member_to_platform",
+        }
+        return {
+            "interface_id": str(raw.get("interface_id") or ""),
+            "issue_code": "kind_schema_mismatch",
+            "current_kind": current_kind,
+            "expected_kind": expected_kind,
+            "reason": distinctive[expected_kind],
+        }
+    return None
+
+
 def _compact_port_id(value: Any) -> str:
     if isinstance(value, dict):
         return str(
@@ -1045,6 +1090,9 @@ def validate_interface_plan_protocol(plan: dict[str, Any]) -> dict[str, Any]:
         expected = INTERFACE_FIELDS[kind]
         allowed = expected | OPTIONAL_INTERFACE_FIELDS[kind] | ({"source_type"} if kind == "platform_to_member" else set())
         if not expected <= set(raw) <= allowed:
+            mismatch = _kind_schema_mismatch(raw)
+            if mismatch:
+                _raise("interface kind does not match its field schema", "kind_schema_mismatch", path=path, **mismatch)
             _raise("interface fields do not match kind schema", "invalid_interface_protocol", path=path,
                    expected=sorted(expected), observed=sorted(raw))
         interface_id = _require_nonempty_string(raw, "interface_id", "invalid_interface_protocol", f"{path}.interface_id")
@@ -1094,6 +1142,9 @@ def validate_interface_intent_plan(*, plan: dict[str, Any], function_items: list
             _raise("interface kind is invalid", "invalid_interface_kind", path=f"{path}.kind")
         expected = INTERFACE_FIELDS[kind]
         if not expected <= set(raw_interface) <= expected | OPTIONAL_INTERFACE_FIELDS[kind]:
+            mismatch = _kind_schema_mismatch(raw_interface)
+            if mismatch:
+                _raise("interface kind does not match its field schema", "kind_schema_mismatch", path=path, **mismatch)
             _raise("interface fields do not match kind schema", "invalid_interface_protocol", path=path, expected=sorted(expected), observed=sorted(raw_interface))
         interface_id = _require_nonempty_string(raw_interface, "interface_id", "invalid_interface_protocol", f"{path}.interface_id")
         if interface_id in seen_ids:
@@ -1364,6 +1415,17 @@ def collect_interface_plan_validation_issues(
 
     for index, interface in enumerate(plan.get("interfaces") or []):
         path, iid, kind = f"$.interfaces[{index}]", str(interface.get("interface_id") or ""), interface.get("kind")
+        mismatch = _kind_schema_mismatch(interface)
+        if mismatch:
+            issues.append({
+                "code": "kind_schema_mismatch", "stage": "interface_plan_validation",
+                "path": path, "error_type": "schema_error",
+                "message": "Interface kind does not match its field schema.",
+                "observed_value": {"kind": kind},
+                "expected_constraint": {"kind": mismatch["expected_kind"]},
+                "details": {}, **mismatch,
+            })
+            continue
         if kind == "platform_to_member":
             source, target, slot = interface["source_platform_input"], interface["target_member"], interface["target_input"]
             receiving_contracts.setdefault((target, slot), []).append(iid)
@@ -2278,8 +2340,12 @@ async def plan_function_item_interfaces(*, original_user_goal: str, frozen_funct
     try:
         parsed = validate_interface_plan_protocol(transport)
     except InterfaceIntentPlanError as exc:
-        protocol_issue = exc
         parsed = transport
+        # A structurally recognizable kind/schema mismatch is an editable
+        # Interface defect, not an opaque transport failure.  Route it through
+        # the targeted patch protocol so the model can emit replace_kind.
+        if exc.code != "kind_schema_mismatch":
+            protocol_issue = exc
     deterministic_issues = collect_interface_plan_validation_issues(
         plan=parsed, function_items=frozen_function_items, platform_contract=platform_contract,
     ) if protocol_issue is None else []
@@ -2321,7 +2387,9 @@ Do not patch only visible wording. Never regenerate all interfaces for a
 semantically valid transport.
 4. CURRENT AUTHORITY
 Modify only Interfaces explicitly named by violations. Use only
-remove_interface, replace_source, or replace_target. Never
+remove_interface, replace_source, replace_target, or replace_kind. When kind
+and its field schema disagree, prefer replace_kind; never use replace_target to
+bypass the schema. Kind determines the Interface field structure. Never
 add an Interface and never regenerate or reorder the complete contract.
 5. HARD ACCEPTANCE CONDITIONS
 The complete result must match INTERFACE_SCHEMA. Every supplied acceptance fact
@@ -2349,7 +2417,7 @@ JSON matching INTERFACE_SCHEMA."""
                 "interface_patch_schema": INTERFACE_PATCH_SCHEMA,
                 "interfaces": (previous_candidate.get("interfaces") or []) if isinstance(previous_candidate, dict) else [],
                 "violations": facts,
-                "allowed_operations": ["remove_interface", "replace_source", "replace_target"],
+                "allowed_operations": ["remove_interface", "replace_source", "replace_target", "replace_kind"],
             }
             if _include_previous_interface_plan(feedback):
                 correction_payload["previous_interface_plan"] = previous_candidate
@@ -2680,7 +2748,10 @@ Returning a renamed equivalent without semantic improvement is forbidden.
 
 8. OUTPUT CONTRACT
 Return only a patch object matching interface_patch_schema. The only allowed
-operations are remove_interface, replace_source, and replace_target. Do not
+operations are remove_interface, replace_source, replace_target, and
+replace_kind. When kind and its field schema disagree, prefer replace_kind;
+never use replace_target to bypass the schema. Kind determines the Interface
+field structure. Do not
 return or regenerate the complete Interface Plan. This is a strict JSON-schema
 response: output exactly one {"operations": [...]} object and no prose. Keep
 the entire response concise and every reason at or below 200 characters.

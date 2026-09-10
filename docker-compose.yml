@@ -57,3 +57,28 @@ services:
     depends_on:
       - backend
     restart: unless-stopped
+
+  creator-mcp:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+
+    command:
+      - python
+      - /app/backend/integrations/dsh/creator_mcp.py
+
+    volumes:
+      - ./backend:/app/backend
+      - ./kernel:/app/kernel:ro
+      - ./skills:/app/skills
+
+    environment:
+      - SUPERSKILLS_CREATOR_URL=http://backend:8000/api/chat/creator
+
+    ports:
+      - "58001:8001"
+
+    depends_on:
+      - backend
+
+    restart: unless-stopped

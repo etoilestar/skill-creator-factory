@@ -3867,6 +3867,96 @@ class PreparePlanRequest(BaseModel):
     requirement_allocations: list[dict[str, Any]] | None = None
 
 
+_CREATOR_DESIGN_FILES = (
+    "blueprint.md",
+    "requirement_graph.json",
+    "creation_plan.json",
+    "interface_contracts.json",
+)
+
+
+def _load_existing_skill_design(skill_name: str) -> dict[str, Any]:
+    """Load an edit source without guessing whether its contract is complete."""
+    root = settings.skills_path / _validate_skill_name(skill_name)
+    if not root.is_dir():
+        raise HTTPException(status_code=404, detail=f"Skill 不存在：{skill_name}")
+    creator_dir = root / ".creator"
+    paths = {name: creator_dir / name for name in _CREATOR_DESIGN_FILES}
+    complete = all(path.is_file() for path in paths.values())
+    result: dict[str, Any] = {
+        "skill_name": skill_name,
+        "contract_complete": complete,
+        "skill_md": (root / "SKILL.md").read_text(encoding="utf-8", errors="replace") if (root / "SKILL.md").is_file() else "",
+    }
+    if complete:
+        result["blueprint"] = paths["blueprint.md"].read_text(encoding="utf-8")
+        for key, filename in (
+            ("requirement_graph", "requirement_graph.json"),
+            ("creation_plan", "creation_plan.json"),
+            ("interface_contracts", "interface_contracts.json"),
+        ):
+            try:
+                result[key] = json.loads(paths[filename].read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise HTTPException(status_code=409, detail=f"已有 Skill 设计合同损坏：{filename}: {exc}") from exc
+    return result
+
+
+async def _preprocess_existing_skill_request(request: PreparePlanRequest) -> PreparePlanRequest:
+    """Dedicated edit-only front layer.  The create planner never sees history."""
+    if request.mode != "revise" or not request.skill_name:
+        return request
+    design = _load_existing_skill_design(request.skill_name)
+    route = route_model("creator_prepare_plan", requested_model=request.model, reason="existing Skill edit preprocessing")
+    if design["contract_complete"]:
+        prompt = """你是 Creator 的独立增量修改分析器，不是 Blueprint Planner。
+根据已保存的完整设计合同和新增需求，输出严格 JSON：
+change_analysis（含 unchanged_functions、changed_functions、new_function_items、responsibility_boundary_changes、interface_contract_changes）以及 complete_requirement。
+complete_requirement 必须是可交给从零 Creator 流程的完整需求描述；保持合理职责，只改受影响部分，避免无关重构。不要输出 Markdown。"""
+        payload = {
+            "existing_design": {
+                "blueprint": design["blueprint"],
+                "requirement_graph": design["requirement_graph"],
+                "interface_contracts": design["interface_contracts"],
+                "creation_plan": design["creation_plan"],
+            },
+            "new_requirement": request.user_request,
+            "new_requirement_context": {
+                "conversation_history": request.conversation_history,
+                "human_feedback": request.human_feedback,
+            },
+        }
+    else:
+        prompt = """你是 Creator 的独立已有能力提取器，不是 Blueprint Planner。
+只依据给出的 SKILL.md 提取已完成业务能力，并与新增需求合并。输出严格 JSON：skill_summary（目标、核心功能、输入、输出、已完成能力、可确认的文件职责）和 complete_requirement。
+complete_requirement 必须是完整需求描述；不得假设任何历史设计合同。不要输出 Markdown。"""
+        payload = {
+            "skill_md": design["skill_md"],
+            "new_requirement": request.user_request,
+            "new_requirement_context": {
+                "conversation_history": request.conversation_history,
+                "human_feedback": request.human_feedback,
+            },
+        }
+    raw = await complete_creator_role_once(
+        [{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+        "planner", fallback_model=route.model, stage="existing_skill_preprocess",
+    )
+    data = _parse_prepare_plan_json(raw)
+    complete_requirement = str(data.get("complete_requirement") or "").strip()
+    if not complete_requirement:
+        raise PreparePlanProtocolError("已有 Skill 前置需求处理未返回 complete_requirement")
+    # Deliberately cross the boundary as an ordinary create request.  No saved
+    # contract, SKILL.md, edit strategy, or existing_skill_context crosses it.
+    return request.model_copy(update={
+        "mode": "create", "user_request": complete_requirement,
+        "conversation_history": [], "previous_blueprint_text": "",
+        "human_feedback": "", "prepare_action": "none",
+        "function_items": None, "responsibility_edges": None,
+        "requirement_allocations": None,
+    })
+
+
 class PreparePlanReviewSummary(BaseModel):
     goal: str = ""
     input: str = ""
@@ -3953,6 +4043,7 @@ class PreparePlanResponse(BaseModel):
     )
 
     workflow_allocation_summary: str = ""
+    interface_contracts: dict[str, Any] = Field(default_factory=dict)
 
     tool_pool_summary: dict[
         str,
@@ -7200,6 +7291,7 @@ async def _bind_executable_responsibility_plan(
     return {
         "function_items": frozen_function_items,
         "responsibility_edges": responsibility_edges,
+        "interface_plan": interface_payload,
     }
 
 
@@ -9756,8 +9848,6 @@ Blueprint Planner 只规划业务责任。
     )
 
     payload = {
-        "mode": request.mode,
-
         "skill_name": (
             request.skill_name
         ),
@@ -9788,10 +9878,6 @@ Blueprint Planner 只规划业务责任。
 
         "human_feedback": (
             request.human_feedback
-        ),
-
-        "existing_skill_context": (
-            existing_context
         ),
 
         "clarification_rounds": (
@@ -9828,6 +9914,12 @@ Blueprint Planner 只规划业务责任。
 
         "platform_io_contract": platform_io_contract_prompt_text(),
     }
+    # Keep the create transport identical to a request that has never heard of
+    # editing.  Edit-only vocabulary is attached solely on the separated legacy
+    # revise branch (the public endpoints preprocess new edits before this call).
+    if request.mode == "revise":
+        payload["mode"] = "revise"
+        payload["existing_skill_context"] = existing_context
 
     route = route_model(
         "creator_prepare_plan",
@@ -10232,6 +10324,7 @@ Blueprint Planner 只规划业务责任。
         data["responsibility_edges"] = normalized_edges
         data["requirement_allocations"] = requirement_allocations
         data["requirement_channels"] = requirement_channels
+        data["interface_plan"] = binding_data.get("interface_plan") or {}
         data["internal_blueprint_text"] = _render_structured_responsibility_view(
             frozen_blueprint_text, normalized_function_items, normalized_edges
         )
@@ -10993,17 +11086,54 @@ def _persist_requirement_graph(
         / _validate_skill_name(skill_name)
         / ".creator"
     )
-    metadata_dir.mkdir(
-        parents=True,
-        exist_ok=True,
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    (metadata_dir / "requirement_graph.json").write_text(
+        graph.model_dump_json(indent=2), encoding="utf-8"
     )
-    (
-        metadata_dir
-        / "requirement_graph.json"
-    ).write_text(
-        graph.model_dump_json(indent=2),
-        encoding="utf-8",
-    )
+
+
+def _persist_creator_design_snapshot(
+    *, skill_name: str, blueprint_text: str, requirement_graph: Any,
+    creation_plan: dict[str, Any], interface_contracts: dict[str, Any] | None,
+) -> None:
+    """Persist observability/edit snapshots without influencing planning."""
+    metadata_dir = settings.skills_path / _validate_skill_name(skill_name) / ".creator"
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    (metadata_dir / "blueprint.md").write_text(str(blueprint_text or "").strip() + "\n", encoding="utf-8")
+    graph_payload = requirement_graph.model_dump(mode="json") if hasattr(requirement_graph, "model_dump") else requirement_graph
+    payloads = {
+        "requirement_graph.json": graph_payload or {},
+        "creation_plan.json": creation_plan,
+        "interface_contracts.json": interface_contracts or {},
+    }
+    for filename, payload in payloads.items():
+        (metadata_dir / filename).write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
+
+
+def _snapshot_interface_contracts(graph: Any, files: list[Any]) -> dict[str, Any]:
+    """Project complete per-FunctionItem contracts from the final frozen graph."""
+    file_responsibilities = {
+        str(getattr(item, "path", "") or ""): {
+            "role": str(getattr(item, "role", "") or ""),
+            "purpose": str(getattr(item, "purpose", "") or ""),
+        }
+        for item in files or []
+    }
+    graph_data = graph.model_dump(mode="json") if hasattr(graph, "model_dump") else (graph or {})
+    interfaces = []
+    for item in graph_data.get("function_items", []) if isinstance(graph_data, dict) else []:
+        target = str(item.get("target_file") or "")
+        if not target:
+            continue
+        projected = project_script_interface_contract(graph_data, target)
+        interfaces.append({
+            "target_file": target,
+            "inputs": item.get("inputs") or [],
+            "outputs": item.get("outputs") or [],
+            "runtime_contract": projected,
+            "file_responsibility": file_responsibilities.get(target, {}),
+        })
+    return {"interfaces": interfaces}
 
 
 def _persist_workflow_allocation_summary(
@@ -12922,7 +13052,7 @@ async def _prepare_plan_impl(
             "tool_pool_summary": tool_pool_summary,
         })
 
-    return PreparePlanResponse(
+    response = PreparePlanResponse(
         status="ready",
 
         prepare_stage="ready",
@@ -12992,6 +13122,8 @@ async def _prepare_plan_impl(
             )
         ),
 
+        interface_contracts=_snapshot_interface_contracts(graph_payload, plan.files),
+
         tool_pool_summary=(
             tool_pool_summary
         ),
@@ -13004,6 +13136,14 @@ async def _prepare_plan_impl(
             unselected_uploaded_files
         ),
     )
+    _persist_creator_design_snapshot(
+        skill_name=plan.skill_name,
+        blueprint_text=final_blueprint_text,
+        requirement_graph=graph_payload,
+        creation_plan=response.model_dump(mode="json"),
+        interface_contracts=response.interface_contracts,
+    )
+    return response
 
 
 @router.post(
@@ -13013,7 +13153,7 @@ async def _prepare_plan_impl(
 async def prepare_plan(
     request: PreparePlanRequest,
 ):
-    return await _prepare_plan_impl(request)
+    return await _prepare_plan_impl(await _preprocess_existing_skill_request(request))
 
 
 @router.post("/prepare-plan/stream")
@@ -13028,8 +13168,9 @@ async def prepare_plan_stream(
 
         async def run_prepare() -> None:
             try:
+                prepared_request = await _preprocess_existing_skill_request(request)
                 plan = await _prepare_plan_impl(
-                    request,
+                    prepared_request,
                     event_emitter=event_emitter,
                 )
                 await queue.put({

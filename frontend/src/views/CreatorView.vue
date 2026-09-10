@@ -6,6 +6,13 @@
     </div>
 
     <div class="toolbar">
+      <label class="skill-mode-select">
+        <span>创建方式</span>
+        <select v-model="selectedExistingSkillName" :disabled="streaming || messages.length > 0" @change="onExistingSkillSelectionChanged">
+          <option value="">新建 Skill</option>
+          <option v-for="item in existingSkills" :key="item.name" :value="item.name">调整：{{ item.name }}</option>
+        </select>
+      </label>
       <button
         class="btn-ghost btn-thoughts"
         :class="{ active: showThoughts }"
@@ -257,8 +264,9 @@
 </template>
 
 <script setup>
-import { ref, computed, nextTick } from 'vue'
+import { ref, computed, nextTick, onMounted } from 'vue'
 import { streamPrepareCreationPlan, buildClarificationQuickActions, uploadCreatorContextFile } from '../composables/useCreator.js'
+import { fetchSkills } from '../composables/useSkills.js'
 import ChatBubble from '../components/ChatBubble.vue'
 import SkillCreationPanel from '../components/SkillCreationPanel.vue'
 import CreatorExecutionPanel from '../components/CreatorExecutionPanel.vue'
@@ -330,6 +338,20 @@ const reviewSummary = ref(null)
 const showInternalBlueprint = ref(false)
 const skillName = ref('')
 const selectedExistingSkillName = ref('')
+const existingSkills = ref([])
+onMounted(async () => {
+  try {
+    const data = await fetchSkills('creator')
+    existingSkills.value = Array.isArray(data) ? data : (data?.skills || [])
+  } catch (e) {
+    uploadError.value = `已有 Skill 列表加载失败：${e.message}`
+  }
+})
+
+function onExistingSkillSelectionChanged() {
+  skillName.value = selectedExistingSkillName.value
+  rootUserRequest.value = ''
+}
 const pendingSupplementQuestion = ref('')
 const pendingPrepareAction = ref('none')
 const recoverablePlanningFailure = ref(null)
@@ -625,13 +647,9 @@ function removeUploadedContextFile(fileId) {
 }
 
 function shouldPreparePlanRevise({
-  skillName,
-  previousBlueprintText,
+  selectedExistingSkill,
 }) {
-  return Boolean(
-    skillName ||
-    previousBlueprintText
-  )
+  return Boolean(selectedExistingSkill)
 }
 
 async function scrollBottom() {
@@ -913,9 +931,7 @@ async function send() {
     const humanFeedback = text
 
     const mode = shouldPreparePlanRevise({
-      skillName: currentSkillName,
-
-      previousBlueprintText,
+      selectedExistingSkill: selectedExistingSkillName.value,
     })
       ? 'revise'
       : 'create'
@@ -1480,6 +1496,9 @@ function clearChat() {
   height: 100%;
   overflow: hidden;
 }
+
+.skill-mode-select { display: inline-flex; align-items: center; gap: 8px; color: var(--text-muted, #94a3b8); font-size: 13px; }
+.skill-mode-select select { min-width: 190px; padding: 7px 10px; border: 1px solid var(--border, #334155); border-radius: 8px; background: var(--surface, #111827); color: inherit; }
 
 .header {
   padding: 20px 24px 12px;

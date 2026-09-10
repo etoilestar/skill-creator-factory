@@ -50,7 +50,12 @@ def test_edit_preprocessor_crosses_into_clean_create_request(monkeypatch, tmp_pa
 def test_contractless_skill_becomes_an_ordinary_complete_create_request(monkeypatch, tmp_path):
     monkeypatch.setattr(api.settings, "skills_path", tmp_path)
     skill = _write_skill(tmp_path, complete=False)
-    skill.joinpath("SKILL.md").write_text("CSV比较工具", encoding="utf-8")
+    skill_md = """# CSV 比较工具
+
+使用 scripts/main.py 比较 CSV，读取 references/schema.json，
+并将结果写入 outputs/result.json。
+"""
+    skill.joinpath("SKILL.md").write_text(skill_md, encoding="utf-8")
     complete_requirement = (
         "创建一个 CSV 比较 Skill：接收两个 CSV 文件，比较数据差异，"
         "并输出包含逐项差异及差异总结的比较结果。"
@@ -61,23 +66,51 @@ def test_contractless_skill_becomes_an_ordinary_complete_create_request(monkeypa
         prompt = messages[0]["content"]
         assert "最终要创建的 Skill" in prompt
         assert '"complete_requirement"' in prompt
-        assert '"skill_summary"' not in prompt
+        assert '"skill_capability_summary"' in prompt
+        for summary_field in ("goal", "capabilities", "inputs", "outputs"):
+            assert f'"{summary_field}"' in prompt
+        assert "已有 Skill 描述" in prompt
+        assert "功能能力参考" in prompt
+        assert "用户新增需求" in prompt
+        assert "新目标需求" in prompt
         for forbidden_semantics in (
             "修改已有 Skill",
             "增加某功能",
             "扩展已有能力",
             "基于原实现",
+            "基于已有实现",
             "保留旧实现",
+            "保持原实现",
+            "完整复制旧 Skill",
         ):
             assert forbidden_semantics in prompt
+        for forbidden_implementation_detail in (
+            "原 SKILL.md 文件结构",
+            "scripts 文件路径",
+            "references 文件",
+            "assets 文件",
+            "schema 文件",
+            "output 目录",
+            "runtime 参数",
+            "原接口名称",
+            "原函数名称",
+            "原代码组织方式",
+        ):
+            assert forbidden_implementation_detail in prompt
         assert "不要说明任何内容的来源或形成过程" in prompt
         assert "迁移" not in prompt
         payload = json.loads(messages[1]["content"])
         assert payload == {
-            "skill_md": "CSV比较工具",
+            "skill_md": skill_md,
             "new_requirement": "增加差异总结",
         }
         return json.dumps({
+            "skill_capability_summary": {
+                "goal": "比较 CSV 数据",
+                "capabilities": ["CSV 比较"],
+                "inputs": ["CSV 文件"],
+                "outputs": ["比较结果"],
+            },
             "complete_requirement": complete_requirement,
         })
 
@@ -119,8 +152,13 @@ def test_contractless_skill_becomes_an_ordinary_complete_create_request(monkeypa
         "扩展已有能力",
         "基于原实现",
         "保留旧实现",
+        "scripts/main.py",
+        "references/schema.json",
+        "outputs/result.json",
     ):
         assert forbidden not in result.user_request
+    assert "CSV 比较" in result.user_request
+    assert "差异总结" in result.user_request
 
     direct_create = api.PreparePlanRequest(
         mode="create",

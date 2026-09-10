@@ -91,6 +91,9 @@ def test_contractless_skill_becomes_an_ordinary_complete_create_request(monkeypa
         conversation_history=[{"role": "user", "content": "不得透传"}],
         human_feedback="不得透传",
         previous_blueprint_text="不得透传",
+        prepare_action="submit_supplement",
+        uploaded_files=[{"path": "inputs/source.csv"}],
+        model="test-model",
         function_items=[{"id": "不得透传"}],
         responsibility_edges=[{"source": "不得透传"}],
         requirement_allocations=[{"requirement": "不得透传"}],
@@ -104,6 +107,10 @@ def test_contractless_skill_becomes_an_ordinary_complete_create_request(monkeypa
     assert result.conversation_history == []
     assert result.human_feedback == ""
     assert result.previous_blueprint_text == ""
+    assert result.prepare_action == "none"
+    assert result.skill_name is None
+    assert result.uploaded_files == [{"path": "inputs/source.csv"}]
+    assert result.model == "test-model"
     assert result.function_items is None
     assert result.responsibility_edges is None
     assert result.requirement_allocations is None
@@ -113,8 +120,9 @@ def test_contractless_skill_becomes_an_ordinary_complete_create_request(monkeypa
 
     direct_create = api.PreparePlanRequest(
         mode="create",
-        skill_name="demo",
         user_request=complete_requirement,
+        uploaded_files=[{"path": "inputs/source.csv"}],
+        model="test-model",
     )
     assert result == direct_create
 
@@ -144,7 +152,6 @@ def test_contractless_and_direct_requirements_are_identical_before_planner(monke
     )))
     direct = api.PreparePlanRequest(
         mode="create",
-        skill_name="demo",
         user_request=direct_requirement,
     )
 

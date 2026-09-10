@@ -9174,15 +9174,11 @@ The first pass only follows the FilePlan protocol. It may plan SKILL.md, scripts
 - 不得先自行创造 asset，再通过 `source=user_upload` 使它看起来合法。
 - `source=user_upload` 只描述一个已经由用户需求授权的 asset
   在 Creation 阶段如何提供；它不是新增 asset 的权限。
-- `source=bundled` 也不是新增 asset 的权限，只能用于已有 bundled inventory
-  或已有 Skill 中已经存在的静态素材。
+- `source=bundled` 也不是新增 asset 的权限，只能用于已有 bundled inventory。
 - 如果用户没有明确提出静态素材需求，应选择不依赖额外 asset 的实现方案，
   不得为了 Planner 自己选择的实现方式要求用户额外上传素材。
 - reference 与 asset 不同。Creator 可以根据实现需要规划并生成
   `references/*.md` 语义指导文件。
-- revise 模式可以保留已有 Skill 中仍然有效的 asset；
-  新增 asset 仍然需要当前 confirmed user context 的明确依据。
-
 返回 `status=ready` 前，对每个新规划的 `assets/**` 做一次自检：
 “哪一条 confirmed user fact 明确要求这个静态素材？”
 如果没有明确答案，删除这个 asset SkillPlan entry，
@@ -9685,8 +9681,7 @@ Blueprint Planner 只规划业务责任。
   asset：assets/** 不能仅由 Script responsibility、implementation choice、
   architecture convenience 或 Planner 自己选择的实现方式授权。新建 Skill 的 asset
   identity 只能来自 confirmed user context 中明确的静态素材意图：用户明确表示会
-  提供、上传、包含、沿用或使用某个现有静态素材。revise 模式中已存在且仍有效的
-  asset 可以保留。实际 confirmed uploaded asset 可以保留。source=bundled 只能描述实际
+  提供、上传、包含、沿用或使用某个现有静态素材。实际 confirmed uploaded asset 可以保留。source=bundled 只能描述实际
   已有 bundled resource。不得先创造 asset，再通过 dependency、FunctionItem
   responsibility、Requirement Projection 或 source=user_upload 使它合法。
 
@@ -9753,7 +9748,7 @@ Blueprint Planner 只规划业务责任。
   可以基于 previous_blueprint_text
   与新增 feedback 修订 full blueprint。
 
-- 除真实 supplement/revise 外，
+- 除真实 supplement 外，
   不得重新定义已经明确的业务动作方向。
 
 - script topology 必须在 blueprint planning
@@ -9964,7 +9959,6 @@ Blueprint Planner 只规划业务责任。
     allowed_resource_paths = _build_prepare_allowed_resource_paths(
         request=request,
         review_summary=first_planner_result.get("review_summary"),
-        existing_skill_context=None,
     )
     frozen_blueprint_text = str(
         first_planner_result.get("internal_blueprint_text")
@@ -12289,11 +12283,6 @@ async def _prepare_plan_impl(
 
     allowed_resource_paths = _build_prepare_allowed_resource_paths(
         request=request,
-        existing_skill_context=(
-            _read_prepare_existing_skill_context(skill_name)
-            if request.mode == "revise"
-            else {}
-        ),
     )
 
     blueprint_text = (
